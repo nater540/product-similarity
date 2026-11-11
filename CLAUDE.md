@@ -6,7 +6,7 @@ marketplace listings. Each revision is embedded field by field with a small BERT
 thresholds. A record's quantities (weight, volume, potency) are compared as numbers beside that, never embedded.
 Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D17) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D18) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -102,6 +102,10 @@ changing a design. Infer conventions from the existing code first.
   editing it, and never quote a figure that was not produced by `just throughput` or `just calibrate`.
 - **Rust end to end, by the owner's choice** (D13): training is `similarity-train`, in Burn. Do not add Python to
   any pipeline. `tools/*.py` are referees that write PyTorch fixtures for the parity tests and nothing else.
+- **`provenance.json` is a note about a model, never part of it** (D18). Whatever writes a model directory writes
+  it, inside the same `write_whole`, and it records what produced the model, not what the model scored. Never add
+  it to the files `ModelFiles::digest` hashes, never make loading depend on it, and never write into a model
+  directory after the fact to add results.
 - **Dropout is never in the module tree.** `forward_training` takes it as an argument; `forward` cannot apply it.
 - **A checkpoint must restore parameter ids before the optimizer state** (`similarity-train/src/checkpoint.rs`).
   Burn files optimizer state under ids that change on every load; skipping this makes a resume silently train

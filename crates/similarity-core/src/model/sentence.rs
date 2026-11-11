@@ -249,6 +249,57 @@ pub struct ModelFiles {
   pub read: Vec<PathBuf>,
 }
 
+impl ModelFiles {
+  /// The same files under another directory: where a copy of the model has been, or is being, written.
+  #[must_use]
+  pub fn rebased(&self, dir: &Path) -> Self {
+    Self {
+      dir: dir.to_path_buf(),
+      read: self
+        .read
+        .iter()
+        .map(|path| {
+          path
+            .strip_prefix(&self.dir)
+            .map_or_else(|_| path.clone(), |relative| dir.join(relative))
+        })
+        .collect(),
+    }
+  }
+
+  /// A digest of the model's content: the first 16 hex digits of the SHA-256 over every file the encoder was
+  /// built from and the tokenizer.
+  ///
+  /// This is the part of a model fingerprint that says *which model*; [`crate::Embedder`] adds the output width
+  /// and the token limit to it. Only the files that determine the output are hashed, so a note left beside them
+  /// (a README, a `provenance.json`) does not make it a different model.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`Error::Io`] if a file cannot be read, or changes size while it is being read.
+  pub fn digest(&self) -> Result<String> {
+    use sha2::{Digest as _, Sha256};
+
+    let tokenizer = self.dir.join(crate::tokenize::TOKENIZER_FILE);
+    let mut hasher = Sha256::new();
+    for path in self.read.iter().chain(std::iter::once(&tokenizer)) {
+      // Streamed: the checkpoint is tens of megabytes.
+      let mut file = std::fs::File::open(path).map_err(|source| Error::io(path, source))?;
+      let length = file.metadata().map_err(|source| Error::io(path, source))?.len();
+      // Length-prefix each file so that moving bytes between two files cannot collide.
+      hasher.update(length.to_le_bytes());
+      let streamed = std::io::copy(&mut file, &mut hasher).map_err(|source| Error::io(path, source))?;
+      if streamed != length {
+        return Err(Error::io(
+          path,
+          std::io::Error::other("the file changed size while it was being read"),
+        ));
+      }
+    }
+    Ok(crate::record::hex_prefix(&hasher.finalize(), 8))
+  }
+}
+
 /// Every learned tensor of the pipeline as one module, so that an optimizer can update all of them in one step.
 #[derive(Module, Debug)]
 pub struct EncoderWeights {

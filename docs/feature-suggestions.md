@@ -1,8 +1,7 @@
 # Feature suggestions
 
 Twenty features that could be added to this project, with what each is, why it matters here, how it would fit the
-code, and what it would cost. **Features 7 and 8 are built** (D17, and "Choosing thresholds" in the README); the
-rest are not. They were proposed in November 2026 from a read of the
+code, and what it would cost. **Features 1, 7, and 8 are built** (D17, D18, and the README); the rest are not. They were proposed in November 2026 from a read of the
 repository as it stood then (`README.md`, `docs/decisions.md`, and the crates); check a suggestion against the
 code before starting on it, since the code will have moved. It has moved once already: records now carry
 quantities, compared as numbers (D16), and the features that touch a verdict or a report say below what that
@@ -50,7 +49,7 @@ and because each would put a Python service in the loop.
 
 | # | Feature | Area | Effort | Needs real data |
 |---|---|---|---|---|
-| 1 | Lineage file in every model directory | Tracking | S | No |
+| 1 | Lineage file in every model directory (built) | Tracking | S | No |
 | 2 | Local run registry | Tracking | M | No |
 | 3 | Evaluation at every checkpoint | Tracking | M | For meaningful results |
 | 4 | Model registry and promotion gate | Tracking | M | No |
@@ -74,6 +73,9 @@ and because each would put a Python service in the loop.
 ## A. Experiment tracking, lineage, and a model registry
 
 ### 1. Lineage file in every model directory
+
+**Built** (D18). One difference from the description below: the file records what produced a model and not what
+the model scored, because a model directory is saved before anything is measured and is never modified in place.
 
 **What.** The trainer writes `provenance.json` next to the weights in `--out` and in every checkpoint:
 

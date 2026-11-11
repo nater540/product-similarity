@@ -17,7 +17,7 @@ use burn::tensor::{Gradients, Tensor, TensorData};
 use serde::{Deserialize, Serialize};
 use similarity_core::model::{EncoderWeights, SentenceEncoder, TrainingDropout};
 use similarity_core::tokenize::pad_batch;
-use similarity_core::{Device, TextTokenizer};
+use similarity_core::{Device, Provenance, TextTokenizer};
 
 use crate::checkpoint::{self, RunIdentity};
 use crate::data::{self, Batch, GroupExample, PairExample, Rng};
@@ -242,12 +242,13 @@ impl Step<'_> {
   /// Writes the run as it stands after this step to `dir`, which must not exist yet.
   ///
   /// The result is a complete model directory (so it can be served or calibrated like any other) that also holds
-  /// what [`fit`] needs to continue from here. See [`crate::checkpoint`].
+  /// what [`fit`] needs to continue from here. See [`crate::checkpoint`]. With a `lineage`, it also records where
+  /// the model came from, as every model directory a run writes should.
   ///
   /// # Errors
   ///
   /// Returns [`TrainError::Checkpoint`] if `dir` exists or cannot be written.
-  pub fn checkpoint(&self, dir: &Path) -> Result<()> {
+  pub fn checkpoint(&self, dir: &Path, lineage: Option<&Provenance>) -> Result<()> {
     checkpoint::write(
       dir,
       self.encoder,
@@ -255,6 +256,7 @@ impl Step<'_> {
       self.progress.step,
       self.progress.total_steps,
       self.run,
+      lineage,
     )
   }
 }
@@ -873,7 +875,7 @@ mod tests {
       &run_options,
       resume,
       |step| match checkpoint {
-        Some((at, dir)) if step.progress.step == at => step.checkpoint(dir),
+        Some((at, dir)) if step.progress.step == at => step.checkpoint(dir, None),
         _ => Ok(()),
       },
     )?;

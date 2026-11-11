@@ -27,6 +27,7 @@ use burn::module::{Module, ModuleMapper, ModuleVisitor, Param, ParamId};
 use burn::tensor::Tensor;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use similarity_core::Provenance;
 use similarity_core::model::{EncoderWeights, SentenceEncoder};
 use similarity_core::record::hex_prefix;
 
@@ -211,14 +212,44 @@ fn write_whole(dir: &Path, fill: impl FnOnce(&Path) -> Result<()>) -> Result<()>
   Ok(())
 }
 
+/// Records, inside the model directory being written at `partial`, where the model came from.
+///
+/// `lineage` says how the run was set up; the digest of the weights just saved and how many steps they have had
+/// are filled in here, since they differ for every directory a run writes. It is written into the partial
+/// directory, before the rename, so that a model directory under its final name always has it.
+fn stamp(
+  partial: &Path,
+  encoder: &SentenceEncoder,
+  lineage: &Provenance,
+  step: usize,
+  total_steps: usize,
+) -> Result<()> {
+  let mut provenance = lineage.clone();
+  provenance.digest = encoder.files().rebased(partial).digest()?;
+  if let Some(trained) = &mut provenance.trained {
+    trained.step = step;
+    trained.total_steps = total_steps;
+  }
+  Ok(provenance.write(partial)?)
+}
+
 /// Writes `encoder` to `out` as a model directory, whole or not at all.
+///
+/// With a `lineage`, the directory also records where the model came from (`provenance.json`), as the finished
+/// model of a run of `total_steps` steps.
 ///
 /// # Errors
 ///
 /// Returns [`TrainError::Checkpoint`] if `out` already holds something or cannot be written, and
-/// [`TrainError::Model`] if the encoder cannot be saved.
-pub fn save_model(encoder: &SentenceEncoder, out: &Path) -> Result<()> {
-  write_whole(out, |partial| Ok(encoder.save(partial)?))
+/// [`TrainError::Model`] if the encoder or its provenance cannot be saved.
+pub fn save_model(encoder: &SentenceEncoder, out: &Path, lineage: Option<(&Provenance, usize)>) -> Result<()> {
+  write_whole(out, |partial| {
+    encoder.save(partial)?;
+    match lineage {
+      Some((lineage, total_steps)) => stamp(partial, encoder, lineage, total_steps, total_steps),
+      None => Ok(()),
+    }
+  })
 }
 
 /// Collects the id of every float parameter, in traversal order.
@@ -267,9 +298,13 @@ pub(crate) fn write(
   step: usize,
   total_steps: usize,
   run: &RunIdentity,
+  lineage: Option<&Provenance>,
 ) -> Result<()> {
   write_whole(dir, |partial| {
     encoder.save(partial)?;
+    if let Some(lineage) = lineage {
+      stamp(partial, encoder, lineage, step, total_steps)?;
+    }
     session.save_optimizer(&optimizer_file(partial))?;
     let state = RunState {
       format: FORMAT,

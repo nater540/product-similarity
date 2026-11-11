@@ -18,13 +18,24 @@ use std::time::Instant;
 
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
+use sha2::{Digest as _, Sha256};
 use similarity_core::model::SentenceEncoder;
-use similarity_core::{Device, Embedder, EmbedderOptions, TextTokenizer};
+use similarity_core::provenance::{Base, Build, DataFile, Resumed, Trained};
+use similarity_core::record::hex_prefix;
+use similarity_core::{Device, Embedder, EmbedderOptions, Provenance, TextTokenizer};
 use similarity_log::RESULT;
 use similarity_train::checkpoint::{self, RunIdentity};
 use similarity_train::data::{self, PairExample, PairExamples, Split};
 use similarity_train::eval::{Separation, Spread, separation};
 use similarity_train::{Examples, Progress, Step, TrainOptions, fit};
+
+/// What this binary knows about itself, for the provenance of every model directory it writes.
+const BUILD: Build = Build::new(
+  "record-similarity-train",
+  env!("CARGO_PKG_VERSION"),
+  env!("RECORD_SIMILARITY_BUILD_COMMIT"),
+  env!("RECORD_SIMILARITY_BUILD_DIRTY"),
+);
 
 /// Where training runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -341,12 +352,12 @@ impl Checkpoints {
           .is_some_and(|every| progress.step.is_multiple_of(every.get())))
   }
 
-  fn after(&mut self, step: &Step<'_>) -> similarity_train::Result<()> {
+  fn after(&mut self, step: &Step<'_>, lineage: &Provenance) -> similarity_train::Result<()> {
     if !self.due(&step.progress) {
       return Ok(());
     }
     let path = self.path(step.progress.step);
-    step.checkpoint(&path)?;
+    step.checkpoint(&path, Some(lineage))?;
     tracing::info!(
       step = step.progress.step,
       epoch = step.progress.epoch,
@@ -558,6 +569,87 @@ impl Cli {
     Ok((encoder, tokenizer, source))
   }
 
+  /// Where the model this run writes will have come from: everything about that which is known before training.
+  ///
+  /// The digest of the weights and the step they are at are filled in when each directory is written.
+  fn lineage(
+    &self,
+    encoder: &SentenceEncoder,
+    source: &Path,
+    examples: &Examples,
+    options: &TrainOptions,
+  ) -> anyhow::Result<Provenance> {
+    let data_file = |role: &str, path: &Path, examples: usize| -> anyhow::Result<DataFile> {
+      Ok(DataFile {
+        role: role.to_owned(),
+        path: path.display().to_string(),
+        sha256: hex_prefix(&Sha256::digest(data::read(path)?.as_bytes()), 32),
+        examples,
+      })
+    };
+    let mut files = Vec::new();
+    if let Some(path) = &self.pairs {
+      files.push(data_file("pairs", path, examples.pairs.len())?);
+    }
+    if let Some(path) = &self.catalog_groups {
+      files.push(data_file("catalog_groups", path, examples.groups.len())?);
+    }
+
+    // The provenance of the directory the weights were loaded from. A model without one is not refused: the
+    // record simply starts here.
+    let inherited = Provenance::read(source).unwrap_or_else(|error| {
+      tracing::warn!(%error, "the provenance of the model being trained from cannot be read and is left out");
+      None
+    });
+    let loaded_from = || -> anyhow::Result<Base> {
+      Ok(Base {
+        dir: source.display().to_string(),
+        digest: encoder.files().digest()?,
+        provenance: None,
+      })
+    };
+    let (base, resumed) = match (&self.resume, inherited) {
+      (Some(checkpoint), inherited) => {
+        // A resumed run is still the run that started from the original base. The checkpoint is where it was
+        // interrupted, and goes on the list of those.
+        let earlier = inherited.and_then(|provenance| provenance.trained);
+        let mut resumed = earlier
+          .as_ref()
+          .map_or_else(Vec::new, |trained| trained.resumed.clone());
+        resumed.push(Resumed {
+          from: checkpoint.display().to_string(),
+          step: checkpoint::read(checkpoint)?.step,
+        });
+        let base = match earlier {
+          Some(trained) => trained.base,
+          None => loaded_from()?,
+        };
+        (base, resumed)
+      }
+      (None, inherited) => {
+        let base = Base {
+          provenance: inherited.map(Box::new),
+          ..loaded_from()?
+        };
+        (base, Vec::new())
+      }
+    };
+
+    let mut provenance = BUILD.provenance(String::new());
+    provenance.trained = Some(Trained {
+      base,
+      data: files,
+      data_fingerprint: checkpoint::data_digest(examples),
+      options: serde_json::to_value(options).context("the training options do not serialize")?,
+      max_tokens: self.max_tokens,
+      device: format!("{:?}", self.device).to_lowercase(),
+      resumed,
+      step: 0,
+      total_steps: 0,
+    });
+    Ok(provenance)
+  }
+
   fn run(&self) -> anyhow::Result<()> {
     ensure_free(&self.out)?;
     anyhow::ensure!(
@@ -589,6 +681,8 @@ impl Cli {
       "model loaded"
     );
 
+    let lineage = self.lineage(&encoder, source, &examples, &options)?;
+
     let score = |encoder: &SentenceEncoder, pairs: &[PairExample]| {
       separation(encoder, &tokenizer, &device, pairs, &options.widths, self.batch_size)
     };
@@ -612,7 +706,7 @@ impl Cli {
           window.log(progress, started);
         }
         match &mut checkpoints {
-          Some(checkpoints) => checkpoints.after(step),
+          Some(checkpoints) => checkpoints.after(step, &lineage),
           None => Ok(()),
         }
       },
@@ -621,7 +715,7 @@ impl Cli {
 
     // Saved before anything else is done with it. Until this returns, the last pass exists only in memory, and
     // the scoring below is minutes of forward passes on a large dataset.
-    checkpoint::save_model(&trained, &self.out)?;
+    checkpoint::save_model(&trained, &self.out, Some((&lineage, steps)))?;
     // Loaded back through the path the server uses, including its warm-up forward pass, so that a directory this
     // command reports as saved is one the server is known to start with.
     let embedder_options = EmbedderOptions {
@@ -1033,5 +1127,188 @@ mod tests {
     assert_eq!(trainable_widths(&[1024], 384), [384]);
     assert_eq!(trainable_widths(&[256, 256], 384), [256]);
     assert!(trainable_widths(&[], 384).is_empty());
+  }
+
+  /// A tiny base model that says it was fetched, and four labeled pairs in words its tokenizer knows.
+  fn workspace() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    std::fs::create_dir(&base).unwrap();
+    similarity_core::testing::write_tiny_model(&base, Some(24));
+    let digest = SentenceEncoder::load(&base, &Device::flex())
+      .unwrap()
+      .files()
+      .digest()
+      .unwrap();
+    let mut fetched = Build::new("record-similarity model fetch", "0.1.0", "abc", "false").provenance(digest);
+    fetched.fetched = Some(similarity_core::provenance::Fetched {
+      repo: "example/tiny".to_owned(),
+      revision: "r1".to_owned(),
+      files: Vec::new(),
+    });
+    fetched.write(&base).unwrap();
+
+    let pairs = dir.path().join("pairs.jsonl");
+    let line = |label: &str, before: &str, after: &str| {
+      format!(r#"{{"label": "{label}", "before": {{"name": "{before}"}}, "after": {{"name": "{after}"}}}}"#)
+    };
+    let text = [
+      line("edit", "blueberry gummies", "blueberry gummies mg"),
+      line("edit", "indica flower", "indica flower resin"),
+      line("recycle", "blueberry gummies", "vape cartridge"),
+      line("recycle", "sativa flower", "wyld edibles"),
+    ]
+    .join("\n");
+    std::fs::write(&pairs, text).unwrap();
+    (dir, base, pairs)
+  }
+
+  fn train(arguments: &[&str]) {
+    let fixed = [
+      "x",
+      "--epochs",
+      "2",
+      "--batch-size",
+      "2",
+      "--max-tokens",
+      "16",
+      "--dims",
+      "24",
+      "--fields",
+      "name",
+      "--no-dropout",
+    ];
+    Cli::parse_from(fixed.iter().chain(arguments)).run().unwrap();
+  }
+
+  fn provenance(dir: &Path) -> (Provenance, Trained) {
+    let provenance = Provenance::read(dir).unwrap().expect("a provenance file");
+    let trained = provenance.trained.clone().expect("a trained model");
+    (provenance, trained)
+  }
+
+  #[test]
+  fn a_trained_model_and_its_checkpoints_record_where_they_came_from() {
+    let (dir, base, pairs) = workspace();
+    let out = dir.path().join("out");
+    let path = |path: &Path| path.to_str().unwrap().to_owned();
+    train(&["--base", &path(&base), "--out", &path(&out), "--pairs", &path(&pairs)]);
+
+    let (model, trained) = provenance(&out);
+    assert_eq!(model.tool, "record-similarity-train");
+    assert_eq!(model.version, env!("CARGO_PKG_VERSION"));
+    assert!(!model.commit.is_empty());
+    let options = EmbedderOptions {
+      max_tokens: 16,
+      ..EmbedderOptions::default()
+    };
+    let loaded = Embedder::load(&out, Device::flex(), &options).unwrap();
+    assert_eq!(
+      model.digest,
+      loaded.content_digest(),
+      "the digest is that of the model the directory holds"
+    );
+
+    // What it was trained from, with that model's own origin nested inside.
+    let base_digest = SentenceEncoder::load(&base, &Device::flex())
+      .unwrap()
+      .files()
+      .digest()
+      .unwrap();
+    assert_eq!(
+      (trained.base.dir.as_str(), &trained.base.digest),
+      (base.to_str().unwrap(), &base_digest)
+    );
+    assert_ne!(model.digest, base_digest, "training moved the weights");
+    let origin = trained.base.provenance.as_ref().expect("the base's provenance");
+    assert_eq!(origin.fetched.as_ref().unwrap().repo, "example/tiny");
+
+    // On what, and how.
+    let [data] = trained.data.as_slice() else {
+      panic!("one data file expected: {:?}", trained.data)
+    };
+    assert_eq!((data.role.as_str(), data.examples), ("pairs", 4));
+    assert_eq!(data.path, pairs.to_str().unwrap());
+    assert_eq!(
+      data.sha256,
+      hex_prefix(&Sha256::digest(std::fs::read(&pairs).unwrap()), 32)
+    );
+    assert_eq!(trained.options["epochs"], 2);
+    assert_eq!(trained.options["dropout"], false);
+    assert_eq!((trained.max_tokens, trained.device.as_str()), (16, "cpu"));
+    assert_eq!((trained.step, trained.total_steps), (4, 4));
+    assert!(trained.resumed.is_empty());
+
+    // The checkpoint after the first pass says the same, for the weights it holds.
+    let checkpoint = checkpoint::sibling(&out, ".checkpoints").join("step-000002");
+    let (at_checkpoint, partway) = provenance(&checkpoint);
+    assert_eq!((partway.step, partway.total_steps), (2, 4));
+    assert_eq!(partway.base, trained.base);
+    assert_ne!(at_checkpoint.digest, model.digest, "it holds other weights");
+    assert_eq!(
+      at_checkpoint.digest,
+      SentenceEncoder::load(&checkpoint, &Device::flex())
+        .unwrap()
+        .files()
+        .digest()
+        .unwrap()
+    );
+  }
+
+  #[test]
+  fn a_resumed_run_keeps_its_original_base_and_lists_where_it_was_resumed() {
+    let (dir, base, pairs) = workspace();
+    let path = |path: &Path| path.to_str().unwrap().to_owned();
+    let first = dir.path().join("first");
+    train(&["--base", &path(&base), "--out", &path(&first), "--pairs", &path(&pairs)]);
+    let checkpoint = checkpoint::sibling(&first, ".checkpoints").join("step-000002");
+
+    let second = dir.path().join("second");
+    train(&[
+      "--resume",
+      &path(&checkpoint),
+      "--out",
+      &path(&second),
+      "--pairs",
+      &path(&pairs),
+      "--checkpoint-dir",
+      &path(&dir.path().join("second-checkpoints")),
+    ]);
+
+    let (_, resumed) = provenance(&second);
+    let (_, uninterrupted) = provenance(&first);
+    assert_eq!(
+      resumed.base, uninterrupted.base,
+      "still the run that started from the base model, not from its own checkpoint"
+    );
+    assert_eq!(
+      resumed.resumed,
+      [Resumed {
+        from: path(&checkpoint),
+        step: 2
+      }]
+    );
+    assert_eq!((resumed.step, resumed.total_steps), (4, 4));
+    assert_eq!(resumed.data_fingerprint, uninterrupted.data_fingerprint);
+  }
+
+  #[test]
+  fn a_base_model_without_provenance_is_trained_from_all_the_same() {
+    let (dir, base, pairs) = workspace();
+    std::fs::remove_file(base.join(similarity_core::provenance::PROVENANCE_FILE)).unwrap();
+    let out = dir.path().join("out");
+    let path = |path: &Path| path.to_str().unwrap().to_owned();
+    train(&[
+      "--base",
+      &path(&base),
+      "--out",
+      &path(&out),
+      "--pairs",
+      &path(&pairs),
+      "--no-checkpoints",
+    ]);
+    let (_, trained) = provenance(&out);
+    assert_eq!(trained.base.provenance, None, "the record starts here");
+    assert_eq!(trained.base.digest.len(), 16);
   }
 }

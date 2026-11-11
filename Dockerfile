@@ -10,6 +10,11 @@ RUN apt-get update \
 
 WORKDIR /src
 COPY . .
+# The build has no `.git` to ask (it is in `.dockerignore`), so the commit the image is built from is passed in:
+# `docker build --build-arg RECORD_SIMILARITY_COMMIT=$(git rev-parse --short=12 HEAD) .`, which is what `just image`
+# does. It ends up in the `provenance.json` of the model fetched below.
+ARG RECORD_SIMILARITY_COMMIT=unknown
+ENV RECORD_SIMILARITY_COMMIT=${RECORD_SIMILARITY_COMMIT}
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked -p similarity-server \

@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use similarity_core::{Device, Embedder};
+use similarity_core::provenance::Build;
+use similarity_core::{Device, Embedder, Provenance};
 use similarity_server::config::{Config, DeviceChoice};
 use similarity_server::engine::{Engine, store_layout};
 use similarity_server::fetch::{self, FetchRequest};
@@ -23,6 +24,14 @@ use similarity_server::offline::events::{self, Run};
 use similarity_server::offline::{self, Confidence, Offline, RecordFields, Selection, diff};
 use similarity_server::worker::EmbedWorker;
 use similarity_store::{MemoryStore, QdrantStore, VectorStore};
+
+/// What this binary knows about itself, for the provenance of a model directory it fetches.
+const BUILD: Build = Build::new(
+  "record-similarity model fetch",
+  env!("CARGO_PKG_VERSION"),
+  env!("RECORD_SIMILARITY_BUILD_COMMIT"),
+  env!("RECORD_SIMILARITY_BUILD_DIRTY"),
+);
 
 /// Detects when an edit to a record turns it into a different record.
 #[derive(Debug, Parser)]
@@ -196,14 +205,39 @@ fn load_embedder(config: &Config) -> anyhow::Result<Embedder> {
       config.model.dir.display()
     )
   })?;
+  // Where the model came from, when its directory says. A model without the note is served like any other, and
+  // so is one whose note cannot be read: lineage is for people, and never a reason to refuse to start.
+  let origin = Provenance::read(&config.model.dir).unwrap_or_else(|error| {
+    tracing::warn!(%error, "the model's provenance file cannot be read and is ignored");
+    None
+  });
+  let trained = origin.as_ref().and_then(|origin| origin.trained.as_ref());
+  let fetched = origin.as_ref().and_then(|origin| origin.fetched.as_ref());
   tracing::info!(
     dir = %config.model.dir.display(),
     fingerprint = embedder.fingerprint(),
     dimension = embedder.dimension(),
     device = ?config.model.device,
     elapsed = ?started.elapsed(),
+    written_by = origin.as_ref().map(|origin| origin.tool.as_str()),
+    written_at = origin.as_ref().map(|origin| origin.written_at),
+    commit = origin.as_ref().map(|origin| origin.commit.as_str()),
+    repo = fetched.map(|fetched| fetched.repo.as_str()),
+    revision = fetched.map(|fetched| fetched.revision.as_str()),
+    base_digest = trained.map(|trained| trained.base.digest.as_str()),
+    trained_steps = trained.map(|trained| trained.step),
     "model loaded"
   );
+  if let Some(origin) = &origin
+    && origin.digest != embedder.content_digest()
+  {
+    // Someone replaced the weights and left the old note beside them. The note is wrong, not the model.
+    tracing::warn!(
+      recorded = origin.digest.as_str(),
+      actual = embedder.content_digest(),
+      "the model's provenance file describes other files than the ones in the directory"
+    );
+  }
   Ok(embedder)
 }
 
@@ -331,6 +365,18 @@ impl FetchArgs {
       "\nmodel loads: {} dimensions natively, up to {} tokens",
       embedder.dimension(),
       embedder.max_tokens()
+    )?;
+
+    // Last, once the directory is known to hold a model that runs: where it came from. The file is not one the
+    // encoder reads, so writing it (again, on a re-run) changes no fingerprint.
+    let provenance = fetch::provenance(&request, &files, embedder.content_digest(), &BUILD);
+    provenance
+      .write(&request.dir)
+      .with_context(|| format!("cannot record the model's origin in {}", request.dir.display()))?;
+    writeln!(
+      out,
+      "recorded where it came from in {}",
+      request.dir.join(similarity_core::provenance::PROVENANCE_FILE).display()
     )?;
     Ok(())
   }

@@ -7,12 +7,10 @@
 use std::path::Path;
 
 use burn::tensor::Device;
-use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 use crate::model::SentenceEncoder;
-use crate::record::hex_prefix;
-use crate::tokenize::{TOKENIZER_FILE, TextTokenizer, pad_batch};
+use crate::tokenize::{TextTokenizer, pad_batch};
 use crate::vector::normalize;
 
 /// Knobs that trade accuracy, latency, and storage against each other.
@@ -46,6 +44,7 @@ pub struct Embedder {
   device: Device,
   batch_size: usize,
   dimension: usize,
+  digest: String,
   fingerprint: String,
 }
 
@@ -59,25 +58,8 @@ impl Embedder {
   /// its position table holds, or more output dimensions than it produces).
   pub fn load(dir: &Path, device: Device, options: &EmbedderOptions) -> Result<Self> {
     let encoder = SentenceEncoder::load(dir, &device)?;
-    let tokenizer_path = dir.join(TOKENIZER_FILE);
     let tokenizer = TextTokenizer::load(dir, options.max_tokens)?;
-
-    let mut hasher = Sha256::new();
-    for path in encoder.files().read.iter().chain(std::iter::once(&tokenizer_path)) {
-      // Streamed: the checkpoint is tens of megabytes and has already been loaded once.
-      let mut file = std::fs::File::open(path).map_err(|source| Error::io(path, source))?;
-      let length = file.metadata().map_err(|source| Error::io(path, source))?.len();
-      // Length-prefix each file so that moving bytes between two files cannot collide.
-      hasher.update(length.to_le_bytes());
-      let streamed = std::io::copy(&mut file, &mut hasher).map_err(|source| Error::io(path, source))?;
-      if streamed != length {
-        return Err(Error::io(
-          path,
-          std::io::Error::other("the file changed size while the model was loading"),
-        ));
-      }
-    }
-    let digest = hex_prefix(&hasher.finalize(), 8);
+    let digest = encoder.files().digest()?;
 
     Self::assemble(tokenizer, encoder, device, options, &digest, dir)
   }
@@ -126,6 +108,7 @@ impl Embedder {
       device,
       batch_size: options.batch_size,
       dimension,
+      digest: digest.to_owned(),
       fingerprint,
     };
     // One real forward pass before anyone depends on this embedder. A model can load cleanly and still be unable
@@ -231,6 +214,12 @@ impl Embedder {
   /// persisted vector and checked on the way back out.
   pub fn fingerprint(&self) -> &str {
     &self.fingerprint
+  }
+
+  /// The digest of the model's files alone: the part of the fingerprint that says which model this is, without
+  /// the width and token limit it is being run at.
+  pub fn content_digest(&self) -> &str {
+    &self.digest
   }
 }
 

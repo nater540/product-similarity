@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use sha2::{Digest, Sha256};
+use similarity_core::Provenance;
 use similarity_core::model::Pipeline;
+use similarity_core::provenance::{self, Build, Fetched};
 
 /// The default model's repository on the Hugging Face Hub.
 pub const DEFAULT_REPO: &str = "MongoDB/mdbr-leaf-mt";
@@ -112,6 +114,27 @@ pub struct FetchedFile {
 /// Returns an error if the JSON is malformed or describes a pipeline the encoder does not implement.
 pub fn files_for(modules_json: &[u8]) -> anyhow::Result<Vec<String>> {
   Ok(Pipeline::parse(modules_json, Path::new("modules.json"))?.files())
+}
+
+/// What a fetched model directory records about its origin: the repository, the revision, and every file with
+/// the digest of what is on disk and whether that was checked against a pinned checksum.
+///
+/// `digest` is the content digest of the model as it loads (see `Embedder::content_digest`).
+pub fn provenance(request: &FetchRequest, files: &[FetchedFile], digest: &str, build: &Build) -> Provenance {
+  let mut provenance = build.provenance(digest);
+  provenance.fetched = Some(Fetched {
+    repo: request.repo.clone(),
+    revision: request.revision.clone(),
+    files: files
+      .iter()
+      .map(|file| provenance::FetchedFile {
+        name: file.name.clone(),
+        sha256: file.sha256.clone(),
+        verified: file.verified,
+      })
+      .collect(),
+  });
+  provenance
 }
 
 fn pinned_checksum(request: &FetchRequest, name: &str) -> Option<&'static str> {
@@ -232,6 +255,46 @@ pub fn fetch(request: &FetchRequest, mut progress: impl FnMut(&FetchedFile)) -> 
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn a_fetched_model_records_its_repository_revision_and_every_file() {
+    let request = FetchRequest {
+      repo: "MongoDB/mdbr-leaf-mt".to_owned(),
+      revision: DEFAULT_REVISION.to_owned(),
+      dir: PathBuf::from("models/mdbr-leaf-mt"),
+    };
+    let file = |name: &str, verified: bool| FetchedFile {
+      name: name.to_owned(),
+      sha256: "ab".repeat(32),
+      verified,
+      cached: !verified,
+    };
+    let files = [file("model.safetensors", true), file("tokenizer.json", false)];
+    let build = Build::new("record-similarity model fetch", "0.1.0", "0123456789ab", "false");
+
+    let written = provenance(&request, &files, "f46e48ee0ea2dd02", &build);
+    assert_eq!(
+      (written.tool.as_str(), written.digest.as_str(), written.dirty),
+      ("record-similarity model fetch", "f46e48ee0ea2dd02", Some(false))
+    );
+    assert!(written.trained.is_none());
+    let fetched = written.fetched.as_ref().unwrap();
+    assert_eq!(
+      (fetched.repo.as_str(), fetched.revision.as_str()),
+      ("MongoDB/mdbr-leaf-mt", DEFAULT_REVISION)
+    );
+    let recorded: Vec<(&str, bool)> = fetched
+      .files
+      .iter()
+      .map(|file| (file.name.as_str(), file.verified))
+      .collect();
+    assert_eq!(recorded, [("model.safetensors", true), ("tokenizer.json", false)]);
+
+    // And it survives the trip to disk beside the model.
+    let dir = tempfile::tempdir().unwrap();
+    written.write(dir.path()).unwrap();
+    assert_eq!(Provenance::read(dir.path()).unwrap(), Some(written));
+  }
 
   const LEAF_MODULES: &str = r#"[
     {"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Transformer"},

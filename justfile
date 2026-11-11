@@ -29,7 +29,7 @@ release-train backend="":
 
 # Container image with the model baked in
 image tag="record-similarity:dev":
-    docker build -t {{ tag }} .
+    docker build --build-arg RECORD_SIMILARITY_COMMIT="$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)" -t {{ tag }} .
 
 # --- test and lint ----------------------------------------------------------
 

@@ -7,7 +7,8 @@ when the last one does.
 
 **Done so far:** step 0 (measuring separated from judging: `Comparison::weigh`, `score::judge`,
 `Evaluation::rejudge`, `Reason::code`), feature 7 (`calibrate --full`, `--ndjson`, slices, intervals; D17), and
-feature 8 (`calibrate-diff`, with `--config-b`; D17). What remains is below.
+feature 8 (`calibrate-diff`, with `--config-b`; D17), and feature 1 (`provenance.json` in every model directory;
+D18). What remains is below.
 
 Read `CLAUDE.md` first (conventions, invariants, commands), then `docs/feature-suggestions.md` for what each
 feature is and why, then this file for how. The feature numbers here are that document's.
@@ -18,7 +19,6 @@ feature is and why, then this file for how. The feature numbers here are that do
 - [What the review found](#what-the-review-found)
 - [Decisions needed from the owner](#decisions-needed-from-the-owner)
 - [Order](#order)
-- [Feature 1. Lineage file in every model directory](#feature-1-lineage-file-in-every-model-directory)
 - [Feature 13. Property-based and state-machine tests](#feature-13-property-based-and-state-machine-tests)
 - [Feature 16. Bulk import and re-index that keeps drift history](#feature-16-bulk-import-and-re-index-that-keeps-drift-history)
 - [The other fifteen, briefly](#the-other-fifteen-briefly)
@@ -107,71 +107,12 @@ None of these blocks starting. Each has the default that will be used if no answ
 
 1. Step 0, the small refactor that features 7, 8, and 19 all stand on. Done.
 2. Feature 7, then feature 8. Both done.
-3. Feature 1. A day's work, and it has to exist before the first real fine-tuning run, not before the first
-   calibration.
+3. Feature 1. Done.
 4. Feature 13. Independent of the others; it can be done at any point, and is worth doing before feature 16
    changes the engine.
 5. Feature 16.
 
 Each step should leave `just ci` green. Tests first where practical; test names are sentences.
-
-## Feature 1. Lineage file in every model directory
-
-### Design
-
-`provenance.json`, written by `record-similarity-train` into `--out` and every checkpoint, and by `model fetch`
-into the directory it fills. It records what produced the model, not what the model scored (finding 4).
-
-```json
-{"format": 1, "written_at": "2026-11-11T05:52:42Z", "tool": "record-similarity-train", "version": "0.1.0",
- "commit": "f2471b2", "dirty": false, "digest": "0123456789abcdef",
- "base": {"dir": "models/mdbr-leaf-mt", "digest": "f46e48ee0ea2dd02", "provenance": {"...": "..."}},
- "data": [{"role": "pairs", "path": "pairs.full.jsonl", "sha256": "...", "examples": 4120}],
- "data_fingerprint": "...", "options": {"...": "..."}, "max_tokens": 256, "device": "metal",
- "resumed": [{"from": "models/x.checkpoints/step-000120", "step": 120}], "step": 240, "total_steps": 240}
-```
-
-What makes this safe, each checked against the code:
-
-- **It does not change the fingerprint.** `Embedder::load` hashes the files the encoder read plus
-  `tokenizer.json` (`embed.rs`), and nothing else in the directory.
-- **It is not inherited by accident.** `SentenceEncoder::save` copies only the files it read and a fixed list of
-  side files, so a base model's `provenance.json` is never copied into a model trained from it. It is nested
-  under `base.provenance` on purpose instead.
-- **It is written whole.** Inside the `write_whole` closures of `checkpoint::save_model` and `checkpoint::write`,
-  after `encoder.save`, so a directory under its final name always has it.
-
-The pieces:
-
-- `similarity_core::model`: a public function for the content digest (the loop now inside `Embedder::load`), so
-  the trainer can compute the base's digest and the saved model's own digest without building an `Embedder`. A
-  test pins the digest of the tiny test model before and after the move; `just test-real` shows the real
-  fingerprint is still `f46e48ee0ea2dd02`.
-- The commit: a `build.rs` in the two binary crates that reads `RECORD_SIMILARITY_COMMIT`, then asks `git`, then
-  settles for `unknown`, with a dirty flag. The `Dockerfile` passes the variable as a build argument.
-- Data files are hashed as read (`data::read` already returns the whole text).
-- A resume reads the checkpoint's `provenance.json` and appends to `resumed`.
-- `model fetch` writes `{tool, repo, revision, files: [{name, sha256, verified}]}`. It adds the file to an
-  already-fetched directory too, which changes no fingerprint.
-- The server logs `provenance` fields on its `model loaded` line when the file is there (base digest, commit),
-  and says nothing when it is not. It never refuses a model for lacking one.
-
-### The work, in order
-
-1. The shared digest function, with the pinning test.
-2. The `provenance` type (serde) in `similarity-core`, since both binaries write it and the server reads it.
-3. `build.rs` and the Dockerfile argument.
-4. The trainer: base, data, options, resume chain; written in `save_model` and `write`. Tests: a saved model and
-   a checkpoint both carry it; a model trained from a model with provenance nests it; a resumed run lists the
-   resume; an extra file in a model directory does not change the fingerprint.
-5. `model fetch`. `fetch` downloads over HTTPS and its tests have no stand-in for the Hub, so keep writing the
-   file apart from downloading and test the writer on a temporary directory of files.
-6. The server's log line.
-
-README: a short "Where a model came from" under "Fine-tuning the model". `models/README.md`. A decision record.
-`just test-parity` and `just test-real` (the loader is touched).
-
-**Effort:** S. **Needs real data:** no.
 
 ## Feature 13. Property-based and state-machine tests
 

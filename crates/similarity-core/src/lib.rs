@@ -16,6 +16,7 @@
 //! - [`schema`]: the fields of a record, their weights, and the composite-vector layout.
 //! - [`quantity`]: the numeric fields of a record, which are compared as numbers and never embedded.
 //! - [`record`]: validating a record, reusing unchanged fields, and packing the stored form.
+//! - [`provenance`]: the note a model directory carries about where it came from.
 //! - [`rng`]: a small seeded generator, for results that must be reproducible from a seed.
 //! - [`score`]: comparing a revision against its baseline and deciding whether to accept it.
 
@@ -25,6 +26,7 @@
 pub mod embed;
 pub mod error;
 pub mod model;
+pub mod provenance;
 pub mod quantity;
 pub mod record;
 pub mod rng;
@@ -37,6 +39,7 @@ pub mod vector;
 
 pub use embed::{Embedder, EmbedderOptions};
 pub use error::{Error, Result};
+pub use provenance::Provenance;
 pub use quantity::{Quantities, Quantity, QuantityChange, QuantityScore};
 pub use record::{Plan, PreparedRecord, RecordVectors};
 pub use schema::{FieldSpec, QuantitySpec, Schema};

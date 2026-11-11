@@ -551,3 +551,43 @@ The events therefore carry the schema they were scored under (`schema_field`, `s
 again under other field or quantity names is refused. On the bundled sample a real second run and a `--config-b`
 judgment report the same flips.
 
+## D18. A model directory says where it came from
+
+A model's fingerprint says which model produced a vector. It does not say how the model came to be. After two
+rounds of fine-tuning, nothing recorded which base, data, and options made a directory under `models/`, and
+thresholds belong to one specific model (D3). That cannot be reconstructed later, so it is written when the model
+is: every directory `model fetch` or the trainer writes holds a `provenance.json`.
+
+- **Fetched:** the repository, the revision, and each file with its SHA-256 and whether that was checked against
+  a pinned checksum.
+- **Trained:** the base model's directory and digest, with the base's own provenance nested inside (so the chain
+  back to a published model is in one file); each data file with the SHA-256 of its text and the number of
+  examples it gave; the existing fingerprint of the examples; the options; the token limit; the device; and the
+  checkpoints the run was resumed from. A resumed run keeps the base it first started from. A checkpoint carries
+  the same record with the step it holds.
+- **Both:** the tool, its version, the commit it was built from, and whether that tree was dirty.
+
+**It records inputs, not results.** The first design also put the final `separation` measurements in the file.
+The trainer saves the model the moment training ends, before measuring anything, so that the last pass is not
+held only in memory through minutes of scoring (D13); and a model directory is written whole and never modified
+in place. Adding results afterwards would break the second rule to serve a convenience. What a model scored is in
+the run's result stream.
+
+**It is not part of the model.** `ModelFiles::digest` hashes the files the encoder is built from and the
+tokenizer, and nothing else, so the file changes no fingerprint and invalidates no stored vector (D12). That
+digest used to be computed inside `Embedder::load`; it is now a function of its own, so that the trainer can
+compute the base's digest and the digest of what it just saved without building an embedder. The pinned model's
+fingerprint is unchanged by the move (`f46e48ee0ea2dd02`). `SentenceEncoder::save` copies only what it read plus a
+fixed list of side files, so a base's provenance is never carried into a model trained from it as if it were that
+model's own; it is nested under `base` on purpose instead.
+
+**Nothing depends on it.** A model without the file trains, loads, and serves as before. The server logs what the
+file says on its `model loaded` line, warns if the digest in the file is not the digest of the files beside it
+(someone replaced the weights and left the note), and never refuses to start over it.
+
+**The commit comes from a build script**, shared by the two binary crates. It reads `RECORD_SIMILARITY_COMMIT`
+if that is set (the Docker build has no `.git`; `just image` passes it), otherwise asks `git`, otherwise says
+`unknown`. It runs on every build, because whether the tree is dirty can change without any file of the crate
+changing; the crate is only rebuilt when the answer does. It lives in the binary crates and not in
+`similarity-core` so that a change of answer relinks two binaries instead of rebuilding the workspace.
+

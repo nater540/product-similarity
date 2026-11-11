@@ -1106,6 +1106,60 @@ The saved directory is also a valid sentence-transformers model. If you want a s
 `just verify-model models/mdbr-leaf-mt-ft` (needs `uv`) loads it there and requires the Burn encoder to reproduce
 PyTorch's embeddings. Nothing in the workflow depends on it.
 
+### Where a model came from
+
+Every model directory these tools write holds a `provenance.json` saying what produced it. After a few rounds of
+fine-tuning that is the only way to tell which base, data, and options made `models/mdbr-leaf-mt-ft`, and
+thresholds belong to one specific model. This is from a one-pass run on the bundled sample (shortened):
+
+```json
+{
+  "format": 1,
+  "written_at": 1794378917,
+  "tool": "record-similarity-train",
+  "version": "0.1.0",
+  "commit": "38175fdd5786",
+  "dirty": true,
+  "digest": "a3dde74c22049b9d",
+  "trained": {
+    "base": {
+      "dir": "models/mdbr-leaf-mt",
+      "digest": "f46e48ee0ea2dd02",
+      "provenance": {
+        "tool": "record-similarity model fetch",
+        "digest": "f46e48ee0ea2dd02",
+        "fetched": {"repo": "MongoDB/mdbr-leaf-mt", "revision": "1ed41b22ce166d66c24f88ebfc340e1f03adb20f"}
+      }
+    },
+    "data": [{"role": "pairs", "path": "data/calibration.sample.full.jsonl", "sha256": "a65fc350...", "examples": 29}],
+    "data_fingerprint": "e71757b4cee8e26fd7a5b77432302746",
+    "options": {"epochs": 1, "learning_rate": 0.00002, "seed": 0},
+    "max_tokens": 256,
+    "device": "cpu",
+    "resumed": [],
+    "step": 1,
+    "total_steps": 1
+  }
+}
+```
+
+- **`digest`** is the first part of the model's fingerprint (`a3dde74c22049b9d-d256-t256`): the files the encoder
+  is built from, and nothing else. The server logs it, and what it finds in this file, on its `model loaded` line.
+- **`trained.base.provenance`** is the base model's own file, nested, so the chain back to the published model is
+  in one place. A base without one is trained from all the same; the record then starts with its digest.
+- **`data`** names each file and the SHA-256 of its text. `data_fingerprint` is over the examples themselves, in
+  order, and is what a resumed run is checked against.
+- **A checkpoint has the same file**, with `step` below `total_steps`. A resumed run keeps the base it first
+  started from and lists each checkpoint it was continued from under `resumed`.
+- **`commit` and `dirty`** are the source the binary was built from, and whether that tree had uncommitted
+  changes. A build without git (the Docker image, unless `RECORD_SIMILARITY_COMMIT` is passed in, as `just image`
+  does) records `unknown`.
+- **`model fetch` writes one too**, with the repository, the revision, and the checksum of every file. Running
+  `just fetch-model` again adds it to a model that was fetched before this existed.
+
+The file records what produced the model, never what the model scored. It is not part of the model either: adding
+it, editing it, or deleting it changes no fingerprint, and nothing refuses a model for not having one.
+
 ## Using a different model
 
 Any sentence-transformers model with a BERT encoder, mean or CLS pooling, and optionally a linear projection can be
@@ -1266,7 +1320,7 @@ data/
   calibration.sample.full.jsonl   the same pairs in the full format a data export uses
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D17)
+  decisions.md               why things are the way they are (D1 to D18)
   data-request-prompt.md     a brief for collecting labeled production data
   feature-suggestions.md     twenty features that could be added, none built yet
   plan-features.md           a plan for the first five of them

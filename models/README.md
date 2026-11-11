@@ -33,5 +33,10 @@ has a different fingerprint, so it needs its own Qdrant collection and its own c
 transfer between models (see `docs/decisions.md`, D3). Remove `output_dim` from the config for any model that was
 not trained to be truncated (D4).
 
-Fine-tuned models written by `record-similarity-train` (`just finetune`) belong here too; see "Fine-tuning the model" in the top-level
-README.
+Fine-tuned models written by `record-similarity-train` (`just finetune`) belong here too; see "Fine-tuning the
+model" in the top-level README.
+
+Every directory these tools write holds a `provenance.json`: for a fetched model, the repository, the revision,
+and the checksum of each file; for a trained one, the base model, the data, the options, and the base's own
+provenance nested inside. It is a note about the model and not part of it, so it changes no fingerprint. See
+"Where a model came from" in the top-level README.
