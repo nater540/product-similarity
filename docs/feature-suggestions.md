@@ -539,6 +539,7 @@ Not features, but found while preparing this list:
   been replaced by a measured figure for the bulk import (2,000 four-field records in 19 seconds). Throughput
   through the gRPC queue is still unmeasured, and feature 12 would measure it.
 - **Choosing a checkpoint on the holdout contaminates the holdout.** See the caveat under feature 3.
-- **Very long fields are a CPU cost risk (verified).** The tokenizer processes a whole field before truncating
-  it to `max_tokens`: one 1 MB field costs about 0.7 s of the single embedding thread, and 3 MB about 2 s, under
-  the default 4 MB gRPC message limit. See `docs/plan-features.md` for the fix that is proposed.
+- **Very long fields were a CPU cost risk (verified, and fixed).** The tokenizer processed a whole field before
+  truncating it to `max_tokens`: one 1 MB field cost about 0.7 s of the single embedding thread, and 3 MB about
+  2 s, under the default 4 MB gRPC message limit. Only the part of a field that could be read is tokenized now
+  (D21).

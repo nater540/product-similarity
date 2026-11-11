@@ -662,3 +662,34 @@ server's queue (D9). On a laptop CPU 2,000 four-field records import in 19 secon
 Not built: a streaming `Import` RPC. The command covers the need as long as it can run next to Qdrant, and an RPC
 that writes without judging is a larger thing to expose than a command an operator runs.
 
+## D21. Only the part of a field that could be read is tokenized
+
+A tokenizer walks the whole of a text before it truncates to `max_tokens`. Only the first 256 tokens of a field
+are ever used, but the cost of a field grew with its full length: scoring one record whose description was 1 MB
+of text took 0.90 s where an ordinary one takes 0.22 s, and 3 MB took 2.2 s (measured with `compare`, on ordinary
+and on unbroken text alike). There is one embedding thread (D9), and a gRPC message may be 4 MB, so a handful of
+such requests held up every other caller.
+
+`TextTokenizer::encode` now hands the tokenizer at most `max_tokens * 64` bytes of a text, cut at a character
+boundary: 16 KB at the default limit. The same measurements are 0.28 s and 0.29 s.
+
+**Why this and not a size limit on requests.** Refusing a long field would make requests fail that succeed
+today, for a caller who has done nothing wrong but store a long description. Cutting what the tokenizer is given
+changes nothing a caller can see.
+
+**Why it changes no embedding that matters.** A token of ordinary text is four or five bytes, and no vocabulary
+entry is anywhere near 64, so the first 256 tokens of a text lie well inside its first 16 KB: what is cut off was
+never going to be read. A test encodes a megabyte of text with and without the cut and requires the same tokens.
+The parity tests against PyTorch pass unchanged, and `just calibrate` prints the numbers it printed before. The
+exception is text made of unbroken runs longer than 64 bytes each, for example a base64 blob: it is a row of
+unknown tokens either way, only a shorter one. The fingerprint is not changed for that (D12), since no vector of
+a real field means anything different.
+
+**What is not cut.** The text's fingerprint is still taken over the whole of it, so an edit beyond the first
+16 KB is still an edit: the field is reported as modified, at a similarity of 1, exactly as an edit beyond the
+256th token always was. Whitespace normalization and hashing still read the whole field; they are linear and
+cheap, and are what the remaining 0.07 s of a 3 MB field goes on.
+
+The cut is in the tokenizer wrapper that serving and training share, so a model is still fine-tuned on exactly
+the token sequences it is served with.
+

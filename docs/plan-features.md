@@ -25,6 +25,7 @@ way it is; the README says how to use it.
 | Feature 1: `provenance.json` in every model directory | D18, README "Where a model came from" |
 | Feature 13: property tests and the engine state machine | D19, README "Development" |
 | Feature 16: `import`, which only creates and can carry a record's original version over as its anchor | D20, README "Importing a catalog" |
+| A cap on how much of a field is handed to the tokenizer (not one of the twenty; found by the review) | D21 |
 
 Real product data never entered this repository. Everything was built and tested on synthetic data; features 7
 and 8 in particular only show their worth on real labeled pairs, where the data lives.
@@ -44,9 +45,9 @@ Seven things in the suggestions needed correcting or deciding, and each is now r
 5. **The store trait did not have to grow for a resumable import.** An import that only creates is resumable by
    being run again.
 6. **A build inside Docker has no `.git`.** The commit is passed in as a build argument.
-7. **Very long fields are a CPU cost risk: verified.** One 1 MB field costs about 0.7 s of the single embedding
-   thread, and 3 MB about 2 s (measured with `compare`). The tokenizer walks the whole field before truncating to
-   `max_tokens`. See the decisions below.
+7. **Very long fields were a CPU cost risk: verified, and fixed.** One 1 MB field cost about 0.7 s of the single
+   embedding thread, and 3 MB about 2 s, because the tokenizer walks the whole field before truncating to
+   `max_tokens`. Only the part that could be read is tokenized now (D21).
 
 Building them turned up three more:
 
@@ -78,15 +79,10 @@ The owner asked for these to be taken on best judgment. Each is easy to reverse.
    first version decides whether drift history can be carried over; the data request asks.
 5. **The import is a command, named `import`**, not `reindex` as first planned: loading a catalog for the first
    time is the same operation. No streaming RPC.
-
-One was left for the owner:
-
-6. **What should happen to a field too long to be worth tokenizing?** Refuse the request above a size
-   (`INVALID_ARGUMENT`), or tokenize only a prefix. The recommendation is the prefix: tokenize the first
-   `max_tokens * 64` bytes, cut at a character boundary, and keep hashing the whole text. Ordinary text reaches
-   256 tokens well inside its first 16 KB, so its embedding does not change, and nothing a caller sends today
-   starts failing. It was not built because it changes what the tokenizer is given, which the parity fixtures
-   pin, and refusing a request is a change to the API's behavior; either is the owner's call.
+6. **A field too long to be worth tokenizing is cut, not refused.** The tokenizer is given the first
+   `max_tokens * 64` bytes; the whole text is still hashed. No request that succeeds today fails, and no
+   embedding of ordinary text changes (D21). The alternative, refusing the request above a size, is a one-line
+   policy change if that is preferred.
 
 ## The other fifteen, briefly
 

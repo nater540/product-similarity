@@ -1271,10 +1271,10 @@ Progress is logged after every batch (`--batch-records`, 64 by default), and the
 on stdout. This is an export of 48 synthetic records, two of them flawed, with the envelope fields removed:
 
 ```json
-{"level":"INFO","message":"importing","records":32,"imported":32,"skipped":0,"failed":0,"elapsed_s":1}
+{"level":"INFO","message":"importing","records":32,"imported":32,"skipped":0,"failed":0,"elapsed_s":1.2}
 {"level":"WARN","message":"record not imported","line":49,"id":"p900","reason":"invalid record: `weight_per_item` is a quantity, not a text field; give it as a number with a unit"}
 {"level":"WARN","message":"record not imported","line":50,"id":"p901","reason":"invalid record: required field `name` is missing or blank"}
-{"level":"INFO","message":"finished","checked_only":false,"records":48,"imported":46,"skipped":0,"failed":2,"elapsed_s":1}
+{"level":"INFO","message":"finished","checked_only":false,"records":48,"imported":46,"skipped":0,"failed":2,"elapsed_s":1.3}
 ```
 
 Running it again imports nothing and skips the 46. One of those records was imported with the version it was
@@ -1387,7 +1387,7 @@ data/
   calibration.sample.full.jsonl   the same pairs in the full format a data export uses
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D20)
+  decisions.md               why things are the way they are (D1 to D21)
   data-request-prompt.md     a brief for collecting labeled production data
   feature-suggestions.md     twenty features that could be added, none built yet
   plan-features.md           a plan for the first five of them
@@ -1447,7 +1447,9 @@ what that field says.
   can still be moved a long way in steps that each stay under the limit; the text drift check
   (`anchor_threshold`) does not see quantities.
 - **Quantities play no part in search.** `FindSimilar` compares vectors, which hold text only.
-- **Truncation.** Text beyond `max_tokens` (256 by default) is ignored.
+- **Truncation.** Text beyond `max_tokens` (256 by default) is ignored. Text beyond 64 bytes per allowed token
+  (16 KB by default) is not even tokenized, so that one enormous field cannot hold up the encoder; ordinary text
+  reaches its token limit long before that. The whole text still decides whether a field counts as changed.
 - **No transport security or authentication** in the server itself.
 
 ## Acknowledgements
