@@ -101,8 +101,6 @@ pub fn compare(
   };
 
   let mut fields = Vec::with_capacity(schema.fields().len());
-  let mut weighted = 0.0_f64;
-  let mut total = 0.0_f64;
   for (((spec, old), new), original) in schema
     .fields()
     .iter()
@@ -126,23 +124,49 @@ pub fn compare(
         }
       }
     };
-    if let Some(similarity) = similarity {
-      weighted += f64::from(spec.weight) * f64::from(similarity);
-      total += f64::from(spec.weight);
-    }
     fields.push(FieldScore {
       field: spec.name.clone(),
       weight: spec.weight,
       change,
       similarity,
-      below_floor: matches!((similarity, spec.reject_below), (Some(found), Some(floor)) if found < floor),
+      below_floor: false,
     });
   }
 
-  Ok(Comparison {
-    similarity: weighted_mean(weighted, total),
+  let mut comparison = Comparison {
+    similarity: 0.0,
     fields,
-  })
+  };
+  comparison.weigh(schema);
+  Ok(comparison)
+}
+
+impl Comparison {
+  /// Applies `schema`'s weights and floors to the field similarities already measured: sets every field's
+  /// `weight` and `below_floor`, and [`Self::similarity`] to the weighted mean.
+  ///
+  /// [`compare`] ends with this. It is public so that a comparison measured once can be weighed again under
+  /// another configuration without embedding anything, which is all a change of weights or floors needs (the
+  /// per-field cosines do not depend on either). A field the schema does not define keeps no weight and is left
+  /// out of the mean.
+  pub fn weigh(&mut self, schema: &Schema) {
+    let mut weighted = 0.0_f64;
+    let mut total = 0.0_f64;
+    for score in &mut self.fields {
+      let Some(spec) = schema.field(&score.field) else {
+        score.weight = 0.0;
+        score.below_floor = false;
+        continue;
+      };
+      score.weight = spec.weight;
+      score.below_floor = matches!((score.similarity, spec.reject_below), (Some(found), Some(floor)) if found < floor);
+      if let Some(similarity) = score.similarity {
+        weighted += f64::from(spec.weight) * f64::from(similarity);
+        total += f64::from(spec.weight);
+      }
+    }
+    self.similarity = weighted_mean(weighted, total);
+  }
 }
 
 /// The anchor after an accepted revision: unchanged, except that a field it has never had a value for takes the
@@ -308,6 +332,52 @@ pub enum Reason {
   MeasureChanged,
 }
 
+impl Reason {
+  /// A short, stable name for the kind of reason, for logs, reports, and anything else that must not parse the
+  /// sentence [`fmt::Display`] writes. These six strings are part of what the tools emit: do not rename one.
+  pub fn code(&self) -> &'static str {
+    match self {
+      Self::BelowThreshold { .. } => "below_threshold",
+      Self::FieldBelowFloor { .. } => "field_below_floor",
+      Self::AnchorDrift { .. } => "anchor_drift",
+      Self::QuantityBeyondFactor { .. } => "quantity_beyond_factor",
+      Self::QuantityIncomparable { .. } => "quantity_incomparable",
+      Self::MeasureChanged => "measure_changed",
+    }
+  }
+
+  /// The field or quantity the reason is about, if it is about one.
+  pub fn subject(&self) -> Option<&str> {
+    match self {
+      Self::FieldBelowFloor { field, .. }
+      | Self::QuantityBeyondFactor { field, .. }
+      | Self::QuantityIncomparable { field, .. } => Some(field),
+      Self::BelowThreshold { .. } | Self::AnchorDrift { .. } | Self::MeasureChanged => None,
+    }
+  }
+
+  /// What was measured: a similarity, or a quantity's factor. `None` where no number describes it.
+  pub fn value(&self) -> Option<f64> {
+    match self {
+      Self::BelowThreshold { similarity, .. }
+      | Self::FieldBelowFloor { similarity, .. }
+      | Self::AnchorDrift { similarity, .. } => Some(f64::from(*similarity)),
+      Self::QuantityBeyondFactor { factor, .. } => *factor,
+      Self::QuantityIncomparable { .. } | Self::MeasureChanged => None,
+    }
+  }
+
+  /// The configured limit the value was held to: a threshold, a floor, or a factor limit.
+  pub fn limit(&self) -> Option<f64> {
+    match self {
+      Self::BelowThreshold { threshold, .. } | Self::AnchorDrift { threshold, .. } => Some(f64::from(*threshold)),
+      Self::FieldBelowFloor { floor, .. } => Some(f64::from(*floor)),
+      Self::QuantityBeyondFactor { limit, .. } => Some(*limit),
+      Self::QuantityIncomparable { .. } | Self::MeasureChanged => None,
+    }
+  }
+}
+
 impl fmt::Display for Reason {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
@@ -395,7 +465,7 @@ impl Evaluation {
   }
 
   /// Compares the quantities of the two versions, records the result, and adds a reason for each configured limit
-  /// that is exceeded.
+  /// that is exceeded: [`compare_quantities`] followed by [`judge_quantities`].
   ///
   /// `anchor` holds the first value the record had for each quantity (see [`quantity::first_values`]); pass an
   /// empty map when there is none. Quantities the schema does not define are ignored: the caller has validated
@@ -412,42 +482,121 @@ impl Evaluation {
     anchor: &Quantities,
     candidate: &Quantities,
   ) {
-    let mut scores = Vec::new();
-    for spec in schema.quantities() {
-      let name = spec.name.as_str();
-      let Some(mut score) = quantity::compare(name, baseline.get(name), anchor.get(name), candidate.get(name)) else {
-        continue;
-      };
-      if let Some(limit) = spec.reject_above_factor
-        && (score.zero_crossing || score.factor.is_some_and(|factor| factor > limit))
-      {
-        score.beyond_limit = true;
-        self.reasons.push(Reason::QuantityBeyondFactor {
-          field: score.field.clone(),
-          factor: score.factor,
-          limit,
-        });
-      }
-      if spec.reject_incomparable && score.incomparable {
-        score.beyond_limit = true;
-        self.reasons.push(Reason::QuantityIncomparable {
-          field: score.field.clone(),
-          previous_unit: score.previous_unit.clone().unwrap_or_default(),
-          unit: score.unit.clone().unwrap_or_default(),
-        });
-      }
-      scores.push(score);
-    }
-
-    let any = |wanted: &[QuantityChange]| scores.iter().any(|score| wanted.contains(&score.change));
-    // Two different quantities are needed for the second case, and they necessarily are: one name has one change.
-    self.measure_changed = scores.iter().any(|score| score.incomparable)
-      || (any(&[QuantityChange::Removed]) && any(&[QuantityChange::Added, QuantityChange::Restored]));
-    if self.measure_changed && policy.reject_on_measure_change {
-      self.reasons.push(Reason::MeasureChanged);
-    }
-    self.quantities = scores;
+    self.quantities = compare_quantities(schema, baseline, anchor, candidate);
+    let (measure_changed, reasons) = judge_quantities(schema, policy, &mut self.quantities);
+    self.measure_changed = measure_changed;
+    self.reasons.extend(reasons);
   }
+
+  /// Judges again, under `schema` and `policy`, what this evaluation already measured: the field similarities,
+  /// the similarity to the anchor, and the quantity comparisons. Every reason is replaced.
+  ///
+  /// This is how a change of weights, floors, thresholds, or quantity limits is tried out on comparisons that
+  /// were measured earlier, with no model loaded. It cannot account for a change of model or of the set of
+  /// fields: those change the measurements themselves.
+  pub fn rejudge(&mut self, schema: &Schema, policy: &Policy) {
+    self.comparison.weigh(schema);
+    self.reasons = judge(schema, policy, &self.comparison, self.anchor_similarity);
+    let (measure_changed, reasons) = judge_quantities(schema, policy, &mut self.quantities);
+    self.measure_changed = measure_changed;
+    self.reasons.extend(reasons);
+  }
+}
+
+/// Compares every quantity the schema defines across two versions of a record, in schema order.
+///
+/// Measuring only: no limit is consulted and no score is marked as beyond one (see [`judge_quantities`]).
+/// Quantities the schema does not define are left out.
+pub fn compare_quantities(
+  schema: &Schema,
+  baseline: &Quantities,
+  anchor: &Quantities,
+  candidate: &Quantities,
+) -> Vec<QuantityScore> {
+  schema
+    .quantities()
+    .iter()
+    .filter_map(|spec| {
+      let name = spec.name.as_str();
+      quantity::compare(name, baseline.get(name), anchor.get(name), candidate.get(name))
+    })
+    .collect()
+}
+
+/// Holds quantity comparisons to the limits `schema` and `policy` configure.
+///
+/// Sets each score's `beyond_limit` (clearing whatever an earlier judgment left there) and returns whether the
+/// record's measures changed, with a reason for every limit exceeded. A score for a quantity the schema does not
+/// define is held to nothing.
+pub fn judge_quantities(schema: &Schema, policy: &Policy, scores: &mut [QuantityScore]) -> (bool, Vec<Reason>) {
+  let mut reasons = Vec::new();
+  for score in scores.iter_mut() {
+    score.beyond_limit = false;
+    let Some(spec) = schema.quantity(&score.field) else {
+      continue;
+    };
+    if let Some(limit) = spec.reject_above_factor
+      && (score.zero_crossing || score.factor.is_some_and(|factor| factor > limit))
+    {
+      score.beyond_limit = true;
+      reasons.push(Reason::QuantityBeyondFactor {
+        field: score.field.clone(),
+        factor: score.factor,
+        limit,
+      });
+    }
+    if spec.reject_incomparable && score.incomparable {
+      score.beyond_limit = true;
+      reasons.push(Reason::QuantityIncomparable {
+        field: score.field.clone(),
+        previous_unit: score.previous_unit.clone().unwrap_or_default(),
+        unit: score.unit.clone().unwrap_or_default(),
+      });
+    }
+  }
+
+  let any = |wanted: &[QuantityChange]| scores.iter().any(|score| wanted.contains(&score.change));
+  // Two different quantities are needed for the second case, and they necessarily are: one name has one change.
+  let measure_changed = scores.iter().any(|score| score.incomparable)
+    || (any(&[QuantityChange::Removed]) && any(&[QuantityChange::Added, QuantityChange::Restored]));
+  if measure_changed && policy.reject_on_measure_change {
+    reasons.push(Reason::MeasureChanged);
+  }
+  (measure_changed, reasons)
+}
+
+/// Holds a comparison to the thresholds and floors `schema` and `policy` configure, and returns why it fails
+/// them; empty means it passes.
+///
+/// It reads the comparison as it stands. To judge under weights or floors other than the ones it was compared
+/// with, call [`Comparison::weigh`] first, or use [`Evaluation::rejudge`], which does both.
+pub fn judge(schema: &Schema, policy: &Policy, comparison: &Comparison, anchor_similarity: Option<f32>) -> Vec<Reason> {
+  let mut reasons = Vec::new();
+  if comparison.similarity < policy.threshold {
+    reasons.push(Reason::BelowThreshold {
+      similarity: comparison.similarity,
+      threshold: policy.threshold,
+    });
+  }
+  for (score, spec) in comparison
+    .fields
+    .iter()
+    .filter_map(|score| Some((score, schema.field(&score.field)?)))
+  {
+    if let (true, Some(similarity), Some(floor)) = (score.below_floor, score.similarity, spec.reject_below) {
+      reasons.push(Reason::FieldBelowFloor {
+        field: score.field.clone(),
+        similarity,
+        floor,
+      });
+    }
+  }
+  if let (Some(similarity), Some(threshold)) = (anchor_similarity, policy.anchor_threshold)
+    && similarity < threshold
+  {
+    reasons.push(Reason::AnchorDrift { similarity, threshold });
+  }
+  reasons
 }
 
 /// Judges `candidate` as a revision of `baseline`.
@@ -475,31 +624,7 @@ pub fn evaluate(
     .map(|anchor| weighted_similarity(schema, dimension, anchor, &candidate.composite))
     .transpose()?;
 
-  let mut reasons = Vec::new();
-  if comparison.similarity < policy.threshold {
-    reasons.push(Reason::BelowThreshold {
-      similarity: comparison.similarity,
-      threshold: policy.threshold,
-    });
-  }
-  for (score, spec) in comparison
-    .fields
-    .iter()
-    .filter_map(|score| Some((score, schema.field(&score.field)?)))
-  {
-    if let (true, Some(similarity), Some(floor)) = (score.below_floor, score.similarity, spec.reject_below) {
-      reasons.push(Reason::FieldBelowFloor {
-        field: score.field.clone(),
-        similarity,
-        floor,
-      });
-    }
-  }
-  if let (Some(similarity), Some(threshold)) = (anchor_similarity, policy.anchor_threshold)
-    && similarity < threshold
-  {
-    reasons.push(Reason::AnchorDrift { similarity, threshold });
-  }
+  let reasons = judge(schema, policy, &comparison, anchor_similarity);
 
   Ok(Evaluation {
     comparison,
@@ -1051,6 +1176,183 @@ mod tests {
         .iter()
         .all(|score| score.change == QuantityChange::Unchanged)
     );
+  }
+
+  #[test]
+  fn every_reason_has_a_stable_code_and_says_what_it_measured() {
+    let reasons = [
+      Reason::BelowThreshold {
+        similarity: 0.5,
+        threshold: 0.9,
+      },
+      Reason::FieldBelowFloor {
+        field: "name".to_owned(),
+        similarity: 0.25,
+        floor: 0.75,
+      },
+      Reason::AnchorDrift {
+        similarity: 0.5,
+        threshold: 0.75,
+      },
+      Reason::QuantityBeyondFactor {
+        field: "weight".to_owned(),
+        factor: Some(8.0),
+        limit: 4.0,
+      },
+      Reason::QuantityBeyondFactor {
+        field: "weight".to_owned(),
+        factor: None,
+        limit: 4.0,
+      },
+      Reason::QuantityIncomparable {
+        field: "thc".to_owned(),
+        previous_unit: "%".to_owned(),
+        unit: "mg".to_owned(),
+      },
+      Reason::MeasureChanged,
+    ];
+    let described: Vec<_> = reasons
+      .iter()
+      .map(|reason| (reason.code(), reason.subject(), reason.value(), reason.limit()))
+      .collect();
+    // Pinned on purpose: reports and logs carry these strings, and tools match on them.
+    assert_eq!(
+      described,
+      [
+        ("below_threshold", None, Some(0.5), Some(f64::from(0.9_f32))),
+        ("field_below_floor", Some("name"), Some(0.25), Some(0.75)),
+        ("anchor_drift", None, Some(0.5), Some(0.75)),
+        ("quantity_beyond_factor", Some("weight"), Some(8.0), Some(4.0)),
+        ("quantity_beyond_factor", Some("weight"), None, Some(4.0)),
+        ("quantity_incomparable", Some("thc"), None, None),
+        ("measure_changed", None, None, None),
+      ]
+    );
+  }
+
+  #[test]
+  fn judging_again_under_the_same_configuration_changes_nothing() {
+    let limited = QuantitySpec {
+      reject_above_factor: Some(4.0),
+      reject_incomparable: true,
+      ..spec("weight")
+    };
+    let floored = |name: &str, weight: f32, floor: Option<f32>| FieldSpec {
+      name: name.to_owned(),
+      weight,
+      required: false,
+      reject_below: floor,
+    };
+    let schema = Schema::new(vec![floored("name", 4.0, Some(0.8)), floored("category", 2.0, None)])
+      .unwrap()
+      .with_quantities(vec![limited, spec("thc")])
+      .unwrap();
+    let mut policy = Policy::new(0.9, Some(0.95)).unwrap();
+    policy.reject_on_measure_change = true;
+
+    let original = record(&schema, &[("name", 0.0, "n0"), ("category", 0.0, "c")]);
+    let old = record(&schema, &[("name", 20.0, "n1"), ("category", 0.0, "c")]);
+    let new = record(&schema, &[("name", 80.0, "n2"), ("category", 30.0, "c2")]);
+    let mut evaluation = evaluate(&schema, &policy, DIM, &old, Some(&original.composite), &new).unwrap();
+    evaluation.judge_quantities(
+      &schema,
+      &policy,
+      &quantities(&[("weight", grams(3.5)), ("thc", Quantity::single(22.0, "%"))]),
+      &Quantities::new(),
+      &quantities(&[("weight", grams(28.0)), ("thc", Quantity::single(22.0, "mg"))]),
+    );
+    assert_eq!(evaluation.reasons.len(), 5, "{:?}", evaluation.reasons);
+
+    let mut again = evaluation.clone();
+    again.rejudge(&schema, &policy);
+    assert_eq!(again, evaluation);
+    again.rejudge(&schema, &policy);
+    assert_eq!(again, evaluation);
+  }
+
+  #[test]
+  fn judging_again_under_other_weights_and_limits_equals_evaluating_under_them() {
+    let fields = |name_weight: f32, floor: Option<f32>| {
+      vec![
+        FieldSpec {
+          name: "name".to_owned(),
+          weight: name_weight,
+          required: false,
+          reject_below: floor,
+        },
+        FieldSpec {
+          name: "description".to_owned(),
+          weight: 1.0,
+          required: false,
+          reject_below: None,
+        },
+      ]
+    };
+    let weight = |limit: Option<f64>| QuantitySpec {
+      reject_above_factor: limit,
+      ..spec("weight")
+    };
+    let first = Schema::new(fields(1.0, None))
+      .unwrap()
+      .with_quantities(vec![weight(None)])
+      .unwrap();
+    let second = Schema::new(fields(9.0, Some(0.6)))
+      .unwrap()
+      .with_quantities(vec![weight(Some(4.0))])
+      .unwrap();
+    let lenient = Policy::new(0.2, None).unwrap();
+    let strict = Policy::new(0.7, None).unwrap();
+
+    let old = record(&first, &[("name", 0.0, "n1"), ("description", 0.0, "d")]);
+    let new = record(&first, &[("name", 60.0, "n2"), ("description", 10.0, "d2")]);
+    let before = quantities(&[("weight", grams(3.5))]);
+    let after = quantities(&[("weight", grams(28.0))]);
+    let evaluated = |schema: &Schema, policy: &Policy| {
+      let mut evaluation = evaluate(schema, policy, DIM, &old, None, &new).unwrap();
+      evaluation.judge_quantities(schema, policy, &before, &Quantities::new(), &after);
+      evaluation
+    };
+
+    let mut rejudged = evaluated(&first, &lenient);
+    assert!(rejudged.accepted(), "{:?}", rejudged.reasons);
+    rejudged.rejudge(&second, &strict);
+
+    let fresh = evaluated(&second, &strict);
+    assert_eq!(rejudged, fresh, "nothing was embedded to get here");
+    let codes: Vec<&str> = fresh.reasons.iter().map(Reason::code).collect();
+    assert_eq!(
+      codes,
+      ["below_threshold", "field_below_floor", "quantity_beyond_factor"]
+    );
+  }
+
+  #[test]
+  fn a_score_for_something_the_schema_no_longer_defines_is_held_to_nothing() {
+    let schema = measured_schema(vec![QuantitySpec {
+      reject_above_factor: Some(2.0),
+      ..spec("weight")
+    }]);
+    let policy = Policy::new(0.8, None).unwrap();
+    let mut evaluation = judged(
+      &schema,
+      &policy,
+      &quantities(&[("weight", grams(1.0))]),
+      &Quantities::new(),
+      &quantities(&[("weight", grams(10.0))]),
+    );
+    assert!(evaluation.quantities[0].beyond_limit);
+
+    // The same measurements under a schema that has dropped the quantity and the `name` field's siblings.
+    let bare = Schema::new(vec![FieldSpec {
+      name: "name".to_owned(),
+      weight: 1.0,
+      required: false,
+      reject_below: None,
+    }])
+    .unwrap();
+    evaluation.rejudge(&bare, &policy);
+    assert!(evaluation.accepted(), "{:?}", evaluation.reasons);
+    assert!(!evaluation.quantities[0].beyond_limit);
   }
 
   #[test]
