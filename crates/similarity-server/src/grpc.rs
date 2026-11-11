@@ -5,6 +5,7 @@
 //! tests of the service.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use similarity_core::{FieldChange, Quantity, QuantityChange, QuantityScore, Reason};
 use similarity_proto::v1 as pb;
@@ -140,6 +141,18 @@ fn reason_detail(reason: &Reason) -> pb::ReasonDetail {
   }
 }
 
+/// A similarity for a log line: widened and rounded to six places, so that a 32-bit value does not print its
+/// conversion noise (`0.5670740008354187`). The response carries the value itself; this is only what is logged.
+fn six(value: f32) -> f64 {
+  (f64::from(value) * 1e6).round() / 1e6
+}
+
+/// How long a request has taken so far, in milliseconds to two places: from the first line of its handler to its
+/// log line, which is everything but the framing of the reply.
+fn milliseconds(started: Instant) -> f64 {
+  (started.elapsed().as_secs_f64() * 100_000.0).round() / 100.0
+}
+
 fn width(value: usize) -> u32 {
   u32::try_from(value).unwrap_or(u32::MAX)
 }
@@ -147,6 +160,7 @@ fn width(value: usize) -> u32 {
 #[tonic::async_trait]
 impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
   async fn evaluate(&self, request: Request<pb::EvaluateRequest>) -> Result<Response<pb::EvaluateResponse>, Status> {
+    let started = Instant::now();
     let request = request.into_inner();
     let mode = write_mode(request.mode)?;
     let Some(record) = request.record else {
@@ -165,11 +179,12 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
     tracing::info!(
       id = id.as_deref().unwrap_or(""),
       verdict = ?output.verdict,
-      similarity = output.similarity,
-      anchor_similarity = output.anchor_similarity,
+      similarity = output.similarity.map(six),
+      anchor_similarity = output.anchor_similarity.map(six),
       stored = output.stored,
       revision = output.revision,
       measure_changed = output.measure_changed,
+      elapsed_ms = milliseconds(started),
       "evaluate"
     );
 
@@ -208,6 +223,7 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
     &self,
     request: Request<pb::FindSimilarRequest>,
   ) -> Result<Response<pb::FindSimilarResponse>, Status> {
+    let started = Instant::now();
     let request = request.into_inner();
     let query = match request.query {
       Some(pb::find_similar_request::Query::Id(id)) => SimilarTo::Id(id),
@@ -223,7 +239,11 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
         min_similarity: request.min_similarity,
       })
       .await?;
-    tracing::info!(neighbors = neighbors.len(), "find_similar");
+    tracing::info!(
+      neighbors = neighbors.len(),
+      elapsed_ms = milliseconds(started),
+      "find_similar"
+    );
 
     Ok(Response::new(pb::FindSimilarResponse {
       neighbors: neighbors
@@ -238,9 +258,10 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
   }
 
   async fn delete(&self, request: Request<pb::DeleteRequest>) -> Result<Response<pb::DeleteResponse>, Status> {
+    let started = Instant::now();
     let pb::DeleteRequest { id, tenant } = request.into_inner();
     let deleted = self.engine.delete(id.clone(), tenant).await?;
-    tracing::info!(%id, deleted, "delete");
+    tracing::info!(%id, deleted, elapsed_ms = milliseconds(started), "delete");
     Ok(Response::new(pb::DeleteResponse { deleted }))
   }
 

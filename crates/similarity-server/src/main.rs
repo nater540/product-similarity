@@ -21,11 +21,13 @@ use similarity_core::provenance::Build;
 use similarity_core::record::hex_prefix;
 use similarity_core::{Device, Embedder, Provenance};
 use similarity_log::Init;
+use similarity_proto::v1::record_similarity_client::RecordSimilarityClient;
 use similarity_runs::{Input, ModelRef, Spec, Status};
 use similarity_server::config::{Config, DeviceChoice};
 use similarity_server::engine::{Engine, store_layout};
 use similarity_server::fetch::{self, FetchRequest};
 use similarity_server::import::{self, Failure, Summary};
+use similarity_server::load;
 use similarity_server::offline::events::{self, Run};
 use similarity_server::offline::{self, Confidence, Offline, RecordFields, Selection, diff};
 use similarity_server::worker::{DirectEmbedder, EmbedWorker};
@@ -68,6 +70,34 @@ enum Command {
   /// Work on a file of labeled pairs.
   #[command(subcommand)]
   Pairs(PairsCommand),
+  /// Measure latency and throughput by driving the API with synthetic records.
+  Load(LoadArgs),
+}
+
+#[derive(Debug, Args)]
+struct LoadArgs {
+  /// The configuration file, for the model and schema of the server started in this process.
+  #[arg(long, short, default_value = "config.toml")]
+  config: PathBuf,
+  /// Drive a server that is already running, at this URL (`http://host:port`), instead of starting one in this
+  /// process on an in-memory store. Its records are written under the tenant `load-test` and deleted afterwards.
+  #[arg(long)]
+  server: Option<String>,
+  /// How many callers at once: each level is run in turn, over records of its own.
+  #[arg(long, value_delimiter = ',', default_value = "1,4,16")]
+  concurrency: Vec<usize>,
+  /// Records per level. Each is created, edited, and saved again.
+  #[arg(long, default_value_t = 200)]
+  records: usize,
+  /// Fixes the synthetic catalog.
+  #[arg(long, default_value_t = 1)]
+  seed: u64,
+  /// The field each edit changes.
+  #[arg(long, default_value = "name")]
+  edit_field: String,
+  /// Leave the records in the store afterwards.
+  #[arg(long)]
+  keep: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -655,6 +685,71 @@ impl CarveArgs {
   }
 }
 
+impl LoadArgs {
+  fn run(self) -> anyhow::Result<()> {
+    let options = load::Options {
+      concurrency: self.concurrency,
+      records: self.records,
+      seed: self.seed,
+      edit_field: self.edit_field,
+      keep: self.keep,
+    };
+    let connect = |url: String| async move {
+      let channel = tonic::transport::Channel::from_shared(url.clone())
+        .with_context(|| format!("`{url}` is not a server address"))?
+        .connect()
+        .await
+        .with_context(|| format!("cannot connect to {url}"))?;
+      Ok::<_, anyhow::Error>(RecordSimilarityClient::new(channel))
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+      .enable_all()
+      .build()
+      .context("cannot start tokio")?;
+    if let Some(url) = self.server {
+      return runtime.block_on(async {
+        load::run(connect(url).await?, &options, None).await?;
+        Ok(())
+      });
+    }
+
+    // A server of its own, on a store in memory: nothing here can touch a real collection.
+    let config = Config::load(&self.config)?;
+    let worker = EmbedWorker::spawn(
+      load_embedder(&config)?,
+      config.model.queue_depth,
+      config.model.batch_size,
+    )
+    .context("cannot start the embedding thread")?;
+    let schema = config.schema()?;
+    let (layout, dimension) = store_layout(&schema, &worker);
+    let engine = Arc::new(Engine::new(
+      MemoryStore::new(layout, dimension),
+      worker.clone(),
+      schema,
+      config.policy()?,
+    ));
+    runtime.block_on(async {
+      let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("cannot bind a local port")?;
+      let address = listener.local_addr().context("the local port has no address")?;
+      let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+      let server = tokio::spawn(similarity_server::serve(engine, listener, async {
+        let _ = stopped.await;
+      }));
+      let outcome = async {
+        let client = connect(format!("http://{address}")).await?;
+        load::run(client, &options, Some(&|| worker.stats())).await
+      }
+      .await;
+      let _ = stop.send(());
+      server.await.context("the server task stopped")??;
+      outcome.map(|_| ())
+    })
+  }
+}
+
 impl RunsListArgs {
   fn run(self) -> anyhow::Result<()> {
     let (runs, unreadable) = similarity_runs::list(&self.runs)?;
@@ -896,6 +991,7 @@ fn main() -> ExitCode {
     Command::Import(args) => args.run(),
     Command::Runs(RunsCommand::List(args)) => args.run(),
     Command::Pairs(PairsCommand::Carve(args)) => args.run(),
+    Command::Load(args) => args.run(),
   }
   .map_err(|error| format!("{error:#}"));
   if let Err(error) = &outcome {

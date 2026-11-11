@@ -20,6 +20,7 @@ pub mod engine;
 pub mod fetch;
 pub mod grpc;
 pub mod import;
+pub mod load;
 pub mod offline;
 #[cfg(test)]
 mod properties;

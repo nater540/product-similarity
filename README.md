@@ -167,6 +167,7 @@ The binary is `record-similarity` (`target/release/record-similarity` after `jus
 | `record-similarity calibrate-diff OLD.ndjson (NEW.ndjson \| --config-b CONFIG) [--fail-on WHAT]` | Compares two calibrations, or one under a second configuration. See [Comparing two calibrations](#comparing-two-calibrations). |
 | `record-similarity runs list [--runs DIR] [--kind KIND] [--limit N]` | Lists what was recorded: every calibration and every training run. See [Recorded runs](#recorded-runs). |
 | `record-similarity pairs carve PAIRS.jsonl --fraction F [--from S] [--into S] [--salt TEXT]` | Gives a share of one split's owners a split of their own. See [Choose a model, then measure it once](#3-choose-a-model-then-measure-it-once). |
+| `record-similarity load [--config config.toml] [--server URL] [--concurrency 1,4,16] [--records N]` | Measures latency and throughput through the API with synthetic records. See [Under concurrent callers](#under-concurrent-callers). |
 
 Environment variables:
 
@@ -1502,6 +1503,61 @@ Model load is about 0.3 s. A stored composite at the example settings is 1024 fl
 400 MB in Qdrant across the two vectors each record keeps, of which half is memory-mapped from disk. Run
 `just throughput` on your own hardware before sizing anything.
 
+### Under concurrent callers
+
+That table is the model alone. What a caller sees also depends on the queue in front of the one embedding thread
+and on how many requests share a forward pass. `just load` measures it: it starts a server in its own process on
+a store in memory, drives it through gRPC with synthetic records, and reports each phase at each number of
+concurrent callers.
+
+```sh
+just load config.example.toml --concurrency 1,4,16,64 --records 300
+```
+
+On the same machine (12 cores, release build, default model, 300 records per level):
+
+| Callers | Phase | Requests per second | Median | 99th percentile | Texts per forward pass | Mean wait in the queue |
+|---|---|---|---|---|---|---|
+| 1 | create | 48 | 21.1 ms | 24.4 ms | 4.0 | 0.0 ms |
+| 1 | edit | 177 | 5.6 ms | 6.3 ms | 1.0 | 0.0 ms |
+| 1 | resave | 10,677 | 0.1 ms | 0.1 ms | | |
+| 4 | create | 60 | 66.7 ms | 77.5 ms | 8.0 | 27.6 ms |
+| 4 | edit | 227 | 17.6 ms | 18.8 ms | 2.0 | 7.8 ms |
+| 16 | create | 79 | 193.6 ms | 383.1 ms | 29.3 | 94.9 ms |
+| 16 | edit | 368 | 41.8 ms | 81.3 ms | 7.5 | 9.0 ms |
+| 64 | create | 80 | 698.6 ms | 1,405.0 ms | 30.8 | 547.1 ms |
+| 64 | edit | 470 | 116.2 ms | 240.3 ms | 23.1 | 52.3 ms |
+| 64 | resave | 26,156 | 2.4 ms | 3.4 ms | | |
+
+- **create** sends a new record, so all four fields go to the model. **edit** sends it back with the name
+  changed, so one short text does: this is edit-time traffic, the figure a replica is sized by. **resave** sends
+  the edited record again unchanged, so nothing reaches the model, and what is left is gRPC, the per-record lock,
+  and the store.
+- **More callers buy throughput by sharing forward passes, and pay for it in latency.** From 1 caller to 64,
+  edits per second go from 177 to 470 while the median goes from 6 ms to 116 ms. The model was busy for all of
+  every create and edit phase: one replica's ceiling on this machine is a few hundred edits a second.
+- **Creating whole records levels off at about 80 a second**, 320 texts, once a forward pass is full
+  (`model.batch_size` is 32). A catalog is loaded faster with `import`, which does not go through the queue.
+- **No request was refused** in any phase: the queue holds 256 (`model.queue_depth`), more than 64 callers can
+  fill. A refused request is counted (`overloaded`) and sent again after 5 ms.
+
+The loop is closed: each caller waits for its answer before sending again. That is latency at a fixed number of
+callers, not at a fixed arrival rate, where a server that falls behind makes a queue grow; do not read these as
+the second kind. The store is in memory, so a round trip to Qdrant comes on top. Results are NDJSON on stdout
+(`> load.ndjson`): a `load_run` line, then one `load_phase` line for each level and phase. The table leaves out
+two of the resave rows. One line:
+
+```json
+{"message":"load_phase","run_id":"1-1794431529","concurrency":16,"phase":"edit","requests":300,"ok":300,"overloaded":0,"failed":0,"created":0,"accepted":300,"rejected":0,"seconds":0.815,"per_second":368.1,"p50_ms":41.78,"p90_ms":44.76,"p99_ms":81.28,"max_ms":114.05,"mean_ms":42.7,"batches":40,"texts":300,"texts_per_batch":7.5,"model_busy":0.999,"queue_wait_ms":9.03}
+```
+
+`--server http://host:port` drives a server that is already running, instead of starting one. Its records are
+written under the tenant `load-test` and deleted afterwards, and the worker's side (`batches`, `texts_per_batch`,
+`model_busy`, `queue_wait_ms`) is left out, since a client cannot see it. No record text is in any result.
+
+In service, every `evaluate`, `find_similar`, and `delete` log line carries `elapsed_ms`: the time from the first
+line of the handler to the log line.
+
 ## Development
 
 ```sh
@@ -1516,6 +1572,7 @@ just test-snapshot   # the curated hard cases against the pinned verdicts, and t
 just test-real       # both of those, then the full stack through gRPC against Qdrant
 just snapshot        # rewrite the pinned verdicts after an intended change, printing what moved
 just throughput      # forward-pass latency on this machine
+just load            # latency and throughput through gRPC, at several numbers of concurrent callers
 ```
 
 Run `just test-real` after touching the encoder, the loader, the tokenizer settings, the trainer, or
@@ -1592,7 +1649,7 @@ data/
   regression.snapshot.ndjson      what the pinned model and the example config make of them
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D25)
+  decisions.md               why things are the way they are (D1 to D26)
   data-request-prompt.md     a brief for collecting labeled production data
   feature-suggestions.md     twenty features that could be added, none built yet
   plan-features.md           a plan for the first five of them

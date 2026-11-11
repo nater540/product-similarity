@@ -59,12 +59,11 @@ Building them turned up three more:
 - **A quantity limit is not placed like a threshold.** Most recycles leave a quantity alone, so there is never a
   gap between the two labels to put a limit in. It is suggested from the largest factor any edit shows (D17).
 - **A README figure was derived, not measured.** "Roughly 375 field texts per second" under concurrent requests
-  was replaced by a measured figure for the bulk import. Throughput through the gRPC queue is still unmeasured.
+  was replaced by a measured figure for the bulk import, and throughput through the gRPC queue is now measured
+  by `just load` (D26).
 
 Still open, noticed along the way and not acted on:
 
-- **The server's `evaluate` log line prints similarities unrounded** (`0.5670740008354187`). D15 says values are
-  rounded where that helps, and every other event now does. Round it when feature 10 touches that line.
 - **Quantities have no drift check.** A factor limit applies to each revision against the one before it. Feature
   11 is where real histories would show whether that matters.
 
@@ -98,7 +97,7 @@ Not planned in detail. What the review would add to each when its turn comes:
 | 9 | Pinned verdict snapshot in CI | **Built** (D22): curated cases, a snapshot checked with and without the model, `calibrate-diff --fail-on moved`, pairs with an `anchor`. |
 | 10 | Production score telemetry | `measure_changed` is already on the `evaluate` log line. Round the similarities there. Add per-quantity factors and reason codes (`Reason::code`). |
 | 11 | Drift-threshold calibration | Replays `sequences.jsonl` through the engine; `Engine::import` with `anchor` is the way to seed each history. Also report, per history, the largest factor each quantity reaches against its first value. |
-| 12 | Latency tracking and a load test | Would replace the last unmeasured throughput figure. |
+| 12 | Latency tracking and a load test | **Built** (D26): `record-similarity load`, worker counters, `elapsed_ms` on request lines. The figure is in README "Performance". |
 | 14 | Fuzzing | The state machine in `similarity-server`'s `properties` module is the structure-aware target, ready to be driven by a fuzzer. Add a target for `RecordFields` and `Quantity` parsing. |
 | 15 | Mutation testing | **Built** (D25): `just mutants` over eight files; 400 mutants, none surviving, after a test for each of the 18 the first runs found. |
 | 17 | Reviewer feedback capture | "`before` matches the stored baseline" has to include the quantities. The event it emits should be a line `calibrate --full` reads. |

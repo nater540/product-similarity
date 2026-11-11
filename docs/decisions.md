@@ -939,3 +939,39 @@ with that reason. After that: 58 mutants, 39 caught, 19 that do not compile, non
 **What it cannot see.** cargo-mutants swaps operators and replaces function bodies. It never changes a constant
 or a method call, so the tolerance in `quantity.rs`, every `saturating_*`, and `min`, `max`, and `clamp` are
 beyond it. Those stay with the named tests and the properties (D19).
+
+## D26. Throughput is measured through the API, with the worker saying why
+
+The README could say what a forward pass costs and not what a caller waits. An earlier draft derived a figure for
+concurrent requests from the forward-pass numbers, and it was removed for being derived. The gap is real:
+between the model and the caller are the queue in front of the one embedding thread, the merging of waiting
+requests into one pass (D9), gRPC, the per-record lock, and the store.
+
+**`record-similarity load` drives the real API.** It starts a server in its own process on a store in memory, or
+is pointed at a running one, and sends synthetic records through gRPC in three phases: create (every field to the
+model), edit (one field), and resave (none). It is a subcommand and not an example so that it is in the image and
+can be run where there is no Rust toolchain, and so that its logic has ordinary tests.
+
+**The worker counts what it does.** A client sees how long a request took and nothing about why. The embedding
+thread now keeps six counters (calls into the model, requests, texts, refusals, time in the model, time requests
+waited), read as snapshots and subtracted for a phase. They are a few atomic additions beside a forward pass of
+milliseconds. Nothing is logged per batch: under load that is the volume D15 warns about.
+
+**What it measured** (12 cores, default model): from one caller to 64, edits per second rise from 177 to 470
+while the median latency rises from 6 ms to 116 ms, with the model busy throughout and the number of texts per
+forward pass rising from 1 to 23. Creating whole records levels off at about 80 a second once a pass is full.
+The full table is in the README.
+
+**The loop is closed, and says so.** Each caller waits for its answer before sending again. That measures latency
+at a fixed number of callers. Latency at a fixed arrival rate, where a server that falls behind makes its queue
+grow, is a different measurement and needs an open loop; the README warns against reading one as the other.
+
+**The store defaults to memory, and Qdrant is never the default.** A load test that wrote into the configured
+collection because nobody said otherwise would be a bad afternoon. Against a running server the records go under
+a tenant of their own and are deleted afterwards.
+
+**Request lines carry `elapsed_ms`,** and the `evaluate` line's similarities are rounded to six places as every
+other event's are (the last line that printed a 32-bit value's conversion noise).
+
+**Left out:** an open-loop mode, a Qdrant store in process, records read from a real export, and a regression
+gate on these figures. A gate on wall time would fail on a busy machine and be switched off.

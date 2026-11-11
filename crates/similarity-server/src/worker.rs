@@ -16,7 +16,9 @@
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::time::{Duration, Instant};
 
 use similarity_core::Embedder;
 use tokio::sync::oneshot;
@@ -78,6 +80,64 @@ impl TextEmbedder for DirectEmbedder {
 struct Job {
   texts: Vec<String>,
   reply: oneshot::Sender<Result<Vec<Vec<f32>>, EmbedError>>,
+  /// When the job joined the queue, for the time it waited there.
+  queued: Instant,
+}
+
+/// What the embedding thread has done since it started. Every count only grows, so two snapshots subtracted
+/// ([`WorkerSnapshot::since`]) describe the time between them.
+///
+/// A client sees how long a request took and nothing about why. These say why: how many requests shared a
+/// forward pass, how long they queued for one, and how much of the time the model was busy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkerSnapshot {
+  /// Calls into the model, each serving one or more requests.
+  pub batches: u64,
+  /// Requests served.
+  pub jobs: u64,
+  /// Texts embedded.
+  pub texts: u64,
+  /// Requests refused because the queue was full.
+  pub overloaded: u64,
+  /// Nanoseconds spent inside the model.
+  pub busy_ns: u64,
+  /// Nanoseconds requests spent in the queue, summed over requests.
+  pub queue_wait_ns: u64,
+}
+
+impl WorkerSnapshot {
+  /// What happened between `earlier` and this snapshot.
+  #[must_use]
+  pub fn since(&self, earlier: &Self) -> Self {
+    Self {
+      batches: self.batches.saturating_sub(earlier.batches),
+      jobs: self.jobs.saturating_sub(earlier.jobs),
+      texts: self.texts.saturating_sub(earlier.texts),
+      overloaded: self.overloaded.saturating_sub(earlier.overloaded),
+      busy_ns: self.busy_ns.saturating_sub(earlier.busy_ns),
+      queue_wait_ns: self.queue_wait_ns.saturating_sub(earlier.queue_wait_ns),
+    }
+  }
+}
+
+/// The counters behind a [`WorkerSnapshot`], shared between the handles and the thread. Relaxed ordering
+/// throughout: these are statistics, not synchronization.
+#[derive(Debug, Default)]
+struct WorkerStats {
+  batches: AtomicU64,
+  jobs: AtomicU64,
+  texts: AtomicU64,
+  overloaded: AtomicU64,
+  busy_ns: AtomicU64,
+  queue_wait_ns: AtomicU64,
+}
+
+fn count(value: usize) -> u64 {
+  u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn nanoseconds(elapsed: Duration) -> u64 {
+  u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// A handle to the embedding thread. Cheap to clone; the thread stops when the last handle is dropped.
@@ -86,6 +146,7 @@ pub struct EmbedWorker {
   queue: SyncSender<Job>,
   dimension: usize,
   fingerprint: Arc<str>,
+  stats: Arc<WorkerStats>,
 }
 
 impl EmbedWorker {
@@ -103,11 +164,26 @@ impl EmbedWorker {
       queue,
       dimension: embedder.dimension(),
       fingerprint: Arc::from(embedder.fingerprint()),
+      stats: Arc::default(),
     };
+    let stats = Arc::clone(&handle.stats);
     std::thread::Builder::new()
       .name("embed-worker".to_owned())
-      .spawn(move || run(&embedder, &jobs, max_batch_texts.max(1)))?;
+      .spawn(move || run(&embedder, &jobs, max_batch_texts.max(1), &stats))?;
     Ok(handle)
+  }
+
+  /// What the embedding thread has done so far.
+  pub fn stats(&self) -> WorkerSnapshot {
+    let read = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+    WorkerSnapshot {
+      batches: read(&self.stats.batches),
+      jobs: read(&self.stats.jobs),
+      texts: read(&self.stats.texts),
+      overloaded: read(&self.stats.overloaded),
+      busy_ns: read(&self.stats.busy_ns),
+      queue_wait_ns: read(&self.stats.queue_wait_ns),
+    }
   }
 }
 
@@ -119,9 +195,16 @@ impl TextEmbedder for EmbedWorker {
     let (reply, response) = oneshot::channel();
     self
       .queue
-      .try_send(Job { texts, reply })
+      .try_send(Job {
+        texts,
+        reply,
+        queued: Instant::now(),
+      })
       .map_err(|refused| match refused {
-        TrySendError::Full(_) => EmbedError::Overloaded,
+        TrySendError::Full(_) => {
+          self.stats.overloaded.fetch_add(1, Ordering::Relaxed);
+          EmbedError::Overloaded
+        }
         TrySendError::Disconnected(_) => EmbedError::WorkerGone,
       })?;
     response.await.map_err(|_| EmbedError::WorkerGone)?
@@ -136,7 +219,7 @@ impl TextEmbedder for EmbedWorker {
   }
 }
 
-fn run(embedder: &Embedder, jobs: &Receiver<Job>, max_batch_texts: usize) {
+fn run(embedder: &Embedder, jobs: &Receiver<Job>, max_batch_texts: usize, stats: &WorkerStats) {
   // `recv` fails only when every handle is gone, which is the signal to stop.
   while let Ok(first) = jobs.recv() {
     let mut batch = vec![first];
@@ -146,7 +229,17 @@ fn run(embedder: &Embedder, jobs: &Receiver<Job>, max_batch_texts: usize) {
       texts = texts.saturating_add(job.texts.len());
       batch.push(job);
     }
+    let taken = Instant::now();
+    let waited: Duration = batch
+      .iter()
+      .map(|job| taken.saturating_duration_since(job.queued))
+      .sum();
+    stats.batches.fetch_add(1, Ordering::Relaxed);
+    stats.jobs.fetch_add(count(batch.len()), Ordering::Relaxed);
+    stats.texts.fetch_add(count(texts), Ordering::Relaxed);
+    stats.queue_wait_ns.fetch_add(nanoseconds(waited), Ordering::Relaxed);
     serve(embedder, batch);
+    stats.busy_ns.fetch_add(nanoseconds(taken.elapsed()), Ordering::Relaxed);
   }
   tracing::debug!("embedding worker stopped: every handle was dropped");
 }
@@ -316,7 +409,14 @@ mod tests {
       .map(|texts| {
         let (reply, receiver) = oneshot::channel();
         let texts = texts.iter().map(|text| (*text).to_owned()).collect();
-        (Job { texts, reply }, receiver)
+        (
+          Job {
+            texts,
+            reply,
+            queued: Instant::now(),
+          },
+          receiver,
+        )
       })
       .unzip()
   }
@@ -367,5 +467,65 @@ mod tests {
       ..WordBagEmbedder::new("test")
     };
     assert_eq!(failing.embed(vec!["a".to_owned()]).await, Err(EmbedError::Overloaded));
+  }
+
+  #[tokio::test]
+  async fn the_worker_counts_what_it_did_and_how_long_requests_waited() {
+    let options = similarity_core::EmbedderOptions {
+      max_tokens: 16,
+      batch_size: 8,
+      output_dim: None,
+    };
+    let worker = EmbedWorker::spawn(similarity_core::testing::tiny_embedder(&options), 4, 8).unwrap();
+    assert_eq!(worker.stats(), WorkerSnapshot::default());
+
+    worker.embed(vec!["blueberry gummies".to_owned()]).await.unwrap();
+    let first = worker.stats();
+    assert_eq!((first.batches, first.jobs, first.texts, first.overloaded), (1, 1, 1, 0));
+    assert!(first.busy_ns > 0);
+
+    worker
+      .embed(vec!["vape cartridge".to_owned(), "indica flower".to_owned()])
+      .await
+      .unwrap();
+    // An empty request never reaches the thread.
+    worker.embed(Vec::new()).await.unwrap();
+    let window = worker.stats().since(&first);
+    assert_eq!(
+      (window.batches, window.jobs, window.texts),
+      (1, 1, 2),
+      "only what happened since"
+    );
+    assert!(window.busy_ns > 0 && worker.stats().busy_ns >= first.busy_ns);
+  }
+
+  /// A full queue refuses a request at once, and that is counted where a load test can read it.
+  #[tokio::test]
+  async fn a_request_refused_by_a_full_queue_is_counted() {
+    // A queue of one that nothing drains: the thread is never started.
+    let (queue, _jobs) = sync_channel(1);
+    let worker = EmbedWorker {
+      queue,
+      dimension: 4,
+      fingerprint: Arc::from("none"),
+      stats: Arc::default(),
+    };
+    let waiting = worker.embed(vec!["first".to_owned()]);
+    tokio::pin!(waiting);
+    // Polled once, the first request is in the queue and waiting for an answer that will not come.
+    assert!(futures_poll_once(waiting.as_mut()).await.is_none());
+    let refused = worker.embed(vec!["second".to_owned()]).await;
+    assert_eq!(refused, Err(EmbedError::Overloaded));
+    assert_eq!(worker.stats().overloaded, 1);
+    assert_eq!(worker.stats().jobs, 0, "nothing was served");
+  }
+
+  /// Polls a future once: `Some` if it finished.
+  async fn futures_poll_once<F: Future + Unpin>(mut future: F) -> Option<F::Output> {
+    std::future::poll_fn(|context| match std::pin::Pin::new(&mut future).poll(context) {
+      std::task::Poll::Ready(output) => std::task::Poll::Ready(Some(output)),
+      std::task::Poll::Pending => std::task::Poll::Ready(None),
+    })
+    .await
   }
 }

@@ -1,7 +1,7 @@
 # Feature suggestions
 
 Twenty features that could be added to this project, with what each is, why it matters here, how it would fit the
-code, and what it would cost. **Features 1, 2, 3, 7, 8, 9, 13, 15, 16, and 19 are built** (D17 to D25, and the README); the rest are not. They were proposed in November 2026 from a read of the
+code, and what it would cost. **Features 1, 2, 3, 7, 8, 9, 12, 13, 15, 16, and 19 are built** (D17 to D26, and the README); the rest are not. They were proposed in November 2026 from a read of the
 repository as it stood then (`README.md`, `docs/decisions.md`, and the crates); check a suggestion against the
 code before starting on it, since the code will have moved. It has moved once already: records now carry
 quantities, compared as numbers (D16), and the features that touch a verdict or a report say below what that
@@ -340,6 +340,10 @@ It writes only to a throwaway store.
 **Effort.** M. **Needs real data:** yes.
 
 ### 12. Latency regression tracking and a load test
+
+**Built** (D26). What came out differently: the worker keeps counters, because a client cannot see batch sizes;
+the loop is closed and says so; the store is in memory unless a running server is named; and there is no gate
+on the figures. An open-loop mode, Qdrant in process, and records from a real export were left out.
 
 **What.**
 

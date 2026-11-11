@@ -143,6 +143,11 @@ calibrate-diff *args:
 runs *flags:
     cargo run --release -q -p similarity-server -- runs list {{ flags }}
 
+# Latency and throughput through the API at several levels of concurrency, on synthetic records and a store in
+# memory: `just load config.example.toml --concurrency 1,4,16,64 --records 300`. Results are NDJSON on stdout
+load config="config.example.toml" *flags:
+    RUST_LOG=warn cargo run --release -q -p similarity-server -- load --config {{ config }} {{ flags }}
+
 # --- run --------------------------------------------------------------------
 
 # Start a local Qdrant (dashboard at http://localhost:6333/dashboard)
