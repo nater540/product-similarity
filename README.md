@@ -967,7 +967,7 @@ just release-train metal        # or: just release-train cuda
 | `--dims` | `1024,512,256` | Embedding widths to keep usable. Must include the server's `output_dim`. A width the model cannot produce is replaced by its native width, so a 384-wide model is trained at `384,256`. |
 | `--epochs` | `2` | Passes over the data. |
 | `--batch-size` | `32` | Larger batches give the catalog-group loss more negatives per step, and cost memory. |
-| `--learning-rate` | `2e-5` | The peak, after a warm-up over the first 10% of steps. Lower it if the result gets worse on the holdout. |
+| `--learning-rate` | `2e-5` | The peak, after a warm-up over the first 10% of steps. Lower it if the model gets worse on pairs held back from training. |
 | `--max-tokens` | `256` | Match `model.max_tokens` in the server config. |
 | `--device` | `cpu` | `cpu`, `metal`, or `cuda`. The GPU ones need a binary built with that feature. |
 | `--seed` | `0` | Fixes the batch order and dropout. |
@@ -1094,12 +1094,24 @@ Keep the fine-tuned model only if the gap between the two overall ranges is clea
 misclassified pairs clearly lower, on the holdout. A model that improves only on the pairs it trained on has
 memorized them.
 
+**The holdout answers that one question, once.** Anything chosen by looking at it (a threshold, a learning rate,
+which of several runs to keep) has been fitted to it, and the error rates it reports afterwards are better than
+production will be. To choose things and still have a fair test, keep a third `split` value in the pairs file,
+say `validation`, made of whole `owner`s that appear in no other split. The trainer trains on `calibrate` and
+leaves every other split alone, and `--split` reads any value:
+
+```sh
+just calibrate pairs.full.jsonl config-finetuned.toml --full --split validation   # choose with this
+```
+
 ### 4. Deploy it
 
 A fine-tuned model is a different model. Its fingerprint differs, so:
 
 1. Set `model.dir` to the new directory and `qdrant.collection` to a **new** collection name.
-2. Set the thresholds from the holdout calibration of the new model. The old thresholds do not carry over.
+2. Set the thresholds from a calibration of the new model on pairs it did not train on: the `validation` split
+   above if there is one. The old thresholds do not carry over. If the holdout is all there is, use it, and
+   expect production to be somewhat worse than the error rates it then reports.
 3. Re-index: see [Re-indexing](#re-indexing).
 4. To ship it in the container image, `COPY` the directory into the image in place of the `model fetch` step in
    the `Dockerfile`, and remove `/models` from `.dockerignore` so the build can see it.
