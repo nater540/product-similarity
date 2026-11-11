@@ -1,7 +1,7 @@
 # Feature suggestions
 
 Twenty features that could be added to this project, with what each is, why it matters here, how it would fit the
-code, and what it would cost. **Features 1, 7, and 8 are built** (D17, D18, and the README); the rest are not. They were proposed in November 2026 from a read of the
+code, and what it would cost. **Features 1, 7, 8, and 13 are built** (D17, D18, D19, and the README); the rest are not. They were proposed in November 2026 from a read of the
 repository as it stood then (`README.md`, `docs/decisions.md`, and the crates); check a suggestion against the
 code before starting on it, since the code will have moved. It has moved once already: records now carry
 quantities, compared as numbers (D16), and the features that touch a verdict or a report say below what that
@@ -61,7 +61,7 @@ and because each would put a Python service in the loop.
 | 10 | Production score telemetry and drift report | Regression | M | Real traffic |
 | 11 | Drift-threshold calibration from histories | Regression | M | Yes |
 | 12 | Latency regression tracking and a load test | Regression | S to M | No |
-| 13 | Property-based and state-machine tests | Testing | M | No |
+| 13 | Property-based and state-machine tests (built) | Testing | M | No |
 | 14 | Fuzzing | Testing | M | No |
 | 15 | Mutation testing | Testing | S to start | No |
 | 16 | Bulk import and re-index that keeps drift history | Serving | M to L | No |
@@ -347,6 +347,9 @@ that figure.
 ## C. Testing depth
 
 ### 13. Property-based and state-machine tests
+
+**Built** (D19), with the quantity properties added. It found that numbers read from JSON depended on which crates
+were in the build, which is fixed.
 
 **What.** Properties checked on generated inputs:
 

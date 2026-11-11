@@ -48,7 +48,11 @@ tokio = { version = "1.54", features = ["rt-multi-thread", "net", "sync", "time"
 qdrant-client = { version = "1.20", default-features = false }
 
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip`: a number read from JSON is exactly the number that was written. Without it serde_json is off
+# by one bit for roughly one value in ten. A checkpoint compares a run's options for equality after a trip through
+# JSON, and a quantity (a weight, a potency) should not depend on which crates happen to be in the build: cargo
+# unifies features, so with this set in one crate only, the same file parsed differently under `cargo test -p`.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 toml = "1"
 thiserror = "2"
 anyhow = "1"
@@ -64,6 +68,9 @@ uuid = { version = "1", features = ["v5"] }
 ureq = "3"
 
 tempfile = "3"
+# Property-based tests only (dev-dependency): generated inputs for the invariants a verdict rests on. Without the
+# default features it needs no process forking and pulls in no timeout machinery.
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

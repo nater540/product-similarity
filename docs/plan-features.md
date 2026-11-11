@@ -7,8 +7,8 @@ when the last one does.
 
 **Done so far:** step 0 (measuring separated from judging: `Comparison::weigh`, `score::judge`,
 `Evaluation::rejudge`, `Reason::code`), feature 7 (`calibrate --full`, `--ndjson`, slices, intervals; D17), and
-feature 8 (`calibrate-diff`, with `--config-b`; D17), and feature 1 (`provenance.json` in every model directory;
-D18). What remains is below.
+feature 8 (`calibrate-diff`, with `--config-b`; D17), feature 1 (`provenance.json` in every model directory; D18),
+and feature 13 (property tests and the engine state machine; D19). What remains is below.
 
 Read `CLAUDE.md` first (conventions, invariants, commands), then `docs/feature-suggestions.md` for what each
 feature is and why, then this file for how. The feature numbers here are that document's.
@@ -19,7 +19,6 @@ feature is and why, then this file for how. The feature numbers here are that do
 - [What the review found](#what-the-review-found)
 - [Decisions needed from the owner](#decisions-needed-from-the-owner)
 - [Order](#order)
-- [Feature 13. Property-based and state-machine tests](#feature-13-property-based-and-state-machine-tests)
 - [Feature 16. Bulk import and re-index that keeps drift history](#feature-16-bulk-import-and-re-index-that-keeps-drift-history)
 - [The other fifteen, briefly](#the-other-fifteen-briefly)
 - [Out of scope](#out-of-scope)
@@ -108,51 +107,10 @@ None of these blocks starting. Each has the default that will be used if no answ
 1. Step 0, the small refactor that features 7, 8, and 19 all stand on. Done.
 2. Feature 7, then feature 8. Both done.
 3. Feature 1. Done.
-4. Feature 13. Independent of the others; it can be done at any point, and is worth doing before feature 16
-   changes the engine.
+4. Feature 13. Done.
 5. Feature 16.
 
 Each step should leave `just ci` green. Tests first where practical; test names are sentences.
-
-## Feature 13. Property-based and state-machine tests
-
-`proptest` as a dev-dependency of `similarity-core` and `similarity-server` (decision 3). `cargo test` stays free
-of model, network, and Qdrant: everything runs on the tiny test encoder, `MemoryStore`, and `WordBagEmbedder`.
-Keep each property to about 64 cases so the fast suite stays fast, and commit the `proptest-regressions` files.
-
-Properties, with the quantity ones the suggestion predates:
-
-| Area | Property |
-|---|---|
-| Composite (D5) | The cosine of two composites equals the weighted mean of the field cosines when both have the same fields filled. |
-| Scores | Every similarity is finite and within `[-1, 1]`. |
-| Normalization | `normalize_text` is idempotent, and `text_hash` is stable under it. |
-| Thresholds | `suggest_threshold` equals a brute-force search over every candidate cut. |
-| Batching (D9) | A text embedded alone and inside a merged, length-bucketed batch agree within tolerance. |
-| Quantity factor | `compare(a, b)` and `compare(b, a)` give the same factor, and it is at least 1. |
-| Quantity units | Rewriting both values in another unit of the same dimension changes no factor (within 1e-9 relative). |
-| Quantity identity | A quantity compared with itself, in any known unit spelling, is `Unchanged`. |
-| Quantity judging | `judge_quantities` never changes `similarity`, never removes a reason, and with no limit configured adds none. |
-| Anchor (D8, D16) | `extend_anchor` and `first_values` never replace a value the anchor holds. |
-| Record files | A `RecordFields` written as JSON reads back equal. |
-
-**The engine state machine.** Random sequences of `Evaluate` (every mode, with and without quantities, tenants,
-and a per-request threshold), `Delete`, and `FindSimilar`, run against a reference model that is deliberately
-naive: a map from id to the last accepted record and the first value of each field and quantity. After every
-step:
-
-- a rejected or `DRY_RUN` revision left the stored record byte-for-byte as it was (D7);
-- an accepted `ENFORCE` write changed no anchor value, text or quantity, that the anchor already held (D8);
-- a `FORCE` write made the anchor equal the record;
-- the revision counter rose by exactly one if and only if `stored`;
-- the tenant rules held (D14);
-- `stored` is false whenever the response is an error.
-
-Work order: the pure properties in `similarity-core` first (cheap, and they exercise step 0), then the state
-machine in `similarity-server`. Anything a property finds is fixed in the same change, with the shrunk case kept
-as an ordinary named test.
-
-**Effort:** M. **Needs real data:** no.
 
 ## Feature 16. Bulk import and re-index that keeps drift history
 

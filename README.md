@@ -1305,6 +1305,15 @@ just throughput      # forward-pass latency on this machine
 Run `just test-real` after touching the encoder, the loader, the tokenizer settings, the trainer, or
 `config.example.toml`.
 
+**Property tests.** `just test` includes tests that state a rule and let the machine look for an input that
+breaks it (the `properties` modules of `similarity-core` and `similarity-server`, on
+[proptest](https://proptest-rs.github.io/proptest/)). The largest drives the engine with random sequences of
+requests, in every write mode, and after each one checks that a rejected revision wrote nothing, that the anchor
+lost nothing it held, that the revision counter moved by exactly one write, and that no request touched a record
+it did not name. Each property runs 64 cases by default so that the suite stays fast;
+`PROPTEST_CASES=5000 just test` is the thorough run. A failure is shrunk to a small input and saved under the
+crate's `proptest-regressions/`, which is checked in, so the case is replayed first from then on.
+
 ### Project layout
 
 ```text
@@ -1320,7 +1329,7 @@ data/
   calibration.sample.full.jsonl   the same pairs in the full format a data export uses
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D18)
+  decisions.md               why things are the way they are (D1 to D19)
   data-request-prompt.md     a brief for collecting labeled production data
   feature-suggestions.md     twenty features that could be added, none built yet
   plan-features.md           a plan for the first five of them

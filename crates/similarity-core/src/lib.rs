@@ -26,6 +26,8 @@
 pub mod embed;
 pub mod error;
 pub mod model;
+#[cfg(test)]
+mod properties;
 pub mod provenance;
 pub mod quantity;
 pub mod record;

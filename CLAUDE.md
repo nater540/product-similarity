@@ -6,7 +6,7 @@ marketplace listings. Each revision is embedded field by field with a small BERT
 thresholds. A record's quantities (weight, volume, potency) are compared as numbers beside that, never embedded.
 Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D18) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D19) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -40,6 +40,10 @@ changing a design. Infer conventions from the existing code first.
   recipe that runs it.
 - Test names are sentences stating the behavior (`a_recycled_record_is_rejected_and_the_baseline_is_untouched`).
 - Store implementations must pass the shared contract in `crates/similarity-store/tests/contract.rs`.
+- **A rule that must hold for every input belongs in a `properties` module** (`similarity-core`, `similarity-server`;
+  proptest, D19), beside the example tests and not in place of them. After changing the engine's write path, the
+  anchor, or the scoring, run `PROPTEST_CASES=5000 just test` once. When a property fails, fix the code or the
+  rule, keep the shrunk case as an ordinary named test, and commit the `proptest-regressions/` file it wrote.
 - After touching the encoder, the loader, the tokenizer settings, the trainer, or `config.example.toml`, run
   `just test-real`. It is the only thing that proves numerical parity with PyTorch (embeddings and training steps)
   and that the shipped thresholds still behave.

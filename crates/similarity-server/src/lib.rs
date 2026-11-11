@@ -18,6 +18,8 @@ pub mod engine;
 pub mod fetch;
 pub mod grpc;
 pub mod offline;
+#[cfg(test)]
+mod properties;
 pub mod worker;
 
 use std::future::Future;

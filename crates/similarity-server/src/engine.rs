@@ -294,6 +294,12 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     }
   }
 
+  /// The store, for tests that check what a request left behind.
+  #[cfg(test)]
+  pub(crate) fn store(&self) -> &S {
+    &self.store
+  }
+
   /// Reports the model, schema, and thresholds in force.
   pub fn describe(&self) -> Description {
     let (_, composite_dimension) = store_layout(&self.schema, &self.embedder);

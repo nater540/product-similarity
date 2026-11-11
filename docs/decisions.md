@@ -335,7 +335,7 @@ the best pass is chosen) plus the optimizer state and a small state file. What c
   the data, and the token limit. The state file records all three (the data as a fingerprint), and a checkpoint
   is refused by any run that differs in one, since it would otherwise continue differently while looking normal.
   The encoder must also have been loaded from the checkpoint directory itself. Options are compared for equality
-  after a trip through JSON, so the trainer's `serde_json` is built with `float_roundtrip`; without it about one
+  after a trip through JSON, so `serde_json` is built with `float_roundtrip` (workspace-wide, D19); without it about one
   `f64` in ten reads back one bit off and such a checkpoint could never be resumed.
 - **Whole or not at all.** A checkpoint and the final model are written to a sibling directory, flushed to disk
   (files and directories), and renamed into place; nothing existing is overwritten. The final model is written
@@ -590,4 +590,40 @@ if that is set (the Docker build has no `.git`; `just image` passes it), otherwi
 `unknown`. It runs on every build, because whether the tree is dirty can change without any file of the crate
 changing; the crate is only rebuilt when the answer does. It lives in the binary crates and not in
 `similarity-core` so that a change of answer relinks two binaries instead of rebuilding the workspace.
+
+## D19. The rules a verdict rests on are stated as properties
+
+D7 (a rejected revision writes nothing) and D8 (the anchor never loses a value) are the product's safety
+properties, and they were covered by scenarios someone had thought of. Scenarios do not cover the request nobody
+thought of, and the engine's write path was about to be changed again (quantities, a bulk import). So the rules
+are also written down as properties and checked on generated inputs, with `proptest` as a dev-dependency (MIT or
+Apache-2.0, never in a release build, built without its process-forking features).
+
+**What is checked.** In `similarity-core`: the composite identity of D5; that a comparison names and scores every
+field from which sides have it; that extending the anchor keeps what it holds; that judging again equals
+evaluating afresh (D17); that a quantity's factor is the same in both directions, at least 1, and unmoved by
+rewriting both sides in another unit (D16); that judging quantities never touches the text verdict; and that a
+text embeds the same alone and in any batch (D9). In `similarity-server`: that the suggested threshold is what
+trying every cut finds, and a **state machine**: random sequences of `Evaluate` (every mode, valid and malformed,
+with and without tenants and quantities), `Delete`, and `FindSimilar`, with every rule of D7, D8, D14, and D16
+checked after every request against what the store held before it.
+
+**It can fail.** Three deliberate breaks of the engine (writing a rejected revision, replacing the anchor's
+quantities, counting a write twice) were each caught within the default 64 cases and shrunk to a two-request
+sequence. A property that cannot fail is decoration.
+
+**What it found.** One real thing: a number read from JSON was not always the number written. `serde_json` is off
+by one bit for about one value in ten unless built with `float_roundtrip`. The trainer already enabled that for
+its checkpoints (D13), and because cargo unifies features across a build, the server crates had it under
+`cargo test --workspace` and not under `cargo test -p similarity-core`: the same file parsed to different numbers
+depending on what else was being compiled. Nothing visible depended on the last bit (quantities are compared
+within a tolerance), but a number that depends on the build is a bug waiting for its symptom. The feature is now
+set once, for the workspace.
+
+It also found a mistake in a test, which is worth recording for what it shows: `Schema::compose` requires unit
+vectors, says so, and does not check. Every caller gives it unit vectors (the encoder normalizes its output, and
+reused blocks are normalized again). The composite identity does not hold otherwise.
+
+**Cost.** Each property runs 64 cases by default, and the whole of it adds well under a second to `just test`.
+`PROPTEST_CASES` raises the count for a thorough run; 5,000 cases of everything take a few seconds.
 
