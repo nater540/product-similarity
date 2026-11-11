@@ -5,7 +5,7 @@ marketplace listings. Each revision is embedded field by field with a small BERT
 [Burn](https://burn.dev), compared with the stored baseline, and accepted or rejected against calibrated
 thresholds. Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D14) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D15) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -19,7 +19,11 @@ changing a design. Infer conventions from the existing code first.
   lints deny them (`[workspace.lints]` in the root `Cargo.toml`). Use `?`, `.get()`, iterators, and
   `saturating_*`/`checked_*`. For Burn tensors use the method forms (`.add()`, `.mul()`, `.div()`), since the
   arithmetic lint also fires on operator overloads. Tests may unwrap and index (`clippy.toml`).
-- No `println!`: libraries log through `tracing`; the binary writes to a locked `stdout` with `writeln!`.
+- No `println!`. Libraries log through `tracing`. **All logging is NDJSON, set up only in `similarity-log`**
+  (D15): never add a text format, a second subscriber, or a preformatted string where a number would do. Log
+  values as numbers and booleans. A training result is an event with `target: similarity_log::RESULT` (stdout,
+  never filtered); a failure goes through `similarity_log::failed`. The server's `model fetch`, `compare`, and
+  `calibrate` reports are for people and are written to a locked `stdout` with `writeln!`.
 - `thiserror` enums in the libraries (`similarity-core`, `similarity-store`, `similarity-train`'s `lib`); `anyhow`
   only in the two binaries.
 - Imports grouped std, external, `crate::`, separated by blank lines.
@@ -42,6 +46,7 @@ changing a design. Infer conventions from the existing code first.
 
 ## Workspace layout
 
+- `crates/similarity-log`: the one logging setup both binaries use.
 - `crates/similarity-proto`: the `.proto` (the source of truth for the API, and where its docs live) and generated
   code.
 - `crates/similarity-core`: encoder, strict weight loading and saving, tokenization, composite vectors, scoring,
@@ -79,6 +84,11 @@ changing a design. Infer conventions from the existing code first.
 - **Rust end to end, by the owner's choice** (D13): training is `similarity-train`, in Burn. Do not add Python to
   any pipeline. `tools/*.py` are referees that write PyTorch fixtures for the parity tests and nothing else.
 - **Dropout is never in the module tree.** `forward_training` takes it as an argument; `forward` cannot apply it.
+- **A checkpoint must restore parameter ids before the optimizer state** (`similarity-train/src/checkpoint.rs`).
+  Burn files optimizer state under ids that change on every load; skipping this makes a resume silently train
+  without its optimizer state. Anything that changes what a training step sees or does belongs in `RunIdentity`,
+  or a resume under a different value will be accepted. Model directories and checkpoints are written through
+  `write_whole` (sibling, flush, rename), never in place.
 - **The trainer is held to PyTorch step for step** (`similarity-train/tests/real_parity.rs`). After changing a
   loss, the clipping, the optimizer settings, or the training forward pass, run `just test-parity`; if the change
   is intended, change `tools/train_golden.py` to match and regenerate with `just golden`.
@@ -94,5 +104,6 @@ changing a design. Infer conventions from the existing code first.
 - Run: `just serve` (needs Qdrant) or `just serve-in-memory`; then `just client describe`
 - Measure: `just throughput`, `just calibrate`
 - Fine-tune: `just finetune --base ... --out ... --pairs ...` (CPU); GPU: `just release-train metal`, then
-  `./target/release/record-similarity-train --device metal ...`
+  `./target/release/record-similarity-train --device metal ...`. Continue an interrupted run with `--resume
+  <out>.checkpoints/step-NNNNNN` in place of `--base`. Results are NDJSON on stdout, logs NDJSON on stderr.
 - PyTorch referees (need `uv`): `just golden` regenerates both fixtures; `just verify-model <dir>` is optional

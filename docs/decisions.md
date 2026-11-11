@@ -321,6 +321,39 @@ back through the audited loader (D2) and PyTorch can open them (`just verify-mod
 heads a published checkpoint may carry are not written; nothing in an embedding pipeline reads them. A directory
 is never written into if it holds anything, because a model's content hash is its identity (D12).
 
+**Checkpoints are model directories, and a resume is the same run.** A run is checkpointed at the end of every
+pass. A checkpoint is what the run would have produced had it stopped there (so it can be calibrated, which is how
+the best pass is chosen) plus the optimizer state and a small state file. What carries the weight:
+
+- **Parameter ids.** Burn's optimizer files its state under parameter ids, and ids are made up afresh whenever a
+  module is built, including when a checkpoint is loaded. A resume that only loaded the weights and the optimizer
+  file would succeed and then never find any of that state, continuing as if it had none. So the state file
+  records every id in traversal order and they are put back first. A unit test resumes with and without that
+  step: with it the result equals the uninterrupted run, without it the result differs. The entry point that
+  loads optimizer state is private to the crate for the same reason: it is only correct after the ids are back.
+- **Run identity.** The batch order, the schedule, and what each batch contains are functions of the options,
+  the data, and the token limit. The state file records all three (the data as a fingerprint), and a checkpoint
+  is refused by any run that differs in one, since it would otherwise continue differently while looking normal.
+  The encoder must also have been loaded from the checkpoint directory itself. Options are compared for equality
+  after a trip through JSON, so the trainer's `serde_json` is built with `float_roundtrip`; without it about one
+  `f64` in ten reads back one bit off and such a checkpoint could never be resumed.
+- **Whole or not at all.** A checkpoint and the final model are written to a sibling directory, flushed to disk
+  (files and directories), and renamed into place; nothing existing is overwritten. The final model is written
+  the moment training ends, before the closing measurements, so the last pass is never held only in memory for
+  longer than it must be.
+- **Found out early.** The checkpoint directory is created and read before training, must lie outside the output
+  directory, and must not already hold a later step. Each of those was otherwise a run lost at its first
+  checkpoint.
+- **Divergence stops the step.** A loss or a gradient norm that is not finite ends the run before the optimizer
+  is applied. Checking only the loss let a step with a finite loss and an infinite gradient through, and the next
+  checkpoint would have been written from NaN weights.
+- **Pruning is conservative.** `--keep-checkpoints` counts the run's own checkpoints across resumes, recognized
+  by their state files; it never deletes another run's, nor the checkpoint the process was loaded from (the model
+  re-reads its tokenizer and configuration files from there on every save). Failing to delete one is a warning.
+
+Without dropout a resumed run ends on bit-identical weights (verified on the real model). With dropout it differs
+only in the random masks after the resume: the backend's random stream is seeded, not saved.
+
 **Cost.** One step on 32 pairs of 256-token texts takes about 9 s and 9 GB on a laptop CPU and about 1.3 s on its
 GPU through Metal. Metal and CPU runs from the same seed without dropout agree to three decimal places in the
 resulting similarities. The CUDA feature compiles and has not been run.
@@ -339,3 +372,29 @@ which is how a catalog indexed before tenants were in use gains them.
 
 This is a consistency check and not access control. The server does not authenticate anyone (see the README's
 limitations), so a caller that can reach it can always supply the right tenant.
+
+## D15. Logs are NDJSON, and results are output
+
+Both binaries log one JSON object per line and offer no other format. They are run by schedulers and read by log
+pipelines far more than by a person at a terminal, and a second format is a second thing to keep correct; the
+first version of the trainer had a text mode and a JSON mode, and the two had already drifted apart in what they
+reported. A person reads the one format with `jq`. The setup lives in one crate, `similarity-log`, so the two
+binaries cannot diverge.
+
+What a line is decides where it goes, and whether it can be filtered:
+
+- **Logs** go to stderr under `RUST_LOG`. Progress and commentary are optional by nature.
+- **Results** go to stdout and are never filtered. What a training run measured is its output, in the same sense
+  as the calibration report in D11; routed through the log filter, `RUST_LOG=warn` produced a successful run that
+  reported nothing.
+- **Failures** go to stderr and are never filtered, panics included (a hook replaces Rust's multi-line message).
+  The line a reader most needs is the one that says the run failed, so it has to be parseable and present.
+
+Fields are logged as numbers and booleans, rounded where that helps, never as preformatted strings; an optional
+value that is absent is left out, not written as `null`. Nothing logged can be `NaN` or infinite, because the
+trainer ends a run on the first loss or gradient that is (D13), and JSON has no way to write either.
+
+Two things stay text: the reports `model fetch`, `compare`, and `calibrate` print on stdout for a person, and
+usage errors from the argument parser, which happen before anything has started. Burn's own training dashboard
+was not used: it comes with `burn-train`'s learner, and a terminal UI is the wrong output for a job run over SSH
+or in a pipeline.

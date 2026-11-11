@@ -1,0 +1,23 @@
+[package]
+name = "similarity-log"
+description = "The one way both record-similarity binaries log: one JSON object per line."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[features]
+# Exposes `similarity_log::testing` (capturing both output streams) to the tests of the binaries.
+testing = []
+
+[dependencies]
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["json"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

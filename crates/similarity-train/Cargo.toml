@@ -29,13 +29,18 @@ burn = { workspace = true, features = ["autodiff", "optim"] }
 anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# `float_roundtrip`: a checkpoint records its run's options and a resume compares them for equality, so every
+# f64 must read back exactly as written. Without it serde_json is off by one bit for roughly one value in ten.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+# Fingerprints the training data, so a checkpoint is only resumed on the examples it was made from.
+sha2.workspace = true
+similarity-log.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 
 [dev-dependencies]
 similarity-core = { workspace = true, features = ["testing"] }
+similarity-log = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 
 [lints]

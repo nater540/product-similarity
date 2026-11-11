@@ -3,18 +3,28 @@
 //! Reads a sentence-transformers model directory, trains it on labeled before/after pairs and/or catalog groups,
 //! and writes a new model directory that the server loads like any other. See "Fine-tuning the model" in the
 //! README for when this is worth doing and what has to be re-done afterwards.
+//!
+//! Everything it says is one JSON object per line (see `similarity-log`): progress on stderr, and what the run
+//! produced on stdout. A run is checkpointed at the end of every pass, and an interrupted one continues with
+//! `--resume`.
 
-use std::io::Write;
+// Tests compare exact floats where exactness is the point (what a rounded number is rounded to).
+#![cfg_attr(test, allow(clippy::float_cmp))]
+
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::time::Instant;
 
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
 use similarity_core::model::SentenceEncoder;
 use similarity_core::{Device, Embedder, EmbedderOptions, TextTokenizer};
+use similarity_log::RESULT;
+use similarity_train::checkpoint::{self, RunIdentity};
 use similarity_train::data::{self, PairExample, PairExamples, Split};
-use similarity_train::eval::{Separation, separation};
-use similarity_train::{Examples, Progress, TrainOptions, fit};
+use similarity_train::eval::{Separation, Spread, separation};
+use similarity_train::{Examples, Progress, Step, TrainOptions, fit};
 
 /// Where training runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -32,8 +42,13 @@ enum DeviceChoice {
 #[command(name = "record-similarity-train", version, about)]
 struct Cli {
   /// The model directory to start from
+  #[arg(long, required_unless_present = "resume", conflicts_with = "resume")]
+  base: Option<PathBuf>,
+
+  /// Continue an interrupted run from this checkpoint directory, in place of --base. Every other option, and the
+  /// data, must be what the run was started with
   #[arg(long)]
-  base: PathBuf,
+  resume: Option<PathBuf>,
 
   /// Where to write the fine-tuned model directory; it must not exist yet, or be empty
   #[arg(long)]
@@ -104,6 +119,22 @@ struct Cli {
   /// Log progress every this many steps
   #[arg(long, default_value_t = 10)]
   log_every: usize,
+
+  /// Where to write checkpoints; must not be inside --out [default: <OUT>.checkpoints]
+  #[arg(long)]
+  checkpoint_dir: Option<PathBuf>,
+
+  /// Also checkpoint every this many steps (at least 1). One is always written at the end of each pass
+  #[arg(long)]
+  checkpoint_every: Option<NonZeroUsize>,
+
+  /// Keep only this many of the run's checkpoints, deleting the oldest; 0 keeps them all
+  #[arg(long, default_value_t = 0)]
+  keep_checkpoints: usize,
+
+  /// Write no checkpoints
+  #[arg(long, conflicts_with_all = ["checkpoint_dir", "checkpoint_every"])]
+  no_checkpoints: bool,
 }
 
 fn device(choice: DeviceChoice) -> anyhow::Result<Device> {
@@ -169,6 +200,19 @@ fn ensure_free(out: &Path) -> anyhow::Result<()> {
   Ok(())
 }
 
+/// `value` to `places` decimal places, so that a log line carries a number and not fifteen digits of noise.
+///
+/// Through the decimal text and back, which is exact about what "four decimal places" means; scaling by a power
+/// of ten and dividing again leaves digits like `0.30000000000000004` behind.
+fn rounded(value: f64, places: usize) -> f64 {
+  format!("{value:.places$}").parse().unwrap_or(value)
+}
+
+/// `value` to three significant digits, for quantities such as a learning rate that span orders of magnitude.
+fn significant(value: f64) -> f64 {
+  format!("{value:.2e}").parse().unwrap_or(value)
+}
+
 /// Running means of the loss since the last progress line, per kind of batch.
 #[derive(Debug, Default)]
 struct Window {
@@ -193,71 +237,229 @@ impl Window {
 
   fn mean((sum, count): (f64, usize)) -> Option<f64> {
     #[expect(clippy::cast_precision_loss, reason = "a handful of steps")]
-    (count > 0).then(|| sum / count as f64)
+    (count > 0).then(|| rounded(sum / count as f64, 4))
   }
 
+  /// One progress event. Every value is a number, so that it can be charted without parsing strings; a loss is
+  /// absent when no batch of its kind fell in the window. (None of them can be NaN or infinite: the trainer stops
+  /// a run on the first loss or gradient that is.)
   fn log(&mut self, progress: &Progress, started: Instant) {
-    let shown = |mean: Option<f64>| mean.map_or_else(|| "-".to_owned(), |mean| format!("{mean:.4}"));
     #[expect(clippy::cast_precision_loss, reason = "a handful of steps")]
     let grad_norm = self.grad_norm / self.steps.max(1) as f64;
     tracing::info!(
       step = progress.step,
       of = progress.total_steps,
       epoch = progress.epoch,
-      pair_loss = %shown(Self::mean(self.pairs)),
-      group_loss = %shown(Self::mean(self.groups)),
-      grad_norm = %format!("{grad_norm:.3}"),
-      rate = %format!("{:.2e}", progress.rate),
-      elapsed = ?started.elapsed(),
+      pair_loss = Self::mean(self.pairs),
+      group_loss = Self::mean(self.groups),
+      grad_norm = rounded(grad_norm, 3),
+      rate = significant(progress.rate),
+      elapsed_s = rounded(started.elapsed().as_secs_f64(), 1),
       "training"
     );
     *self = Self::default();
   }
 }
 
-fn write_separation(
-  out: &mut impl Write,
-  title: &str,
-  before: &[Separation],
-  after: &[Separation],
-) -> std::io::Result<()> {
-  let spread = |spread: Option<similarity_train::eval::Spread>| {
-    spread.map_or_else(
-      || "       (none)       ".to_owned(),
-      |spread| format!("{:.3} / {:.3} / {:.3}", spread.min, spread.mean, spread.max),
-    )
-  };
-  let gap = |separation: &Separation| {
-    separation
-      .mean_gap()
-      .map_or_else(|| "    -".to_owned(), |gap| format!("{gap:+.3}"))
-  };
-  let count = |pick: fn(&Separation) -> Option<similarity_train::eval::Spread>| {
-    before.first().and_then(pick).map_or(0, |spread| spread.count)
-  };
-  writeln!(
-    out,
-    "\n{title}: {} edit and {} recycle field texts",
-    count(|separation| separation.edits),
-    count(|separation| separation.recycles)
-  )?;
-  writeln!(
-    out,
-    "  width          edits min / mean / max   recycles min / mean / max   gap of means"
-  )?;
-  for (before, after) in before.iter().zip(after) {
-    for (stage, separation) in [("before", before), ("after ", after)] {
-      writeln!(
-        out,
-        "  {:>5}  {stage}  {}    {}      {}",
-        separation.width,
-        spread(separation.edits),
-        spread(separation.recycles),
-        gap(separation)
-      )?;
+/// When and where a run is checkpointed, and which checkpoints on disk are its own.
+#[derive(Debug)]
+struct Checkpoints {
+  dir: PathBuf,
+  every: Option<NonZeroUsize>,
+  keep: usize,
+  /// This run's checkpoints, oldest first: the ones `keep` counts and may delete.
+  own: Vec<PathBuf>,
+}
+
+/// The step a checkpoint directory name (`step-000120`) stands for.
+fn step_of(name: &str) -> Option<usize> {
+  name.strip_prefix("step-")?.parse().ok()
+}
+
+impl Checkpoints {
+  fn path(&self, step: usize) -> PathBuf {
+    self.dir.join(format!("step-{step:06}"))
+  }
+
+  /// Makes sure, before any training, that checkpoints can be written where they are meant to go.
+  ///
+  /// Everything checked here would otherwise be found out at the first checkpoint: a run lost part-way, to the
+  /// very mechanism meant to prevent that. `done` is the step the run starts from (0 unless resuming).
+  ///
+  /// It also takes stock of the run's earlier checkpoints, so that `--keep-checkpoints` bounds what is on disk
+  /// across a resume and not only within one process. A checkpoint is counted, and so may later be deleted, only
+  /// if its own state file says it was written by this same run, and never if it is `source`, the checkpoint
+  /// this process was loaded from: the model keeps reading its configuration and tokenizer files from there
+  /// every time it is saved, up to and including the final one.
+  fn prepare(&mut self, out: &Path, source: Option<&Path>, done: usize, run: &RunIdentity) -> anyhow::Result<()> {
+    let same = |left: &Path, right: &Path| match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+      (Ok(left), Ok(right)) => left == right,
+      _ => left.components().eq(right.components()),
+    };
+    let normalized = |path: &Path| path.components().collect::<PathBuf>();
+    anyhow::ensure!(
+      !normalized(&self.dir).starts_with(normalized(out)),
+      "the checkpoint directory {} is inside the output directory {}, which has to be empty when the model is \
+       written; give another --checkpoint-dir",
+      self.dir.display(),
+      out.display()
+    );
+    std::fs::create_dir_all(&self.dir)
+      .with_context(|| format!("cannot create the checkpoint directory {}", self.dir.display()))?;
+    let entries = std::fs::read_dir(&self.dir)
+      .with_context(|| format!("cannot read the checkpoint directory {}", self.dir.display()))?;
+
+    let mut earlier = Vec::new();
+    for entry in entries {
+      let entry = entry.with_context(|| format!("cannot read the checkpoint directory {}", self.dir.display()))?;
+      let Some(step) = entry.file_name().to_str().and_then(step_of) else {
+        continue;
+      };
+      anyhow::ensure!(
+        step <= done,
+        "{} already holds a checkpoint for step {step}, which this run would write again; remove the checkpoints \
+         after step {done}, or give another --checkpoint-dir",
+        self.dir.display()
+      );
+      let in_use = source.is_some_and(|source| same(source, &entry.path()));
+      if !in_use && checkpoint::read(&entry.path()).is_ok_and(|state| checkpoint::same_run(&state, run)) {
+        earlier.push((step, entry.path()));
+      }
+    }
+    earlier.sort();
+    self.own = earlier.into_iter().map(|(_, path)| path).collect();
+    Ok(())
+  }
+
+  fn due(&self, progress: &Progress) -> bool {
+    // The end of the run is the model in --out, written as soon as training ends; a checkpoint of it would be a
+    // second copy of the same weights.
+    progress.step < progress.total_steps
+      && (progress.epoch_complete
+        || self
+          .every
+          .is_some_and(|every| progress.step.is_multiple_of(every.get())))
+  }
+
+  fn after(&mut self, step: &Step<'_>) -> similarity_train::Result<()> {
+    if !self.due(&step.progress) {
+      return Ok(());
+    }
+    let path = self.path(step.progress.step);
+    step.checkpoint(&path)?;
+    tracing::info!(
+      step = step.progress.step,
+      epoch = step.progress.epoch,
+      path = %path.display(),
+      "checkpoint"
+    );
+    self.own.push(path);
+    self.prune();
+    Ok(())
+  }
+
+  /// Deletes the oldest of this run's checkpoints beyond the number to keep.
+  ///
+  /// Never an error. The new checkpoint is already safely written, and failing to tidy up behind it is no reason
+  /// to throw the run away; a checkpoint someone has moved elsewhere to keep is simply no longer here to delete.
+  fn prune(&mut self) {
+    while self.keep > 0 && self.own.len() > self.keep {
+      let oldest = self.own.remove(0);
+      match std::fs::remove_dir_all(&oldest) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+          path = %oldest.display(),
+          %error,
+          "could not delete an old checkpoint; training continues"
+        ),
+      }
     }
   }
-  Ok(())
+}
+
+/// What a run measured and produced, reported once at the end.
+struct Outcome<'a> {
+  out: &'a Path,
+  examples: &'a Examples,
+  held_out: usize,
+  resumed_at: Option<usize>,
+  steps: usize,
+  elapsed_s: f64,
+  /// Before and after, on the training pairs and on the held-out pairs.
+  training: (&'a [Separation], &'a [Separation]),
+  held: (&'a [Separation], &'a [Separation]),
+}
+
+/// The lowest, mean, and highest similarity of one label's examples, rounded for reporting.
+fn spread(side: Option<Spread>) -> [Option<f64>; 3] {
+  let number = |value: f32| rounded(f64::from(value), 4);
+  match side {
+    Some(spread) => [
+      Some(number(spread.min)),
+      Some(number(spread.mean)),
+      Some(number(spread.max)),
+    ],
+    None => [None; 3],
+  }
+}
+
+impl Outcome<'_> {
+  /// Reports the results: one `separation` event per split, stage, and width that has something to report, then
+  /// one `finished` event for the run. These are the run's output, so they go to stdout and no log level hides
+  /// them.
+  fn report(&self) {
+    // When a run was resumed, its "before" is the checkpoint it resumed from, which is not where the run began.
+    let baseline = if self.resumed_at.is_some() {
+      "checkpoint"
+    } else {
+      "base model"
+    };
+    let splits = [
+      ("training", self.examples.pairs.len(), self.training),
+      ("held_out", self.held_out, self.held),
+    ];
+    for (split, examples, (before, after)) in splits {
+      // No pairs in a split means no measurement, which is not the same as a measurement of zero examples.
+      if examples == 0 {
+        continue;
+      }
+      for (stage, rows) in [("before", before), ("after", after)] {
+        for row in rows {
+          let [edits_min, edits_mean, edits_max] = spread(row.edits);
+          let [recycles_min, recycles_mean, recycles_max] = spread(row.recycles);
+          tracing::info!(
+            target: RESULT,
+            split,
+            stage,
+            compared_with = (stage == "before").then_some(baseline),
+            width = row.width,
+            edits = row.edits.map_or(0, |spread| spread.count),
+            edits_min,
+            edits_mean,
+            edits_max,
+            recycles = row.recycles.map_or(0, |spread| spread.count),
+            recycles_min,
+            recycles_mean,
+            recycles_max,
+            gap_of_means = row.mean_gap().map(|gap| rounded(f64::from(gap), 4)),
+            "separation"
+          );
+        }
+      }
+    }
+    tracing::info!(
+      target: RESULT,
+      out = %self.out.display(),
+      pair_examples = self.examples.pairs.len(),
+      catalog_examples = self.examples.groups.len(),
+      held_out_examples = self.held_out,
+      steps = self.steps,
+      resumed_at = self.resumed_at,
+      elapsed_s = rounded(self.elapsed_s, 1),
+      "finished"
+    );
+  }
 }
 
 impl Cli {
@@ -304,13 +506,8 @@ impl Cli {
     Ok((training, held_out.examples))
   }
 
-  fn run(&self) -> anyhow::Result<()> {
-    ensure_free(&self.out)?;
-    anyhow::ensure!(
-      self.pairs.is_some() || self.catalog_groups.is_some(),
-      "nothing to train on: give --pairs and/or --catalog-groups"
-    );
-
+  /// Everything to train on, and the held-out pairs to report on.
+  fn examples(&self) -> anyhow::Result<(Examples, Vec<PairExample>)> {
     let (training, held_out) = self.pairs()?;
     let groups = match &self.catalog_groups {
       Some(path) => {
@@ -324,24 +521,71 @@ impl Cli {
       pairs: training.examples,
       groups,
     };
+    Ok((examples, held_out))
+  }
 
-    let device = device(self.device)?;
-    let encoder = SentenceEncoder::load(&self.base, &device)
-      .with_context(|| format!("cannot load the base model from {}", self.base.display()))?;
-    let tokenizer = TextTokenizer::load(&self.base, self.max_tokens)?;
+  /// Where and when this run checkpoints, if it does.
+  fn checkpoints(&self) -> Option<Checkpoints> {
+    if self.no_checkpoints {
+      return None;
+    }
+    let dir = self
+      .checkpoint_dir
+      .clone()
+      .unwrap_or_else(|| checkpoint::sibling(&self.out, ".checkpoints"));
+    Some(Checkpoints {
+      dir,
+      every: self.checkpoint_every,
+      keep: self.keep_checkpoints,
+      own: Vec::new(),
+    })
+  }
+
+  /// Loads the model to train: the base model, or the checkpoint being resumed, which is a model directory too.
+  fn load(&self, device: &Device) -> anyhow::Result<(SentenceEncoder, TextTokenizer, &Path)> {
+    let Some(source) = self.resume.as_deref().or(self.base.as_deref()) else {
+      anyhow::bail!("give --base, or --resume to continue an interrupted run");
+    };
+    let encoder = SentenceEncoder::load(source, device)
+      .with_context(|| format!("cannot load the model from {}", source.display()))?;
+    let tokenizer = TextTokenizer::load(source, self.max_tokens)?;
     anyhow::ensure!(
       self.max_tokens <= encoder.max_positions(),
       "--max-tokens is {} but the model's position table only covers {}",
       self.max_tokens,
       encoder.max_positions()
     );
+    Ok((encoder, tokenizer, source))
+  }
+
+  fn run(&self) -> anyhow::Result<()> {
+    ensure_free(&self.out)?;
+    anyhow::ensure!(
+      self.pairs.is_some() || self.catalog_groups.is_some(),
+      "nothing to train on: give --pairs and/or --catalog-groups"
+    );
+    let resumed_at = match &self.resume {
+      Some(dir) => Some(checkpoint::read(dir)?.step),
+      None => None,
+    };
+
+    let (examples, held_out) = self.examples()?;
+    let device = device(self.device)?;
+    let (encoder, tokenizer, source) = self.load(&device)?;
     let options = self.options(&encoder);
+    let mut checkpoints = self.checkpoints();
+    if let Some(checkpoints) = &mut checkpoints {
+      let run = RunIdentity::of(&options, &examples, self.max_tokens);
+      checkpoints.prepare(&self.out, self.resume.as_deref(), resumed_at.unwrap_or(0), &run)?;
+    }
     tracing::info!(
-      base = %self.base.display(),
+      model = %source.display(),
+      resumed_at,
       device = ?self.device,
       native_width = encoder.dimension(),
       widths = ?options.widths,
       dropout = options.dropout,
+      checkpoints = checkpoints.as_ref().map(|checkpoints| checkpoints.dir.display().to_string()),
       "model loaded"
     );
 
@@ -352,81 +596,434 @@ impl Cli {
 
     let started = Instant::now();
     let mut window = Window::default();
+    let mut steps = 0;
     let trained = fit(
       encoder,
       tokenizer.clone(),
       device.clone(),
       &examples,
       &options,
-      |progress| {
+      self.resume.as_deref(),
+      |step| {
+        let progress = &step.progress;
+        steps = progress.total_steps;
         window.add(progress);
         if progress.step.is_multiple_of(self.log_every.max(1)) || progress.step == progress.total_steps {
           window.log(progress, started);
         }
+        match &mut checkpoints {
+          Some(checkpoints) => checkpoints.after(step),
+          None => Ok(()),
+        }
       },
     )?;
-    let elapsed = started.elapsed();
-    let after = (score(&trained, &examples.pairs)?, score(&trained, &held_out)?);
+    let elapsed_s = started.elapsed().as_secs_f64();
 
-    trained
-      .save(&self.out)
-      .with_context(|| format!("cannot save the model to {}", self.out.display()))?;
-    // Load what was just written through the path the server uses, including its warm-up forward pass, so that a
-    // directory this command reports as saved is one the server is known to start with.
+    // Saved before anything else is done with it. Until this returns, the last pass exists only in memory, and
+    // the scoring below is minutes of forward passes on a large dataset.
+    checkpoint::save_model(&trained, &self.out)?;
+    // Loaded back through the path the server uses, including its warm-up forward pass, so that a directory this
+    // command reports as saved is one the server is known to start with.
     let embedder_options = EmbedderOptions {
       max_tokens: self.max_tokens,
       ..EmbedderOptions::default()
     };
     Embedder::load(&self.out, Device::flex(), &embedder_options)
       .with_context(|| format!("the model saved to {} does not load back", self.out.display()))?;
+    tracing::info!(out = %self.out.display(), "model saved and verified to load");
 
-    let mut out = std::io::stdout().lock();
-    writeln!(
-      out,
-      "trained on {} pair and {} catalog examples in {elapsed:.1?}",
-      examples.pairs.len(),
-      examples.groups.len()
-    )?;
-    writeln!(
-      out,
-      "similarity of single field texts, not record verdicts: use `record-similarity calibrate` for those"
-    )?;
-    if !examples.pairs.is_empty() {
-      write_separation(&mut out, "training pairs (seen during training)", &before.0, &after.0)?;
+    let after = (score(&trained, &examples.pairs)?, score(&trained, &held_out)?);
+    Outcome {
+      out: &self.out,
+      examples: &examples,
+      held_out: held_out.len(),
+      resumed_at,
+      steps,
+      elapsed_s,
+      training: (&before.0, &after.0),
+      held: (&before.1, &after.1),
     }
-    if held_out.is_empty() {
-      writeln!(
-        out,
-        "\nno pair has `split: \"{}\"`, so there is no held-out measurement",
-        self.holdout_split
-      )?;
-    } else {
-      write_separation(&mut out, "held-out pairs (never trained on)", &before.1, &after.1)?;
-    }
-    writeln!(out, "\nsaved to {} and verified that it loads", self.out.display())?;
-    writeln!(
-      out,
-      "next: point `model.dir` at it, re-calibrate the thresholds on held-out pairs, and re-index (README.md)"
-    )?;
+    .report();
     Ok(())
   }
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> ExitCode {
   let cli = Cli::parse();
-  tracing_subscriber::fmt()
-    .with_env_filter(
-      tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-    )
-    .with_writer(std::io::stderr)
-    .init();
-  cli.run()
+  similarity_log::init();
+  match cli.run() {
+    Ok(()) => ExitCode::SUCCESS,
+    Err(error) => {
+      similarity_log::failed(&format!("{error:#}"));
+      ExitCode::FAILURE
+    }
+  }
 }
 
 #[cfg(test)]
 mod tests {
+  use similarity_log::testing::capture;
+  use similarity_train::StepReport;
+  use similarity_train::data::GroupExample;
+
   use super::*;
+
+  #[test]
+  fn log_numbers_are_rounded_to_what_is_worth_reading() {
+    assert_eq!(rounded(0.016_234_567, 4), 0.0162);
+    assert_eq!(rounded(0.1 + 0.2, 4), 0.3);
+    assert_eq!(significant(1.894_736_8e-5), 1.89e-5);
+    assert_eq!(significant(2e-5), 2e-5);
+    assert_eq!(significant(12_345.678), 12_300.0);
+    assert_eq!(significant(0.0), 0.0);
+    // Far outside anything a learning rate takes, and still a number.
+    assert_eq!(significant(1.234_5e-310), 1.23e-310);
+  }
+
+  fn progress(step: usize, total_steps: usize, epoch_complete: bool) -> Progress {
+    Progress {
+      step,
+      total_steps,
+      epoch: 1,
+      epoch_complete,
+      examples: 4,
+      ranking: false,
+      rate: 2e-5,
+      report: StepReport {
+        loss: 0.1,
+        grad_norm: 1.0,
+      },
+    }
+  }
+
+  fn checkpoints(dir: &Path, every: Option<usize>, keep: usize) -> Checkpoints {
+    Checkpoints {
+      dir: dir.to_path_buf(),
+      every: every.and_then(NonZeroUsize::new),
+      keep,
+      own: Vec::new(),
+    }
+  }
+
+  fn examples() -> Examples {
+    Examples {
+      pairs: vec![PairExample {
+        before: "blueberry gummies".to_owned(),
+        after: "blueberry gummies mg".to_owned(),
+        same: true,
+      }],
+      groups: vec![GroupExample {
+        catalog: "vape cartridge".to_owned(),
+        listing: "sativa vape cartridge".to_owned(),
+      }],
+    }
+  }
+
+  fn identity(seed: u64) -> RunIdentity {
+    let options = TrainOptions {
+      seed,
+      ..TrainOptions::default()
+    };
+    RunIdentity::of(&options, &examples(), 256)
+  }
+
+  /// A directory that reads as a checkpoint of `run` taken after `step` steps.
+  fn fake_checkpoint(dir: &Path, step: usize, run: &RunIdentity) -> PathBuf {
+    let path = dir.join(format!("step-{step:06}"));
+    std::fs::create_dir_all(&path).unwrap();
+    let state = serde_json::json!({"format": 1, "step": step, "total_steps": 99, "run": run, "param_ids": []});
+    std::fs::write(path.join(checkpoint::STATE_FILE), state.to_string()).unwrap();
+    path
+  }
+
+  #[test]
+  fn a_checkpoint_is_due_at_the_end_of_each_pass_and_never_at_the_end_of_the_run() {
+    let by_pass = checkpoints(Path::new("c"), None, 0);
+    assert!(by_pass.due(&progress(10, 30, true)));
+    assert!(!by_pass.due(&progress(11, 30, false)));
+    assert!(
+      !by_pass.due(&progress(30, 30, true)),
+      "the final model is the output, not a checkpoint"
+    );
+
+    let by_step = checkpoints(Path::new("c"), Some(4), 0);
+    assert!(by_step.due(&progress(8, 30, false)));
+    assert!(by_step.due(&progress(10, 30, true)), "the end of a pass still counts");
+    assert!(!by_step.due(&progress(9, 30, false)));
+    assert_eq!(by_step.path(8), Path::new("c/step-000008"));
+  }
+
+  #[test]
+  fn a_run_refuses_to_start_over_checkpoints_it_would_have_to_write_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = identity(0);
+    for step in [4, 8] {
+      fake_checkpoint(dir.path(), step, &run);
+    }
+    std::fs::create_dir(dir.path().join("notes")).unwrap();
+    let out = dir.path().join("out");
+
+    // Resuming from step 8: nothing later exists, so there is nothing to collide with.
+    assert!(checkpoints(dir.path(), None, 0).prepare(&out, None, 8, &run).is_ok());
+    // Resuming from step 4, or starting over: step 8 is in the way.
+    let error = checkpoints(dir.path(), None, 0)
+      .prepare(&out, None, 4, &run)
+      .unwrap_err();
+    assert!(error.to_string().contains("step 8"), "{error}");
+    assert!(checkpoints(dir.path(), None, 0).prepare(&out, None, 0, &run).is_err());
+  }
+
+  #[test]
+  fn a_place_checkpoints_cannot_go_is_found_out_before_training_not_at_the_first_checkpoint() {
+    let scratch = tempfile::tempdir().unwrap();
+    let run = identity(0);
+    let out = scratch.path().join("out");
+
+    // Missing is fine: it is created now, so that the first checkpoint cannot fail on it later.
+    let fresh = scratch.path().join("a/b/checkpoints");
+    checkpoints(&fresh, None, 0).prepare(&out, None, 0, &run).unwrap();
+    assert!(fresh.is_dir());
+
+    // Under a regular file there can never be a directory.
+    let file = scratch.path().join("file");
+    std::fs::write(&file, b"x").unwrap();
+    let error = checkpoints(&file.join("checkpoints"), None, 0)
+      .prepare(&out, None, 0, &run)
+      .unwrap_err();
+    assert!(
+      error.to_string().contains("cannot create the checkpoint directory"),
+      "{error}"
+    );
+
+    // Inside the output directory, the final save would find that directory not empty and refuse.
+    for inside in [
+      out.join("checkpoints"),
+      out.clone(),
+      scratch.path().join("out/.checkpoints"),
+    ] {
+      let error = checkpoints(&inside, None, 0).prepare(&out, None, 0, &run).unwrap_err();
+      assert!(error.to_string().contains("inside the output directory"), "{error}");
+    }
+    assert!(!out.exists(), "nothing was created inside the output directory");
+  }
+
+  #[test]
+  fn the_default_checkpoint_directory_sits_beside_the_output_however_the_output_is_spelled() {
+    for out in ["models/ft", "models/ft/"] {
+      let cli = Cli::parse_from(["x", "--base", "b", "--out", out, "--pairs", "p"]);
+      assert_eq!(
+        cli.checkpoints().unwrap().dir,
+        Path::new("models/ft.checkpoints"),
+        "{out}"
+      );
+    }
+  }
+
+  #[test]
+  fn keeping_the_newest_checkpoints_counts_the_runs_earlier_ones_and_only_those() {
+    let dir = tempfile::tempdir().unwrap();
+    let (run, other_run) = (identity(0), identity(1));
+    let out = dir.path().join("out");
+    let first = fake_checkpoint(dir.path(), 2, &run);
+    let second = fake_checkpoint(dir.path(), 4, &run);
+    // Same directory, another run's checkpoint, and something that is not a checkpoint at all.
+    let foreign = fake_checkpoint(dir.path(), 3, &other_run);
+    let stray = dir.path().join("step-000001");
+    std::fs::create_dir(&stray).unwrap();
+
+    // A resume from step 4 that keeps two: the earlier process's checkpoints count toward the two.
+    let mut resumed = checkpoints(dir.path(), None, 2);
+    resumed.prepare(&out, None, 4, &run).unwrap();
+    assert_eq!(resumed.own, [first.clone(), second.clone()]);
+
+    // The checkpoint a run was loaded from is never counted, so never deleted: the model reads its tokenizer
+    // and configuration files from that directory again each time it is saved.
+    let mut loaded_from_second = checkpoints(dir.path(), None, 1);
+    loaded_from_second.prepare(&out, Some(&second), 4, &run).unwrap();
+    assert_eq!(loaded_from_second.own, std::slice::from_ref(&first));
+
+    let third = fake_checkpoint(dir.path(), 6, &run);
+    resumed.own.push(third.clone());
+    resumed.prune();
+    assert!(!first.exists(), "the oldest of this run's three was deleted");
+    assert!(second.exists() && third.exists());
+    assert!(
+      foreign.exists() && stray.exists(),
+      "nothing that is not this run's is ever deleted"
+    );
+
+    // A checkpoint someone moved away to keep is not an error, and neither is anything else about tidying up.
+    std::fs::remove_dir_all(&second).unwrap();
+    resumed.own.push(fake_checkpoint(dir.path(), 8, &run));
+    resumed.prune();
+    assert_eq!(resumed.own.len(), 2);
+    assert!(third.exists());
+  }
+
+  #[test]
+  fn resume_stands_in_for_base_and_impossible_checkpoint_options_are_refused_at_once() {
+    let fresh = Cli::parse_from(["x", "--base", "b", "--out", "o", "--pairs", "p"]);
+    assert!(fresh.base.is_some() && fresh.resume.is_none());
+    let resumed = Cli::parse_from(["x", "--resume", "c/step-000004", "--out", "o", "--pairs", "p"]);
+    assert!(resumed.base.is_none());
+
+    let refused = |arguments: &[&str]| Cli::try_parse_from(arguments).is_err();
+    assert!(
+      refused(&["x", "--out", "o", "--pairs", "p"]),
+      "neither --base nor --resume"
+    );
+    assert!(refused(&["x", "--base", "b", "--resume", "c", "--out", "o"]));
+    // Zero would mean "every step": 265 MB per step until the disk is full.
+    assert!(refused(&["x", "--base", "b", "--out", "o", "--checkpoint-every", "0"]));
+    assert!(
+      refused(&["x", "--base", "b", "--out", "o", "--log-format", "json"]),
+      "there is one format"
+    );
+    let none = Cli::parse_from(["x", "--base", "b", "--out", "o", "--pairs", "p", "--no-checkpoints"]);
+    assert!(none.checkpoints().is_none());
+  }
+
+  fn row(width: usize, edits: Option<(usize, f32)>, recycles: Option<(usize, f32)>) -> Separation {
+    let spread = |side: Option<(usize, f32)>| {
+      side.map(|(count, mean)| Spread {
+        count,
+        min: mean - 0.1,
+        mean,
+        max: mean + 0.1,
+      })
+    };
+    Separation {
+      width,
+      edits: spread(edits),
+      recycles: spread(recycles),
+    }
+  }
+
+  fn reported(outcome: &Outcome<'_>, level: &str) -> (Vec<serde_json::Value>, usize) {
+    let captured = capture(level, || outcome.report());
+    let results = captured
+      .results
+      .iter()
+      .map(|line| serde_json::from_str(line).unwrap())
+      .collect();
+    (results, captured.logs.len())
+  }
+
+  #[test]
+  fn results_are_json_lines_on_stdout_that_no_log_level_can_hide() {
+    let examples = examples();
+    let before = [row(256, Some((5, 0.9)), Some((8, 0.6)))];
+    let after = [row(256, Some((5, 0.95)), Some((8, 0.5)))];
+    let outcome = Outcome {
+      out: Path::new("models/ft"),
+      examples: &examples,
+      held_out: 13,
+      resumed_at: None,
+      steps: 60,
+      elapsed_s: 19.84,
+      training: (&before, &after),
+      held: (&before, &after),
+    };
+
+    for level in ["info", "warn", "off"] {
+      let (results, log_lines) = reported(&outcome, level);
+      assert_eq!(log_lines, 0, "{level}: results are not log lines");
+      assert_eq!(
+        results.len(),
+        5,
+        "{level}: two splits, two stages, one width, and the run"
+      );
+
+      let held_after = &results[3];
+      assert_eq!(held_after["message"], "separation");
+      assert_eq!(
+        (&held_after["split"], &held_after["stage"]),
+        (&"held_out".into(), &"after".into())
+      );
+      assert_eq!(held_after["width"], 256);
+      assert_eq!((&held_after["edits"], &held_after["recycles"]), (&5.into(), &8.into()));
+      // Numbers, rounded: something a chart can use as it is.
+      assert_eq!(held_after["edits_mean"], 0.95);
+      assert_eq!(held_after["recycles_max"], 0.6);
+      assert_eq!(held_after["gap_of_means"], 0.45);
+      assert!(
+        held_after.get("compared_with").is_none(),
+        "only a `before` row has a baseline"
+      );
+      assert_eq!(results[2]["compared_with"], "base model");
+
+      let finished = &results[4];
+      assert_eq!(finished["message"], "finished");
+      assert_eq!(finished["out"], "models/ft");
+      assert_eq!(
+        (&finished["steps"], &finished["held_out_examples"]),
+        (&60.into(), &13.into())
+      );
+      assert_eq!(finished["elapsed_s"], 19.8);
+      assert!(finished.get("resumed_at").is_none());
+    }
+  }
+
+  #[test]
+  fn a_split_with_no_pairs_reports_no_measurement_and_a_resumed_run_says_what_before_means() {
+    // Catalog groups only, nothing held out, resumed from step 10.
+    let examples = Examples {
+      pairs: Vec::new(),
+      ..examples()
+    };
+    let empty = [row(256, None, None)];
+    let outcome = Outcome {
+      out: Path::new("o"),
+      examples: &examples,
+      held_out: 0,
+      resumed_at: Some(10),
+      steps: 60,
+      elapsed_s: 1.0,
+      training: (&empty, &empty),
+      held: (&empty, &empty),
+    };
+    let (results, _) = reported(&outcome, "info");
+    assert_eq!(
+      results.len(),
+      1,
+      "no `separation` event claims a measurement that was never made"
+    );
+    assert_eq!(results[0]["message"], "finished");
+    assert_eq!(results[0]["resumed_at"], 10);
+
+    // With held-out pairs, the `before` rows of a resumed run say they describe the checkpoint.
+    let measured = [row(256, Some((5, 0.9)), None)];
+    let outcome = Outcome {
+      held_out: 5,
+      held: (&measured, &measured),
+      ..outcome
+    };
+    let (results, _) = reported(&outcome, "info");
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["compared_with"], "checkpoint");
+    // No recycles among them: their statistics are left out, not written as zeros or nulls.
+    assert_eq!(results[0]["recycles"], 0);
+    assert!(results[0].get("recycles_mean").is_none() && results[0].get("gap_of_means").is_none());
+  }
+
+  #[test]
+  fn progress_is_logged_as_numbers_and_an_absent_loss_is_left_out() {
+    let mut window = Window::default();
+    window.add(&progress(10, 60, false));
+    let captured = capture("info", || window.log(&progress(10, 60, false), Instant::now()));
+    assert!(captured.results.is_empty());
+    let line: serde_json::Value = serde_json::from_str(&captured.logs[0]).unwrap();
+    assert_eq!(line["message"], "training");
+    assert_eq!((&line["step"], &line["of"]), (&10.into(), &60.into()));
+    assert_eq!(line["pair_loss"], 0.1);
+    assert_eq!(line["grad_norm"], 1.0);
+    assert_eq!(line["rate"], 2e-5);
+    assert!(line["elapsed_s"].is_number());
+    assert!(
+      line.get("group_loss").is_none(),
+      "no catalog batch fell in this window: {line}"
+    );
+  }
 
   #[test]
   fn a_width_the_model_cannot_produce_becomes_its_native_width() {

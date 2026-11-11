@@ -42,7 +42,7 @@ pub fn text_hash(normalized: &str) -> String {
 }
 
 /// The first `bytes` bytes of `digest` as lowercase hex.
-pub(crate) fn hex_prefix(digest: &[u8], bytes: usize) -> String {
+pub fn hex_prefix(digest: &[u8], bytes: usize) -> String {
   use std::fmt::Write as _;
   digest.iter().take(bytes).fold(String::new(), |mut hex, byte| {
     // Writing to a `String` cannot fail.

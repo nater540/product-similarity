@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+  "crates/similarity-log",
   "crates/similarity-proto",
   "crates/similarity-core",
   "crates/similarity-store",
@@ -16,6 +17,7 @@ license = "MIT OR Apache-2.0"
 authors = ["Nate Strandberg"]
 
 [workspace.dependencies]
+similarity-log = { path = "crates/similarity-log" }
 similarity-proto = { path = "crates/similarity-proto" }
 similarity-core = { path = "crates/similarity-core" }
 similarity-store = { path = "crates/similarity-store" }
@@ -52,6 +54,7 @@ thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
+# Used only by `similarity-log`, which is the one place the log format is decided.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Field-text fingerprints (skip re-embedding unchanged fields) and model-download verification.
 sha2 = "0.10"

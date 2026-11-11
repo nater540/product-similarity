@@ -42,13 +42,25 @@ pub enum TrainError {
   #[error("nothing to train on: {0}")]
   NoExamples(String),
 
-  /// The loss stopped being a finite number, so every later update would poison the weights.
-  #[error("training diverged at step {step}: the loss is {loss}")]
+  /// The loss or the gradient stopped being a finite number. The step is not taken: applying it would turn the
+  /// weights into NaN, and everything written afterwards (a checkpoint, the model) would be garbage.
+  #[error("training diverged at step {step}: the {quantity} is {value}")]
   Diverged {
     /// The one-based step at which it happened.
     step: usize,
+    /// Which quantity went wrong: `loss` or `gradient norm`.
+    quantity: &'static str,
     /// The offending value.
-    loss: f64,
+    value: f64,
+  },
+
+  /// A checkpoint could not be written, could not be read, or does not belong to this run.
+  #[error("checkpoint {path}: {reason}")]
+  Checkpoint {
+    /// The checkpoint directory or file.
+    path: PathBuf,
+    /// What is wrong with it.
+    reason: String,
   },
 
   /// The backend returned tensor data in an unexpected shape or dtype.

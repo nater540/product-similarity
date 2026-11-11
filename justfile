@@ -86,7 +86,7 @@ golden:
 
 # Fine-tune the model: `just finetune --base models/mdbr-leaf-mt --out models/my-model --pairs pairs.full.jsonl`
 finetune *args:
-    cargo run --release -q -p similarity-train -- {{ args }}
+    @cargo run --release -q -p similarity-train -- {{ args }}
 
 # Optional: check that PyTorch reads a model directory and agrees with the Burn encoder on it (needs `uv`)
 verify-model dir:

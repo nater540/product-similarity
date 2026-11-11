@@ -154,7 +154,22 @@ Environment variables:
 | Variable | Effect |
 |---|---|
 | `QDRANT_API_KEY` | The API key for a secured Qdrant or Qdrant Cloud. Never read from the config file. |
-| `RUST_LOG` | Log filter, `info` by default. `RUST_LOG=warn` quiets the per-request lines; `RUST_LOG=debug` adds detail. Logs go to stderr. |
+| `RUST_LOG` | Log filter, `info` by default. `RUST_LOG=warn` quiets the per-request lines; `RUST_LOG=debug` adds detail. |
+
+**Logs are NDJSON.** Both binaries log one JSON object per line on stderr and nothing else: there is no text
+format to switch to. Each line has `timestamp`, `level`, `message`, and `target`, with the event's own fields
+beside them:
+
+```json
+{"timestamp":"2026-11-11T03:16:50.406229Z","level":"INFO","message":"serving gRPC","address":"127.0.0.1:50051","target":"record_similarity"}
+{"timestamp":"2026-11-11T03:16:52.286685Z","level":"INFO","message":"evaluate","id":"sku-1","verdict":"Created","stored":true,"revision":1,"target":"similarity_server::grpc"}
+```
+
+A command that fails ends with a `failed` line at level `ERROR` carrying the reason in `error`, and a crash is
+reported the same way as `panicked`. Neither can be filtered out by `RUST_LOG`. To read logs at a terminal, pipe
+them through `jq`: `just serve 2>&1 | jq -r '[.level, .message, (del(.timestamp, .level, .message, .target) |
+tostring)] | join("  ")'`. The reports that `model fetch`, `compare`, and `calibrate` print on stdout are for a
+person and stay as text. Usage errors for a mistyped command line are text too.
 
 Ways to run it:
 
@@ -522,7 +537,8 @@ server loads like any other. It is a separate binary so that the server stays an
 - The trainer is checked against PyTorch on the real model (`just test-parity`). Replaying six optimizer steps that
   PyTorch took on fixed batches, it reproduces the loss and the gradient norm of every step to about one part in
   100,000, and ends on the same embeddings.
-- The workflow below has been run end to end on synthetic data, on the CPU and on Metal.
+- The workflow below has been run end to end on synthetic data, on the CPU and on Metal. That includes killing a
+  run part-way and resuming it from its last checkpoint.
 - It has not been used to produce a better model, because that needs real data. The CUDA build compiles but has
   never been run.
 
@@ -562,7 +578,7 @@ just release-train metal        # or: just release-train cuda
 
 | Option | Default | Notes |
 |---|---|---|
-| `--base` | (required) | The model directory to start from. |
+| `--base` | (required) | The model directory to start from. Replaced by `--resume` when continuing a run. |
 | `--out` | (required) | Where to write the fine-tuned directory. Put it under `models/`, which git ignores. It must not exist yet, or be empty: a model is never overwritten. |
 | `--pairs`, `--catalog-groups` | | At least one. |
 | `--fields` | `name,description` | Fields to learn from. |
@@ -579,6 +595,11 @@ just release-train metal        # or: just release-train cuda
 | `--weight-decay` | `0` | Applied to every parameter. |
 | `--max-grad-norm` | `1` | Global gradient-norm clipping; `0` disables it. |
 | `--log-every` | `10` | Steps between progress lines. |
+| `--checkpoint-dir` | `<out>.checkpoints` | Where checkpoints are written. Must not be inside `--out`. |
+| `--checkpoint-every` | (none) | Also checkpoint every this many steps (at least 1). One is always written at the end of each pass. |
+| `--keep-checkpoints` | `0` | Keep only this many of the run's checkpoints, deleting the oldest. `0` keeps all. |
+| `--no-checkpoints` | off | Write none. |
+| `--resume` | | A checkpoint directory to continue from, in place of `--base`. |
 
 What it does:
 
@@ -592,18 +613,80 @@ What it does:
 - The optimizer is AdamW with a linear warm-up and decay, and the encoder's own dropout (10%) is active. Dropout
   exists only inside the training pass; the server's forward pass has none to forget to turn off.
 
-When it finishes it saves the model, loads it back the way the server does, and prints where edits and recycles sit
-before and after. This run trained on 47 pair and 15 catalog examples (synthetic) in 4 seconds on a laptop CPU:
+When training ends it saves the model, loads it back the way the server does, and reports where edits and
+recycles sit before and after. This run trained on 47 pair and 15 catalog examples (synthetic) in 4 seconds on a
+laptop CPU; these are two of the lines it wrote to stdout, shortened:
 
-```text
-held-out pairs (never trained on): 5 edit and 8 recycle field texts
-  width          edits min / mean / max   recycles min / mean / max   gap of means
-    256  before  0.936 / 0.963 / 0.978    0.589 / 0.644 / 0.734      +0.319
-    256  after   0.934 / 0.962 / 0.977    0.550 / 0.611 / 0.712      +0.351
+```json
+{"message":"separation","split":"held_out","stage":"before","compared_with":"base model","width":256,"edits":5,"edits_mean":0.9629,"recycles":8,"recycles_mean":0.6444,"gap_of_means":0.3185}
+{"message":"separation","split":"held_out","stage":"after","width":256,"edits":5,"edits_mean":0.9617,"recycles":8,"recycles_mean":0.6108,"gap_of_means":0.3509}
 ```
 
-That table is a progress check on single field texts, with no field weights, floors, or thresholds. It tells you
-whether training moved things the right way; step 3 tells you whether the model is better.
+Those numbers are a progress check on single field texts, with no field weights, floors, or thresholds. They tell
+you whether training moved things the right way; step 3 tells you whether the model is better.
+
+**Output.** Everything the trainer writes is one JSON object per line (NDJSON), in two streams:
+
+- **stdout: results.** One `separation` line per split (`training`, `held_out`), stage (`before`, `after`), and
+  width, then one `finished` line. This is the run's output, so no log level hides it:
+  `just finetune ... > results.ndjson`.
+- **stderr: logs.** Progress, filtered by `RUST_LOG` (default `info`). A failure is always written here,
+  whatever `RUST_LOG` says, as a `failed` line at level `ERROR` (or `panicked`, for a crash).
+
+```json
+{"timestamp":"2026-11-11T03:16:49.201435Z","level":"INFO","message":"training","step":10,"of":10,"epoch":2,"pair_loss":0.0171,"group_loss":0.4298,"grad_norm":12.734,"rate":0.00000222,"elapsed_s":4.0,"target":"record_similarity_train"}
+{"timestamp":"2026-11-11T03:16:47.285904Z","level":"INFO","message":"checkpoint","step":5,"epoch":1,"path":"models/mdbr-leaf-mt-ft.checkpoints/step-000005","target":"record_similarity_train"}
+```
+
+| `message` | Stream | When | Fields |
+|---|---|---|---|
+| `labeled pairs`, `catalog groups` | stderr | Once, as the data is read. | Example counts, and how many pairs were skipped or held out. |
+| `model loaded` | stderr | Once. | The model, device, widths, and checkpoint directory; `resumed_at` when resuming. |
+| `training` | stderr | Every `--log-every` steps. | `step`, `of`, `epoch`, `pair_loss` and `group_loss` (means since the last line; left out if no batch of that kind fell in it), `grad_norm`, `rate`, `elapsed_s`. |
+| `checkpoint` | stderr | Each checkpoint. | `step`, `epoch`, `path`. |
+| `separation` | stdout | At the end. Only for a split that has pairs. | `split`, `stage`, `width`; `edits` and `recycles` (counts) with `_min`, `_mean`, `_max` for each; `gap_of_means`. A `before` line also says what it describes: `compared_with` is `base model`, or `checkpoint` on a resumed run. |
+| `finished` | stdout | At the end. | `out`, example counts, `steps`, `elapsed_s`, `resumed_at` if resumed. |
+| `failed` | stderr | In place of the results. | `error`. |
+
+Losses, rates, and similarities are numbers, rounded, so they chart without parsing. For example, the loss curve:
+`jq -c 'select(.message == "training") | [.step, .pair_loss, .group_loss]'`. A loss or a gradient that stops being
+a finite number ends the run with a `failed` line before the step is applied, so none of these is ever `NaN`.
+`just` and `cargo` print a line or two of their own on stderr; the binary itself writes only JSON, apart from
+usage errors for a mistyped command line.
+
+**Checkpoints.** A run saves itself at the end of every pass over the data (and every `--checkpoint-every`
+steps, if set) into `<out>.checkpoints/step-000120` and so on. A checkpoint does two jobs:
+
+- **It lets an interrupted run continue.** Give the same command again with `--resume` in place of `--base`:
+
+  ```sh
+  just finetune --resume models/mdbr-leaf-mt-ft.checkpoints/step-000120 --out models/mdbr-leaf-mt-ft \
+    --pairs pairs.full.jsonl --catalog-groups catalog-groups.jsonl
+  ```
+
+  The run picks up at that step: the same batches in the same order, the same point in the learning-rate
+  schedule, and the optimizer state it had. Every other option (`--max-tokens` included) and the data must be
+  what the run was started with, and a checkpoint from a different run is refused rather than continued on a
+  different schedule. With `--no-dropout` the resumed run ends on exactly the weights an uninterrupted one would
+  have (checked on the real model: not one of the 101 tensors differs). With dropout it differs only in which
+  units are dropped after the resume.
+- **It is a complete model directory.** Point a config's `model.dir` at a checkpoint and calibrate it like any
+  other model (step 3). That is how to pick the best pass of a long run instead of assuming it is the last.
+
+A checkpoint of the default model is about 265 MB: the weights (90 MB) plus the optimizer's state (184 MB), which
+is two running averages for every weight. Some things worth knowing:
+
+- **Disk.** `--keep-checkpoints N` keeps the newest N of the run's checkpoints, counting the ones an earlier,
+  interrupted process of the same run wrote. It never deletes the checkpoint a run was resumed from, nor
+  anything in the directory that another run wrote. Delete the checkpoint directory once you have chosen a
+  model.
+- **Where.** The checkpoint directory must be outside `--out`, and is created and checked before training
+  starts, so a place that cannot be written to is an error in the first second and not at the first checkpoint.
+- **Durability.** A checkpoint, and the final model, is written to a sibling directory, flushed to disk, and
+  renamed into place. A directory with a checkpoint's name is a complete checkpoint, after a killed process or a
+  power cut alike. The final model is written as soon as training ends, before the results are measured.
+- **The model a run started from must stay where it is until the run ends.** Each save copies its tokenizer and
+  configuration files from there.
 
 **How long it takes.** Each step encodes `2 x batch-size` texts and its cost follows their length. Measured on an
 Apple-silicon laptop with the default batch size of 32:
@@ -797,6 +880,7 @@ Run `just test-real` after touching the encoder, the loader, the tokenizer setti
 
 ```text
 crates/
+  similarity-log/       logging for both binaries: one JSON object per line, nothing else
   similarity-proto/     the .proto file and generated gRPC code
   similarity-core/      the encoder (Burn), tokenization, composite vectors, scoring, policy. No network, no async.
   similarity-store/     the VectorStore trait, an in-memory implementation, and the Qdrant one
@@ -806,7 +890,7 @@ data/
   calibration.sample.jsonl   synthetic labeled pairs
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D14)
+  decisions.md               why things are the way they are (D1 to D15)
   data-request-prompt.md     a brief for collecting labeled production data
 models/                 fetched and fine-tuned model directories (ignored by git)
 tools/                  referees, not part of any pipeline: they write the fixtures the parity tests compare with
@@ -817,6 +901,9 @@ tools/                  referees, not part of any pipeline: they write the fixtu
 Conventions (two-space indentation, no `unwrap` in library code, tests first) are in [`CLAUDE.md`](CLAUDE.md).
 
 ## Troubleshooting
+
+An error from either binary arrives as the `error` field of a `failed` line on stderr; the messages below are
+what that field says.
 
 | Symptom | Cause and fix |
 |---|---|
@@ -831,6 +918,8 @@ Conventions (two-space indentation, no `unwrap` in library code, tests first) ar
 | `device = "metal" needs a binary built with --features metal` | Build with `just release-metal`, or set `device = "cpu"`. |
 | `--device metal needs a binary built with --features metal` (fine-tuning) | Build with `just release-train metal` and run `./target/release/record-similarity-train`; `just finetune` always runs the CPU build. |
 | `... already exists and is not empty` (fine-tuning) | `--out` names a directory that holds something. Choose a new one; a model directory is never overwritten. |
+| `... already holds a checkpoint for step N, which this run would write again` | The checkpoint directory has checkpoints from an earlier run of the same name. Resume from the latest with `--resume`, or delete them, or give another `--checkpoint-dir`. |
+| `checkpoint ...: belongs to a run with different options` (or `different training data`) | `--resume` was given with other options or data than the run was started with. Repeat the original command, changing only `--base` to `--resume`. |
 | `INVALID_ARGUMENT: invalid record: unknown field ...` | The request used a field name the schema does not define. `Describe` lists the valid ones. |
 | Many `RESOURCE_EXHAUSTED` | More requests are arriving than the encoder can serve. Back off in the client, add CPU, or add replicas. |
 | Everything is rejected, or nothing is | The thresholds do not suit the model or the data. Run `calibrate`. Thresholds never carry over between models. |

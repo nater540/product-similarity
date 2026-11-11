@@ -6016,6 +6016,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "similarity-log"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "similarity-proto"
 version = "0.1.0"
 dependencies = [
@@ -6036,6 +6045,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "similarity-core",
+ "similarity-log",
  "similarity-proto",
  "similarity-store",
  "tempfile",
@@ -6046,7 +6056,6 @@ dependencies = [
  "tonic-health",
  "tonic-reflection",
  "tracing",
- "tracing-subscriber",
  "ureq 3.5.1",
 ]
 
@@ -6073,11 +6082,12 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "sha2",
  "similarity-core",
+ "similarity-log",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -6856,6 +6866,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-serde"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1"
+dependencies = [
+ "serde",
+ "tracing-core",
+]
+
+[[package]]
 name = "tracing-subscriber"
 version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6865,12 +6885,15 @@ dependencies = [
  "nu-ansi-term",
  "once_cell",
  "regex-automata",
+ "serde",
+ "serde_json",
  "sharded-slab",
  "smallvec",
  "thread_local",
  "tracing",
  "tracing-core",
  "tracing-log",
+ "tracing-serde",
 ]
 
 [[package]]

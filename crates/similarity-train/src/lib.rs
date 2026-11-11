@@ -12,6 +12,7 @@
 //! - [`loss`]: the contrastive and ranking losses at truncated widths.
 //! - [`eval`]: a progress check on labeled pairs.
 //! - [`trainer`]: the training loop.
+//! - [`checkpoint`]: a run written to disk part-way, to resume or to evaluate.
 
 // Tests compute expected values with ordinary arithmetic and compare exact floats where exactness is the point.
 #![cfg_attr(
@@ -19,6 +20,7 @@
   allow(clippy::arithmetic_side_effects, clippy::float_cmp, clippy::indexing_slicing)
 )]
 
+pub mod checkpoint;
 pub mod data;
 pub mod error;
 pub mod eval;
@@ -27,4 +29,4 @@ pub mod schedule;
 pub mod trainer;
 
 pub use error::{Result, TrainError};
-pub use trainer::{Examples, Progress, Session, StepReport, TextBatch, TrainOptions, fit};
+pub use trainer::{Examples, Progress, Session, Step, StepReport, TextBatch, TrainOptions, fit};

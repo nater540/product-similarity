@@ -10,6 +10,7 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -313,21 +314,25 @@ impl CalibrateArgs {
   }
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> ExitCode {
   let cli = Cli::parse();
-  tracing_subscriber::fmt()
-    .with_env_filter(
-      tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-    )
-    .with_writer(std::io::stderr)
-    .init();
+  // Logs are one JSON object per line on stderr (see `similarity-log`). The reports that `model fetch`,
+  // `compare`, and `calibrate` print for a person to read are not logs, and stay as text on stdout.
+  similarity_log::init();
 
-  match cli.command {
+  let outcome = match cli.command {
     Command::Serve(args) => args.run(),
     Command::Model(ModelCommand::Fetch(args)) => args.run(),
     Command::Compare(args) => args.run(),
     Command::Calibrate(args) => args.run(),
+  };
+  match outcome {
+    Ok(()) => ExitCode::SUCCESS,
+    Err(error) => {
+      // A failure is a line in the same stream and the same format as everything before it.
+      similarity_log::failed(&format!("{error:#}"));
+      ExitCode::FAILURE
+    }
   }
 }
 
