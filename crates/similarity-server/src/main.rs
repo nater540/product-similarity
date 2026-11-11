@@ -14,12 +14,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::Context;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use similarity_core::{Device, Embedder};
 use similarity_server::config::{Config, DeviceChoice};
 use similarity_server::engine::{Engine, store_layout};
 use similarity_server::fetch::{self, FetchRequest};
-use similarity_server::offline::{self, Confidence, Offline, RecordFields, Selection};
+use similarity_server::offline::events::{self, Run};
+use similarity_server::offline::{self, Confidence, Offline, RecordFields, Selection, diff};
 use similarity_server::worker::EmbedWorker;
 use similarity_store::{MemoryStore, QdrantStore, VectorStore};
 
@@ -42,6 +43,8 @@ enum Command {
   Compare(CompareArgs),
   /// Score a file of labeled pairs and report the threshold that separates edits from recycled records.
   Calibrate(CalibrateArgs),
+  /// Compare two calibrations written with `calibrate --ndjson`, or one of them under a second configuration.
+  CalibrateDiff(CalibrateDiffArgs),
 }
 
 #[derive(Debug, Args)]
@@ -114,6 +117,49 @@ struct CalibrateArgs {
   /// Fixes the resampling behind the intervals, so that a run can be reproduced.
   #[arg(long, default_value_t = 0)]
   seed: u64,
+}
+
+#[derive(Debug, Args)]
+struct CalibrateDiffArgs {
+  /// The earlier run: the output of `calibrate --ndjson`.
+  old: PathBuf,
+  /// The later run, over the same pairs.
+  #[arg(required_unless_present = "config_b", conflicts_with = "config_b")]
+  new: Option<PathBuf>,
+  /// In place of a second run: judge the first run's pairs again under this configuration. No model is loaded;
+  /// only `[policy]`, `[fields]`, and `[quantities]` are read, and the field and quantity names must be the run's.
+  #[arg(long)]
+  config_b: Option<PathBuf>,
+  /// Compare the pairs both runs have, where the runs were not made from the same selection of the same file.
+  #[arg(long)]
+  intersect: bool,
+  /// Fail (exit status 1) if the comparison shows this.
+  #[arg(long, value_enum)]
+  fail_on: Option<FailOn>,
+  /// Write the comparison as NDJSON events on stdout in place of the report.
+  #[arg(long)]
+  ndjson: bool,
+}
+
+/// What `calibrate-diff --fail-on` can gate on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum FailOn {
+  /// A recycle that was rejected is now accepted.
+  NewFalseAccepts,
+  /// Any verdict changed.
+  AnyFlip,
+  /// The new run gets more pairs wrong than the old.
+  ErrorsUp,
+}
+
+impl From<FailOn> for diff::FailOn {
+  fn from(on: FailOn) -> Self {
+    match on {
+      FailOn::NewFalseAccepts => Self::NewFalseAccepts,
+      FailOn::AnyFlip => Self::AnyFlip,
+      FailOn::ErrorsUp => Self::ErrorsUp,
+    }
+  }
 }
 
 fn device(choice: DeviceChoice) -> anyhow::Result<Device> {
@@ -349,6 +395,66 @@ impl CalibrateArgs {
   }
 }
 
+fn read_run(path: &Path) -> anyhow::Result<Run> {
+  let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+  events::read(&text).with_context(|| format!("{} is not a calibration run", path.display()))
+}
+
+fn describe_run(run: &Run) -> String {
+  format!(
+    "{}, threshold {:.3}, {} pairs",
+    run.info.fingerprint,
+    run.info.threshold,
+    run.calibration.pairs.len()
+  )
+}
+
+impl CalibrateDiffArgs {
+  fn run(self) -> anyhow::Result<()> {
+    let old = read_run(&self.old)?;
+    let (new, new_line) = match (&self.new, &self.config_b) {
+      (Some(path), _) => {
+        let new = read_run(path)?;
+        if !self.intersect && !diff::same_pairs(&old.calibration.input, &new.calibration.input) {
+          anyhow::bail!(
+            "the two runs were not made from the same selection of the same pairs file; score both from one file \
+             with the same --split and --min-confidence, or pass --intersect to compare the pairs they share"
+          );
+        }
+        let line = describe_run(&new);
+        (new.calibration, line)
+      }
+      (None, Some(path)) => {
+        let config = Config::load(path)?;
+        let policy = config.policy()?;
+        let judged = diff::rejudge(&old, &config.schema()?, &policy)?;
+        let line = format!(
+          "the old run judged again under {}: threshold {:.3}",
+          path.display(),
+          policy.threshold
+        );
+        (judged, line)
+      }
+      (None, None) => anyhow::bail!("give a second run, or --config-b"),
+    };
+
+    let difference = diff::diff(&old.calibration, &new);
+    if self.ndjson {
+      diff::emit(&difference);
+    } else {
+      write!(
+        std::io::stdout().lock(),
+        "{}",
+        diff::render_diff(&difference, &describe_run(&old), &new_line)
+      )?;
+    }
+    if let Some(reason) = self.fail_on.and_then(|on| diff::failure(&difference, on.into())) {
+      anyhow::bail!("the comparison fails the gate: {reason}");
+    }
+    Ok(())
+  }
+}
+
 fn main() -> ExitCode {
   let cli = Cli::parse();
   // Logs are one JSON object per line on stderr (see `similarity-log`). The reports that `model fetch`,
@@ -360,6 +466,7 @@ fn main() -> ExitCode {
     Command::Model(ModelCommand::Fetch(args)) => args.run(),
     Command::Compare(args) => args.run(),
     Command::Calibrate(args) => args.run(),
+    Command::CalibrateDiff(args) => args.run(),
   };
   match outcome {
     Ok(()) => ExitCode::SUCCESS,
@@ -390,6 +497,44 @@ mod tests {
     };
     assert_eq!(args.config, PathBuf::from("config.toml"));
     assert!(!args.in_memory && args.listen.is_none());
+  }
+
+  #[test]
+  fn calibrate_diff_takes_a_second_run_or_a_second_configuration_and_not_both() {
+    let parse =
+      |arguments: &[&str]| Cli::try_parse_from([&["record-similarity", "calibrate-diff"], arguments].concat());
+    assert!(parse(&["old.ndjson", "new.ndjson"]).is_ok());
+    assert!(parse(&["old.ndjson", "--config-b", "b.toml", "--fail-on", "new-false-accepts"]).is_ok());
+    assert!(parse(&["old.ndjson"]).is_err(), "nothing to compare with");
+    assert!(parse(&["old.ndjson", "new.ndjson", "--config-b", "b.toml"]).is_err());
+    assert!(parse(&["old.ndjson", "new.ndjson", "--fail-on", "anything"]).is_err());
+  }
+
+  #[test]
+  fn calibrate_reads_the_strict_format_unless_told_otherwise() {
+    let parse = |arguments: &[&str]| Cli::try_parse_from([&["record-similarity", "calibrate"], arguments].concat());
+    let Command::Calibrate(args) = parse(&["pairs.jsonl"]).unwrap().command else {
+      panic!("expected calibrate")
+    };
+    assert!(!args.full && !args.ndjson && args.split.is_none());
+    assert_eq!((args.min_confidence, args.seed), (Confidence::Medium, 0));
+    assert!(
+      parse(&["pairs.jsonl", "--split", "holdout"]).is_err(),
+      "--split needs --full"
+    );
+    assert!(parse(&["pairs.jsonl", "--full", "--min-confidence", "certain"]).is_err());
+    assert!(
+      parse(&[
+        "pairs.jsonl",
+        "--full",
+        "--split",
+        "holdout",
+        "--min-confidence",
+        "high",
+        "--ndjson"
+      ])
+      .is_ok()
+    );
   }
 
   #[test]

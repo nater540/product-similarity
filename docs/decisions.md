@@ -541,3 +541,13 @@ gets no suggestion: there is nothing to place a limit above.
 The generator behind the bootstrap is the trainer's `SplitMix64`, moved to `similarity-core` so that the server
 can use it without depending on the trainer (D13). Its sequence is pinned by a test, since a trained model and a
 reported interval are both reproducible only while it does not change.
+
+**Comparing two calibrations judges again; it does not embed again.** `calibrate-diff` reads two event files and
+reports every verdict that changed. For weights, floors, thresholds, and quantity limits it needs only one:
+`--config-b` re-applies them to the per-field similarities and per-quantity factors of the first run
+(`Evaluation::rejudge`), with no model loaded. An embedding cache was considered for this and dropped: the only
+changes it would serve are a new model or a new set of fields, and those are a new calibration by definition.
+The events therefore carry the schema they were scored under (`schema_field`, `schema_quantity`), and judging
+again under other field or quantity names is refused. On the bundled sample a real second run and a `--config-b`
+judgment report the same flips.
+

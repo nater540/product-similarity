@@ -6,8 +6,8 @@ of the conversation that produced it can carry it out. Each section is deleted a
 when the last one does.
 
 **Done so far:** step 0 (measuring separated from judging: `Comparison::weigh`, `score::judge`,
-`Evaluation::rejudge`, `Reason::code`) and feature 7 (`calibrate --full`, `--ndjson`, slices, intervals; D17).
-What remains is below.
+`Evaluation::rejudge`, `Reason::code`), feature 7 (`calibrate --full`, `--ndjson`, slices, intervals; D17), and
+feature 8 (`calibrate-diff`, with `--config-b`; D17). What remains is below.
 
 Read `CLAUDE.md` first (conventions, invariants, commands), then `docs/feature-suggestions.md` for what each
 feature is and why, then this file for how. The feature numbers here are that document's.
@@ -18,7 +18,6 @@ feature is and why, then this file for how. The feature numbers here are that do
 - [What the review found](#what-the-review-found)
 - [Decisions needed from the owner](#decisions-needed-from-the-owner)
 - [Order](#order)
-- [Feature 8. Calibration diff](#feature-8-calibration-diff)
 - [Feature 1. Lineage file in every model directory](#feature-1-lineage-file-in-every-model-directory)
 - [Feature 13. Property-based and state-machine tests](#feature-13-property-based-and-state-machine-tests)
 - [Feature 16. Bulk import and re-index that keeps drift history](#feature-16-bulk-import-and-re-index-that-keeps-drift-history)
@@ -107,8 +106,7 @@ None of these blocks starting. Each has the default that will be used if no answ
 ## Order
 
 1. Step 0, the small refactor that features 7, 8, and 19 all stand on. Done.
-2. Feature 7 (done), then feature 8. Real labeled pairs are about to exist, and nearly everything else consumes
-   these events.
+2. Feature 7, then feature 8. Both done.
 3. Feature 1. A day's work, and it has to exist before the first real fine-tuning run, not before the first
    calibration.
 4. Feature 13. Independent of the others; it can be done at any point, and is worth doing before feature 16
@@ -116,38 +114,6 @@ None of these blocks starting. Each has the default that will be used if no answ
 5. Feature 16.
 
 Each step should leave `just ci` green. Tests first where practical; test names are sentences.
-
-## Feature 8. Calibration diff
-
-### Design
-
-`record-similarity calibrate-diff OLD.ndjson NEW.ndjson`, reading two files of feature 7's events.
-
-- A reader for those events in `offline/` (plain `serde` structs, one per `message`), shared with nothing else
-  yet. It ignores lines whose `target` is not `result`, so a file that captured both streams still reads.
-- Refuses two runs over different pair sets (`pairs_sha256` differs) unless `--intersect`, which diffs the pairs
-  both have and says how many each side had alone.
-- Reports, as text by default and as events with `--ndjson`:
-  - every verdict flip, sorted by score change, labeled as a new false accept, a new false reject, or a fix;
-  - per-slice change in error rates and in margin;
-  - per-field and per-quantity shifts in the two ranges.
-- `--fail-on new-false-accepts|any-flip|errors-up` sets the exit code, for scripts.
-- `--config-b CONFIG` takes one run and re-judges it under another config, with no model loaded: step 0's
-  `judge` over the cached `pair_field` and `pair_quantity` lines. It refuses a config whose field or quantity
-  names differ from the run's, and says that a change of model or field set needs a new calibration run.
-
-### The work, in order
-
-1. The event reader, round-tripped against feature 7's writer in a test.
-2. The join and the flip report. Tests: a pair that flips each way; identical runs report nothing and exit 0.
-3. `--intersect` and the refusal without it.
-4. `--config-b`. Test: re-judging a run under its own config reproduces it exactly; raising a field's weight
-   changes the overall score to what a fresh calibration under that config gives (use the tiny test encoder).
-5. `--fail-on` and exit codes.
-
-README: a "Comparing two calibrations" subsection under "Choosing thresholds". `just calibrate-diff`.
-
-**Effort:** M. **Needs real data:** no.
 
 ## Feature 1. Lineage file in every model directory
 

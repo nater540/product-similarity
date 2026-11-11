@@ -162,6 +162,7 @@ The binary is `record-similarity` (`target/release/record-similarity` after `jus
 | `record-similarity model fetch [--repo R] [--revision REV] [--dir DIR]` | Downloads and verifies a model directory. `--dir` defaults to `models/<repository name>`, so two models never share a directory. |
 | `record-similarity compare [--config config.toml] BEFORE.json AFTER.json` | Scores one before/after pair offline. |
 | `record-similarity calibrate [--config config.toml] PAIRS.jsonl [--full] [--split S] [--ndjson]` | Scores labeled pairs and suggests a threshold. See [Choosing thresholds](#choosing-thresholds). |
+| `record-similarity calibrate-diff OLD.ndjson (NEW.ndjson \| --config-b CONFIG) [--fail-on WHAT]` | Compares two calibrations, or one under a second configuration. See [Comparing two calibrations](#comparing-two-calibrations). |
 
 Environment variables:
 
@@ -805,7 +806,63 @@ its `pair_id`. One recycle from the sample, with the envelope fields removed:
 A value that does not apply is left out, never `null`. The reason codes are `below_threshold`,
 `field_below_floor`, `anchor_drift`, `quantity_beyond_factor`, `quantity_incomparable`, and `measure_changed`.
 A pair's `pair_id` is the one the file gave it; a pair without one gets a fingerprint of its content, so the same
-pair has the same id in every run. Similarities are rounded to six places.
+pair has the same id in every run. Similarities are rounded to six places. `schema_field` and `schema_quantity`
+lines after the first say which fields and quantities the run was scored with, and their weights and limits.
+
+### Comparing two calibrations
+
+Keep a run as a file, and the next one can be held against it: did the new model, thresholds, weights, or code
+change any verdict?
+
+```sh
+just calibrate pairs.full.jsonl config.toml --full --ndjson > old.ndjson
+just calibrate pairs.full.jsonl config-new.toml --full --ndjson > new.ndjson
+just calibrate-diff old.ndjson new.ndjson
+```
+
+For a change of **weights, floors, thresholds, or quantity limits** the second run is not needed. Those are all
+applied to measurements the first run already wrote down, so `--config-b` judges its pairs again under another
+configuration without loading a model or embedding anything. It takes a fraction of a second, which makes trying
+a setting cheap. Here the sample is judged again with the threshold raised to 0.95 and the weight of `name`
+doubled:
+
+```text
+$ just calibrate-diff old.ndjson --config-b config-b.toml
+old    f46e48ee0ea2dd02-d256-t256, threshold 0.900, 48 pairs
+new    the old run judged again under config-b.toml: threshold 0.950
+pairs  48 compared (0 only in the old run, 0 only in the new)
+
+label      old                new           what              pair
+unsure   0.938 accepted  -> 0.912 rejected  changed           p048 an eighth becomes a quarter
+edit     0.950 accepted  -> 0.928 rejected  NEW FALSE REJECT  p014 flower weight written out
+unsure   0.911 accepted  -> 0.910 rejected  changed           p049 a single pre-roll becomes a two pack
+
+                                 old     new
+edits wrongly rejected             0       1
+recycles wrongly accepted          0       0
+best overall threshold         0.895   0.857
+its margin                     0.046   0.072
+
+slices whose errors changed
+category Flower: wrongly rejected 0 -> 1, wrongly accepted 0 -> 0
+label source identifiers_unchanged: wrongly rejected 0 -> 1, wrongly accepted 0 -> 0
+owner brand-2: wrongly rejected 0 -> 1, wrongly accepted 0 -> 0
+```
+
+Reading it: every pair whose verdict changed is listed, the largest change in score first, and named for what it
+means given its label. Raising the threshold costs one edit; the heavier `name` also moves two of the `unsure`
+variant changes below it, and widens the margin a best threshold would have. A real second run under the same
+second configuration prints the same three lines, which is the check that judging again and scoring again agree.
+
+- `--config-b` reads only `[policy]`, `[fields]`, and `[quantities]`. The field and quantity names must be the
+  ones the run was scored with. A change of **model or of the set of fields** changes the measurements themselves
+  and needs a real second run.
+- Two runs are compared only if they were made from the same selection of the same pairs file (the same file,
+  `--split`, and `--min-confidence`). `--intersect` compares the pairs they share and counts the rest.
+- `--fail-on new-false-accepts`, `any-flip`, or `errors-up` makes the command fail (exit status 1, with a `failed`
+  line saying why) when the comparison shows that, for use in a script. `--ndjson` writes one `flip` line per
+  changed verdict and a closing `diff` line in place of the report.
+- Pairs with any other label are listed when their verdict changes and never count as an error either way.
 
 If the two overall ranges overlap on real data, there are three things to try, in order of cost: weights and
 floors, [a different model](#using-a-different-model), and [fine-tuning](#fine-tuning-the-model).

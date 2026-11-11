@@ -102,6 +102,10 @@ throughput model="models/mdbr-leaf-mt":
 calibrate pairs="data/calibration.sample.jsonl" config="config.example.toml" *flags:
     RUST_LOG=warn cargo run --release -q -p similarity-server -- calibrate --config {{ config }} {{ pairs }} {{ flags }}
 
+# Compare two `calibrate --ndjson` runs, or one run under a second config: `just calibrate-diff old.ndjson --config-b b.toml`
+calibrate-diff *args:
+    cargo run --release -q -p similarity-server -- calibrate-diff {{ args }}
+
 # --- run --------------------------------------------------------------------
 
 # Start a local Qdrant (dashboard at http://localhost:6333/dashboard)

@@ -18,9 +18,11 @@
 //! - [`calibrate`]: scoring a file of pairs, and the threshold that separates the two labels.
 //! - [`stats`]: what the scored pairs show beyond their totals: ranges, slices, error rates with intervals.
 //! - [`report`]: the reports a person reads at a terminal.
-//! - [`events`]: the same calibration as a stream of result events, for tools.
+//! - [`events`]: the same calibration as a stream of result events, for tools, and reading one back.
+//! - [`diff`]: comparing two calibrations, or one calibration under two configurations.
 
 pub mod calibrate;
+pub mod diff;
 pub mod events;
 pub mod pairs;
 pub mod report;
