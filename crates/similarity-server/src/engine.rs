@@ -881,6 +881,83 @@ mod tests {
     engine.store.get(id).await.unwrap()
   }
 
+  /// A store whose reads give way to other tasks, as a round trip to a real store does.
+  struct Slow(MemoryStore);
+
+  impl VectorStore for Slow {
+    async fn get(&self, id: &str) -> Result<Option<StoredRecord>, StoreError> {
+      let found = self.0.get(id).await;
+      tokio::task::yield_now().await;
+      found
+    }
+
+    async fn put(&self, record: &StoredRecord) -> Result<(), StoreError> {
+      self.0.put(record).await
+    }
+
+    async fn delete(&self, id: &str) -> Result<bool, StoreError> {
+      self.0.delete(id).await
+    }
+
+    async fn search(&self, query: SearchQuery<'_>) -> Result<Vec<Neighbor>, StoreError> {
+      self.0.search(query).await
+    }
+  }
+
+  /// A verdict is a read, a judgment, and a write. Two requests for one id that interleave would both read "no
+  /// such record" and both create it, and the second would never be judged against the first: a recycle through
+  /// the gap between two requests. Each id is therefore handled by one request at a time.
+  #[tokio::test]
+  async fn two_requests_for_one_record_are_judged_one_after_the_other() {
+    let embedder = WordBagEmbedder::new("word-bag-v1");
+    let (layout, dimension) = store_layout(&schema(), &embedder);
+    let store = Slow(MemoryStore::new(layout, dimension));
+    let engine = Engine::new(store, embedder, schema(), Policy::new(0.75, None).unwrap());
+
+    let (first, second) = tokio::join!(
+      engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)),
+      engine.evaluate(evaluate_input(Some("p1"), &VAPE)),
+    );
+    let verdicts = [first.unwrap().verdict, second.unwrap().verdict];
+    let created = verdicts.iter().filter(|verdict| **verdict == Verdict::Created).count();
+    assert_eq!(
+      created, 1,
+      "one created it, and the other was judged against that: {verdicts:?}"
+    );
+    assert!(
+      verdicts.contains(&Verdict::Rejected),
+      "gummies and a vape are not one record: {verdicts:?}"
+    );
+    assert_eq!(
+      engine.store.0.get("p1").await.unwrap().unwrap().revision,
+      1,
+      "the rejected one wrote nothing"
+    );
+
+    // Requests for different ids do not wait on each other, and both get their answer.
+    let (a, b) = tokio::join!(
+      engine.evaluate(evaluate_input(Some("p2"), &GUMMIES)),
+      engine.evaluate(evaluate_input(Some("p3"), &VAPE)),
+    );
+    assert_eq!(
+      (a.unwrap().verdict, b.unwrap().verdict),
+      (Verdict::Created, Verdict::Created)
+    );
+  }
+
+  #[tokio::test]
+  async fn a_stored_record_carries_the_time_it_was_written() {
+    let clock = || SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let engine = engine();
+    let before = clock();
+    engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
+    let written = stored(&engine, "p1").await.unwrap().updated_at;
+    assert!(
+      (before..=clock()).contains(&written),
+      "{written} is not between {before} and now"
+    );
+  }
+
   #[tokio::test]
   async fn a_record_without_an_id_is_embedded_and_nothing_is_stored() {
     let engine = engine();

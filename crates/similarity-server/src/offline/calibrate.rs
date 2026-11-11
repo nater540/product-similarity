@@ -76,25 +76,37 @@ impl Calibration {
   }
 }
 
+/// The thresholds worth trying between `sorted`, distinct scores in rising order: one for each pair of neighbors,
+/// with half the gap it sits in.
+///
+/// A record is accepted when its score is at or above the threshold, so any value above the lower neighbor and at
+/// or below the upper one puts the two on different sides. The midpoint is such a value, except between two
+/// scores so close that it rounds to the lower one. There the upper score itself is the threshold; the midpoint
+/// would leave both above it and report as inseparable two scores that a threshold does separate.
+pub(crate) fn cuts(sorted: &[f32]) -> impl Iterator<Item = (f32, f32)> + '_ {
+  sorted.windows(2).filter_map(|pair| match pair {
+    [below, above] => {
+      let middle = f32::midpoint(*below, *above);
+      Some((if middle > *below { middle } else { *above }, (above - below) / 2.0))
+    }
+    _ => None,
+  })
+}
+
 /// Finds the overall threshold that misclassifies the fewest pairs, preferring the widest margin among ties.
 ///
-/// A record is accepted when its score is at or above the threshold, so candidate thresholds are the midpoints
-/// between neighboring scores. Returns `None` unless both labels are present.
+/// Candidate thresholds are the ones [`cuts`] gives: the midpoints between neighboring scores. Returns `None`
+/// unless both labels are present.
 pub fn suggest_threshold(scores: &[(Label, f32)]) -> Option<Suggestion> {
-  let count = |label: Label| scores.iter().filter(|(found, _)| *found == label).count();
-  if count(Label::Edit) == 0 || count(Label::Recycle) == 0 {
+  let has = |wanted: fn(&Label) -> bool| scores.iter().any(|(label, _)| wanted(label));
+  if !has(|label| matches!(label, Label::Edit)) || !has(|label| matches!(label, Label::Recycle)) {
     return None;
   }
   let mut sorted: Vec<f32> = scores.iter().map(|(_, score)| *score).collect();
   sorted.sort_by(f32::total_cmp);
   sorted.dedup();
 
-  sorted
-    .windows(2)
-    .filter_map(|pair| match pair {
-      [below, above] => Some((f32::midpoint(*below, *above), (above - below) / 2.0)),
-      _ => None,
-    })
+  cuts(&sorted)
     .map(|(threshold, margin)| Suggestion {
       threshold,
       margin,

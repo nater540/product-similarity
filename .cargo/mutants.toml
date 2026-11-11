@@ -29,4 +29,7 @@ profile = "mutants"
 # Mutants that cannot change behavior, each with why. Matched on the function and the replacement, never on a
 # line number, so that editing the file does not silently un-exclude or mis-exclude one.
 exclude_re = [
+  # A block is absent when its length is at most 1e-6. No block has exactly that length: an absent one is zero,
+  # and `Schema::new` refuses a weighting that could make a present one shorter than 1e-3.
+  "replace > with >= in Schema::blocks",
 ]

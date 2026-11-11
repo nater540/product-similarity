@@ -167,28 +167,23 @@ pub fn quantity_suggestions(calibration: &Calibration) -> Vec<QuantitySuggestion
   quantity_names(calibration)
     .into_iter()
     .map(|quantity| {
-      let factors = |label: Label| {
-        calibration
-          .labeled(label)
-          .flat_map(|scored| &scored.evaluation.quantities)
-          .filter(move |score| score.field == quantity)
-          .filter_map(|score| score.factor.filter(|factor| *factor > 1.0))
-      };
       let edits = quantity_range(calibration, quantity, Label::Edit);
       let recycles = quantity_range(calibration, quantity, Label::Recycle);
       let edits_high = edits.factors.map(|range| range.high);
-      let recycles_next = edits_high.and_then(|floor| {
-        factors(Label::Recycle)
-          .filter(|factor| *factor > floor)
-          .min_by(f64::total_cmp)
+      // The recycles a limit could reject: those that change the amount by more than every edit does. A recycle
+      // that changes it exactly as much as some edit cannot be told from that edit by any limit.
+      let beyond: Vec<f64> = edits_high.map_or_else(Vec::new, |floor| {
+        calibration
+          .labeled(Label::Recycle)
+          .flat_map(|scored| &scored.evaluation.quantities)
+          .filter(|score| score.field == quantity)
+          .filter_map(|score| score.factor.filter(|factor| *factor > floor))
+          .collect()
       });
+      let recycles_next = beyond.iter().copied().min_by(f64::total_cmp);
       let reject_above_factor = edits_high.zip(recycles_next).map(|(floor, next)| (floor * next).sqrt());
-      let recycles_caught = reject_above_factor.map_or(0, |limit| {
-        factors(Label::Recycle)
-          .filter(|factor| *factor > limit)
-          .count()
-          .saturating_add(recycles.zero_crossings)
-      });
+      // The limit lies below the nearest of them, so it rejects them all.
+      let recycles_caught = reject_above_factor.map_or(0, |_| beyond.len().saturating_add(recycles.zero_crossings));
       QuantitySuggestion {
         quantity: quantity.to_owned(),
         edits_high,
@@ -425,18 +420,12 @@ pub fn operating_points(calibration: &Calibration, seed: u64) -> Vec<OperatingPo
   if recycles == 0 || scores(Label::Edit).count() == 0 {
     return Vec::new();
   }
-  // A record is accepted at or above the threshold, so the thresholds worth considering are the midpoints
-  // between neighboring scores, lowest first.
+  // The thresholds worth considering are the ones between neighboring scores, lowest first: the same candidates
+  // the suggested threshold is chosen from.
   let mut sorted: Vec<f32> = scores(Label::Edit).chain(scores(Label::Recycle)).collect();
   sorted.sort_by(f32::total_cmp);
   sorted.dedup();
-  let cuts: Vec<f32> = sorted
-    .windows(2)
-    .filter_map(|pair| match pair {
-      [below, above] => Some(f32::midpoint(*below, *above)),
-      _ => None,
-    })
-    .collect();
+  let cuts: Vec<f32> = super::calibrate::cuts(&sorted).map(|(cut, _)| cut).collect();
   let clusters = owners(calibration);
 
   let mut points = Vec::new();
@@ -491,6 +480,127 @@ mod tests {
     assert_eq!(overall.count, 1);
     assert!((overall.low - f64::from(0.95_f32)).abs() < 1e-12);
     assert_eq!(score_range(&calibration, None), None);
+  }
+
+  fn with_fields(mut scored: ScoredPair, fields: &[(&str, FieldChange, Option<f32>)]) -> ScoredPair {
+    scored.evaluation.comparison.fields = fields
+      .iter()
+      .map(|(field, change, similarity)| similarity_core::score::FieldScore {
+        field: (*field).to_owned(),
+        weight: 1.0,
+        change: *change,
+        similarity: *similarity,
+        below_floor: false,
+      })
+      .collect();
+    scored
+  }
+
+  /// A field's floor is read from this range, so what goes into it matters: this field, this label, and only
+  /// where the text was really changed.
+  #[test]
+  fn a_field_range_is_of_one_field_in_one_label_where_its_text_was_modified() {
+    let calibration = summarized(vec![
+      with_fields(
+        scored(Label::Edit, 0.95, true),
+        &[
+          ("name", FieldChange::Modified, Some(0.9)),
+          ("brand", FieldChange::Modified, Some(0.3)),
+        ],
+      ),
+      with_fields(
+        scored(Label::Edit, 0.96, true),
+        &[
+          ("name", FieldChange::Modified, Some(0.8)),
+          ("brand", FieldChange::Unchanged, Some(1.0)),
+        ],
+      ),
+      with_fields(
+        scored(Label::Edit, 0.97, true),
+        &[
+          ("name", FieldChange::Unchanged, Some(1.0)),
+          ("brand", FieldChange::Added, None),
+        ],
+      ),
+      with_fields(
+        scored(Label::Recycle, 0.2, false),
+        &[("name", FieldChange::Modified, Some(0.1))],
+      ),
+    ]);
+    assert_eq!(
+      field_names(&calibration).into_iter().collect::<Vec<_>>(),
+      ["brand", "name"]
+    );
+
+    let name = field_range(&calibration, "name", Label::Edit).unwrap();
+    assert_eq!(name.count, 2, "the unchanged name and the recycle's are not in it");
+    assert!((name.low - f64::from(0.8_f32)).abs() < 1e-9 && (name.high - f64::from(0.9_f32)).abs() < 1e-9);
+    let brand = field_range(&calibration, "brand", Label::Edit).unwrap();
+    assert_eq!(
+      brand.count, 1,
+      "the brand that stayed and the brand that was added are not in it"
+    );
+    assert!(
+      (brand.high - f64::from(0.3_f32)).abs() < 1e-9,
+      "and it is the brand's own similarity"
+    );
+    let recycled = field_range(&calibration, "name", Label::Recycle).unwrap();
+    assert!((recycled.high - f64::from(0.1_f32)).abs() < 1e-9);
+    assert_eq!(field_range(&calibration, "brand", Label::Recycle), None);
+    assert_eq!(field_range(&calibration, "description", Label::Edit), None);
+  }
+
+  /// A limit has to sit above every edit. A recycle that changes a quantity by exactly as much as the largest
+  /// edit is not something a limit can catch, so it is neither the "next" recycle nor counted as caught.
+  #[test]
+  fn a_recycle_that_changes_a_quantity_exactly_as_an_edit_does_is_not_beyond_it() {
+    let change =
+      |label: Label, after: f64| measured(label, &[("weight", Some(amount(1.0, "g")), Some(amount(after, "g")))]);
+    let calibration = summarized(vec![
+      change(Label::Edit, 2.0),
+      change(Label::Recycle, 2.0),
+      change(Label::Recycle, 8.0),
+      change(Label::Recycle, 16.0),
+    ]);
+    let [weight] = quantity_suggestions(&calibration).try_into().unwrap();
+    assert!((weight.edits_high.unwrap() - 2.0).abs() < 1e-9);
+    assert!(
+      (weight.recycles_next.unwrap() - 8.0).abs() < 1e-9,
+      "not the recycle at 2"
+    );
+    assert!(
+      (weight.reject_above_factor.unwrap() - 4.0).abs() < 1e-9,
+      "sqrt(2 * 8), which is not (2 + 8) / 2"
+    );
+    assert_eq!((weight.recycles_caught, weight.recycles_changed), (2, 3));
+  }
+
+  /// Two scores one float apart are still two scores, and a threshold separates them: the upper one itself.
+  #[test]
+  fn two_neighboring_scores_are_separated_by_the_upper_one() {
+    let (recycle, edit) = (0.5_f32, 0.5_f32.next_up());
+    assert_eq!(
+      f32::midpoint(recycle, edit),
+      recycle,
+      "the midpoint cannot be told from the lower score"
+    );
+    let calibration = summarized(vec![
+      scored(Label::Recycle, recycle, false),
+      scored(Label::Edit, edit, true),
+    ]);
+
+    let suggestion = crate::offline::suggest_threshold(&[(Label::Recycle, recycle), (Label::Edit, edit)]).unwrap();
+    assert_eq!(suggestion.threshold, edit);
+    assert_eq!((suggestion.false_rejects, suggestion.false_accepts), (0, 0));
+
+    let [point] = operating_points(&calibration, 0).try_into().unwrap();
+    assert_eq!(point.threshold, Some(edit));
+    assert_eq!(point.false_accept.unwrap().errors, 0, "the recycle is below it");
+    assert_eq!(
+      point.false_reject.unwrap().errors,
+      0,
+      "an edit at the threshold is accepted"
+    );
   }
 
   #[test]
@@ -690,6 +800,10 @@ mod tests {
     assert!(
       interval.low <= rate && rate <= interval.high,
       "{interval:?} around {rate}"
+    );
+    assert!(
+      interval.low >= 0.0 && interval.high <= 1.0,
+      "a rate is a share: {interval:?}"
     );
     assert!(
       interval.low < 0.01 && interval.high > 0.5,
