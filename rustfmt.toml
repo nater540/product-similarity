@@ -1,0 +1,7 @@
+max_width = 120
+tab_spaces = 2
+hard_tabs = false
+edition = "2024"
+# Nightly-only options we would enable if/when available on stable; kept here as documentation of intent:
+# wrap_comments = true
+# comment_width = 120

@@ -1,0 +1,9 @@
+/target
+/models
+/qdrant_storage
+/.git
+/.github
+/docs
+.env
+.idea
+.DS_Store

@@ -1,0 +1,50 @@
+[package]
+name = "similarity-server"
+description = "The record-similarity gRPC server and its command-line entry point."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "record-similarity"
+path = "src/main.rs"
+
+[features]
+# Run the encoder on the GPU through Metal. For development on Apple silicon; production images build without it
+# and run on the CPU (`flex`) backend. Select it at runtime with `device = "metal"` in the config.
+metal = ["burn/metal"]
+
+[dependencies]
+similarity-core.workspace = true
+similarity-proto.workspace = true
+similarity-store.workspace = true
+
+# Named here only so that this crate, where the process is assembled, can switch backends on with a feature.
+burn.workspace = true
+
+tonic.workspace = true
+tonic-health.workspace = true
+tonic-reflection.workspace = true
+tokio.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# The example client is a single-threaded program; the server itself never uses the current-thread runtime.
+tokio = { workspace = true, features = ["rt"] }
+
+[lints]
+workspace = true

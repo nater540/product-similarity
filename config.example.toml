@@ -1,0 +1,61 @@
+# record-similarity configuration. Copy to `config.toml` and adjust.
+#
+# Every key is validated at start-up; a misspelled key is an error, not a silent default. The Qdrant API key is read
+# from the QDRANT_API_KEY environment variable, never from this file.
+
+[server]
+# Where the gRPC server listens. Use 0.0.0.0 inside a container.
+listen = "127.0.0.1:50051"
+
+[model]
+# A sentence-transformers model directory, as written by `record-similarity model fetch`.
+dir = "models/mdbr-leaf-mt"
+# "cpu" (always available) or "metal" (needs a binary built with `--features metal`).
+device = "cpu"
+# Texts are truncated to this many tokens. Cost grows with the square of it.
+max_tokens = 256
+# Keep the first N components of each field vector. The default model is trained to allow this; REMOVE THIS LINE
+# for any model that is not (all-MiniLM-L6-v2, gte-small, bge-small-en-v1.5, ...), or part of its embedding is
+# thrown away. Changing it, the model, or max_tokens changes the model fingerprint, which means re-indexing into a
+# new collection.
+output_dim = 256
+# The most texts in one forward pass.
+batch_size = 32
+# Requests that may wait for the encoder before new ones get RESOURCE_EXHAUSTED.
+queue_depth = 256
+
+[qdrant]
+url = "http://localhost:6334"
+collection = "records"
+timeout_ms = 5000
+
+[policy]
+# Reject a revision whose weighted similarity to the stored record is below this.
+#
+# Cosine similarities from a sentence encoder are not percentages: with the default model two unrelated products
+# still score around 0.5. On data/calibration.sample.jsonl ordinary edits score 0.94 to 1.00 and recycled products
+# 0.50 to 0.85, so 0.90 sits in the gap. Those pairs are synthetic; re-run `record-similarity calibrate` on labeled
+# edits from production before trusting this number.
+threshold = 0.90
+# Reject a revision that has drifted this far from the record as first stored, however small each step was.
+# Omit to report drift (`anchor_similarity` in the response) without enforcing it.
+anchor_threshold = 0.85
+
+# The record schema. Field names here are the keys callers send. Weights are relative. Adding or removing a field
+# changes the vector layout, which means re-indexing into a new collection; changing a weight does not.
+
+[fields.name]
+weight = 4.0
+required = true
+# The name alone may not change beyond this, whatever the overall score says. In the calibration set a legitimately
+# edited name never scores below 0.87 and a recycled one never above 0.73.
+reject_below = 0.80
+
+[fields.category]
+weight = 3.0
+
+[fields.brand]
+weight = 1.0
+
+[fields.description]
+weight = 2.0

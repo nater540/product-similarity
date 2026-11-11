@@ -1,0 +1,96 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/similarity-proto",
+  "crates/similarity-core",
+  "crates/similarity-store",
+  "crates/similarity-server",
+  "crates/similarity-train",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+authors = ["Nate Strandberg"]
+
+[workspace.dependencies]
+similarity-proto = { path = "crates/similarity-proto" }
+similarity-core = { path = "crates/similarity-core" }
+similarity-store = { path = "crates/similarity-store" }
+
+# Burn 0.22 has no default execution backend: `flex` is the pure-Rust CPU backend (it replaces the deprecated
+# `ndarray`) and is what production and every test runs on. `similarity-server` adds `metal` behind a cargo feature
+# for local development on Apple silicon. `default-features = false` drops the optimizer stack, so the server is an
+# inference-only build; `similarity-train` alone turns `autodiff` and `optim` back on (D13).
+burn = { version = "0.22.1", default-features = false, features = ["std", "flex", "simd", "rayon"] }
+# Safetensors import with PyTorch-layout adaptation. `memmap` keeps the load from copying the checkpoint twice.
+burn-store = { version = "0.22.1", default-features = false, features = ["std", "safetensors", "memmap"] }
+
+# No `onig` C toolchain and no TLS/HTTP stack in the library: `fancy-regex` (pure Rust) is the minimum viable
+# feature set for loading a `tokenizer.json`.
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+
+# gRPC. The server sits behind the platform's mesh / load balancer, so no TLS features are enabled here;
+# `qdrant-client` brings its own (ring-backed rustls) for talking to Qdrant Cloud.
+tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "server", "channel", "transport"] }
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+tonic-health = "0.14"
+tonic-reflection = "0.14"
+prost = "0.14"
+tokio = { version = "1.54", features = ["rt-multi-thread", "net", "sync", "time", "signal", "macros"] }
+
+# The default features pull in `reqwest` for snapshot downloads, which this service never does.
+qdrant-client = { version = "1.20", default-features = false }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Field-text fingerprints (skip re-embedding unchanged fields) and model-download verification.
+sha2 = "0.10"
+# Qdrant point ids must be an integer or a UUID; record ids are arbitrary strings, so they are mapped through UUIDv5.
+uuid = { version = "1", features = ["v5"] }
+# `model fetch` only: a blocking, dependency-light HTTPS client, so no second async HTTP stack in the binary.
+ureq = "3"
+
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+unwrap_in_result = "deny"
+missing_errors_doc = "warn"
+missing_panics_doc = "deny"
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
+# Inference in an unoptimized build is roughly 50x slower, which turns the weight-parity tests and any local
+# `cargo run` into a wait. Optimize dependencies (Burn, gemm, tokenizers) while keeping workspace crates debuggable.
+[profile.dev.package."*"]
+opt-level = 3

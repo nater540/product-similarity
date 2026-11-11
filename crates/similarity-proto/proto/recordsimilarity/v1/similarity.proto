@@ -1,0 +1,249 @@
+syntax = "proto3";
+
+package recordsimilarity.v1;
+
+// Decides whether a proposed revision of a record is still the same record.
+//
+// Records are embedded field by field with a sentence-embedding model. The vectors of every accepted revision are
+// kept, so that the next revision of the same `id` can be compared against them and so that records can be searched
+// by similarity.
+service RecordSimilarity {
+  // Embeds a record and, when it has an `id`, judges it against the stored baseline for that id.
+  //
+  // - No `id`: the record is embedded and nothing is compared or stored (`VERDICT_EMBEDDED`).
+  // - An `id` with no stored baseline: the record becomes the baseline (`VERDICT_CREATED`).
+  // - An `id` with a baseline: the record is compared against it (`VERDICT_ACCEPTED` or `VERDICT_REJECTED`), and
+  //   replaces the baseline only if it is accepted. A rejected revision leaves the stored record untouched, so a
+  //   retry with the original content still compares against the original.
+  //
+  // Errors: `INVALID_ARGUMENT` for a record that does not fit the configured schema or a `mode` this server does
+  // not know, `FAILED_PRECONDITION` if the stored baseline belongs to a tenant the request does not name or was
+  // written under a different model or schema layout, `RESOURCE_EXHAUSTED` if the embedding queue is full,
+  // `UNAVAILABLE` if the vector store cannot be reached.
+  rpc Evaluate(EvaluateRequest) returns (EvaluateResponse);
+
+  // Finds stored records similar to a given one, most similar first.
+  //
+  // For two records with values for the same fields, the similarity reported here is exactly the weighted score
+  // `Evaluate` uses, so "what did this record turn into?" and "does this already exist?" are answered on the same
+  // scale as the accept/reject decision. A field that only one of the two has a value for lowers the score here,
+  // whereas `Evaluate` leaves such a field out.
+  rpc FindSimilar(FindSimilarRequest) returns (FindSimilarResponse);
+
+  // Forgets a record. The next `Evaluate` for its id starts a new baseline.
+  //
+  // Errors: `FAILED_PRECONDITION` if the record is stored under a tenant the request does not name.
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  // Reports the model, schema, and thresholds this server is running with.
+  rpc Describe(DescribeRequest) returns (DescribeResponse);
+}
+
+// A record to embed.
+message Record {
+  // The caller's identifier for the record. Opaque to this service; any non-empty string.
+  optional string id = 1;
+
+  // The owner of the record (a merchant, an account). Stored with the record and usable as a search filter.
+  //
+  // Once a record is stored under a tenant, every later `Evaluate` or `Delete` for its id must name that same
+  // tenant; one that names another tenant, or none, is refused. A record stored without a tenant takes the tenant
+  // of the first revision that names one. This catches a caller applying one merchant's edit to another merchant's
+  // record. It is a consistency check and not access control: this service does not authenticate its callers.
+  optional string tenant = 2;
+
+  // Field name to text. Names must be ones the server's schema defines (see `Describe`). A missing field and a
+  // blank one are the same thing: no value.
+  map<string, string> fields = 3;
+}
+
+// What `Evaluate` may do to the stored baseline.
+enum WriteMode {
+  // Same as `WRITE_MODE_ENFORCE`.
+  WRITE_MODE_UNSPECIFIED = 0;
+
+  // Store the record if it is new or accepted; leave the baseline alone if it is rejected.
+  WRITE_MODE_ENFORCE = 1;
+
+  // Never write. Use this to preview a verdict, for example while a merchant is still typing.
+  WRITE_MODE_DRY_RUN = 2;
+
+  // Always store, whatever the verdict, and make this revision the new anchor for drift detection. This is the
+  // override for a human reviewer who has decided the change is legitimate. The response still reports the verdict
+  // the policy would have given.
+  WRITE_MODE_FORCE = 3;
+}
+
+message EvaluateRequest {
+  // The record. Required.
+  Record record = 1;
+
+  WriteMode mode = 2;
+
+  // Overrides the server's overall similarity threshold for this request. Cosine scale, [-1, 1].
+  optional float threshold = 3;
+
+  // Return the record's composite vector in the response.
+  bool return_vector = 4;
+}
+
+enum Verdict {
+  VERDICT_UNSPECIFIED = 0;
+
+  // The record had no `id`: it was embedded, and nothing was compared or stored.
+  VERDICT_EMBEDDED = 1;
+
+  // There was no baseline for this `id`; this record is now the baseline (unless the mode was `DRY_RUN`).
+  VERDICT_CREATED = 2;
+
+  // The record is similar enough to its baseline to be the same record.
+  VERDICT_ACCEPTED = 3;
+
+  // The record differs too much from its baseline; `reasons` says why.
+  VERDICT_REJECTED = 4;
+}
+
+enum FieldChange {
+  FIELD_CHANGE_UNSPECIFIED = 0;
+
+  // The text is identical after whitespace normalization.
+  FIELD_CHANGE_UNCHANGED = 1;
+
+  // Both the baseline and the record have a value, and the text differs.
+  FIELD_CHANGE_MODIFIED = 2;
+
+  // Only the record has a value, and the stored record has never had one for this field.
+  FIELD_CHANGE_ADDED = 3;
+
+  // Only the baseline has a value.
+  FIELD_CHANGE_REMOVED = 4;
+
+  // The baseline has no value, but the record had one when it was first stored (or last force-written), and now
+  // has one again. The field is scored against that original value, so that removing a field and then filling it
+  // with something else is judged like any other change to it.
+  FIELD_CHANGE_RESTORED = 5;
+}
+
+// How one field of the record compares with the baseline.
+message FieldScore {
+  string field = 1;
+
+  FieldChange change = 2;
+
+  // Cosine similarity between the baseline's value and the record's; for `FIELD_CHANGE_RESTORED`, between the
+  // field's original value and the record's. Absent for `FIELD_CHANGE_ADDED` and `FIELD_CHANGE_REMOVED`.
+  optional float similarity = 3;
+
+  // The field's weight in the overall score.
+  float weight = 4;
+
+  // The field's similarity is below its own floor, which rejects the record regardless of the overall score.
+  bool below_floor = 5;
+}
+
+message EvaluateResponse {
+  Verdict verdict = 1;
+
+  // Overall similarity to the baseline: the weighted mean of the per-field similarities over the fields that have
+  // one (see `FieldScore.similarity`). Absent when there was no baseline.
+  optional float similarity = 2;
+
+  // The overall threshold that was applied.
+  float threshold = 3;
+
+  // Per-field detail, for every field either side has a value for. Empty when there was no baseline.
+  repeated FieldScore fields = 4;
+
+  // Overall similarity to the record's anchor: the first value each field had since the record was first stored
+  // (or last force-written). Lets a caller see slow drift across many individually acceptable revisions.
+  optional float anchor_similarity = 5;
+
+  // Whether this call changed what is stored.
+  bool stored = 6;
+
+  // Human-readable reasons for a `VERDICT_REJECTED`. Empty otherwise.
+  repeated string reasons = 7;
+
+  // The record's composite vector, if `return_vector` was set.
+  repeated float vector = 8;
+
+  // How many times this record has been written, including this call if `stored`. Zero if it has never been stored.
+  uint64 revision = 9;
+}
+
+message FindSimilarRequest {
+  oneof query {
+    // Search around a stored record. `NOT_FOUND` if there is none.
+    string id = 1;
+
+    // Search around an arbitrary record, which is embedded but not stored. If it carries an `id`, that id is
+    // excluded from the results.
+    Record record = 2;
+  }
+
+  // How many neighbors to return. Defaults to 10; at most 100.
+  uint32 limit = 3;
+
+  // Only return records of this tenant.
+  optional string tenant = 4;
+
+  // Only return records at least this similar. Cosine scale, [-1, 1].
+  optional float min_similarity = 5;
+}
+
+message Neighbor {
+  string id = 1;
+
+  optional string tenant = 2;
+
+  float similarity = 3;
+}
+
+message FindSimilarResponse {
+  repeated Neighbor neighbors = 1;
+}
+
+message DeleteRequest {
+  string id = 1;
+
+  // The record's tenant. Required if the record is stored under one.
+  optional string tenant = 2;
+}
+
+message DeleteResponse {
+  // Whether there was a record to delete.
+  bool deleted = 1;
+}
+
+message DescribeRequest {}
+
+// One field of the server's schema.
+message FieldDescription {
+  string name = 1;
+
+  float weight = 2;
+
+  bool required = 3;
+
+  optional float reject_below = 4;
+}
+
+message DescribeResponse {
+  // Identifies the model, tokenizer, vector width, and truncation limit. Vectors are only comparable under the
+  // same fingerprint.
+  string model_fingerprint = 1;
+
+  // Width of one field's vector.
+  uint32 dimension = 2;
+
+  // Width of a record's composite vector: `dimension` times the number of fields.
+  uint32 composite_dimension = 3;
+
+  repeated FieldDescription fields = 4;
+
+  // The default overall similarity threshold.
+  float threshold = 5;
+
+  // The drift threshold against the anchor, if drift is enforced.
+  optional float anchor_threshold = 6;
+}

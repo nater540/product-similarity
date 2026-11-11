@@ -1,0 +1,9 @@
+/target
+# Model weights are fetched, not vendored (`record-similarity model fetch`); the provenance note is checked in.
+/models/*
+!/models/README.md
+# Local Qdrant storage from `just qdrant-up`.
+/qdrant_storage/
+.env
+.idea/
+.DS_Store

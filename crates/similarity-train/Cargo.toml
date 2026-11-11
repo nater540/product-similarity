@@ -1,0 +1,42 @@
+[package]
+name = "similarity-train"
+description = "Fine-tunes the record-similarity embedding model on labeled listing data, in Burn."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "record-similarity-train"
+path = "src/main.rs"
+
+[features]
+# Train on the GPU through Metal (Apple silicon). Select it at runtime with `--device metal`.
+metal = ["burn/metal"]
+# Train on an NVIDIA GPU. Select it at runtime with `--device cuda`.
+cuda = ["burn/cuda"]
+
+[dependencies]
+similarity-core.workspace = true
+
+# The only crate in the workspace that turns on Burn's automatic differentiation and optimizers. Cargo unifies
+# features per build, so `cargo build -p similarity-server` (what `just release` and the Dockerfile run) still
+# produces an inference-only server; see D13 in docs/decisions.md.
+burn = { workspace = true, features = ["autodiff", "optim"] }
+
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+similarity-core = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - if: runner.os == 'macOS'
+        run: brew install protobuf
+      - run: cargo test --workspace --all-targets
+      - run: cargo test --workspace --doc
+
+  # The storage contract against a real Qdrant. The model-dependent tests stay local (`just test-real`): they need a
+  # 90 MB download, and the parity fixture they check against is already pinned in the repository.
+  qdrant:
+    name: qdrant contract
+    runs-on: ubuntu-latest
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.20.0
+        ports:
+          - 6334:6334
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: cargo test -p similarity-store --test contract -- --ignored
+        env:
+          QDRANT_URL: http://localhost:6334
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

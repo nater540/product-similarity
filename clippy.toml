@@ -1,0 +1,10 @@
+# Library paths never unwrap, index, or panic (see `[workspace.lints]`); tests may, because a failed assumption in a
+# test should fail loudly at the line that made it.
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests = true
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-dbg-in-tests = true
+
+# Proper nouns that `doc_markdown` would otherwise want in backticks; ".." keeps clippy's built-in list.
+doc-valid-idents = ["PyTorch", "SafeTensors", "MiniLM", "UUIDv5", ".."]

@@ -1,0 +1,25 @@
+# Local development stack.
+#
+#   docker compose up -d qdrant                  # just the vector store, for `cargo run` and the ignored tests
+#   docker compose --profile server up --build   # the server too, built from this checkout
+#
+# Qdrant's dashboard is at http://localhost:6333/dashboard.
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.20.0
+    ports:
+      - "127.0.0.1:6333:6333" # REST and dashboard
+      - "127.0.0.1:6334:6334" # gRPC, which the server uses
+    volumes:
+      - ./qdrant_storage:/qdrant/storage
+
+  server:
+    build: .
+    profiles: ["server"]
+    depends_on:
+      - qdrant
+    ports:
+      - "127.0.0.1:50051:50051"
+    environment:
+      RUST_LOG: info
