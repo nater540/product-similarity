@@ -1086,6 +1086,8 @@ data/
 docs/
   decisions.md               why things are the way they are (D1 to D16)
   data-request-prompt.md     a brief for collecting labeled production data
+  feature-suggestions.md     twenty features that could be added, none built yet
+  plan-features.md           a plan for the first five of them
 models/                 fetched and fine-tuned model directories (ignored by git)
 tools/                  referees, not part of any pipeline: they write the fixtures the parity tests compare with
   golden.py             PyTorch reference embeddings
