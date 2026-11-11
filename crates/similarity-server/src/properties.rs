@@ -21,7 +21,7 @@ use proptest::prelude::*;
 use proptest::test_runner::Config;
 use similarity_core::score::Evaluation;
 use similarity_core::vector::cosine;
-use similarity_core::{FieldSpec, Policy, Quantity, QuantitySpec, Schema};
+use similarity_core::{FieldSpec, Policy, Quantity, QuantitySpec, Reason, Schema};
 use similarity_store::{MemoryStore, StoredRecord, VectorStore};
 
 use crate::engine::{
@@ -357,6 +357,32 @@ async fn step(engine: &TestEngine, request: &Request) -> Result<(), TestCaseErro
         prop_assert_eq!(output.verdict == Verdict::Rejected, !output.reasons.is_empty());
       }
 
+      // A reason about a field or a quantity names an entry of this response that is marked as beyond its limit.
+      // The API promises a client that join (`ReasonDetail.subject`).
+      for reason in &output.reasons {
+        match reason {
+          Reason::FieldBelowFloor { field, .. } => {
+            prop_assert!(
+              output
+                .fields
+                .iter()
+                .any(|score| &score.field == field && score.below_floor)
+            );
+          }
+          Reason::QuantityBeyondFactor { field, .. } | Reason::QuantityIncomparable { field, .. } => {
+            prop_assert!(
+              output
+                .quantities
+                .iter()
+                .any(|score| &score.field == field && score.beyond_limit)
+            );
+          }
+          Reason::BelowThreshold { .. } | Reason::AnchorDrift { .. } | Reason::MeasureChanged => {
+            prop_assert!(reason.subject().is_none());
+          }
+        }
+      }
+
       // D7: what may be written, and what was.
       match (mode, output.verdict) {
         (_, Verdict::Embedded) | (WriteMode::DryRun, _) | (WriteMode::Enforce, Verdict::Rejected) => {
@@ -655,11 +681,14 @@ fn an_evaluation_judged_again_under_its_own_configuration_is_itself() {
       };
       let again = judged(&evaluation);
       assert!((again.comparison.similarity - output.similarity.unwrap()).abs() < 1e-6);
-      assert_eq!(
-        again.reasons.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        output.reasons,
-        "{name}"
-      );
+      // The kinds and what they are about, not the numbers inside: the similarity was allowed 1e-6 just above.
+      let kinds = |reasons: &[Reason]| -> Vec<(&'static str, Option<String>)> {
+        reasons
+          .iter()
+          .map(|reason| (reason.code(), reason.subject().map(str::to_owned)))
+          .collect()
+      };
+      assert_eq!(kinds(&again.reasons), kinds(&output.reasons), "{name}");
     }
   });
 }

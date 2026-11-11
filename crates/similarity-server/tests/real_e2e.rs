@@ -223,16 +223,20 @@ async fn scenario(mut client: RecordSimilarityClient<Channel>) {
     "{:?}",
     recycled.similarity
   );
+  assert_eq!(recycled.reasons.len(), recycled.reason_details.len());
   assert!(
     recycled
-      .reasons
+      .reason_details
       .iter()
-      .any(|reason| reason.contains("below the threshold")),
+      .any(|reason| reason.code() == pb::ReasonCode::BelowThreshold),
     "{:?}",
     recycled.reasons
   );
   assert!(
-    recycled.reasons.iter().any(|reason| reason.contains("`name`")),
+    recycled
+      .reason_details
+      .iter()
+      .any(|reason| reason.code() == pb::ReasonCode::FieldBelowFloor && reason.subject.as_deref() == Some("name")),
     "{:?}",
     recycled.reasons
   );

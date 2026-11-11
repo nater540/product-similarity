@@ -89,7 +89,9 @@ changing a design. Infer conventions from the existing code first.
 - **Calibration events are flat, and their names are an interface** (D17). `calibrate --ndjson` writes one `pair`
   line and then one line per field, quantity, and reason, joined on `pair_id`, through `similarity-log`. Do not
   nest an object or a list into an event (it could only be a preformatted string), and do not rename an event, a
-  field, or a `Reason::code`: other tools read them. Add fields; never repurpose one.
+  field, or a `Reason::code`: other tools read them. Add fields; never repurpose one. The API carries the same
+  codes as `ReasonCode` (`REASON_CODE_` plus the code in capitals, held by a test in `grpc.rs`): a new `Reason`
+  needs a new code in both places and a new enum number, never a reused one.
 - **Every number in the text report and in the events comes from `offline::stats`**, so the two cannot disagree.
   Put a new statistic there, not in a renderer.
 - **An import only creates** (D20). `Engine::import` writes an id that is not stored and leaves one that is

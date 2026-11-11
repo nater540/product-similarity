@@ -1,7 +1,7 @@
 # Feature suggestions
 
 Twenty features that could be added to this project, with what each is, why it matters here, how it would fit the
-code, and what it would cost. **Features 1, 7, 8, 13, and 16 are built** (D17 to D20, and the README); the rest are not. They were proposed in November 2026 from a read of the
+code, and what it would cost. **Features 1, 7, 8, 13, 16, and 19 are built** (D17 to D20, and the README); the rest are not. They were proposed in November 2026 from a read of the
 repository as it stood then (`README.md`, `docs/decisions.md`, and the crates); check a suggestion against the
 code before starting on it, since the code will have moved. It has moved once already: records now carry
 quantities, compared as numbers (D16), and the features that touch a verdict or a report say below what that
@@ -482,6 +482,9 @@ with feature 12.
 **Effort.** L. **Needs real data:** real traffic, not labels.
 
 ### 19. Structured reason codes and explanations
+
+**Built** (D17), as `EvaluateResponse.reason_details`. The word-level diff and the neighbor search on rejection
+were left out: the server stores no text to diff against, and a neighbor cut-off would be an unmeasured threshold.
 
 **What.** `EvaluateResponse` gains `repeated ReasonDetail`: a kind (`BELOW_THRESHOLD`, `FIELD_BELOW_FLOOR`,
 `ANCHOR_DRIFT`, and the three quantity reasons that now exist, `QUANTITY_BEYOND_FACTOR`, `QUANTITY_INCOMPARABLE`,

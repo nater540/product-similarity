@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use similarity_core::{FieldChange, Quantity, QuantityChange, QuantityScore};
+use similarity_core::{FieldChange, Quantity, QuantityChange, QuantityScore, Reason};
 use similarity_proto::v1 as pb;
 use similarity_proto::v1::record_similarity_server::RecordSimilarity;
 use similarity_store::VectorStore;
@@ -119,6 +119,27 @@ fn quantity_score(score: QuantityScore) -> pb::QuantityScore {
   }
 }
 
+/// Exhaustive on purpose: a new kind of [`Reason`] does not compile until it has a value on the wire.
+fn reason_code(reason: &Reason) -> pb::ReasonCode {
+  match reason {
+    Reason::BelowThreshold { .. } => pb::ReasonCode::BelowThreshold,
+    Reason::FieldBelowFloor { .. } => pb::ReasonCode::FieldBelowFloor,
+    Reason::AnchorDrift { .. } => pb::ReasonCode::AnchorDrift,
+    Reason::QuantityBeyondFactor { .. } => pb::ReasonCode::QuantityBeyondFactor,
+    Reason::QuantityIncomparable { .. } => pb::ReasonCode::QuantityIncomparable,
+    Reason::MeasureChanged => pb::ReasonCode::MeasureChanged,
+  }
+}
+
+fn reason_detail(reason: &Reason) -> pb::ReasonDetail {
+  pb::ReasonDetail {
+    code: reason_code(reason).into(),
+    subject: reason.subject().map(str::to_owned),
+    value: reason.value(),
+    limit: reason.limit(),
+  }
+}
+
 fn width(value: usize) -> u32 {
   u32::try_from(value).unwrap_or(u32::MAX)
 }
@@ -169,7 +190,9 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
         .collect(),
       anchor_similarity: output.anchor_similarity,
       stored: output.stored,
-      reasons: output.reasons,
+      // The sentence and the data are two renderings of one list, so they cannot fall out of step.
+      reasons: output.reasons.iter().map(ToString::to_string).collect(),
+      reason_details: output.reasons.iter().map(reason_detail).collect(),
       vector: if request.return_vector {
         output.vector
       } else {
@@ -277,6 +300,118 @@ mod tests {
     for (error, code) in cases {
       let status = Status::from(error);
       assert_eq!((status.code(), status.message()), (code, "m"));
+    }
+  }
+
+  /// One of each kind of reason, with numbers that are awkward on purpose.
+  fn one_of_each_reason() -> Vec<Reason> {
+    vec![
+      Reason::BelowThreshold {
+        similarity: 1.0 / 3.0,
+        threshold: 0.9,
+      },
+      Reason::FieldBelowFloor {
+        field: "name".to_owned(),
+        similarity: 0.1 + 0.2,
+        floor: 0.8,
+      },
+      Reason::AnchorDrift {
+        similarity: 0.567,
+        threshold: 0.85,
+      },
+      Reason::QuantityBeyondFactor {
+        field: "weight".to_owned(),
+        factor: Some(8.0),
+        limit: 4.0,
+      },
+      Reason::QuantityIncomparable {
+        field: "thc".to_owned(),
+        previous_unit: "%".to_owned(),
+        unit: "mg".to_owned(),
+      },
+      Reason::MeasureChanged,
+    ]
+  }
+
+  #[test]
+  fn every_reason_has_a_wire_code_of_its_own() {
+    let reasons = one_of_each_reason();
+    let mut wire: Vec<i32> = reasons.iter().map(|reason| reason_code(reason).into()).collect();
+    wire.sort_unstable();
+    wire.dedup();
+    assert_eq!(wire.len(), reasons.len());
+    assert!(!wire.contains(&i32::from(pb::ReasonCode::Unspecified)));
+  }
+
+  /// D17: the codes `calibrate --ndjson` writes are an interface. The API's enum is the same names, so a reason
+  /// read from a response and one read from a calibration are joined without a table.
+  #[test]
+  fn a_wire_reason_code_is_named_after_the_code_calibrate_writes() {
+    for reason in one_of_each_reason() {
+      assert_eq!(
+        reason_code(&reason).as_str_name(),
+        format!("REASON_CODE_{}", reason.code().to_uppercase())
+      );
+    }
+  }
+
+  #[test]
+  fn a_reason_detail_carries_the_subject_value_and_limit_of_its_reason() {
+    let details: Vec<pb::ReasonDetail> = one_of_each_reason().iter().map(reason_detail).collect();
+    let shape = |detail: &pb::ReasonDetail| {
+      (
+        detail.code(),
+        detail.subject.clone(),
+        detail.value.is_some(),
+        detail.limit.is_some(),
+      )
+    };
+    assert_eq!(
+      details.iter().map(shape).collect::<Vec<_>>(),
+      [
+        (pb::ReasonCode::BelowThreshold, None, true, true),
+        (pb::ReasonCode::FieldBelowFloor, Some("name".to_owned()), true, true),
+        (pb::ReasonCode::AnchorDrift, None, true, true),
+        (
+          pb::ReasonCode::QuantityBeyondFactor,
+          Some("weight".to_owned()),
+          true,
+          true
+        ),
+        (
+          pb::ReasonCode::QuantityIncomparable,
+          Some("thc".to_owned()),
+          false,
+          false
+        ),
+        (pb::ReasonCode::MeasureChanged, None, false, false),
+      ]
+    );
+    assert_eq!((details[3].value, details[3].limit), (Some(8.0), Some(4.0)));
+
+    // A quantity that moved between zero and a value above zero has no factor, and is still held to its limit.
+    let from_zero = reason_detail(&Reason::QuantityBeyondFactor {
+      field: "thc".to_owned(),
+      factor: None,
+      limit: 2.0,
+    });
+    assert_eq!((from_zero.value, from_zero.limit), (None, Some(2.0)));
+  }
+
+  #[test]
+  #[allow(clippy::cast_possible_truncation, reason = "narrowing back is the point of the test")]
+  fn a_similarity_on_the_wire_narrows_back_to_the_similarity_it_repeats() {
+    for reason in one_of_each_reason() {
+      let (similarity, limit) = match reason {
+        Reason::BelowThreshold { similarity, threshold } | Reason::AnchorDrift { similarity, threshold } => {
+          (similarity, threshold)
+        }
+        Reason::FieldBelowFloor { similarity, floor, .. } => (similarity, floor),
+        _ => continue,
+      };
+      let detail = reason_detail(&reason);
+      assert_eq!(detail.value.unwrap() as f32, similarity);
+      assert_eq!(detail.limit.unwrap() as f32, limit);
     }
   }
 

@@ -17,7 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use similarity_core::quantity::first_values;
 use similarity_core::score::{self, FieldScore};
 use similarity_core::{
-  FieldChange, Policy, PreparedRecord, Quantities, Quantity, QuantityChange, QuantityScore, RecordVectors, Schema,
+  FieldChange, Policy, PreparedRecord, Quantities, Quantity, QuantityChange, QuantityScore, Reason, RecordVectors,
+  Schema,
 };
 use similarity_store::{Neighbor, SearchQuery, StoreError, StoredRecord, VectorStore};
 use tokio::sync::Mutex;
@@ -148,8 +149,9 @@ pub struct EvaluateOutput {
   pub anchor_similarity: Option<f32>,
   /// Whether this call changed what is stored.
   pub stored: bool,
-  /// Why the record was rejected.
-  pub reasons: Vec<String>,
+  /// Why the record was rejected: empty unless the verdict is [`Verdict::Rejected`], in the order the checks
+  /// found them. The values, not their sentences: what to show a person is for the caller to render.
+  pub reasons: Vec<Reason>,
   /// The record's composite vector.
   pub vector: Vec<f32>,
   /// The record's revision after this call; zero if it is not stored.
@@ -529,7 +531,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       fields: evaluation.comparison.fields,
       anchor_similarity: evaluation.anchor_similarity,
       stored: write,
-      reasons: evaluation.reasons.iter().map(ToString::to_string).collect(),
+      reasons: evaluation.reasons,
       vector: candidate.composite,
       revision,
       quantities: evaluation.quantities,
@@ -975,12 +977,15 @@ mod tests {
       recycled
         .reasons
         .iter()
-        .any(|reason| reason.contains("below the threshold")),
+        .any(|reason| matches!(reason, Reason::BelowThreshold { .. })),
       "{:?}",
       recycled.reasons
     );
     assert!(
-      recycled.reasons.iter().any(|reason| reason.contains("`name`")),
+      recycled
+        .reasons
+        .iter()
+        .any(|reason| matches!(reason, Reason::FieldBelowFloor { field, .. } if field == "name")),
       "{:?}",
       recycled.reasons
     );
@@ -1091,7 +1096,11 @@ mod tests {
     assert!(output.similarity.unwrap() >= 0.4, "{:?}", output.similarity);
     assert_eq!(output.verdict, Verdict::Rejected);
     assert_eq!(output.reasons.len(), 1);
-    assert!(output.reasons[0].contains("`name`"), "{:?}", output.reasons);
+    assert!(
+      matches!(&output.reasons[0], Reason::FieldBelowFloor { field, .. } if field == "name"),
+      "{:?}",
+      output.reasons
+    );
     assert!(
       output
         .fields
@@ -1177,7 +1186,7 @@ mod tests {
       verdicts[rejected]
         .reasons
         .iter()
-        .any(|reason| reason.contains("original record"))
+        .any(|reason| matches!(reason, Reason::AnchorDrift { .. }))
     );
     assert!(
       verdicts[rejected].similarity.unwrap() >= 0.75,
@@ -1469,7 +1478,10 @@ mod tests {
     );
     assert_eq!(resized.reasons.len(), 1);
     assert!(
-      resized.reasons[0].contains("`weight`") && resized.reasons[0].contains("factor of 8.00"),
+      matches!(
+        &resized.reasons[0],
+        Reason::QuantityBeyondFactor { field, factor: Some(factor), .. } if field == "weight" && (factor - 8.0).abs() < 1e-9
+      ),
       "{:?}",
       resized.reasons
     );
@@ -1487,7 +1499,10 @@ mod tests {
     assert_eq!(other_kind.verdict, Verdict::Rejected);
     assert_eq!(quantity(&other_kind, "thc").change, QuantityChange::Incomparable);
     assert!(
-      other_kind.reasons[0].contains("`%` to `mg`"),
+      matches!(
+        &other_kind.reasons[0],
+        Reason::QuantityIncomparable { field, previous_unit, unit } if field == "thc" && previous_unit == "%" && unit == "mg"
+      ),
       "{:?}",
       other_kind.reasons
     );
@@ -1534,7 +1549,7 @@ mod tests {
     let traded = strict.evaluate(measured(&beverage)).await.unwrap();
     assert_eq!(traded.verdict, Verdict::Rejected);
     assert!(traded.measure_changed && !traded.stored);
-    assert!(traded.reasons[0].contains("measures"), "{:?}", traded.reasons);
+    assert_eq!(traded.reasons, [Reason::MeasureChanged]);
     assert_eq!(stored(&strict, "p1").await.unwrap(), before);
 
     // A request that overrides the threshold is still held to the rest of the policy.
@@ -1763,7 +1778,10 @@ mod tests {
     let next = [("name", DRIFT[5]), ("category", "Vape Pens")];
     let step = engine.evaluate(evaluate_input(Some("p1"), &next)).await.unwrap();
     assert!(
-      step.reasons.iter().any(|reason| reason.contains("original record")),
+      step
+        .reasons
+        .iter()
+        .any(|reason| matches!(reason, Reason::AnchorDrift { .. })),
       "{:?}",
       step.reasons
     );
@@ -1772,7 +1790,10 @@ mod tests {
     forgetful.import(vec![import_of("p1", &today, None)]).await.unwrap();
     let step = forgetful.evaluate(evaluate_input(Some("p1"), &next)).await.unwrap();
     assert!(
-      !step.reasons.iter().any(|reason| reason.contains("original record")),
+      !step
+        .reasons
+        .iter()
+        .any(|reason| matches!(reason, Reason::AnchorDrift { .. })),
       "{:?}",
       step.reasons
     );

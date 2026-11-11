@@ -103,7 +103,7 @@ Not planned in detail. What the review would add to each when its turn comes:
 | 15 | Mutation testing | Add `quantity.rs` and `offline/stats.rs`; their boundaries (`>` against `>=` at a limit, the tolerance) are verdicts. |
 | 17 | Reviewer feedback capture | "`before` matches the stored baseline" has to include the quantities. The event it emits should be a line `calibrate --full` reads. |
 | 18 | Shadow evaluation | The shadow collection is filled with `import`; disagreements are a `calibrate-diff`. |
-| 19 | Structured reason codes | `Reason::code`, `subject`, `value`, and `limit` exist. What is left is the proto message and the mapping in `grpc.rs`. Six kinds now, not three. |
+| 19 | Structured reason codes | **Built** (D17, "The API carries the same codes"): `EvaluateResponse.reason_details`. The word diff and the neighbor lookup were left out, for the reasons given there. |
 | 20 | Menu-item to brand-product matching | Quantities are a natural re-ranking signal for a match and are deliberately not used by `FindSimilar` today (D16). Decide when this is designed. |
 
 ## What to build next
@@ -113,7 +113,7 @@ With real labeled pairs about to exist, in this order:
 1. **Nothing here, first.** Run `calibrate --full` on the real `pairs.full.jsonl`, read the slices, the `unsure`
    pairs, and the quantity lines, and set thresholds and limits from that. Keep the `--ndjson` output of every
    run: it is what the next one is compared against.
-2. **Feature 19** (reason codes on the wire). Small now, and the first thing a reviewer's screen will want.
+2. **Feature 19** (reason codes on the wire). Built.
 3. **Feature 9** (a pinned snapshot in CI). Also small now, and it turns "run `just test-real` after touching
    the encoder" from a rule into a check.
 4. **Feature 11** (drift calibration from histories), once `sequences.jsonl` exists. It answers the two open

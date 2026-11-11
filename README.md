@@ -36,15 +36,16 @@ field     name            0.509  Modified  << below floor
 quantity  thc_per_item            -  Incomparable (g to %)
 quantity  weight_per_item    x40.00  Modified (g to g)
 measures  changed
-reason    overall similarity 0.562 is below the threshold 0.900
-reason    field `name` similarity 0.509 is below its floor 0.800
-reason    similarity to the original record 0.567 is below the drift threshold 0.850
+reason    below_threshold              0.562 < 0.900
+reason    field_below_floor name       0.509 < 0.800
+reason    anchor_drift                 0.567 < 0.850
 ```
 
 The edited gummies give their THC as `0.1 g` where the original said `100 mg`: the same amount, so unchanged. The
 vape's weight is a fortieth of the gummies' and its THC is a percentage, which cannot be compared with a mass at
 all. Those three lines are reported, not enforced: the example configuration sets no limit on any quantity (see
-[Choosing thresholds](#choosing-thresholds)), and the three reasons are all about the text.
+[Choosing thresholds](#choosing-thresholds)), and the three reasons are all about the text. A `reason` line is the
+reason's code, what it is about if it is about one field, and the number against the limit it was held to.
 
 ## Contents
 
@@ -342,11 +343,19 @@ grpcurl -plaintext -d '{
     { "field": "thc_per_item", "change": "QUANTITY_CHANGE_INCOMPARABLE", "incomparable": true, "previousUnit": "mg", "unit": "%" },
     { "field": "weight_per_item", "change": "QUANTITY_CHANGE_MODIFIED", "factor": 40, "previousUnit": "g", "unit": "g" }
   ],
-  "measureChanged": true
+  "measureChanged": true,
+  "reasonDetails": [
+    { "code": "REASON_CODE_BELOW_THRESHOLD", "value": 0.5413923263549805, "limit": 0.8999999761581421 },
+    { "code": "REASON_CODE_FIELD_BELOW_FLOOR", "subject": "name", "value": 0.5116651654243469, "limit": 0.800000011920929 },
+    { "code": "REASON_CODE_ANCHOR_DRIFT", "value": 0.5413923263549805, "limit": 0.8500000238418579 }
+  ]
 }
 ```
 
-The quantities are reported and, with no limit configured, are not among the reasons.
+The quantities are reported and, with no limit configured, are not among the reasons. `reasonDetails` is the
+same three reasons as data, in the same order as the sentences. Its numbers are the response's 32-bit values
+written out as 64-bit ones, which is why the threshold `0.9` reads `0.8999999761581421` there: narrowed back to
+32 bits they are equal to `similarity` and `threshold` exactly.
 
 Other requests:
 
@@ -400,7 +409,12 @@ let request = pb::EvaluateRequest {
 };
 let response = client.evaluate(request).await?.into_inner();
 if response.verdict() == pb::Verdict::Rejected {
-  eprintln!("rejected: {:?}", response.reasons);
+  for (detail, sentence) in response.reason_details.iter().zip(&response.reasons) {
+    match detail.code() {
+      pb::ReasonCode::FieldBelowFloor => eprintln!("the {:?} changed too much", detail.subject),
+      _ => eprintln!("rejected: {sentence}"),
+    }
+  }
 }
 for quantity in &response.quantities {
   eprintln!("{}: {:?}, factor {:?}", quantity.field, quantity.change(), quantity.factor);
@@ -430,6 +444,8 @@ record = pb.Record(
 
 response = client.Evaluate(pb.EvaluateRequest(record=record, mode=pb.WRITE_MODE_DRY_RUN))
 print(pb.Verdict.Name(response.verdict), response.similarity, list(response.reasons))
+for reason in response.reason_details:
+    print(pb.ReasonCode.Name(reason.code), reason.subject, reason.value, reason.limit)
 for quantity in response.quantities:
     print(quantity.field, pb.QuantityChange.Name(quantity.change), quantity.factor)
 ```
@@ -441,7 +457,7 @@ for quantity in response.quantities:
 | No `id` | `VERDICT_EMBEDDED`: vector computed, nothing compared | never |
 | `id` with no baseline | `VERDICT_CREATED`: this is the baseline now | yes |
 | `id`, similar enough | `VERDICT_ACCEPTED` | yes (skipped if nothing changed) |
-| `id`, too different | `VERDICT_REJECTED`, with `reasons` | no: the baseline is untouched |
+| `id`, too different | `VERDICT_REJECTED`, with `reasons` and `reason_details` | no: the baseline is untouched |
 
 `mode` changes the write, never the verdict:
 
@@ -453,9 +469,17 @@ for quantity in response.quantities:
 
 Response fields: `similarity` (overall, absent when there was no baseline), `threshold` (the one applied),
 `fields` (per field: `change`, `similarity`, `weight`, `below_floor`), `anchor_similarity` (similarity to the
-first value each of the record's fields had), `stored`, `reasons`, `revision`, `quantities` (per quantity, below),
-`measure_changed`, and `vector` if requested. `threshold` on the request overrides the configured overall
-threshold for that one call.
+first value each of the record's fields had), `stored`, `reasons`, `reason_details`, `revision`, `quantities` (per
+quantity, below), `measure_changed`, and `vector` if requested. `threshold` on the request overrides the
+configured overall threshold for that one call.
+
+`reasons` are sentences for a person; `reason_details` are the same reasons as data, one per sentence and in the
+same order. Each has a `code` (`REASON_CODE_BELOW_THRESHOLD`, `_FIELD_BELOW_FLOOR`, `_ANCHOR_DRIFT`,
+`_QUANTITY_BEYOND_FACTOR`, `_QUANTITY_INCOMPARABLE`, `_MEASURE_CHANGED`), and where they apply a `subject`, a
+`value`, and a `limit`. The `subject` is the name of an entry in `fields` or `quantities` of the same response,
+where the change and the units are; `value` is the similarity or the factor that was measured. The wording of a
+sentence may change and a code will not, so branch on the code. A client that meets a code it does not know (a
+newer server) should show the sentence at the same position.
 
 A field's `change` is one of:
 
@@ -806,7 +830,8 @@ its `pair_id`. One recycle from the sample, with the envelope fields removed:
 | `summary` | run, last | `pairs`, `edits`, `recycles`, `unlabeled`, both error counts and rates with `_low` and `_high`, `owners`, `skipped_split`, `skipped_confidence` |
 
 A value that does not apply is left out, never `null`. The reason codes are `below_threshold`,
-`field_below_floor`, `anchor_drift`, `quantity_beyond_factor`, `quantity_incomparable`, and `measure_changed`.
+`field_below_floor`, `anchor_drift`, `quantity_beyond_factor`, `quantity_incomparable`, and `measure_changed`,
+and the API's `reason_details` carry the same six as `REASON_CODE_` plus the code in capitals.
 A pair's `pair_id` is the one the file gave it; a pair without one gets a fingerprint of its content, so the same
 pair has the same id in every run. Similarities are rounded to six places. `schema_field` and `schema_quantity`
 lines after the first say which fields and quantities the run was scored with, and their weights and limits.

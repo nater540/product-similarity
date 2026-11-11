@@ -115,9 +115,38 @@ fn print_evaluation(response: &pb::EvaluateResponse) {
   if response.measure_changed {
     println!("measures  changed");
   }
-  for reason in &response.reasons {
-    println!("reason    {reason}");
+  for (index, sentence) in response.reasons.iter().enumerate() {
+    println!(
+      "reason    {}",
+      reason_line(response.reason_details.get(index), sentence)
+    );
   }
+}
+
+/// One reason as data: its code, what it is about, and the number against its limit. The sentence instead, where
+/// the data is no use to this client: a server too old to send it, or one new enough to send a code this client
+/// was not built to know. An unknown reason is still a reason.
+fn reason_line(detail: Option<&pb::ReasonDetail>, sentence: &str) -> String {
+  let known = detail.and_then(|detail| {
+    let code = pb::ReasonCode::try_from(detail.code).ok()?;
+    (code != pb::ReasonCode::Unspecified).then_some((detail, code))
+  });
+  let Some((detail, code)) = known else {
+    return sentence.to_owned();
+  };
+  // The same string `calibrate --ndjson` writes as a `pair_reason` code.
+  let name = code.as_str_name().trim_start_matches("REASON_CODE_").to_lowercase();
+  let about = match &detail.subject {
+    Some(subject) => format!("{name} {subject}"),
+    None => name,
+  };
+  let numbers = match (code, detail.value, detail.limit) {
+    (pb::ReasonCode::QuantityBeyondFactor, Some(factor), Some(limit)) => format!("x{factor:.2} > x{limit:.2}"),
+    (pb::ReasonCode::QuantityBeyondFactor, None, Some(limit)) => format!("from or to zero (limit x{limit:.2})"),
+    (_, Some(similarity), Some(limit)) => format!("{similarity:.3} < {limit:.3}"),
+    _ => String::new(),
+  };
+  format!("{about:<28} {numbers}").trim_end().to_owned()
 }
 
 fn print_description(description: pb::DescribeResponse) {

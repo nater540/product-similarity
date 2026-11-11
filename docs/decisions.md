@@ -551,6 +551,19 @@ The events therefore carry the schema they were scored under (`schema_field`, `s
 again under other field or quantity names is refused. On the bundled sample a real second run and a `--config-b`
 judgment report the same flips.
 
+**The API carries the same codes.** `EvaluateResponse.reason_details` is each reason as data: a `ReasonCode`, and
+where they apply the `subject`, `value`, and `limit` that `Reason` already had. The code is an enum, like every
+other categorical on the wire, and each value is named `REASON_CODE_` plus the `Reason::code` string in capitals;
+a test holds the two together, so a reason read from a response and one read from a calibration go by one name.
+The engine now returns the `Reason` values and `grpc.rs` renders both the sentence and the detail from that one
+list, which is what keeps them in step. The sentences stay, not deprecated: they are what an older client shows
+and what a newer one falls back to for a code it does not know. Units are not repeated on a reason, because its
+`subject` names the `QuantityScore` that has them, and a property holds that join for every generated history.
+Two things the suggestion also asked for were left out. A word-level diff of a modified field cannot be made here:
+the server keeps a hash of each field's text, never the text, and the caller already has both versions. A
+neighbor search on rejection would show a neighbor only above some similarity, and that number has not been
+measured; a caller can ask `FindSimilar` today.
+
 ## D18. A model directory says where it came from
 
 A model's fingerprint says which model produced a vector. It does not say how the model came to be. After two

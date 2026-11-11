@@ -207,6 +207,7 @@ mod tests {
       .into_inner();
     assert_eq!(created.verdict(), pb::Verdict::Created);
     assert!(created.stored);
+    assert!(created.reasons.is_empty() && created.reason_details.is_empty());
     assert_eq!((created.similarity, created.revision), (None, 1));
     assert!(created.vector.is_empty(), "the vector is only returned on request");
 
@@ -217,6 +218,7 @@ mod tests {
       .into_inner();
     assert_eq!(edited.verdict(), pb::Verdict::Accepted);
     assert!(edited.stored && edited.similarity.unwrap() > 0.75);
+    assert!(edited.reasons.is_empty() && edited.reason_details.is_empty());
     assert_eq!(edited.revision, 2);
     let name = edited.fields.iter().find(|field| field.field == "name").unwrap();
     assert_eq!(name.change(), pb::FieldChange::Modified);
@@ -236,6 +238,19 @@ mod tests {
     assert_eq!(recycled.verdict(), pb::Verdict::Rejected);
     assert!(!recycled.stored && !recycled.reasons.is_empty());
     assert_eq!(recycled.revision, 2);
+
+    // One detail per sentence, in the same order, and each sentence is about what its detail says.
+    assert_eq!(recycled.reasons.len(), recycled.reason_details.len());
+    let below = &recycled.reason_details[0];
+    assert_eq!(below.code(), pb::ReasonCode::BelowThreshold);
+    assert!(recycled.reasons[0].contains("below the threshold"));
+    assert_eq!(below.subject, None);
+    #[allow(
+      clippy::cast_possible_truncation,
+      reason = "a similarity on the wire is an f32 widened"
+    )]
+    let narrowed = (below.value.unwrap() as f32, below.limit.unwrap() as f32);
+    assert_eq!(narrowed, (recycled.similarity.unwrap(), recycled.threshold));
     assert!((recycled.threshold - 0.75).abs() < f32::EPSILON);
   }
 
@@ -281,6 +296,17 @@ mod tests {
     assert_eq!(rejected.verdict(), pb::Verdict::Rejected);
     assert!(!rejected.stored && rejected.measure_changed);
     assert_eq!(rejected.reasons.len(), 1, "{:?}", rejected.reasons);
+    let detail = &rejected.reason_details[0];
+    assert_eq!(rejected.reason_details.len(), 1);
+    assert_eq!(
+      (detail.code(), detail.subject.as_deref()),
+      (pb::ReasonCode::QuantityBeyondFactor, Some("weight"))
+    );
+    assert!((detail.value.unwrap() - 8.0).abs() < 1e-9 && detail.limit.is_some());
+    assert!(
+      rejected.reasons[0].contains("`weight`"),
+      "the sentence beside it is about the same thing"
+    );
     let weight = find(&rejected, "weight");
     assert!(weight.beyond_limit && (weight.factor.unwrap() - 8.0).abs() < 1e-9);
     let thc = find(&rejected, "thc");

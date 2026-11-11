@@ -192,6 +192,57 @@ enum QuantityChange {
   QUANTITY_CHANGE_INCOMPARABLE = 6;
 }
 
+// Why a revision was rejected, as data. Each value names one kind of check. The string beside each is the `code`
+// that `calibrate --ndjson` writes on its `pair_reason` lines (the value's name without its prefix, in lower case),
+// so a reason seen here and one seen in a calibration go by the same name.
+//
+// A server newer than a client may send a value the client does not know. Show the sentence at the same index of
+// `EvaluateResponse.reasons` for it; never treat an unknown reason as no reason.
+enum ReasonCode {
+  REASON_CODE_UNSPECIFIED = 0;
+
+  // `below_threshold`: the overall similarity is below the threshold that applied.
+  REASON_CODE_BELOW_THRESHOLD = 1;
+
+  // `field_below_floor`: one field's similarity is below that field's own floor.
+  REASON_CODE_FIELD_BELOW_FLOOR = 2;
+
+  // `anchor_drift`: the overall similarity to the record's anchor is below the drift threshold.
+  REASON_CODE_ANCHOR_DRIFT = 3;
+
+  // `quantity_beyond_factor`: one quantity changed by more than its factor limit, or moved between zero and a
+  // value above zero.
+  REASON_CODE_QUANTITY_BEYOND_FACTOR = 4;
+
+  // `quantity_incomparable`: one quantity is now in a unit that cannot be converted from the one it had, and its
+  // schema entry rejects that.
+  REASON_CODE_QUANTITY_INCOMPARABLE = 5;
+
+  // `measure_changed`: the measures the record is described by changed (`EvaluateResponse.measure_changed`), and
+  // the server's policy rejects that.
+  REASON_CODE_MEASURE_CHANGED = 6;
+}
+
+// One reason a revision was rejected.
+message ReasonDetail {
+  ReasonCode code = 1;
+
+  // The field or quantity the reason is about. Set for `FIELD_BELOW_FLOOR` (a `FieldScore.field`, whose
+  // `below_floor` is set) and for the two quantity codes (a `QuantityScore.field`, whose `beyond_limit` is set);
+  // look there for the units and the change. Absent for the others, which are about the whole record.
+  optional string subject = 2;
+
+  // What was measured: the similarity for the three similarity codes, the factor for `QUANTITY_BEYOND_FACTOR`.
+  // Absent where no number describes it: a quantity that moved between zero and a value above zero
+  // (`QuantityScore.zero_crossing`), `QUANTITY_INCOMPARABLE`, and `MEASURE_CHANGED`. A similarity is the same
+  // 32-bit value as the `similarity` it repeats, widened; narrowing it gives that value back exactly.
+  optional double value = 3;
+
+  // The configured limit `value` was held to: the threshold, the field's floor, the drift threshold, or the factor
+  // limit. Absent for `QUANTITY_INCOMPARABLE` and `MEASURE_CHANGED`, which are yes-or-no rules.
+  optional double limit = 4;
+}
+
 // How one quantity of the record compares with the baseline.
 message QuantityScore {
   string field = 1;
@@ -244,7 +295,8 @@ message EvaluateResponse {
   // Whether this call changed what is stored.
   bool stored = 6;
 
-  // Human-readable reasons for a `VERDICT_REJECTED`. Empty otherwise.
+  // Human-readable reasons for a `VERDICT_REJECTED`. Empty otherwise. One sentence per entry of `reason_details`,
+  // in the same order. The wording is for people and may change; read `reason_details` instead of parsing it.
   repeated string reasons = 7;
 
   // The record's composite vector, if `return_vector` was set.
@@ -262,6 +314,10 @@ message EvaluateResponse {
   // merely missing does not set this. It rejects the record only if the server's policy says so (see
   // `DescribeResponse.reject_on_measure_change`).
   bool measure_changed = 11;
+
+  // Why a `VERDICT_REJECTED` was rejected, as data: one entry per sentence in `reasons`, in the same order. Empty
+  // otherwise. A rejected response with `reasons` but no `reason_details` came from a server older than this field.
+  repeated ReasonDetail reason_details = 12;
 }
 
 message FindSimilarRequest {
