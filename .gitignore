@@ -7,3 +7,5 @@
 .env
 .idea/
 .DS_Store
+# Recorded runs (`--runs`): what was trained and calibrated here. They name data files and owners, and stay local.
+/runs/

@@ -20,6 +20,7 @@ metal = ["burn/metal"]
 [dependencies]
 similarity-core.workspace = true
 similarity-log.workspace = true
+similarity-runs.workspace = true
 similarity-proto.workspace = true
 similarity-store.workspace = true
 

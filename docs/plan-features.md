@@ -90,7 +90,7 @@ Not planned in detail. What the review would add to each when its turn comes:
 
 | # | Feature | Note |
 |---|---|---|
-| 2 | Local run registry | `similarity_log::subscriber` is already generic over its two writers, so a file sink is a tee, not a second subscriber. The manifest and `provenance.json` should share types; the build stamp (`provenance::Build`) is the start of that. |
+| 2 | Local run registry | **Built** (D23): `calibrate` and the trainer each leave a directory under `runs/`; `runs list`. |
 | 3 | Evaluation at every checkpoint | The hook is `Checkpoints::after` in the trainer's `main.rs`. A validation fold by brand hash needs `owner`, which the trainer's pair parser does not read yet. |
 | 4 | Model registry and promotion gate | Now mostly assembly: `provenance.json` identifies a model, `calibrate --ndjson` records a calibration with its fingerprint, and `calibrate-diff --fail-on` is the gate. |
 | 5 | Run report and compare | Depends on 2. The calibration half can be drawn from the events that exist now. |
@@ -117,4 +117,4 @@ With real labeled pairs about to exist, in this order:
 3. **Feature 9** (a pinned snapshot in CI). Built.
 4. **Feature 11** (drift calibration from histories), once `sequences.jsonl` exists. It answers the two open
    questions about drift: where `anchor_threshold` belongs, and whether quantities need a drift check.
-5. **Feature 2** (the run registry), before the first real fine-tuning runs, so that their results are kept.
+5. **Feature 2** (the run registry). Built.

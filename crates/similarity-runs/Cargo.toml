@@ -1,0 +1,24 @@
+[package]
+name = "similarity-runs"
+description = "A local record of what the record-similarity tools ran: one directory per run, as plain files."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+# For the types a run's manifest shares with a model's `provenance.json`: the build stamp and a data file.
+similarity-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -11,6 +11,11 @@
 //! - **Failures** (target [`FAILURE`]) go to stderr, always, panics included. A run that fails says so in the
 //!   same stream and the same format as everything else, whatever `RUST_LOG` is set to.
 //!
+//! A process that is recording a run (see [`Init`]) also keeps one file with all three kinds in the order they
+//! were emitted: every result, every failure, and logs at `info` whatever `RUST_LOG` says, since a run's loss curve
+//! is made of logs and must not depend on how quiet someone wanted stderr. It is a third layer on the same
+//! subscriber, built by the same function as the other two, so its lines are the lines the streams carry.
+//!
 //! Every line has `timestamp`, `level`, `message`, and `target`, with the event's own fields beside them at the
 //! top level. Field values are logged as numbers and booleans where they are numbers and booleans, never as
 //! preformatted text, so a consumer can chart or filter on them without parsing strings.
@@ -19,11 +24,15 @@
 //! anything has started, for whoever typed the command.
 
 use std::fmt::Display;
+use std::fs::File;
+use std::sync::Mutex;
 
 use tracing::{Metadata, Subscriber};
 use tracing_subscriber::filter::{EnvFilter, FilterExt, filter_fn};
 use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::fmt::format::{Format, Json, JsonFields};
 use tracing_subscriber::layer::{Layer, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 
 /// The target of an event that is part of a run's output. Always written, to stdout.
@@ -40,6 +49,23 @@ fn is_failure(metadata: &Metadata<'_>) -> bool {
   metadata.target() == FAILURE
 }
 
+/// The one shape of line there is, written to `writer`: fields at the top level of each object, which is what log
+/// pipelines and `jq` expect, and no span context, since these programs have no spans.
+///
+/// Every layer is made here, so no stream can come to differ from another in format.
+fn json_layer<S, W>(writer: W) -> tracing_subscriber::fmt::Layer<S, JsonFields, Format<Json>, W>
+where
+  S: Subscriber + for<'span> LookupSpan<'span>,
+  W: for<'writer> MakeWriter<'writer> + 'static,
+{
+  tracing_subscriber::fmt::layer()
+    .json()
+    .flatten_event(true)
+    .with_current_span(false)
+    .with_span_list(false)
+    .with_writer(writer)
+}
+
 /// Builds the subscriber: `logs` receives filtered logs and every failure, `results` receives every result.
 ///
 /// Separate from [`init`] so that tests can capture both streams.
@@ -48,31 +74,68 @@ where
   L: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
   R: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
 {
-  // Fields at the top level of each object, which is what log pipelines and `jq` expect, and no span context:
-  // these programs have no spans.
-  let log_lines = tracing_subscriber::fmt::layer()
-    .json()
-    .flatten_event(true)
-    .with_current_span(false)
-    .with_span_list(false)
-    .with_writer(logs)
-    .with_filter(filter.and(filter_fn(is_result).not()).or(filter_fn(is_failure)));
-  let result_lines = tracing_subscriber::fmt::layer()
-    .json()
-    .flatten_event(true)
-    .with_current_span(false)
-    .with_span_list(false)
-    .with_writer(results)
-    .with_filter(filter_fn(is_result));
-  tracing_subscriber::registry().with(log_lines).with(result_lines)
+  subscriber_with(logs, Some(results), None::<fn() -> std::io::Sink>, filter)
+}
+
+/// Builds the subscriber of a process that may be recording a run.
+///
+/// `logs` receives filtered logs and every failure. `results`, if given, receives every result. `record`, if
+/// given, receives every result, every failure, and logs at `info` and above whatever `filter` says, in the order
+/// they are emitted.
+pub fn subscriber_with<L, R, K>(
+  logs: L,
+  results: Option<R>,
+  record: Option<K>,
+  filter: EnvFilter,
+) -> impl Subscriber + Send + Sync + 'static
+where
+  L: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
+  R: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
+  K: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
+{
+  let log_lines = json_layer(logs).with_filter(filter.and(filter_fn(is_result).not()).or(filter_fn(is_failure)));
+  let result_lines = results.map(|results| json_layer(results).with_filter(filter_fn(is_result)));
+  let record_lines = record.map(|record| {
+    json_layer(record).with_filter(
+      filter_fn(is_result)
+        .or(filter_fn(is_failure))
+        .or(EnvFilter::new("info")),
+    )
+  });
+  tracing_subscriber::registry()
+    .with(log_lines)
+    .with(result_lines)
+    .with(record_lines)
+}
+
+/// How a process logs, beyond the two streams every process has.
+#[derive(Debug)]
+pub struct Init {
+  /// The file that keeps everything the run emits, if the process is recording a run. Each event is one write of
+  /// one line, unbuffered, so a run that is killed keeps everything up to its last line.
+  pub record: Option<File>,
+  /// Whether results go to stdout. False only where stdout carries a report for a person and the same results
+  /// are in the record: results on stdout are otherwise never switched off.
+  pub results_on_stdout: bool,
 }
 
 /// Starts logging for the process: logs and failures to stderr, results to stdout, panics reported as failures.
 ///
 /// The log level comes from `RUST_LOG` and defaults to `info`. Call once, first thing in `main`.
 pub fn init() {
+  init_with(Init {
+    record: None,
+    results_on_stdout: true,
+  });
+}
+
+/// Starts logging as [`init`] does, with a run's record and the choice about stdout that [`Init`] describes.
+pub fn init_with(init: Init) {
   let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-  subscriber(std::io::stderr, std::io::stdout, filter).init();
+  let results = init
+    .results_on_stdout
+    .then_some(std::io::stdout as fn() -> std::io::Stdout);
+  subscriber_with(std::io::stderr, results, init.record.map(Mutex::new), filter).init();
 
   // Rust's default panic message is several lines of plain text. In a stream of JSON lines that is the one entry
   // a reader most needs to parse, so it is reported as an event like any other failure.
@@ -152,6 +215,8 @@ pub mod testing {
     pub logs: Vec<String>,
     /// What would have gone to stdout: every result.
     pub results: Vec<String>,
+    /// What a run's record would hold. Empty when nothing is being recorded.
+    pub record: Vec<String>,
   }
 
   /// Runs `emit` with logging set up as [`super::init`] sets it up, at the `RUST_LOG` value `level`.
@@ -162,6 +227,24 @@ pub mod testing {
     Captured {
       logs: logs.lines(),
       results: results.lines(),
+      record: Vec::new(),
+    }
+  }
+
+  /// Runs `emit` with logging set up as [`super::init_with`] sets it up for a process that is recording a run.
+  pub fn capture_recorded(level: &str, results_on_stdout: bool, emit: impl FnOnce()) -> Captured {
+    let (logs, results, record) = (Capture::default(), Capture::default(), Capture::default());
+    let subscriber = super::subscriber_with(
+      logs.clone(),
+      results_on_stdout.then(|| results.clone()),
+      Some(record.clone()),
+      EnvFilter::new(level),
+    );
+    tracing::subscriber::with_default(subscriber, emit);
+    Captured {
+      logs: logs.lines(),
+      results: results.lines(),
+      record: record.lines(),
     }
   }
 }
@@ -235,5 +318,82 @@ mod tests {
     assert_eq!(logs[0]["error"], "disk full");
     assert_eq!(logs[0]["level"], "ERROR");
     assert_eq!(results[0]["target"], RESULT);
+  }
+
+  fn emit_one_of_each() {
+    tracing::info!(step = 1, "training");
+    tracing::debug!("detail");
+    tracing::info!(target: RESULT, gap = 0.4, "separation");
+    tracing::warn!("careful");
+    failed(&"disk full");
+  }
+
+  fn messages(lines: &[String]) -> Vec<String> {
+    lines
+      .iter()
+      .map(|line| {
+        let line: serde_json::Value = serde_json::from_str(line).unwrap();
+        line["message"].as_str().unwrap().to_owned()
+      })
+      .collect()
+  }
+
+  #[test]
+  fn a_recorded_run_gets_logs_results_and_failures_in_one_file_in_the_order_emitted() {
+    let captured = testing::capture_recorded("info", true, emit_one_of_each);
+    assert_eq!(
+      messages(&captured.record),
+      ["training", "separation", "careful", "failed"]
+    );
+    assert_eq!(messages(&captured.logs), ["training", "careful", "failed"]);
+    assert_eq!(messages(&captured.results), ["separation"]);
+  }
+
+  /// A run's loss curve is made of `info` logs. Quietening stderr must not lose it.
+  #[test]
+  fn the_record_keeps_info_logs_that_rust_log_hides_from_stderr() {
+    for level in ["warn", "off"] {
+      let captured = testing::capture_recorded(level, true, emit_one_of_each);
+      assert_eq!(
+        messages(&captured.record),
+        ["training", "separation", "careful", "failed"],
+        "{level}"
+      );
+      assert!(!messages(&captured.logs).contains(&"training".to_owned()), "{level}");
+    }
+    // And a louder stderr does not make the record louder: it is `info`, whatever is asked of stderr.
+    let captured = testing::capture_recorded("debug", true, emit_one_of_each);
+    assert!(messages(&captured.logs).contains(&"detail".to_owned()));
+    assert!(!messages(&captured.record).contains(&"detail".to_owned()));
+  }
+
+  #[test]
+  fn results_kept_off_stdout_still_reach_the_record() {
+    let captured = testing::capture_recorded("info", false, emit_one_of_each);
+    assert!(captured.results.is_empty());
+    assert!(messages(&captured.record).contains(&"separation".to_owned()));
+  }
+
+  #[test]
+  fn a_line_in_the_record_is_the_line_the_streams_carry() {
+    let captured = testing::capture_recorded("info", true, emit_one_of_each);
+    let undated = |line: &String| {
+      let mut object: serde_json::Map<String, serde_json::Value> = serde_json::from_str(line).unwrap();
+      assert!(object.remove("timestamp").is_some());
+      object
+    };
+    let record: Vec<_> = captured.record.iter().map(undated).collect();
+    for line in captured.logs.iter().chain(&captured.results) {
+      assert!(record.contains(&undated(line)), "{line}");
+    }
+    assert_eq!(record.len(), captured.logs.len() + captured.results.len());
+  }
+
+  #[test]
+  fn without_a_record_logging_is_exactly_as_before() {
+    let plain = testing::capture("info", emit_one_of_each);
+    assert!(plain.record.is_empty());
+    assert_eq!(messages(&plain.logs), ["training", "careful", "failed"]);
+    assert_eq!(messages(&plain.results), ["separation"]);
   }
 }

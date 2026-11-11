@@ -121,6 +121,10 @@ calibrate pairs="data/calibration.sample.jsonl" config="config.example.toml" *fl
 calibrate-diff *args:
     cargo run --release -q -p similarity-server -- calibrate-diff {{ args }}
 
+# What was recorded: every calibration and every training run, newest first (`--kind train`, `--limit 5`)
+runs *flags:
+    cargo run --release -q -p similarity-server -- runs list {{ flags }}
+
 # --- run --------------------------------------------------------------------
 
 # Start a local Qdrant (dashboard at http://localhost:6333/dashboard)

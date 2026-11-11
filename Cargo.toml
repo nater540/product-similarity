@@ -5,6 +5,7 @@ members = [
   "crates/similarity-proto",
   "crates/similarity-core",
   "crates/similarity-store",
+  "crates/similarity-runs",
   "crates/similarity-server",
   "crates/similarity-train",
 ]
@@ -21,6 +22,7 @@ similarity-log = { path = "crates/similarity-log" }
 similarity-proto = { path = "crates/similarity-proto" }
 similarity-core = { path = "crates/similarity-core" }
 similarity-store = { path = "crates/similarity-store" }
+similarity-runs = { path = "crates/similarity-runs" }
 
 # Burn 0.22 has no default execution backend: `flex` is the pure-Rust CPU backend (it replaces the deprecated
 # `ndarray`) and is what production and every test runs on. `similarity-server` adds `metal` behind a cargo feature

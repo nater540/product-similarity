@@ -23,7 +23,8 @@ use similarity_core::model::SentenceEncoder;
 use similarity_core::provenance::{Base, Build, DataFile, Resumed, Trained};
 use similarity_core::record::hex_prefix;
 use similarity_core::{Device, Embedder, EmbedderOptions, Provenance, TextTokenizer};
-use similarity_log::RESULT;
+use similarity_log::{Init, RESULT};
+use similarity_runs::{Continues, ModelRef, Output, Run, Spec};
 use similarity_train::checkpoint::{self, RunIdentity};
 use similarity_train::data::{self, PairExample, PairExamples, Split};
 use similarity_train::eval::{Separation, Spread, separation};
@@ -146,6 +147,14 @@ struct Cli {
   /// Write no checkpoints
   #[arg(long, conflicts_with_all = ["checkpoint_dir", "checkpoint_every"])]
   no_checkpoints: bool,
+
+  /// Where runs are recorded: each run gets a directory there with its manifest and everything it emitted
+  #[arg(long, env = "RECORD_SIMILARITY_RUNS", default_value = "runs")]
+  runs: PathBuf,
+
+  /// Do not record this run
+  #[arg(long)]
+  no_run: bool,
 }
 
 fn device(choice: DeviceChoice) -> anyhow::Result<Device> {
@@ -612,6 +621,7 @@ impl Cli {
       (Some(checkpoint), inherited) => {
         // A resumed run is still the run that started from the original base. The checkpoint is where it was
         // interrupted, and goes on the list of those.
+        let written_by = inherited.as_ref().and_then(|provenance| provenance.run.clone());
         let earlier = inherited.and_then(|provenance| provenance.trained);
         let mut resumed = earlier
           .as_ref()
@@ -619,6 +629,7 @@ impl Cli {
         resumed.push(Resumed {
           from: checkpoint.display().to_string(),
           step: checkpoint::read(checkpoint)?.step,
+          run: written_by,
         });
         let base = match earlier {
           Some(trained) => trained.base,
@@ -650,7 +661,39 @@ impl Cli {
     Ok(provenance)
   }
 
-  fn run(&self) -> anyhow::Result<()> {
+  /// What the run being started is, for the registry: a training run named after its output directory, and for
+  /// a resumed one the checkpoint it goes on from and the run that wrote it.
+  fn spec(&self) -> Spec<'_> {
+    let continues = self.resume.as_ref().map(|checkpoint| {
+      // Whatever cannot be read here is read again, and reported properly, when the run itself loads it.
+      let provenance = Provenance::read(checkpoint).ok().flatten();
+      Continues {
+        run: provenance.as_ref().and_then(|provenance| provenance.run.clone()),
+        from: checkpoint.display().to_string(),
+        step: provenance
+          .and_then(|provenance| provenance.trained)
+          .map_or(0, |trained| trained.step),
+      }
+    });
+    Spec {
+      root: &self.runs,
+      kind: similarity_runs::KIND_TRAIN,
+      slug: self
+        .out
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default(),
+      build: BUILD.stamp(),
+      argv: std::env::args_os()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect(),
+      continues,
+    }
+  }
+
+  /// Trains. `run` is the record being kept of it, if one is: tests pass `None`, and so write nothing outside
+  /// the directories they were given.
+  fn run(&self, run: Option<&Run>) -> anyhow::Result<()> {
     ensure_free(&self.out)?;
     anyhow::ensure!(
       self.pairs.is_some() || self.catalog_groups.is_some(),
@@ -681,7 +724,22 @@ impl Cli {
       "model loaded"
     );
 
-    let lineage = self.lineage(&encoder, source, &examples, &options)?;
+    let mut lineage = self.lineage(&encoder, source, &examples, &options)?;
+    if let (Some(run), Some(trained)) = (run, &lineage.trained) {
+      run.note_options(trained.options.clone());
+      run.note_model(ModelRef {
+        role: "base".to_owned(),
+        dir: trained.base.dir.clone(),
+        digest: trained.base.digest.clone(),
+        fingerprint: None,
+      });
+      for file in &trained.data {
+        run.note_input(file.into());
+      }
+    }
+    // Every checkpoint and the final model name the run that wrote them. A run id changes nothing a step does,
+    // so it is no part of `RunIdentity`: a resume is always another run, and must be accepted.
+    lineage.run = run.map(|run| run.id().to_owned());
 
     let score = |encoder: &SentenceEncoder, pairs: &[PairExample]| {
       separation(encoder, &tokenizer, &device, pairs, &options.widths, self.batch_size)
@@ -722,9 +780,16 @@ impl Cli {
       max_tokens: self.max_tokens,
       ..EmbedderOptions::default()
     };
-    Embedder::load(&self.out, Device::flex(), &embedder_options)
+    let saved = Embedder::load(&self.out, Device::flex(), &embedder_options)
       .with_context(|| format!("the model saved to {} does not load back", self.out.display()))?;
     tracing::info!(out = %self.out.display(), "model saved and verified to load");
+    if let Some(run) = run {
+      run.note_output(Output {
+        role: "model".to_owned(),
+        path: self.out.display().to_string(),
+        digest: Some(saved.content_digest().to_owned()),
+      });
+    }
 
     let after = (score(&trained, &examples.pairs)?, score(&trained, &held_out)?);
     Outcome {
@@ -744,13 +809,51 @@ impl Cli {
 
 fn main() -> ExitCode {
   let cli = Cli::parse();
-  similarity_log::init();
-  match cli.run() {
-    Ok(()) => ExitCode::SUCCESS,
-    Err(error) => {
-      similarity_log::failed(&format!("{error:#}"));
-      ExitCode::FAILURE
+  // The record is started before anything else, so that whatever would stop it from being kept (a runs directory
+  // that cannot be written) is found out before an hour of training and not after.
+  let run = if cli.no_run {
+    None
+  } else {
+    match Run::start(cli.spec()) {
+      Ok(run) => Some(run),
+      Err(error) => {
+        similarity_log::init();
+        similarity_log::failed(&format!(
+          "the run cannot be recorded: {error} (give --runs another directory, or --no-run to go without)"
+        ));
+        return ExitCode::FAILURE;
+      }
     }
+  };
+  let (record, unopened) = match run.as_ref().map(Run::events).transpose() {
+    Ok(record) => (record, None),
+    Err(error) => (None, Some(error)),
+  };
+  similarity_log::init_with(Init {
+    record,
+    results_on_stdout: true,
+  });
+  match (&run, unopened) {
+    (Some(run), None) => tracing::info!(run = run.id(), dir = %run.dir().display(), "run recorded"),
+    (Some(run), Some(error)) => {
+      tracing::warn!(run = run.id(), %error, "the run's events cannot be kept; its manifest still is");
+    }
+    (None, _) => {}
+  }
+
+  let outcome = cli.run(run.as_ref()).map_err(|error| format!("{error:#}"));
+  if let Err(error) = &outcome {
+    similarity_log::failed(error);
+  }
+  if let Some(run) = run
+    && let Err(error) = run.finish(outcome.as_ref().copied().map_err(String::as_str))
+  {
+    tracing::warn!(%error, "the end of the run could not be recorded");
+  }
+  if outcome.is_ok() {
+    ExitCode::SUCCESS
+  } else {
+    ExitCode::FAILURE
   }
 }
 
@@ -1178,7 +1281,117 @@ mod tests {
       "name",
       "--no-dropout",
     ];
-    Cli::parse_from(fixed.iter().chain(arguments)).run().unwrap();
+    Cli::parse_from(fixed.iter().chain(arguments)).run(None).unwrap();
+  }
+
+  /// Trains as `train` does, with a record of the run kept under `root`, and reads the record back.
+  fn train_recorded(root: &Path, arguments: &[&str]) -> similarity_runs::Listed {
+    let fixed = [
+      "x",
+      "--epochs",
+      "2",
+      "--batch-size",
+      "2",
+      "--max-tokens",
+      "16",
+      "--dims",
+      "24",
+      "--fields",
+      "name",
+      "--no-dropout",
+      "--runs",
+    ];
+    let root = root.to_str().unwrap();
+    let cli = Cli::parse_from(fixed.iter().chain(&[root]).chain(arguments));
+    let run = Run::start(cli.spec()).unwrap();
+    let dir = run.dir().to_owned();
+    cli.run(Some(&run)).unwrap();
+    run.finish(Ok(())).unwrap();
+    similarity_runs::open(&dir).unwrap()
+  }
+
+  #[test]
+  fn a_recorded_run_says_what_it_trained_from_on_what_and_what_it_wrote() {
+    let (dir, base, pairs) = workspace();
+    let (out, runs) = (dir.path().join("mdbr-ft"), dir.path().join("runs"));
+    let path = |path: &Path| path.to_str().unwrap().to_owned();
+    let recorded = train_recorded(
+      &runs,
+      &["--base", &path(&base), "--out", &path(&out), "--pairs", &path(&pairs)],
+    );
+
+    assert_eq!(recorded.status, similarity_runs::Status::Finished);
+    let manifest = &recorded.manifest;
+    assert_eq!(manifest.kind, similarity_runs::KIND_TRAIN);
+    assert!(manifest.id.ends_with("-train-mdbr-ft"), "{}", manifest.id);
+    assert_eq!(manifest.build.tool, "record-similarity-train");
+    assert_eq!(manifest.options.as_ref().unwrap()["epochs"], 2);
+    assert_eq!(manifest.continues, None);
+
+    // The same facts the model's own provenance carries, kept even if the model directory is later deleted.
+    let (model, trained) = provenance(&out);
+    let base_model = manifest.model.as_ref().unwrap();
+    assert_eq!(
+      (base_model.role.as_str(), &base_model.digest),
+      ("base", &trained.base.digest)
+    );
+    assert_eq!(manifest.inputs.len(), 1);
+    assert_eq!(
+      (
+        manifest.inputs[0].role.as_str(),
+        &manifest.inputs[0].sha256,
+        manifest.inputs[0].examples
+      ),
+      ("pairs", &trained.data[0].sha256, Some(trained.data[0].examples))
+    );
+    assert_eq!(manifest.outputs.len(), 1);
+    assert_eq!(manifest.outputs[0].digest.as_deref(), Some(model.digest.as_str()));
+
+    // And the model names the run that wrote it, as does every checkpoint of that run.
+    assert_eq!(model.run.as_deref(), Some(manifest.id.as_str()));
+    let checkpoint = dir.path().join("mdbr-ft.checkpoints/step-000002");
+    assert_eq!(provenance(&checkpoint).0.run.as_deref(), Some(manifest.id.as_str()));
+  }
+
+  #[test]
+  fn a_resumed_run_is_a_run_of_its_own_that_names_the_one_it_continues() {
+    let (dir, base, pairs) = workspace();
+    let (first, second, runs) = (
+      dir.path().join("first"),
+      dir.path().join("second"),
+      dir.path().join("runs"),
+    );
+    let path = |path: &Path| path.to_str().unwrap().to_owned();
+    let original = train_recorded(
+      &runs,
+      &["--base", &path(&base), "--out", &path(&first), "--pairs", &path(&pairs)],
+    );
+    let checkpoint = dir.path().join("first.checkpoints/step-000002");
+    let resumed = train_recorded(
+      &runs,
+      &[
+        "--resume",
+        &path(&checkpoint),
+        "--out",
+        &path(&second),
+        "--pairs",
+        &path(&pairs),
+      ],
+    );
+
+    assert_ne!(resumed.manifest.id, original.manifest.id);
+    let continues = resumed.manifest.continues.as_ref().unwrap();
+    assert_eq!(continues.run.as_deref(), Some(original.manifest.id.as_str()));
+    assert_eq!(
+      (continues.from.as_str(), continues.step),
+      (path(&checkpoint).as_str(), 2)
+    );
+
+    // The resumed model names its own run, and its history names the run that wrote the checkpoint.
+    let (model, trained) = provenance(&second);
+    assert_eq!(model.run.as_deref(), Some(resumed.manifest.id.as_str()));
+    assert_eq!(trained.resumed[0].run.as_deref(), Some(original.manifest.id.as_str()));
+    assert_eq!(similarity_runs::list(&runs).unwrap().0.len(), 2);
   }
 
   fn provenance(dir: &Path) -> (Provenance, Trained) {
@@ -1285,7 +1498,8 @@ mod tests {
       resumed.resumed,
       [Resumed {
         from: path(&checkpoint),
-        step: 2
+        step: 2,
+        run: None,
       }]
     );
     assert_eq!((resumed.step, resumed.total_steps), (4, 4));

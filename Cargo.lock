@@ -6067,6 +6067,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "similarity-runs"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+ "similarity-core",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "similarity-server"
 version = "0.1.0"
 dependencies = [
@@ -6080,6 +6093,7 @@ dependencies = [
  "similarity-core",
  "similarity-log",
  "similarity-proto",
+ "similarity-runs",
  "similarity-store",
  "tempfile",
  "thiserror 2.0.21",
@@ -6118,6 +6132,7 @@ dependencies = [
  "sha2",
  "similarity-core",
  "similarity-log",
+ "similarity-runs",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",

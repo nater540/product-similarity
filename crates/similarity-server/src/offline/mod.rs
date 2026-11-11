@@ -163,6 +163,11 @@ impl Offline {
     self.embedder.fingerprint()
   }
 
+  /// The digest of the model's files alone: which model this is, whatever width and token limit it is run at.
+  pub fn content_digest(&self) -> &str {
+    self.embedder.content_digest()
+  }
+
   /// The width of one field's vector.
   pub fn dimension(&self) -> usize {
     self.embedder.dimension()

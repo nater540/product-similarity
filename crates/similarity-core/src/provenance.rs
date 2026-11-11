@@ -43,6 +43,10 @@ pub struct Provenance {
   pub dirty: Option<bool>,
   /// The content digest of the model in this directory: the first part of its fingerprint.
   pub digest: String,
+  /// The id of the recorded run that wrote the directory, if the program was recording one. It names what
+  /// produced the model, like everything else here, and a run's results are found under that id, not in this file.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub run: Option<String>,
   /// Set for a model that was downloaded.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub fetched: Option<Fetched>,
@@ -129,6 +133,24 @@ pub struct Resumed {
   pub from: String,
   /// The step it held.
   pub step: usize,
+  /// The id of the recorded run that wrote that checkpoint, if one did.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub run: Option<String>,
+}
+
+/// A program's build, as it is written down: in a model's provenance (flat, as [`Provenance`]'s first fields) and
+/// in a run's manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stamp {
+  /// The program, as a person would name it.
+  pub tool: String,
+  /// Its version.
+  pub version: String,
+  /// The source commit it was built from, or `unknown`.
+  pub commit: String,
+  /// Whether the source tree had uncommitted changes then. Absent when that is not known.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub dirty: Option<bool>,
 }
 
 /// What a program knows about itself when it writes a model directory.
@@ -162,6 +184,16 @@ impl Build {
     }
   }
 
+  /// This build, in the form that is written down.
+  pub fn stamp(&self) -> Stamp {
+    Stamp {
+      tool: self.tool.to_owned(),
+      version: self.version.to_owned(),
+      commit: self.commit.to_owned(),
+      dirty: self.dirty,
+    }
+  }
+
   /// The provenance of a model with content digest `digest`, written by this build now. The caller adds how the
   /// model was made.
   pub fn provenance(&self, digest: impl Into<String>) -> Provenance {
@@ -175,6 +207,7 @@ impl Build {
       commit: self.commit.to_owned(),
       dirty: self.dirty,
       digest: digest.into(),
+      run: None,
       fetched: None,
       trained: None,
     }
@@ -240,6 +273,7 @@ mod tests {
       commit: "0123456789ab".to_owned(),
       dirty: Some(false),
       digest: digest.to_owned(),
+      run: None,
       fetched: Some(Fetched {
         repo: "MongoDB/mdbr-leaf-mt".to_owned(),
         revision: "1ed41b2".to_owned(),
@@ -286,6 +320,7 @@ mod tests {
         resumed: vec![Resumed {
           from: "models/x.checkpoints/step-000120".to_owned(),
           step: 120,
+          run: Some("20261111T120002Z-train-x".to_owned()),
         }],
         step: 240,
         total_steps: 240,
@@ -330,6 +365,46 @@ mod tests {
       Build::new("t", "v", "unknown", "").dirty,
       None,
       "a build that could not ask git does not claim a clean tree"
+    );
+  }
+
+  /// Runs came later than the file. One written before them has no `run` key anywhere, and must still read.
+  #[test]
+  fn a_provenance_file_written_before_runs_existed_reads_with_no_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = concat!(
+      r#"{"format": 1, "written_at": 1700000000, "tool": "record-similarity-train", "version": "0.1.0", "#,
+      r#""commit": "0123456789ab", "digest": "aaaa", "trained": {"base": {"dir": "m", "digest": "bbbb"}, "#,
+      r#""data": [], "data_fingerprint": "cccc", "options": {}, "max_tokens": 256, "device": "cpu", "#,
+      r#""resumed": [{"from": "m.checkpoints/step-000010", "step": 10}], "step": 20, "total_steps": 20}}"#,
+    );
+    std::fs::write(dir.path().join(PROVENANCE_FILE), old).unwrap();
+    let read = Provenance::read(dir.path()).unwrap().unwrap();
+    assert_eq!(read.run, None);
+    assert_eq!(read.trained.unwrap().resumed[0].run, None);
+
+    // And a file with no run is written without the key, so an older reader is not shown one either.
+    let written = serde_json::to_string(&fetched("aaaa")).unwrap();
+    assert!(!written.contains("\"run\""), "{written}");
+  }
+
+  #[test]
+  fn a_build_stamp_carries_what_the_provenance_fields_carry() {
+    let build = Build::new("record-similarity-train", "0.1.0", "0123456789ab", "true");
+    let (stamp, provenance) = (build.stamp(), build.provenance("aaaa"));
+    assert_eq!(
+      (&stamp.tool, &stamp.version, &stamp.commit, stamp.dirty),
+      (
+        &provenance.tool,
+        &provenance.version,
+        &provenance.commit,
+        provenance.dirty
+      )
+    );
+    let unknown = Build::new("x", "0.1.0", "unknown", "").stamp();
+    assert!(
+      !serde_json::to_string(&unknown).unwrap().contains("dirty"),
+      "an unknown is left out"
     );
   }
 

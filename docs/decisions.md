@@ -786,3 +786,51 @@ requires every quoted line to be one it prints.
 
 Regenerating is local (`just snapshot`) and CI only checks: a job that rewrote a pinned file would be an
 unreviewed change to it.
+
+## D23. A run leaves a directory behind
+
+What a fine-tuning run measured was whatever someone remembered to redirect: results to one file, logs to another,
+and a calibration's data only if `--ndjson` had been typed. The first real training runs are about to happen, and
+a result that was not kept cannot be recovered.
+
+`calibrate` and the trainer now each record a run: a directory under `runs/` with a manifest (`run.json`), every
+event the run emitted (`events.ndjson`), and for a calibration read as text, the report. It is on unless
+`--no-run` is given. Nothing leaves the machine, and nothing depends on Weights & Biases or any other service: an
+exporter to one could read these files afterwards.
+
+**The record is a third layer of the one logging setup, not a second one** (D15). `similarity-log` builds every
+layer with the same function, so a line in the record is the line the streams carry. It has a level of its own:
+results and failures always, and logs at `info` whatever `RUST_LOG` says. The loss curve is made of `info` logs,
+and a copy of the two streams would have lost it whenever someone quietened stderr.
+
+**A calibration is data in either mode.** Read as text, a calibration used to write no events at all. A recorded
+one writes them to the record alone while stdout keeps the report, which is the one case where results do not
+go to stdout: the same results are in the run, and stdout has what the person asked for.
+
+**`killed` is never written.** A killed process writes nothing, and the trainer installs no signal handler. The
+manifest says `running` until the run ends and is then rewritten as `finished` or `failed` (a destructor covers a
+panic). The process holds a lock on a file in its run directory, which the operating system releases however the
+process ends, so a reader concludes `killed` from a `running` manifest whose lock nobody holds. Readers never
+write.
+
+**A resumed run is a run of its own.** Appending to the original run's directory was the suggestion, and is
+wrong three ways: the resume may be on another machine, may start from an earlier checkpoint than the last (its
+steps would then be in one file twice), and may be started twice by mistake. Each invocation gets a directory,
+and a resumed one names the checkpoint it went on from and the run that wrote it. The link is carried by
+`provenance.json`, which gains the id of the run that wrote the directory: that is a fact about what produced a
+model, so it belongs there (D18), and it is no part of a run's identity for resuming, because a resume is always
+another run and must be accepted.
+
+**Everything that could stop a run from being recorded is found out before any work**, as with checkpoints (D13).
+After that, a note that cannot be written is a warning: the training matters more than the note about it.
+
+**The id is the time, the kind, and a name**, `20261111T201826Z-train-mdbr-leaf-mt-ft`, so that a directory
+listing is in order and needs no index. The name comes from a path the caller chose, so a property holds that an
+id is always a single safe path component.
+
+**What it does not do.** It records and lists. Comparing runs, drawing them, and deciding on them are features
+4 and 5, which read these files. `serve` and `import` are not recorded: a server is not a run, and an import's
+command line may one day carry a secret, which a manifest must not keep.
+
+The crate is `similarity-runs`. It depends on `similarity-core` for the two types a manifest shares with a
+model's provenance, the build stamp and a data file; both binaries link `similarity-core` already.

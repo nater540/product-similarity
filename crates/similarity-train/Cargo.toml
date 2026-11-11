@@ -35,6 +35,7 @@ serde_json.workspace = true
 # Fingerprints the training data, so a checkpoint is only resumed on the examples it was made from.
 sha2.workspace = true
 similarity-log.workspace = true
+similarity-runs.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

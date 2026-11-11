@@ -5,6 +5,7 @@
 //! - `serve` runs the gRPC server.
 //! - `model fetch` downloads and verifies a model directory.
 //! - `compare` and `calibrate` score records offline, for choosing thresholds.
+//! - `runs list` shows what was recorded: every `calibrate`, and every training run, leaves a directory behind.
 //!
 //! Only `serve` starts an async runtime; the other commands are plain synchronous programs.
 
@@ -15,8 +16,12 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use sha2::{Digest as _, Sha256};
 use similarity_core::provenance::Build;
+use similarity_core::record::hex_prefix;
 use similarity_core::{Device, Embedder, Provenance};
+use similarity_log::Init;
+use similarity_runs::{Input, ModelRef, Spec, Status};
 use similarity_server::config::{Config, DeviceChoice};
 use similarity_server::engine::{Engine, store_layout};
 use similarity_server::fetch::{self, FetchRequest};
@@ -57,6 +62,28 @@ enum Command {
   CalibrateDiff(CalibrateDiffArgs),
   /// Load a whole catalog into the store: every record of an export that is not stored yet becomes a baseline.
   Import(ImportArgs),
+  /// Look at the runs that were recorded.
+  #[command(subcommand)]
+  Runs(RunsCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum RunsCommand {
+  /// List the recorded runs, newest first.
+  List(RunsListArgs),
+}
+
+#[derive(Debug, Args)]
+struct RunsListArgs {
+  /// Where runs are recorded.
+  #[arg(long, env = "RECORD_SIMILARITY_RUNS", default_value = "runs")]
+  runs: PathBuf,
+  /// Only runs of this kind (`train`, `calibrate`).
+  #[arg(long)]
+  kind: Option<String>,
+  /// At most this many.
+  #[arg(long)]
+  limit: Option<usize>,
 }
 
 #[derive(Debug, Args)]
@@ -129,6 +156,13 @@ struct CalibrateArgs {
   /// Fixes the resampling behind the intervals, so that a run can be reproduced.
   #[arg(long, default_value_t = 0)]
   seed: u64,
+  /// Where runs are recorded: this calibration gets a directory there with its manifest, its events (with or
+  /// without --ndjson), and its report.
+  #[arg(long, env = "RECORD_SIMILARITY_RUNS", default_value = "runs")]
+  runs: PathBuf,
+  /// Do not record this run.
+  #[arg(long)]
+  no_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -423,15 +457,21 @@ fn read_fields(path: &Path) -> anyhow::Result<RecordFields> {
   })
 }
 
-fn offline(config_path: &Path) -> anyhow::Result<(Offline, similarity_core::Policy)> {
-  let config = Config::load(config_path)?;
+fn offline(config: &Config) -> anyhow::Result<(Offline, similarity_core::Policy)> {
   let policy = config.policy()?;
-  Ok((Offline::new(load_embedder(&config)?, config.schema()?, policy), policy))
+  Ok((Offline::new(load_embedder(config)?, config.schema()?, policy), policy))
+}
+
+/// The SHA-256 of a file a run read, for its manifest. A file that cannot be read again here is one the command
+/// has already read or is about to fail on, so there is nothing more to say about it.
+fn sha256_of(path: &Path) -> Option<String> {
+  let bytes = std::fs::read(path).ok()?;
+  Some(hex_prefix(&Sha256::digest(&bytes), 32))
 }
 
 impl CompareArgs {
   fn run(self) -> anyhow::Result<()> {
-    let (offline, policy) = offline(&self.config)?;
+    let (offline, policy) = offline(&Config::load(&self.config)?)?;
     let evaluation = offline.compare(&read_fields(&self.before)?, &read_fields(&self.after)?, None)?;
     write!(
       std::io::stdout().lock(),
@@ -444,8 +484,36 @@ impl CompareArgs {
 }
 
 impl CalibrateArgs {
-  fn run(self) -> anyhow::Result<()> {
-    let (offline, policy) = offline(&self.config)?;
+  /// What this calibration is, for the registry: named after the pairs file, and the split if one was asked for.
+  fn spec(&self) -> Spec<'_> {
+    let stem = self
+      .pairs
+      .file_stem()
+      .map(|stem| stem.to_string_lossy())
+      .unwrap_or_default();
+    Spec {
+      root: &self.runs,
+      kind: similarity_runs::KIND_CALIBRATE,
+      slug: match &self.split {
+        Some(split) => format!("{stem}-{split}"),
+        None => stem.into_owned(),
+      },
+      build: Build {
+        tool: "record-similarity calibrate",
+        ..BUILD
+      }
+      .stamp(),
+      argv: std::env::args_os()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect(),
+      continues: None,
+    }
+  }
+
+  /// Calibrates. `run` is the record being kept of it, if one is.
+  fn run(self, run: Option<&similarity_runs::Run>) -> anyhow::Result<()> {
+    let config = Config::load(&self.config)?;
+    let (offline, policy) = offline(&config)?;
     let text = std::fs::read_to_string(&self.pairs).with_context(|| format!("cannot read {}", self.pairs.display()))?;
     let pairs = if self.full {
       let selection = Selection {
@@ -458,14 +526,111 @@ impl CalibrateArgs {
     }
     .with_context(|| format!("in {}", self.pairs.display()))?;
     let calibration = offline::calibrate(&offline, pairs)?;
+
+    if let Some(run) = run {
+      run.note_model(ModelRef {
+        role: "scored".to_owned(),
+        dir: config.model.dir.display().to_string(),
+        digest: offline.content_digest().to_owned(),
+        fingerprint: Some(offline.fingerprint().to_owned()),
+      });
+      run.note_input(Input {
+        role: "pairs".to_owned(),
+        path: self.pairs.display().to_string(),
+        sha256: calibration.input.sha256.clone(),
+        examples: Some(calibration.pairs.len()),
+      });
+      if let Some(sha256) = sha256_of(&self.config) {
+        run.note_input(Input {
+          role: "config".to_owned(),
+          path: self.config.display().to_string(),
+          sha256,
+          examples: None,
+        });
+      }
+    }
+
     if self.ndjson {
       offline::events::emit(&offline, &policy, &calibration, self.seed);
     } else {
-      write!(
-        std::io::stdout().lock(),
+      let report = format!(
         "{}\n{}",
         offline.model_line(),
         offline::render_calibration(&calibration, &policy, self.seed)
+      );
+      write!(std::io::stdout().lock(), "{report}")?;
+      if let Some(run) = run {
+        // A calibration read by a person is data all the same: the events go to the run alone (stdout has the
+        // report), so that a later run can be compared with this one whatever mode either was in.
+        run.note_report(&report);
+        offline::events::emit(&offline, &policy, &calibration, self.seed);
+      }
+    }
+    Ok(())
+  }
+}
+
+/// How long a run took, for a listing: `41.2s`, `12m05s`, `1h02m`.
+fn duration(seconds: f64) -> String {
+  if seconds < 60.0 {
+    return format!("{seconds:.1}s");
+  }
+  // A run's length in whole seconds is far below what a `u64` holds, and never negative.
+  #[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a duration, rounded"
+  )]
+  let whole = seconds.round() as u64;
+  let (hours, minutes, seconds) = (
+    whole.div_euclid(3600),
+    whole.rem_euclid(3600).div_euclid(60),
+    whole.rem_euclid(60),
+  );
+  if hours > 0 {
+    format!("{hours}h{minutes:02}m")
+  } else {
+    format!("{minutes}m{seconds:02}s")
+  }
+}
+
+impl RunsListArgs {
+  fn run(self) -> anyhow::Result<()> {
+    let (runs, unreadable) = similarity_runs::list(&self.runs)?;
+    let mut out = std::io::stdout().lock();
+    let wanted = runs
+      .iter()
+      .filter(|run| self.kind.as_ref().is_none_or(|kind| &run.manifest.kind == kind))
+      .take(self.limit.unwrap_or(usize::MAX));
+    for run in wanted {
+      let manifest = &run.manifest;
+      // A run that did not end has no length; one that was killed stopped at a time nobody wrote down.
+      let took = match (run.status, manifest.elapsed_s) {
+        (Status::Finished | Status::Failed, Some(seconds)) => duration(seconds),
+        _ => "-".to_owned(),
+      };
+      let model = manifest
+        .model
+        .as_ref()
+        .map_or("-", |model| model.fingerprint.as_deref().unwrap_or(&model.digest));
+      let input = manifest.inputs.first().map_or("-", |input| input.path.as_str());
+      writeln!(
+        out,
+        "{:<52} {:<10} {:<9} {took:>7}  {model:<28} {input}",
+        manifest.id,
+        manifest.kind,
+        run.status.as_str()
+      )?;
+    }
+    for directory in &unreadable {
+      tracing::warn!(dir = %directory.dir.display(), reason = directory.reason.as_str(), "not a run");
+    }
+    if !unreadable.is_empty() {
+      writeln!(
+        out,
+        "{} directory(ies) under {} are not runs",
+        unreadable.len(),
+        self.runs.display()
       )?;
     }
     Ok(())
@@ -623,25 +788,67 @@ impl CalibrateDiffArgs {
 
 fn main() -> ExitCode {
   let cli = Cli::parse();
+  // A calibration is recorded as a run. The record is started first, so that whatever would stop it from being
+  // kept is found out before the model is loaded and the pairs are scored.
+  let run = match &cli.command {
+    Command::Calibrate(args) if !args.no_run => match similarity_runs::Run::start(args.spec()) {
+      Ok(run) => Some(run),
+      Err(error) => {
+        similarity_log::init();
+        similarity_log::failed(&format!(
+          "the run cannot be recorded: {error} (give --runs another directory, or --no-run to go without)"
+        ));
+        return ExitCode::FAILURE;
+      }
+    },
+    _ => None,
+  };
+  // With a report on stdout, a recorded calibration's events go to the record alone.
+  let results_on_stdout = match &cli.command {
+    Command::Calibrate(args) => args.ndjson || run.is_none(),
+    _ => true,
+  };
+  let (record, unopened) = match run.as_ref().map(similarity_runs::Run::events).transpose() {
+    Ok(record) => (record, None),
+    Err(error) => (None, Some(error)),
+  };
   // Logs are one JSON object per line on stderr (see `similarity-log`). The reports that `model fetch`,
   // `compare`, and `calibrate` print for a person to read are not logs, and stay as text on stdout.
-  similarity_log::init();
+  similarity_log::init_with(Init {
+    record,
+    results_on_stdout,
+  });
+  match (&run, unopened) {
+    (Some(run), None) => tracing::info!(run = run.id(), dir = %run.dir().display(), "run recorded"),
+    (Some(run), Some(error)) => {
+      tracing::warn!(run = run.id(), %error, "the run's events cannot be kept; its manifest still is");
+    }
+    (None, _) => {}
+  }
 
   let outcome = match cli.command {
     Command::Serve(args) => args.run(),
     Command::Model(ModelCommand::Fetch(args)) => args.run(),
     Command::Compare(args) => args.run(),
-    Command::Calibrate(args) => args.run(),
+    Command::Calibrate(args) => args.run(run.as_ref()),
     Command::CalibrateDiff(args) => args.run(),
     Command::Import(args) => args.run(),
-  };
-  match outcome {
-    Ok(()) => ExitCode::SUCCESS,
-    Err(error) => {
-      // A failure is a line in the same stream and the same format as everything before it.
-      similarity_log::failed(&format!("{error:#}"));
-      ExitCode::FAILURE
-    }
+    Command::Runs(RunsCommand::List(args)) => args.run(),
+  }
+  .map_err(|error| format!("{error:#}"));
+  if let Err(error) = &outcome {
+    // A failure is a line in the same stream and the same format as everything before it.
+    similarity_log::failed(error);
+  }
+  if let Some(run) = run
+    && let Err(error) = run.finish(outcome.as_ref().copied().map_err(String::as_str))
+  {
+    tracing::warn!(%error, "the end of the run could not be recorded");
+  }
+  if outcome.is_ok() {
+    ExitCode::SUCCESS
+  } else {
+    ExitCode::FAILURE
   }
 }
 
@@ -650,6 +857,36 @@ mod tests {
   use clap::CommandFactory;
 
   use super::*;
+
+  #[test]
+  fn a_calibration_is_recorded_under_the_name_of_its_pairs_and_split() {
+    let cli = Cli::parse_from([
+      "record-similarity",
+      "calibrate",
+      "data/Pairs.Full.jsonl",
+      "--full",
+      "--split",
+      "holdout",
+      "--runs",
+      "elsewhere",
+    ]);
+    let Command::Calibrate(args) = cli.command else {
+      panic!("expected calibrate")
+    };
+    let spec = args.spec();
+    assert_eq!((spec.kind, spec.slug.as_str()), ("calibrate", "Pairs.Full-holdout"));
+    assert_eq!(similarity_runs::slug(&spec.slug), "pairs-full-holdout");
+    assert_eq!(spec.root, Path::new("elsewhere"));
+    assert_eq!(spec.build.tool, "record-similarity calibrate");
+    assert!(!args.no_run, "recording is the default");
+  }
+
+  #[test]
+  fn the_length_of_a_run_is_written_the_way_a_person_would_say_it() {
+    for (seconds, expected) in [(0.04, "0.0s"), (41.24, "41.2s"), (725.0, "12m05s"), (3725.0, "1h02m")] {
+      assert_eq!(duration(seconds), expected);
+    }
+  }
 
   #[test]
   fn the_command_line_definition_is_internally_consistent() {

@@ -1,7 +1,7 @@
 # Feature suggestions
 
 Twenty features that could be added to this project, with what each is, why it matters here, how it would fit the
-code, and what it would cost. **Features 1, 7, 8, 9, 13, 16, and 19 are built** (D17 to D22, and the README); the rest are not. They were proposed in November 2026 from a read of the
+code, and what it would cost. **Features 1, 2, 7, 8, 9, 13, 16, and 19 are built** (D17 to D23, and the README); the rest are not. They were proposed in November 2026 from a read of the
 repository as it stood then (`README.md`, `docs/decisions.md`, and the crates); check a suggestion against the
 code before starting on it, since the code will have moved. It has moved once already: records now carry
 quantities, compared as numbers (D16), and the features that touch a verdict or a report say below what that
@@ -102,6 +102,10 @@ dependencies.
 **Effort.** S: everything is already in memory when the model is saved. **Needs real data:** no.
 
 ### 2. Local run registry
+
+**Built** (D23). What came out differently: the record is a third logging layer with a level of its own, not a
+copy of the two streams (the loss curve is made of logs); `killed` is worked out when runs are read, not written;
+and a resumed run is a run of its own that names the one it continues.
 
 **What.** Every `record-similarity-train`, `calibrate`, and `throughput` invocation creates a run directory,
 `runs/<utc>-<slug>/`, holding:

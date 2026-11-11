@@ -165,6 +165,7 @@ The binary is `record-similarity` (`target/release/record-similarity` after `jus
 | `record-similarity compare [--config config.toml] BEFORE.json AFTER.json` | Scores one before/after pair offline. |
 | `record-similarity calibrate [--config config.toml] PAIRS.jsonl [--full] [--split S] [--ndjson]` | Scores labeled pairs and suggests a threshold. See [Choosing thresholds](#choosing-thresholds). |
 | `record-similarity calibrate-diff OLD.ndjson (NEW.ndjson \| --config-b CONFIG) [--fail-on WHAT]` | Compares two calibrations, or one under a second configuration. See [Comparing two calibrations](#comparing-two-calibrations). |
+| `record-similarity runs list [--runs DIR] [--kind KIND] [--limit N]` | Lists what was recorded: every calibration and every training run. See [Recorded runs](#recorded-runs). |
 
 Environment variables:
 
@@ -172,6 +173,7 @@ Environment variables:
 |---|---|
 | `QDRANT_API_KEY` | The API key for a secured Qdrant or Qdrant Cloud. Never read from the config file. |
 | `RUST_LOG` | Log filter, `info` by default. `RUST_LOG=warn` quiets the per-request lines; `RUST_LOG=debug` adds detail. |
+| `RECORD_SIMILARITY_RUNS` | Where runs are recorded, `runs` by default. The same as `--runs` on `calibrate`, `runs list`, and the trainer. |
 
 **Logs are NDJSON.** Both binaries log one JSON object per line on stderr and nothing else: there is no text
 format to switch to. Each line has `timestamp`, `level`, `message`, and `target`, with the event's own fields
@@ -1229,6 +1231,48 @@ thresholds belong to one specific model. This is from a one-pass run on the bund
 The file records what produced the model, never what the model scored. It is not part of the model either: adding
 it, editing it, or deleting it changes no fingerprint, and nothing refuses a model for not having one.
 
+### Recorded runs
+
+A fine-tuning run and a calibration each leave a directory under `runs/`, without being asked:
+
+```text
+runs/20261111T201826Z-train-mdbr-leaf-mt-ft/
+  run.json        what ran: the build, the machine, the command line, the options, the model, the data, how it ended
+  events.ndjson   everything the run emitted, in order: every result and failure, and logs at `info`
+  report.txt      for a calibration read as text, the report
+```
+
+Nothing is sent anywhere, and the directory is the whole record. It exists so that the answer to "which options
+gave that result" is a file and not somebody's shell history:
+
+```text
+$ just runs
+20261111T201826Z-train-mdbr-leaf-mt-ft               train      finished    16.0s  f46e48ee0ea2dd02             data/calibration.sample.jsonl
+20261111T201704Z-calibrate-calibration-sample-full   calibrate  finished     1.1s  f46e48ee0ea2dd02-d256-t256   data/calibration.sample.full.jsonl
+20261111T201701Z-calibrate-calibration-sample        calibrate  finished     2.5s  f46e48ee0ea2dd02-d256-t256   data/calibration.sample.jsonl
+```
+
+Each line is the run's id, its kind, how it stands, how long it took, the model (the base it trained from, or the
+fingerprint it scored with), and its first input.
+
+- **`events.ndjson` is the run's output, kept.** For training it has the `training` lines the loss curve is made
+  of, whatever `RUST_LOG` was: quietening stderr does not thin the record. For a calibration it has the events
+  `--ndjson` writes, with or without `--ndjson`, so any two calibrations can be compared later:
+  `just calibrate-diff runs/<one>/events.ndjson runs/<other>/events.ndjson`.
+- **A run that was killed says so.** A manifest is written as `running` and rewritten when the run ends. A
+  process that is killed writes nothing, so `runs list` works it out: a run still marked `running` whose process
+  no longer holds its lock is shown as `killed`.
+- **A resumed run is a run of its own.** `--resume` starts a new directory whose `run.json` names the checkpoint
+  it went on from and the run that wrote it (`continues`). The model's `provenance.json` names the run that wrote
+  it (`run`), and each checkpoint it was resumed from names its own.
+- **`--runs DIR`** (or `RECORD_SIMILARITY_RUNS`) puts the records somewhere else, and **`--no-run`** records
+  nothing. If the directory cannot be written, the command stops before doing any work and says so.
+- **Runs stay where they were made.** `runs/` is ignored by git and left out of the container image. A run on
+  real data names its files and holds pair ids and owner pseudonyms in its events; `run.json` also has the host
+  name, the working directory, and the command line.
+
+Only `calibrate` and the trainer are recorded. `serve`, `import`, `compare`, and `calibrate-diff` are not.
+
 ## Using a different model
 
 Any sentence-transformers model with a BERT encoder, mean or CLS pooling, and optionally a linear projection can be
@@ -1476,7 +1520,7 @@ data/
   regression.snapshot.ndjson      what the pinned model and the example config make of them
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D22)
+  decisions.md               why things are the way they are (D1 to D23)
   data-request-prompt.md     a brief for collecting labeled production data
   feature-suggestions.md     twenty features that could be added, none built yet
   plan-features.md           a plan for the first five of them

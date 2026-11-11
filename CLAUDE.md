@@ -6,7 +6,7 @@ marketplace listings. Each revision is embedded field by field with a small BERT
 thresholds. A record's quantities (weight, volume, potency) are compared as numbers beside that, never embedded.
 Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D22) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D23) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -63,6 +63,8 @@ changing a design. Infer conventions from the existing code first.
 - `crates/similarity-core`: encoder, strict weight loading and saving, tokenization, composite vectors, quantities,
   scoring, policy. Synchronous, no I/O beyond reading and writing a model directory, no network code ever (D11).
 - `crates/similarity-store`: the `VectorStore` trait, `MemoryStore`, `QdrantStore`.
+- `crates/similarity-runs`: the local record of runs (D23): the manifest, starting and ending a run, reading runs
+  back. It records and lists; it decides nothing.
 - `crates/similarity-server`: config, the embedding worker thread, `Engine` (all behavior), the thin gRPC layer,
   `model fetch`, `import`, `compare`/`calibrate` (the `offline` module), and the `record-similarity` binary. Keep
   `grpc.rs` free of decisions.
@@ -117,6 +119,11 @@ changing a design. Infer conventions from the existing code first.
   editing it, and never quote a figure that was not produced by `just throughput` or `just calibrate`.
 - **Rust end to end, by the owner's choice** (D13): training is `similarity-train`, in Burn. Do not add Python to
   any pipeline. `tools/*.py` are referees that write PyTorch fixtures for the parity tests and nothing else.
+- **A run is recorded by `main`, never by the code it calls** (D23). `calibrate` and the trainer start a
+  `similarity_runs::Run` before any work and pass it down as an `Option`; tests pass `None`, so no test writes
+  into `runs/`. The record is a third layer in `similarity-log`, built by the same function as the two streams:
+  never a second subscriber, and never a writer with a format of its own. `killed` is never stored; it is
+  concluded on read from the lock. Do not record a command whose arguments can hold a secret.
 - **`provenance.json` is a note about a model, never part of it** (D18). Whatever writes a model directory writes
   it, inside the same `write_whole`, and it records what produced the model, not what the model scored. Never add
   it to the files `ModelFiles::digest` hashes, never make loading depend on it, and never write into a model
@@ -143,6 +150,8 @@ changing a design. Infer conventions from the existing code first.
 - Run: `just serve` (needs Qdrant) or `just serve-in-memory`; then `just client describe`
 - Load a catalog: `just import export.jsonl config.toml` (`--check` validates only)
 - Measure: `just throughput`, `just calibrate`, `just calibrate-diff`, `just verdict-gate old.ndjson pairs.full.jsonl`
+- See what was run: `just runs` (`calibrate` and the trainer each leave a directory under `runs/`; `--no-run`
+  turns that off)
 - Fine-tune: `just finetune --base ... --out ... --pairs ...` (CPU); GPU: `just release-train metal`, then
   `./target/release/record-similarity-train --device metal ...`. Continue an interrupted run with `--resume
   <out>.checkpoints/step-NNNNNN` in place of `--base`. Results are NDJSON on stdout, logs NDJSON on stderr.
