@@ -106,3 +106,13 @@ strip = "symbols"
 # `cargo run` into a wait. Optimize dependencies (Burn, gemm, tokenizers) while keeping workspace crates debuggable.
 [profile.dev.package."*"]
 opt-level = 3
+
+# Mutation testing (`just mutants`) builds a crate once per mutant. Debug info is most of a debug build's size and
+# link time, and nothing reads it there. Dependencies stay optimized, as in `dev`, or the tests that run the tiny
+# encoders take as long as the build.
+[profile.mutants]
+inherits = "test"
+debug = "none"
+
+[profile.mutants.package."*"]
+opt-level = 3

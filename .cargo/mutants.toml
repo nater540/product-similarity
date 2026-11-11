@@ -1,0 +1,32 @@
+# cargo-mutants configuration: `just mutants`. https://mutants.rs
+#
+# The files listed here are the ones whose boundaries are verdicts (docs/decisions.md, D24). A mutant that survives
+# in one is an untested boundary: kill it with a test, or, only if it cannot change any observable behavior,
+# exclude it below with the reason. Never exclude a mutant because it is hard to kill.
+
+examine_globs = [
+  "crates/similarity-core/src/score.rs",
+  "crates/similarity-core/src/quantity.rs",
+  "crates/similarity-core/src/schema.rs",
+  "crates/similarity-core/src/vector.rs",
+  "crates/similarity-core/src/record.rs",
+  "crates/similarity-server/src/engine.rs",
+  "crates/similarity-server/src/offline/stats.rs",
+  "crates/similarity-server/src/offline/calibrate.rs",
+]
+
+# Every test that can kill a mutant in these files is in a crate's library target. The integration targets either
+# need the model or Qdrant (and are ignored) or test something else, so building and linking them for every mutant
+# buys nothing.
+additional_cargo_test_args = ["--lib"]
+
+# A mutant can leave a parameter unused or a value unread. That is a warning, and must not make the mutant fail to
+# build: a mutant that does not build is a mutant nobody tested.
+cap_lints = true
+
+profile = "mutants"
+
+# Mutants that cannot change behavior, each with why. Matched on the function and the replacement, never on a
+# line number, so that editing the file does not silently un-exclude or mis-exclude one.
+exclude_re = [
+]

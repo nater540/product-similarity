@@ -61,6 +61,24 @@ verdict-gate old pairs config="config.toml" *flags:
     RUST_LOG=warn cargo run --release -q -p similarity-server -- calibrate --config {{ config }} {{ pairs }} --full --ndjson {{ flags }} > target/verdict-gate.ndjson
     cargo run --release -q -p similarity-server -- calibrate-diff {{ old }} target/verdict-gate.ndjson --fail-on any-flip --fail-on moved
 
+# For a mutation run: one fixed proptest seed, so that a mutant is caught or missed the same way every time, and no
+# regression files written into the copied tree. The commit is given so that the build script does not ask `git`
+# in a copy that has none.
+mutants_env := "PROPTEST_RNG_SEED=1 PROPTEST_DISABLE_FAILURE_PERSISTENCE=1 RECORD_SIMILARITY_COMMIT=mutants"
+
+# Mutation testing of the files whose boundaries are verdicts (slow; needs `cargo install cargo-mutants`)
+mutants *flags:
+    {{ mutants_env }} cargo mutants --output target {{ flags }}
+
+# Only the mutants in what changed since `base`: `just mutants-diff` (uncommitted), `just mutants-diff main`
+mutants-diff base="HEAD":
+    git diff --no-ext-diff {{ base }} > target/mutants.diff
+    {{ mutants_env }} cargo mutants --output target --in-diff target/mutants.diff
+
+# Mutation testing of the trainer's checkpoint rules
+mutants-train *flags:
+    {{ mutants_env }} cargo mutants --config .cargo/mutants-train.toml --output target/mutants-train {{ flags }}
+
 # The storage contract against a live Qdrant (needs `just qdrant-up`)
 test-qdrant:
     QDRANT_URL={{ qdrant_url }} cargo test -p similarity-store --test contract -- --ignored

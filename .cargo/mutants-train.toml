@@ -1,0 +1,7 @@
+# The trainer's checkpoint rules: `just mutants-train`. Kept apart from `mutants.toml` because these tests run
+# real optimizer steps, and the trainer changes rarely.
+examine_globs = ["crates/similarity-train/src/checkpoint.rs"]
+additional_cargo_test_args = ["--lib"]
+cap_lints = true
+profile = "mutants"
+exclude_re = []
