@@ -13,7 +13,7 @@
 
 use std::future::Future;
 
-use similarity_core::RecordVectors;
+use similarity_core::{Quantities, RecordVectors};
 
 mod memory;
 mod qdrant;
@@ -77,6 +77,12 @@ pub struct StoredRecord {
   pub vectors: RecordVectors,
   /// The composite of the record as first stored (or last force-written), for drift detection.
   pub anchor: Vec<f32>,
+  /// The record's current quantities: what the next revision's are compared against. They are stored beside the
+  /// vectors and are part of neither, so a record written before quantities existed simply has none.
+  pub quantities: Quantities,
+  /// The first value the record had for each quantity since it was first stored (or last force-written): what a
+  /// quantity that was removed and comes back is compared against.
+  pub anchor_quantities: Quantities,
   /// How many times the record has been written.
   pub revision: u64,
   /// When the record was last written, in seconds since the Unix epoch.

@@ -22,8 +22,8 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use similarity_core::RecordVectors;
 use similarity_core::vector::{cosine, normalize};
+use similarity_core::{Quantities, Quantity, RecordVectors};
 use similarity_store::{MemoryStore, QdrantSettings, QdrantStore, SearchQuery, StoreError, StoredRecord, VectorStore};
 
 const DIM: usize = 6;
@@ -45,9 +45,18 @@ fn record(id: &str, tenant: Option<&str>, composite: [f32; DIM]) -> StoredRecord
       hashes: BTreeMap::from([("name".to_owned(), format!("hash-of-{id}"))]),
     },
     anchor: unit([0.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
+    quantities: Quantities::new(),
+    anchor_quantities: Quantities::new(),
     revision: 1,
     updated_at: 1_700_000_000,
   }
+}
+
+fn quantities(entries: &[(&str, Quantity)]) -> Quantities {
+  entries
+    .iter()
+    .map(|(name, value)| ((*name).to_owned(), value.clone()))
+    .collect()
 }
 
 fn query(vector: &[f32]) -> SearchQuery<'_> {
@@ -89,16 +98,39 @@ async fn contract<S: VectorStore>(store: &S, other_layout: &S) {
   assert_eq!(read.vectors.hashes, gummies.vectors.hashes);
   assert_same_direction(&read.vectors.composite, &gummies.vectors.composite);
   assert_same_direction(&read.anchor, &gummies.anchor);
+  assert!(
+    read.quantities.is_empty() && read.anchor_quantities.is_empty(),
+    "a record written without quantities has none"
+  );
 
   // A second write to the same id replaces the first; the anchor is whatever the caller says it is.
   let mut revised = record("gummies", Some("merchant-1"), [1.0, 0.3, 0.0, 0.0, 0.0, 0.0]);
   revised.revision = 2;
   revised.anchor = gummies.vectors.composite.clone();
+  // Quantities come back exactly as written: single values, ranges, whole numbers, fractions, and units the
+  // store has no opinion about. The current and the original set are kept apart.
+  revised.quantities = quantities(&[
+    ("weight_per_item", Quantity::single(3.5, "g")),
+    ("thc_per_item", Quantity::range(18.0, 22.0, "%")),
+    ("strength", Quantity::single(0.1, "mg/g")),
+  ]);
+  revised.anchor_quantities = quantities(&[("weight_per_item", Quantity::single(1.0, "oz"))]);
   store.put(&revised).await.unwrap();
   let read = store.get("gummies").await.unwrap().unwrap();
   assert_eq!(read.revision, 2);
   assert_same_direction(&read.vectors.composite, &revised.vectors.composite);
   assert_same_direction(&read.anchor, &gummies.vectors.composite);
+  assert_eq!(read.quantities, revised.quantities);
+  assert_eq!(read.anchor_quantities, revised.anchor_quantities);
+
+  // Writing the record again without them removes them; nothing lingers from the previous write.
+  let mut bare = revised.clone();
+  bare.quantities.clear();
+  bare.anchor_quantities.clear();
+  store.put(&bare).await.unwrap();
+  let read = store.get("gummies").await.unwrap().unwrap();
+  assert!(read.quantities.is_empty() && read.anchor_quantities.is_empty());
+  store.put(&revised).await.unwrap();
 
   // Ids are opaque strings, not just slugs.
   let odd_id = "merchant 1 / SKU #42 – ブルーベリー";
@@ -389,6 +421,53 @@ async fn a_collection_that_lost_its_payload_indexes_gets_them_back_on_connect() 
   assert_eq!(created, ["layout", "tenant"]);
   assert!(stripped.is_empty(), "{stripped:?}");
   assert_eq!(repaired, created);
+}
+
+#[tokio::test]
+#[ignore = "needs a Qdrant server at $QDRANT_URL (`just qdrant-up`); run with `just test-qdrant`"]
+async fn a_point_written_before_quantities_existed_reads_back_with_none() {
+  use qdrant_client::Payload;
+  use qdrant_client::qdrant::{PointsIdsList, ScrollPointsBuilder, SetPayloadPointsBuilder};
+
+  let settings = qdrant_settings(unique_collection("legacy"));
+  let store = QdrantStore::connect(&settings, LAYOUT, DIM).await.unwrap();
+  let mut measured = record("gummies", Some("merchant-1"), [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+  measured.quantities = quantities(&[("weight_per_item", Quantity::single(3.5, "g"))]);
+  measured.anchor_quantities = measured.quantities.clone();
+  store.put(&measured).await.unwrap();
+
+  // Turn the point into what an older server wrote: the same payload without the two quantity keys. Overwriting
+  // the payload through the raw client is the only way to get one, since this crate no longer writes them.
+  let client = qdrant_client::Qdrant::from_url(&settings.url).build().unwrap();
+  let scrolled = client
+    .scroll(ScrollPointsBuilder::new(settings.collection.as_str()).with_payload(true))
+    .await
+    .unwrap();
+  let point = scrolled.result.into_iter().next().unwrap();
+  let mut legacy = serde_json::to_value(Payload::from(point.payload)).unwrap();
+  let keys = legacy.as_object_mut().unwrap();
+  assert!(keys.remove("quantities").is_some() && keys.remove("anchor_quantities").is_some());
+  client
+    .overwrite_payload(
+      SetPayloadPointsBuilder::new(settings.collection.as_str(), Payload::try_from(legacy).unwrap())
+        .points_selector(PointsIdsList {
+          ids: vec![point.id.unwrap()],
+        })
+        .wait(true),
+    )
+    .await
+    .unwrap();
+
+  let read = store.get("gummies").await;
+  store.delete_collection().await.unwrap();
+
+  let read = read.unwrap().unwrap();
+  assert!(read.quantities.is_empty() && read.anchor_quantities.is_empty());
+  assert_eq!(
+    (read.tenant.as_deref(), read.revision),
+    (Some("merchant-1"), 1),
+    "and the rest of the record is intact"
+  );
 }
 
 #[tokio::test]

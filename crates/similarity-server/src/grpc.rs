@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use similarity_core::FieldChange;
+use similarity_core::{FieldChange, Quantity, QuantityChange, QuantityScore};
 use similarity_proto::v1 as pb;
 use similarity_proto::v1::record_similarity_server::RecordSimilarity;
 use similarity_store::VectorStore;
@@ -52,6 +52,12 @@ fn record_input(record: pb::Record) -> RecordInput {
     id: record.id,
     tenant: record.tenant,
     fields: record.fields.into_iter().collect(),
+    // Passed on exactly as sent. Whether a quantity is a usable measurement is the engine's to decide.
+    quantities: record
+      .quantities
+      .into_iter()
+      .map(|(name, quantity)| (name, Quantity::range(quantity.min, quantity.max, quantity.unit)))
+      .collect(),
   }
 }
 
@@ -89,6 +95,30 @@ fn field_change(change: FieldChange) -> pb::FieldChange {
   }
 }
 
+fn quantity_change(change: QuantityChange) -> pb::QuantityChange {
+  match change {
+    QuantityChange::Unchanged => pb::QuantityChange::Unchanged,
+    QuantityChange::Modified => pb::QuantityChange::Modified,
+    QuantityChange::Incomparable => pb::QuantityChange::Incomparable,
+    QuantityChange::Added => pb::QuantityChange::Added,
+    QuantityChange::Removed => pb::QuantityChange::Removed,
+    QuantityChange::Restored => pb::QuantityChange::Restored,
+  }
+}
+
+fn quantity_score(score: QuantityScore) -> pb::QuantityScore {
+  pb::QuantityScore {
+    field: score.field,
+    change: quantity_change(score.change).into(),
+    factor: score.factor,
+    zero_crossing: score.zero_crossing,
+    incomparable: score.incomparable,
+    previous_unit: score.previous_unit,
+    unit: score.unit,
+    beyond_limit: score.beyond_limit,
+  }
+}
+
 fn width(value: usize) -> u32 {
   u32::try_from(value).unwrap_or(u32::MAX)
 }
@@ -118,6 +148,7 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
       anchor_similarity = output.anchor_similarity,
       stored = output.stored,
       revision = output.revision,
+      measure_changed = output.measure_changed,
       "evaluate"
     );
 
@@ -145,6 +176,8 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
         Vec::new()
       },
       revision: output.revision,
+      quantities: output.quantities.into_iter().map(quantity_score).collect(),
+      measure_changed: output.measure_changed,
     }))
   }
 
@@ -207,6 +240,17 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
         .collect(),
       threshold: description.policy.threshold,
       anchor_threshold: description.policy.anchor_threshold,
+      quantities: description
+        .schema
+        .quantities()
+        .iter()
+        .map(|quantity| pb::QuantityDescription {
+          name: quantity.name.clone(),
+          reject_above_factor: quantity.reject_above_factor,
+          reject_incomparable: quantity.reject_incomparable,
+        })
+        .collect(),
+      reject_on_measure_change: description.policy.reject_on_measure_change,
     }))
   }
 }
@@ -233,6 +277,41 @@ mod tests {
     for (error, code) in cases {
       let status = Status::from(error);
       assert_eq!((status.code(), status.message()), (code, "m"));
+    }
+  }
+
+  #[test]
+  fn every_quantity_change_has_a_wire_value_of_its_own() {
+    let changes = [
+      QuantityChange::Unchanged,
+      QuantityChange::Modified,
+      QuantityChange::Incomparable,
+      QuantityChange::Added,
+      QuantityChange::Removed,
+      QuantityChange::Restored,
+    ];
+    let mut wire: Vec<i32> = changes
+      .into_iter()
+      .map(|change| quantity_change(change).into())
+      .collect();
+    wire.sort_unstable();
+    wire.dedup();
+    assert_eq!(wire.len(), changes.len());
+    assert!(!wire.contains(&i32::from(pb::QuantityChange::Unspecified)));
+
+    // The five changes a text field can also have keep the numbers `FieldChange` gives them.
+    for (quantity, field) in [
+      (QuantityChange::Unchanged, FieldChange::Unchanged),
+      (QuantityChange::Modified, FieldChange::Modified),
+      (QuantityChange::Added, FieldChange::Added),
+      (QuantityChange::Removed, FieldChange::Removed),
+      (QuantityChange::Restored, FieldChange::Restored),
+    ] {
+      assert_eq!(
+        i32::from(quantity_change(quantity)),
+        i32::from(field_change(field)),
+        "{quantity:?}"
+      );
     }
   }
 

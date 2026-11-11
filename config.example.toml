@@ -30,7 +30,8 @@ collection = "records"
 timeout_ms = 5000
 
 [policy]
-# Reject a revision whose weighted similarity to the stored record is below this.
+# Reject a revision whose weighted similarity to the stored record is below this. Only text fields enter this
+# score; quantities (below) are compared separately and never move it.
 #
 # Cosine similarities from a sentence encoder are not percentages: with the default model two unrelated products
 # still score around 0.5. On data/calibration.sample.jsonl ordinary edits score 0.94 to 1.00 and recycled products
@@ -40,6 +41,11 @@ threshold = 0.90
 # Reject a revision that has drifted this far from the record as first stored, however small each step was.
 # Omit to report drift (`anchor_similarity` in the response) without enforcing it.
 anchor_threshold = 0.85
+# Reject a revision that changes which measures a record is described by: a quantity whose unit can no longer be
+# compared with its old one (THC in % becoming THC in mg), or one quantity removed as another appears (a weight
+# for a volume). Reported in every response as `measure_changed`; uncomment to enforce it, once `calibrate` on
+# labeled production edits shows that legitimate edits never do this.
+# reject_on_measure_change = true
 
 # The record schema. Field names here are the keys callers send. Weights are relative. Adding or removing a field
 # changes the vector layout, which means re-indexing into a new collection; changing a weight does not.
@@ -59,3 +65,25 @@ weight = 1.0
 
 [fields.description]
 weight = 2.0
+
+# The record's quantities: numeric fields with a unit, compared as numbers after unit conversion and never
+# embedded. Naming one here is what defines it; callers send it in `quantities`, not in `fields`. Adding or removing
+# a quantity changes no vector, so it never means re-indexing.
+#
+# NO LIMITS ARE SET HERE, ON PURPOSE. Every quantity below is compared and reported in each response (how many
+# times larger or smaller it became, whether its unit is still comparable) and rejects nothing. Where a limit
+# belongs is a measurement, exactly like a threshold: run `record-similarity calibrate` on labeled production
+# edits, read the "quantity (factor)" section of the report, and only then set, per quantity:
+#
+#   reject_above_factor = 4.0   # reject a change by more than this factor, in either direction (always >= 1)
+#   reject_incomparable = true  # reject a unit that cannot be compared with the old one
+#
+# The synthetic pairs in data/calibration.sample.jsonl are far too few to choose either from.
+
+[quantities.weight_per_item]
+
+[quantities.volume_per_item]
+
+[quantities.thc_per_item]
+
+[quantities.cbd_per_item]

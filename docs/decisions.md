@@ -398,3 +398,93 @@ Two things stay text: the reports `model fetch`, `compare`, and `calibrate` prin
 usage errors from the argument parser, which happen before anything has started. Burn's own training dashboard
 was not used: it comes with `burn-train`'s learner, and a terminal UI is the wrong output for a job run over SSH
 or in a pipeline.
+
+## D16. Quantities are compared, not embedded
+
+A product record has numeric fields as well as text: a weight, a volume, a THC and a CBD content, each with a
+unit. The obvious way to take them into account is to render them as text and embed them as four more fields.
+Measured with the shipped model (`mdbr-leaf-mt`, 256 dimensions), scoring each pair of strings as a `name` with
+`record-similarity compare`:
+
+| Before | After | What it is | Similarity |
+|---|---|---|---|
+| `1 g` | `1000 mg` | The same quantity | 0.742 |
+| `3.5 g` | `3.5 grams` | The same quantity | 0.970 |
+| `weight 3.5 g` | `weight 0.125 oz` | The same quantity (roughly) | 0.832 |
+| `THC 21.3 %` | `THC 22.8 %` | A routine batch update | 0.892 |
+| `THC 18 % to 22 %` | `THC 19 % to 23 %` | A routine batch update | 0.951 |
+| `3.5 g` | `28 g` | Eight times the size | 0.758 |
+| `THC 100 mg` | `THC 10 mg` | A tenth of the potency | 0.924 |
+| `THC 100 mg` | `THC 1000 mg` | Ten times the potency | 0.961 |
+| `THC 22 %` | `THC 22 mg` | A different kind of product | 0.873 |
+| `weight 3.5 g, THC 22 %` | `volume 355 ml, THC 10 mg` | A different kind of product | 0.727 |
+
+The ordering is backwards. A tenfold change in potency scores higher than a routine batch update, and an
+identical weight written in other units scores lowest of all. Embedded, these fields would add noise to every
+verdict. So a quantity is never embedded. It is a `Quantity { min, max, unit }` (a single value is a range whose
+ends are equal), compared as a number, which gives three signals the text model cannot:
+
+- **How much it changed**, after unit conversion, as a *factor*: the larger value over the smaller, so it is always
+  at least 1 and "eight times bigger" and "an eighth" both read 8. `1 g` to `1000 mg` is 1; `3.5 g` to `28 g` is
+  8. For a range it is the factor of whichever end moved more. A move between zero and a value above zero has no
+  factor; it is reported as a `zero_crossing` and counts as beyond any limit.
+- **That it stopped being comparable.** A potency in `%` becoming a potency in `mg` is not a bigger or smaller
+  number. It is reported as `INCOMPARABLE`, with both units.
+- **Which measures a record has.** One flag per evaluation, `measure_changed`, is set when a quantity became
+  incomparable or when one quantity went away as a different one arrived (a weight for a volume: flower becoming
+  a beverage). Filling in a quantity that was simply missing does not set it.
+
+**Units.** A small table in `similarity_core::quantity` converts mass (to mg), volume (to ml), and percentages,
+matched without regard to case or spacing. A unit it does not know is never an error: it is its own dimension,
+comparable only with the identical unit. The real unit vocabulary is not known here (the data request asks for
+it), so the table has to be able to lag behind the data without refusing a record. Extending it is one line.
+
+**Report-only by default.** A quantity is defined by naming it under `[quantities]`, and every response then
+carries its comparison. It rejects only where the config asks: `reject_above_factor` and `reject_incomparable` per
+quantity, `policy.reject_on_measure_change` overall. `config.example.toml` names four quantities and sets no
+limit, because a limit is a measurement in the same sense as a threshold (D3) and there is nothing to measure it
+on yet: real product data never enters this repository, and the sample pairs are synthetic. `calibrate` prints,
+per quantity, the factors seen in edits beside those seen in recycles, which is what a limit is read from.
+
+**Out of the score.** Quantities never enter the weighted similarity. Folding them in would change what
+`policy.threshold` means, invalidate every calibration done so far, and let a wholesale change of text hide behind
+four unchanged numbers. Kept apart, the text thresholds are untouched: `just calibrate` printed the same overall
+ranges (edits from 0.941, recycles up to 0.850) and the same suggested threshold (0.895) before and after
+quantities were added to the sample pairs. `FindSimilar` ignores them too; it compares vectors.
+
+**The anchor rule carries over (D8).** A quantity only one version has cannot be compared, so alone that rule
+would let any quantity be swapped in two steps: remove it, then send another. The anchor therefore keeps the first
+value of every quantity the record has ever had, exactly as it does for text. A quantity that comes back is
+`RESTORED` and compared with that first value, an ordinary accepted write never replaces a value the anchor holds,
+and a `FORCE` write resets them along with the anchor vector.
+
+**What counts as a change.** A change in a quantity alone, with no text touched, is a change to the record: it is
+written and bumps the revision. The same amount in another unit is not (`1 g` re-sent as `1000 mg`), for the
+reason text re-saved with different whitespace is not (D9): re-submitting what is stored must not churn the store.
+
+**The layout does not change (D12).** Quantities are stored in the point's payload, beside the vectors and part of
+neither. `Schema::layout_id` leaves them out, so adding or removing a quantity needs no new collection and no
+re-index. A point written before quantities existed has no such payload keys and reads back with none; the first
+revision that carries a quantity reports it as `ADDED` and the anchor takes it.
+
+**Open questions, and the default in force until real data answers them.** The data request
+(`docs/data-request-prompt.md`) asks for each.
+
+| Question | Default |
+|---|---|
+| Which unit strings actually occur? | The built-in table, matched without regard to case or spacing; anything else is comparable only with itself. |
+| Is THC ever given as `mg/g`, or per package instead of per item? | `mg/g` is an unknown unit, its own dimension. Add it to the percentage dimension (factor 0.1) only once it is confirmed to occur. |
+| Are `min` and `max` always both set? | A caller that has one sends it as both. |
+| Does zero mean "none" or "not measured"? | Zero is a value. A move between zero and anything else is a `zero_crossing`, and rejects only under a factor limit. |
+| Is there a pack-size or item-count column? | Not assumed. It would be a fifth `[quantities.<name>]` table and no code. |
+| Where do the limits go? | Nowhere yet: the example configuration ships with none. |
+
+**What this does not do.**
+
+- There is no drift check for quantities. `reject_above_factor` applies to each revision against the one before
+  it, so a quantity can still be walked a long way in steps that each stay under the limit. The anchor's first
+  values are stored, so reporting the factor against them is a small addition if real data shows the need.
+- It knows nothing about what a quantity means. A quantity "per item" where the item is a pack and one where the
+  item is a piece are simply two numbers; the caller has to be consistent.
+- It cannot say where a limit belongs, or whether zero means "none" or "not measured". Those are questions for
+  the real data.

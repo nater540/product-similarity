@@ -2,5 +2,7 @@
   "name": "Sour Diesel Vape Cartridge 1g",
   "category": "Vape Pens > Cartridges",
   "brand": "STIIIZY",
-  "description": "One gram 510-thread cartridge filled with premium distillate and cannabis-derived terpenes. Energizing sativa with a pungent diesel flavor."
+  "description": "One gram 510-thread cartridge filled with premium distillate and cannabis-derived terpenes. Energizing sativa with a pungent diesel flavor.",
+  "weight_per_item": {"value": 1, "unit": "g"},
+  "thc_per_item": {"min": 85, "max": 90, "unit": "%"}
 }

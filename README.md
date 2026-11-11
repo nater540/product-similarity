@@ -5,8 +5,10 @@ A gRPC service that answers one question about an edit to a record: **is this st
 Marketplace listings get "recycled": a merchant takes an existing product, say a blueberry gummy, and edits it into
 an entirely different one, keeping the id and everything attached to it (reviews, rankings, history). This service
 embeds each revision of a record field by field with a small sentence-embedding model running on
-[Burn](https://burn.dev), compares it with the stored version, and accepts or rejects the change. Accepted vectors
-are kept in [Qdrant](https://qdrant.tech), which also makes the catalog searchable by similarity.
+[Burn](https://burn.dev), compares it with the stored version, and accepts or rejects the change. A record's
+quantities (weight, volume, potency) are compared beside the text, as numbers: converted to a common unit and
+reported as "how many times larger or smaller". Accepted vectors are kept in [Qdrant](https://qdrant.tech), which
+also makes the catalog searchable by similarity.
 
 ```text
 $ just client evaluate sku-1 data/examples/gummies.json
@@ -20,6 +22,8 @@ field     brand           1.000  Unchanged
 field     category        1.000  Unchanged
 field     description     0.981  Modified
 field     name            0.963  Modified
+quantity  thc_per_item        x1.00  Unchanged (mg to g)
+quantity  weight_per_item     x1.00  Unchanged (g to g)
 
 $ just client evaluate sku-1 data/examples/vape.json                # a different product under the same id
 verdict   Rejected (stored: false, revision 2)
@@ -29,10 +33,18 @@ field     brand           0.642  Modified
 field     category        0.559  Modified
 field     description     0.635  Modified
 field     name            0.509  Modified  << below floor
+quantity  thc_per_item            -  Incomparable (g to %)
+quantity  weight_per_item    x40.00  Modified (g to g)
+measures  changed
 reason    overall similarity 0.562 is below the threshold 0.900
 reason    field `name` similarity 0.509 is below its floor 0.800
 reason    similarity to the original record 0.567 is below the drift threshold 0.850
 ```
+
+The edited gummies give their THC as `0.1 g` where the original said `100 mg`: the same amount, so unchanged. The
+vape's weight is a fortieth of the gummies' and its THC is a percentage, which cannot be compared with a mass at
+all. Those three lines are reported, not enforced: the example configuration sets no limit on any quantity (see
+[Choosing thresholds](#choosing-thresholds)), and the three reasons are all about the text.
 
 ## Contents
 
@@ -56,14 +68,16 @@ reason    similarity to the original record 0.567 is below the drift threshold 0
 ## Status
 
 Working end to end and tested at every layer, including a full-stack test against a real Qdrant with the real model.
-Three things stand between this and enforcing on production traffic:
+Four things stand between this and enforcing on production traffic:
 
 1. **Thresholds are calibrated on synthetic data.** `data/calibration.sample.jsonl` holds 46 pairs written for this
    repository. Collect labeled edits from production (`docs/data-request-prompt.md` describes exactly what to
    collect), run `calibrate` on them, and set the thresholds from that. Start in `DRY_RUN`.
 2. **The choice of model is a prior, not a measured win.** On the synthetic pairs the default model and
    `all-MiniLM-L6-v2` are close. Real pairs should decide ([Using a different model](#using-a-different-model)).
-3. **Per-record locking is per process.** See [Limitations](#limitations).
+3. **No quantity limit has been measured.** Quantities are compared and reported in every response, and reject
+   nothing until a limit is configured. Where a limit belongs has to be read from the same labeled edits.
+4. **Per-record locking is per process.** See [Limitations](#limitations).
 
 ## Dependencies
 
@@ -161,8 +175,8 @@ format to switch to. Each line has `timestamp`, `level`, `message`, and `target`
 beside them:
 
 ```json
-{"timestamp":"2026-11-11T03:16:50.406229Z","level":"INFO","message":"serving gRPC","address":"127.0.0.1:50051","target":"record_similarity"}
-{"timestamp":"2026-11-11T03:16:52.286685Z","level":"INFO","message":"evaluate","id":"sku-1","verdict":"Created","stored":true,"revision":1,"target":"similarity_server::grpc"}
+{"timestamp":"2026-11-11T05:52:42.870451Z","level":"INFO","message":"serving gRPC","address":"127.0.0.1:50051","target":"record_similarity"}
+{"timestamp":"2026-11-11T05:52:43.254934Z","level":"INFO","message":"evaluate","id":"sku-1","verdict":"Created","stored":true,"revision":1,"measure_changed":false,"target":"similarity_server::grpc"}
 ```
 
 A command that fails ends with a `failed` line at level `ERROR` carrying the reason in `error`, and a crash is
@@ -198,8 +212,15 @@ The API is defined, with full documentation of every field, in
 | `Delete` | Forgets a record. |
 | `Describe` | Reports the model fingerprint, schema, and thresholds in force. |
 
-A record is an optional `id`, an optional `tenant`, and a map of field name to text. The field names must be ones
-the server's schema defines; `Describe` lists them.
+A record is an optional `id`, an optional `tenant`, a map of field name to text, and a map of quantity name to
+quantity. The names must be ones the server's schema defines; `Describe` lists both kinds.
+
+**Quantities.** A quantity is `{min, max, unit}`. A single value is sent with `min` equal to `max`, and so is a
+range of which only one end is known. `unit` is free text: mass (`mcg`, `mg`, `g`, `kg`, `oz`, `lb`), volume (`ml`,
+`cl`, `l`, `fl oz`), and `%` are converted before comparing, whatever their case or spacing, so `1 g` and
+`1000 mg` are the same quantity. Any other unit is accepted and is comparable only with itself. Values must be
+finite, not negative, and `min` not above `max`. A quantity is never sent as text in `fields`, and a quantity the
+record does not have is left out. [Mapping your records](#mapping-your-records) shows where each column goes.
 
 **Tenants.** Once a record is stored under a tenant, every later `Evaluate` or `Delete` for its id must name the
 same tenant. A request naming another tenant, or none, gets `FAILED_PRECONDITION`. A record stored without a
@@ -220,7 +241,20 @@ just client delete <id> [--tenant T]
 just client --server http://other-host:50051 describe
 ```
 
-`fields.json` is a JSON object of field name to text, like the files in `data/examples/`.
+`fields.json` is one JSON object holding the record's text fields and its quantities together, like the files in
+`data/examples/`. A string value is a text field. An object value is a quantity, written either as
+`{"value": 3.5, "unit": "g"}` or as `{"min": 18, "max": 22, "unit": "%"}`:
+
+```json
+{
+  "name": "Sour Diesel Vape Cartridge 1g",
+  "category": "Vape Pens > Cartridges",
+  "weight_per_item": {"value": 1, "unit": "g"},
+  "thc_per_item": {"min": 85, "max": 90, "unit": "%"}
+}
+```
+
+`compare` and `calibrate` read records in the same shape.
 
 ### With grpcurl
 
@@ -244,6 +278,10 @@ grpcurl -plaintext -d '{
       "category": "Edibles > Gummies",
       "brand": "WYLD",
       "description": "Ten vegan gummies made with real fruit. 10mg THC per piece, 100mg per package."
+    },
+    "quantities": {
+      "weight_per_item": {"min": 40, "max": 40, "unit": "g"},
+      "thc_per_item": {"min": 100, "max": 100, "unit": "mg"}
     }
   }
 }' localhost:50051 recordsimilarity.v1.RecordSimilarity/Evaluate
@@ -270,6 +308,10 @@ grpcurl -plaintext -d '{
       "category": "Vape Pens > Cartridges",
       "brand": "STIIIZY",
       "description": "One gram 510-thread cartridge filled with premium distillate."
+    },
+    "quantities": {
+      "weight_per_item": {"min": 1, "max": 1, "unit": "g"},
+      "thc_per_item": {"min": 85, "max": 90, "unit": "%"}
     }
   },
   "mode": "WRITE_MODE_DRY_RUN"
@@ -293,9 +335,16 @@ grpcurl -plaintext -d '{
     "field `name` similarity 0.512 is below its floor 0.800",
     "similarity to the original record 0.541 is below the drift threshold 0.850"
   ],
-  "revision": "1"
+  "revision": "1",
+  "quantities": [
+    { "field": "thc_per_item", "change": "QUANTITY_CHANGE_INCOMPARABLE", "incomparable": true, "previousUnit": "mg", "unit": "%" },
+    { "field": "weight_per_item", "change": "QUANTITY_CHANGE_MODIFIED", "factor": 40, "previousUnit": "g", "unit": "g" }
+  ],
+  "measureChanged": true
 }
 ```
+
+The quantities are reported and, with no limit configured, are not among the reasons.
 
 Other requests:
 
@@ -338,6 +387,11 @@ let request = pb::EvaluateRequest {
     id: Some("sku-1".to_owned()),
     tenant: Some("merchant-1".to_owned()),
     fields: [("name".to_owned(), "Blueberry Gummies 100mg".to_owned())].into(),
+    quantities: [(
+      "weight_per_item".to_owned(),
+      pb::Quantity { min: 40.0, max: 40.0, unit: "g".to_owned() },
+    )]
+    .into(),
   }),
   mode: pb::WriteMode::DryRun.into(),
   ..Default::default()
@@ -345,6 +399,9 @@ let request = pb::EvaluateRequest {
 let response = client.evaluate(request).await?.into_inner();
 if response.verdict() == pb::Verdict::Rejected {
   eprintln!("rejected: {:?}", response.reasons);
+}
+for quantity in &response.quantities {
+  eprintln!("{}: {:?}, factor {:?}", quantity.field, quantity.change(), quantity.factor);
 }
 ```
 
@@ -362,10 +419,17 @@ import grpc
 from recordsimilarity.v1 import similarity_pb2 as pb, similarity_pb2_grpc as rpc
 
 client = rpc.RecordSimilarityStub(grpc.insecure_channel("127.0.0.1:50051"))
-record = pb.Record(id="sku-1", tenant="merchant-1", fields={"name": "Blueberry Gummies 100mg"})
+record = pb.Record(
+    id="sku-1",
+    tenant="merchant-1",
+    fields={"name": "Blueberry Gummies 100mg"},
+    quantities={"weight_per_item": pb.Quantity(min=80, max=80, unit="g")},
+)
 
 response = client.Evaluate(pb.EvaluateRequest(record=record, mode=pb.WRITE_MODE_DRY_RUN))
 print(pb.Verdict.Name(response.verdict), response.similarity, list(response.reasons))
+for quantity in response.quantities:
+    print(quantity.field, pb.QuantityChange.Name(quantity.change), quantity.factor)
 ```
 
 ### What `Evaluate` returns
@@ -387,8 +451,9 @@ print(pb.Verdict.Name(response.verdict), response.similarity, list(response.reas
 
 Response fields: `similarity` (overall, absent when there was no baseline), `threshold` (the one applied),
 `fields` (per field: `change`, `similarity`, `weight`, `below_floor`), `anchor_similarity` (similarity to the
-first value each of the record's fields had), `stored`, `reasons`, `revision`, and `vector` if requested.
-`threshold` on the request overrides the configured overall threshold for that one call.
+first value each of the record's fields had), `stored`, `reasons`, `revision`, `quantities` (per quantity, below),
+`measure_changed`, and `vector` if requested. `threshold` on the request overrides the configured overall
+threshold for that one call.
 
 A field's `change` is one of:
 
@@ -403,11 +468,39 @@ A field's `change` is one of:
 `RESTORED` exists so that a field cannot be swapped in two steps, by blanking it in one edit and filling it with
 something else in the next. The refill is judged exactly as if the field had been changed directly.
 
+Each entry of `quantities` describes one quantity that either version has:
+
+| Field | Meaning |
+|---|---|
+| `change` | One of the values below. |
+| `factor` | How many times larger or smaller the amount became, after unit conversion; for a range, whichever end moved more. Always at least 1, so "eight times bigger" and "an eighth" are both 8, and exactly 1 when nothing changed. Absent when there is no number to give. |
+| `zero_crossing` | The amount moved between zero and a value above zero, so no factor describes it. |
+| `incomparable` | The two values are in units that cannot be converted into one another. |
+| `previous_unit`, `unit` | The unit of the value compared against, and the record's. |
+| `beyond_limit` | This quantity exceeds a limit the schema sets for it, which rejects the record. Never set when no limit is configured. |
+
+| Change | Meaning |
+|---|---|
+| `QUANTITY_CHANGE_UNCHANGED` | The same amount, in whatever unit. `1 g` and `1000 mg`. |
+| `QUANTITY_CHANGE_MODIFIED` | Both versions have a value, in comparable units, and the amounts differ. |
+| `QUANTITY_CHANGE_INCOMPARABLE` | Both versions have a value, in units that cannot be compared (`%` and `mg`). |
+| `QUANTITY_CHANGE_ADDED` | The record has never had this quantity. Taken on trust, as a new text field is. |
+| `QUANTITY_CHANGE_REMOVED` | The stored version has it and this one does not. |
+| `QUANTITY_CHANGE_RESTORED` | The stored version has none, but the record once did, and has one again. Compared with the first value it had. |
+
+`measure_changed` is set when the record changed which measures it is described by: a quantity became
+incomparable, or one quantity was removed as a different one appeared (a weight for a volume). Filling in a
+quantity that was merely missing does not set it.
+
+A quantity never moves `similarity`. Whether it can reject is a matter of configuration, and by default it cannot
+([How a verdict is reached](#how-a-verdict-is-reached)). A change in a quantity alone is still a change to the
+record: an accepted one is stored and counts as a revision.
+
 ### Errors
 
 | Status | Meaning | What to do |
 |---|---|---|
-| `INVALID_ARGUMENT` | The record does not fit the schema (unknown field, missing required field, blank id), a parameter is out of range, or `mode` is a value this server does not know. | Fix the request. Retrying will not help. |
+| `INVALID_ARGUMENT` | The record does not fit the schema (unknown field or quantity, missing required field, blank id, a quantity that is negative, not finite, has `min` above `max`, or has no unit), a parameter is out of range, or `mode` is a value this server does not know. | Fix the request. Retrying will not help. |
 | `NOT_FOUND` | `FindSimilar` by an id that is not stored. | |
 | `FAILED_PRECONDITION` | The stored record belongs to a tenant the request does not name (it names another, or none), or was written under a different model or field set. | Send the record's tenant, or see [Re-indexing](#re-indexing). |
 | `RESOURCE_EXHAUSTED` | The embedding queue is full. | Retry with backoff. |
@@ -438,6 +531,38 @@ together as far as you can: if your save fails after an `ACCEPTED`, re-submit th
 **Rolling it out.** Run it in `DRY_RUN` on real traffic first and log the responses. That costs nothing, shows what
 would have been rejected, and produces exactly the data the next two sections need.
 
+### Mapping your records
+
+The service has two kinds of field: text, which is embedded, and quantities, which are compared as numbers. For a
+brand's product record, with the example configuration:
+
+| On the record | In the request | Notes |
+|---|---|---|
+| Brand foreign key | `tenant`, as a string | The tenant is the brand that owns the product. A product moving to another brand is then refused by the tenant check. |
+| Brand name, looked up from the key | `fields["brand"]` | The same for every product of a brand, so it rarely moves a score. |
+| Root and sub category, through the join | `fields["category"]`, for example `Edibles > Gummies` | See the two rules below. |
+| `name`, `description` | `fields["name"]`, `fields["description"]` | Sent as stored. Do not trim or clean them; the service normalizes whitespace itself. |
+| `weight_per_item_value` and `_unit` | `quantities["weight_per_item"]` | A single value: `min` and `max` both set to it. |
+| `volume_per_item_value` and `_unit` | `quantities["volume_per_item"]` | A single value. |
+| `thc_per_item_min_value`, `_max_value`, `_unit` | `quantities["thc_per_item"]` | A range. |
+| `cbd_per_item_min_value`, `_max_value`, `_unit` | `quantities["cbd_per_item"]` | A range. |
+
+Twelve columns become two text fields and four quantities. The quantity names are configuration, not code: a
+fifth (a pack size, say) is a new `[quantities.<name>]` table and nothing else.
+
+Rules for the caller:
+
+- **Category text is built from names, never ids**, root first and then the sub category. An id says nothing to a
+  text model, and two ids are as different as any other two.
+- **Category text is built in a fixed order.** If a product can have several category rows, sort them the same way
+  every time. Otherwise a product whose rows merely came back in another order looks edited.
+- **A quantity is never rendered into text.** Not as a field of its own and not appended to the name. What the
+  name already says about size or potency stays in the name; the columns go in `quantities`.
+- **A null column is a quantity left out**, not a zero. A stored zero is a value and is sent as one. A move
+  between zero and anything else is reported as a `zero_crossing`.
+- **Send the unit as stored.** The service converts the units it knows. A unit it does not know is still
+  accepted, and compared with itself.
+
 ## How a verdict is reached
 
 1. **Each field is embedded on its own**, into a unit vector. Fields whose text has not changed since the stored
@@ -454,6 +579,24 @@ would have been rejected, and produces exactly the data the next two sections ne
    - the similarity to the record's *anchor* is below `policy.anchor_threshold`. The anchor holds the first
      value each field had since the record was created (or last force-written). This catches a record being
      walked somewhere else in a series of small, individually acceptable edits.
+
+**Quantities are judged beside this, never inside it.** They are not embedded and do not enter the weighted
+mean, so every threshold above means the same with or without them (D16 has the measurements behind that). For
+each quantity the schema names:
+
+1. Both values are converted to their dimension's base unit and compared. The result is a **factor**, the larger
+   over the smaller: 1 for the same amount, 8 for `3.5 g` against `28 g` in either direction. A unit of another
+   dimension makes the pair **incomparable** instead.
+2. A quantity that was removed earlier and has a value again is compared with the first value it had, for the
+   reason a text field is: otherwise it could be swapped in two steps.
+3. The revision is additionally rejected if, and only if, the configuration says so:
+   - the factor is above that quantity's `reject_above_factor` (a move between zero and a value above zero
+     counts as above any limit);
+   - the quantity became incomparable and has `reject_incomparable`;
+   - the record's measures changed and `policy.reject_on_measure_change` is set.
+
+With none of those configured, which is how the example configuration ships, quantities are reported in every
+response and change no verdict.
 
 The field vectors are stored as one weighted, concatenated vector per record, built so that plain cosine similarity
 between two of them is the weighted score. That is why `FindSimilar` results are on the same scale as verdicts
@@ -472,10 +615,11 @@ just calibrate path/to/pairs.jsonl config.toml            # your pairs, your con
 ```
 
 The input is one JSON object per line, labeled `edit` (should be accepted) or `recycle` (should be rejected).
-Blank lines and lines starting with `#` are ignored. The field names must be ones the schema defines.
+Blank lines and lines starting with `#` are ignored. `before` and `after` are records in the shape the bundled
+client reads: a string is a text field, an object is a quantity, and every name must be one the schema defines.
 
 ```json
-{"label": "recycle", "note": "gummies become a vape", "before": {"name": "..."}, "after": {"name": "..."}}
+{"label": "recycle", "note": "an eighth becomes an ounce", "before": {"name": "...", "weight_per_item": {"value": 3.5, "unit": "g"}}, "after": {"name": "...", "weight_per_item": {"value": 28, "unit": "g"}}}
 ```
 
 The report starts with the model and the width it ran at, lists every pair with its score and verdict, flags the
@@ -493,7 +637,14 @@ category             0.804 to 0.925 ( 3)    0.493 to 0.869 (16)
 description          0.837 to 0.989 ( 8)    0.511 to 0.734 (17)
 name                 0.875 to 1.000 (15)    0.319 to 0.725 (20)
 
-configured policy (threshold 0.900 plus field floors): 0 edit(s) wrongly rejected, 0 recycle(s) wrongly accepted, of 46 pairs
+quantity (factor)    in edits                               in recycles
+cbd_per_item         1 to or from zero                      -
+thc_per_item         1.01 to 1.14 ( 4)                      1.04 to 10.00 ( 6), 2 incomparable
+volume_per_item      1.01 to 1.01 ( 1)                      -
+weight_per_item      1.01 to 1.01 ( 1)                      2.00 to 40.00 ( 5)
+measures changed in 0 of 26 edit(s) and 4 of 20 recycle(s)
+
+configured policy (threshold 0.900 plus field floors and any quantity limits): 0 edit(s) wrongly rejected, 0 recycle(s) wrongly accepted, of 46 pairs
 best overall threshold for this data: 0.895 (margin 0.046; 0 edit(s) rejected, 0 recycle(s) accepted)
 ```
 
@@ -508,12 +659,46 @@ Reading it:
   Change them in the config and re-run; nothing needs re-indexing.
 - **`policy.anchor_threshold`** is chosen from whole edit histories rather than pairs: it should sit below how far
   a legitimate record drifts over its lifetime.
+- **`reject_above_factor` for a quantity** belongs above the largest factor that quantity shows in edits and below
+  the smallest it shows in recycles, if those leave a gap. Each cell is the range of factors over the pairs that
+  changed the amount, with their count; the same amount in another unit is no change and is not counted. In the
+  sample, `weight_per_item` has such a gap (1.01 against 2.00) and `thc_per_item` does not: one recycle changes
+  the potency by 1.04, less than an ordinary batch update.
+- **`reject_incomparable`** is safe for a quantity when `incomparable` never appears for it under `in edits`.
+- **`policy.reject_on_measure_change`** is safe when the last line counts no edits.
+- **`to or from zero`** deserves a look before any factor limit is set, because such a change is beyond every
+  limit. In the sample it is an edit: a CBD content that went from 0 to 0.1%.
+
+**The quantity lines of the sample are there to show the report, not to be read from.** Nineteen of the 46
+synthetic pairs carry quantities, written by hand. That is why `config.example.toml` sets no quantity limit at
+all, and why none should be set until this section has been produced from labeled production edits.
 
 If the two overall ranges overlap on real data, there are three things to try, in order of cost: weights and
 floors, [a different model](#using-a-different-model), and [fine-tuning](#fine-tuning-the-model).
 
 `record-similarity compare before.json after.json` scores a single pair the same way, to see why one verdict came
-out as it did.
+out as it did. For the example gummies against the example vape:
+
+```text
+$ record-similarity compare --config config.example.toml data/examples/gummies.json data/examples/vape.json
+model     f46e48ee0ea2dd02-d256-t256 (256 dimensions per field, up to 256 tokens)
+
+field            weight similarity  change
+brand              1.00      0.642  modified
+category           3.00      0.559  modified
+description        2.00      0.653  modified
+name               4.00      0.512  modified  << below floor
+
+quantity               factor  change         units
+thc_per_item                -  incomparable   mg to %
+weight_per_item         40.00  modified       g to g
+the measures the record is described by changed
+
+overall similarity 0.567 (threshold 0.900)
+verdict: REJECTED
+  - overall similarity 0.567 is below the threshold 0.900
+  - field `name` similarity 0.512 is below its floor 0.800
+```
 
 [`docs/data-request-prompt.md`](docs/data-request-prompt.md) is a ready-made brief for collecting labeled pairs from
 production data. Its most important rule: labels must come from evidence other than how different the text looks
@@ -559,6 +744,8 @@ Two kinds of signal, either or both. The formats are the ones `docs/data-request
 
 By default only `name` and `description` are learned from (`--fields`). Categorical fields are left out because the
 same change (say, sativa to hybrid) appears in both edits and recycles, which is noise at the level of one field.
+Quantities are never learned from: they are not text, the server does not embed them, and the trainer skips any
+value that is not a string.
 
 ### 2. Train
 
@@ -707,7 +894,8 @@ format:
 
 ```sh
 jq -c 'select(.split == "holdout" and (.label == "edit" or .label == "recycle"))
-  | def keep: with_entries(select(.key | IN("name", "category", "brand", "description")));
+  | def keep: with_entries(select(.key | IN("name", "category", "brand", "description",
+      "weight_per_item", "volume_per_item", "thc_per_item", "cbd_per_item")));
     {label, note: "\(.pair_id) \(.note)", before: (.before | keep), after: (.after | keep)}' \
   pairs.full.jsonl > holdout.jsonl
 ```
@@ -787,17 +975,23 @@ commented starting point.
 | `qdrant.timeout_ms` | `5000` | Deadline for one Qdrant request. |
 | `policy.threshold` | (required) | Minimum overall similarity to the stored record. |
 | `policy.anchor_threshold` | none | Minimum overall similarity to the record's anchor (the first value of each field). Omit to report drift without enforcing it. |
+| `policy.reject_on_measure_change` | `false` | Reject a revision whose measures changed: a quantity that became incomparable with its old value, or one quantity removed as another appeared. Reported as `measure_changed` either way. |
 | `fields.<name>.weight` | (required) | Relative importance of the field. Only ratios matter. |
 | `fields.<name>.required` | `false` | Refuse records with no value for this field. |
 | `fields.<name>.reject_below` | none | Reject a revision whose similarity for this field alone is below this. |
+| `[quantities.<name>]` | none defined | Naming the table defines the quantity, even with nothing in it. It is then accepted in requests, compared, and reported. |
+| `quantities.<name>.reject_above_factor` | none | Reject a revision that changes this quantity by more than this factor, in either direction, or moves it between zero and a value above zero. At least 1. |
+| `quantities.<name>.reject_incomparable` | `false` | Reject a revision that puts this quantity in a unit that cannot be compared with the one it had. |
 
-At least one field is required. Field names may contain letters, digits, and underscores.
+At least one field is required. Field and quantity names may contain letters, digits, and underscores, and a name
+cannot be both. The example configuration defines four quantities and sets no limit on any of them.
 
 What a change costs:
 
 | Change | Consequence |
 |---|---|
 | A threshold, a floor, `required` | None. Takes effect on restart. |
+| A quantity added, removed, or given a limit | None. Quantities are stored beside the vectors, not in them. A record stored before a quantity existed reports it as `ADDED` the first time it arrives. |
 | A field weight | Verdicts use the new weight at once. Search rankings use the weights records were written with until they are rewritten. |
 | `model.dir`, `output_dim`, `max_tokens`, or the set of fields | Stored vectors are no longer comparable. Use a new collection and re-index. The server refuses to mix them. |
 
@@ -882,7 +1076,7 @@ Run `just test-real` after touching the encoder, the loader, the tokenizer setti
 crates/
   similarity-log/       logging for both binaries: one JSON object per line, nothing else
   similarity-proto/     the .proto file and generated gRPC code
-  similarity-core/      the encoder (Burn), tokenization, composite vectors, scoring, policy. No network, no async.
+  similarity-core/      the encoder (Burn), tokenization, composite vectors, quantities, scoring, policy. No network, no async.
   similarity-store/     the VectorStore trait, an in-memory implementation, and the Qdrant one
   similarity-server/    config, embedding worker thread, engine, gRPC service, and the `record-similarity` binary
   similarity-train/     fine-tuning: data, losses, the training loop, and the `record-similarity-train` binary
@@ -890,7 +1084,7 @@ data/
   calibration.sample.jsonl   synthetic labeled pairs
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D15)
+  decisions.md               why things are the way they are (D1 to D16)
   data-request-prompt.md     a brief for collecting labeled production data
 models/                 fetched and fine-tuned model directories (ignored by git)
 tools/                  referees, not part of any pipeline: they write the fixtures the parity tests compare with
@@ -921,6 +1115,9 @@ what that field says.
 | `... already holds a checkpoint for step N, which this run would write again` | The checkpoint directory has checkpoints from an earlier run of the same name. Resume from the latest with `--resume`, or delete them, or give another `--checkpoint-dir`. |
 | `checkpoint ...: belongs to a run with different options` (or `different training data`) | `--resume` was given with other options or data than the run was started with. Repeat the original command, changing only `--base` to `--resume`. |
 | `INVALID_ARGUMENT: invalid record: unknown field ...` | The request used a field name the schema does not define. `Describe` lists the valid ones. |
+| `INVALID_ARGUMENT: invalid record: unknown quantity ...` | The request used a quantity the schema does not define. Add a `[quantities.<name>]` table to the config, or drop it from the request. |
+| `` invalid record: `...` is a quantity, not a text field `` | A quantity was sent as text in `fields`. Send it in `quantities`, as a number with a unit. |
+| A quantity reports `INCOMPARABLE` for a unit that should convert | The unit is not in the service's table, so it is comparable only with itself. The table is `UNITS` in `crates/similarity-core/src/quantity.rs`; adding a unit is one line. |
 | Many `RESOURCE_EXHAUSTED` | More requests are arriving than the encoder can serve. Back off in the client, add CPU, or add replicas. |
 | Everything is rejected, or nothing is | The thresholds do not suit the model or the data. Run `calibrate`. Thresholds never carry over between models. |
 | The first Docker command fails with `Cannot connect to the Docker daemon` | Docker is not running. Start Docker Desktop, or `orbctl start` for OrbStack. |
@@ -938,7 +1135,12 @@ what that field says.
   which is most visible when searching by a name alone. See D5.
 - **No bulk API.** Bootstrapping and re-indexing are one `Evaluate` call per record.
 - **English only.** The default model is English. Other languages need another model and a new calibration.
-- **Text only.** Images are not considered. A recycler who changes only the photo is invisible to this service.
+- **Text and quantities only.** Images are not considered. A recycler who changes only the photo is invisible to
+  this service.
+- **No drift check for quantities.** A factor limit applies to each revision against the one before it. A quantity
+  can still be moved a long way in steps that each stay under the limit; the text drift check
+  (`anchor_threshold`) does not see quantities.
+- **Quantities play no part in search.** `FindSimilar` compares vectors, which hold text only.
 - **Truncation.** Text beyond `max_tokens` (256 by default) is ignored.
 - **No transport security or authentication** in the server itself.
 

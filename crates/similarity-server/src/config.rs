@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use serde::Deserialize;
-use similarity_core::{EmbedderOptions, FieldSpec, Policy, Schema};
+use similarity_core::{EmbedderOptions, FieldSpec, Policy, QuantitySpec, Schema};
 use similarity_store::QdrantSettings;
 
 /// The whole configuration file.
@@ -33,6 +33,10 @@ pub struct Config {
   pub policy: PolicyConfig,
   /// The record schema: field name to its settings. At least one field is required.
   pub fields: BTreeMap<String, FieldConfig>,
+  /// The record's quantities: name to its limits. Optional; a quantity is defined by naming it, even with an
+  /// empty table.
+  #[serde(default)]
+  pub quantities: BTreeMap<String, QuantityConfig>,
 }
 
 /// `[server]`
@@ -154,6 +158,10 @@ pub struct PolicyConfig {
   /// without enforcing it.
   #[serde(default)]
   pub anchor_threshold: Option<f32>,
+  /// Reject a revision that changes which measures the record is described by: a quantity that became
+  /// incomparable with its old value, or one quantity traded for another.
+  #[serde(default)]
+  pub reject_on_measure_change: bool,
 }
 
 /// `[fields.<name>]`
@@ -168,6 +176,21 @@ pub struct FieldConfig {
   /// Reject a revision whose similarity for this field alone is below this.
   #[serde(default)]
   pub reject_below: Option<f32>,
+}
+
+/// `[quantities.<name>]`
+///
+/// Both keys are optional, and with neither the quantity is compared and reported and never rejects. That is the
+/// default on purpose: a limit is a measurement, chosen from `calibrate` on labeled pairs, like a threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuantityConfig {
+  /// Reject a revision that changes this quantity by more than this factor, in either direction.
+  #[serde(default)]
+  pub reject_above_factor: Option<f64>,
+  /// Reject a revision that puts this quantity in a unit of another dimension.
+  #[serde(default)]
+  pub reject_incomparable: bool,
 }
 
 impl Config {
@@ -201,11 +224,12 @@ impl Config {
     Self::parse(&text).with_context(|| format!("invalid config file {}", path.display()))
   }
 
-  /// The record schema described by `[fields]`.
+  /// The record schema described by `[fields]` and `[quantities]`.
   ///
   /// # Errors
   ///
-  /// Returns an error if the schema is invalid (no fields, a bad name, a non-positive weight, ...).
+  /// Returns an error if the schema is invalid (no fields, a bad name, a non-positive weight, a quantity named
+  /// like a field, a factor limit below 1, ...).
   pub fn schema(&self) -> anyhow::Result<Schema> {
     let fields = self
       .fields
@@ -217,7 +241,16 @@ impl Config {
         reject_below: field.reject_below,
       })
       .collect();
-    Ok(Schema::new(fields)?)
+    let quantities = self
+      .quantities
+      .iter()
+      .map(|(name, quantity)| QuantitySpec {
+        name: name.clone(),
+        reject_above_factor: quantity.reject_above_factor,
+        reject_incomparable: quantity.reject_incomparable,
+      })
+      .collect();
+    Ok(Schema::new(fields)?.with_quantities(quantities)?)
   }
 
   /// The thresholds described by `[policy]`.
@@ -226,7 +259,9 @@ impl Config {
   ///
   /// Returns an error if a threshold lies outside the cosine range.
   pub fn policy(&self) -> anyhow::Result<Policy> {
-    Ok(Policy::new(self.policy.threshold, self.policy.anchor_threshold)?)
+    let mut policy = Policy::new(self.policy.threshold, self.policy.anchor_threshold)?;
+    policy.reject_on_measure_change = self.policy.reject_on_measure_change;
+    Ok(policy)
   }
 }
 
@@ -254,6 +289,8 @@ mod tests {
     assert_eq!(config.qdrant.collection, "records");
     assert_eq!(config.policy.anchor_threshold, None);
     assert_eq!(config.schema().unwrap().fields().len(), 1);
+    assert!(config.schema().unwrap().quantities().is_empty());
+    assert!(!config.policy().unwrap().reject_on_measure_change);
   }
 
   #[test]
@@ -264,6 +301,59 @@ mod tests {
     assert_eq!(config.model.output_dim, Some(256));
     assert!(schema.field("name").is_some_and(|field| field.required));
     assert!(config.policy().is_ok());
+
+    // The shipped quantities are report-only: nobody has measured where a limit belongs (docs/decisions.md, D16).
+    let names: Vec<&str> = schema.quantities().iter().map(|spec| spec.name.as_str()).collect();
+    assert_eq!(
+      names,
+      ["cbd_per_item", "thc_per_item", "volume_per_item", "weight_per_item"]
+    );
+    assert!(
+      schema
+        .quantities()
+        .iter()
+        .all(|spec| spec.reject_above_factor.is_none() && !spec.reject_incomparable)
+    );
+    assert!(!config.policy().unwrap().reject_on_measure_change);
+  }
+
+  #[test]
+  fn quantities_are_defined_by_naming_them_and_limited_only_when_asked() {
+    let config = Config::parse(&format!(
+      "{MINIMAL}
+      [quantities.thc_per_item]
+
+      [quantities.weight_per_item]
+      reject_above_factor = 4.0
+      reject_incomparable = true
+      "
+    ))
+    .unwrap();
+    let schema = config.schema().unwrap();
+    let thc = schema.quantity("thc_per_item").unwrap();
+    assert_eq!((thc.reject_above_factor, thc.reject_incomparable), (None, false));
+    let weight = schema.quantity("weight_per_item").unwrap();
+    assert_eq!(
+      (weight.reject_above_factor, weight.reject_incomparable),
+      (Some(4.0), true)
+    );
+
+    let strict = Config::parse(&MINIMAL.replace("threshold = 0.8", "threshold = 0.8\nreject_on_measure_change = true"));
+    assert!(strict.unwrap().policy().unwrap().reject_on_measure_change);
+  }
+
+  #[test]
+  fn invalid_quantities_are_refused_at_parse_time() {
+    let with = |table: &str| Config::parse(&format!("{MINIMAL}\n{table}"));
+    assert!(
+      with("[quantities.weight]\nreject_above_factor = 0.5").is_err(),
+      "below 1"
+    );
+    assert!(with("[quantities.name]").is_err(), "named like a text field");
+    assert!(with("[quantities.\"per item\"]").is_err(), "a space in the name");
+    let typo = with("[quantities.weight]\nreject_above = 4.0").unwrap_err();
+    assert!(format!("{typo:#}").contains("reject_above"), "{typo:#}");
+    assert!(with("[quantities.weight]\nreject_above_factor = 4.0").is_ok());
   }
 
   #[test]

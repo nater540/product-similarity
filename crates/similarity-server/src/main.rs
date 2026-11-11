@@ -19,7 +19,7 @@ use similarity_core::{Device, Embedder};
 use similarity_server::config::{Config, DeviceChoice};
 use similarity_server::engine::{Engine, store_layout};
 use similarity_server::fetch::{self, FetchRequest};
-use similarity_server::offline::{self, FieldMap, Offline};
+use similarity_server::offline::{self, Offline, RecordFields};
 use similarity_server::worker::EmbedWorker;
 use similarity_store::{MemoryStore, QdrantStore, VectorStore};
 
@@ -84,7 +84,8 @@ struct CompareArgs {
   /// The configuration file (for the model, schema, and thresholds).
   #[arg(long, short, default_value = "config.toml")]
   config: PathBuf,
-  /// The record before the change: a JSON object of field name to text.
+  /// The record before the change: a JSON object of field name to text, and quantity name to {value, unit} or
+  /// {min, max, unit}.
   before: PathBuf,
   /// The record after the change.
   after: PathBuf,
@@ -273,9 +274,14 @@ impl FetchArgs {
   }
 }
 
-fn read_fields(path: &Path) -> anyhow::Result<FieldMap> {
+fn read_fields(path: &Path) -> anyhow::Result<RecordFields> {
   let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-  serde_json::from_str(&text).with_context(|| format!("{} must be a JSON object of field name to text", path.display()))
+  serde_json::from_str(&text).with_context(|| {
+    format!(
+      "{} must be a JSON object of field name to text and quantity name to an object with a unit",
+      path.display()
+    )
+  })
 }
 
 fn offline(config_path: &Path) -> anyhow::Result<(Offline, similarity_core::Policy)> {

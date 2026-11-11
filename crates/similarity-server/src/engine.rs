@@ -14,8 +14,11 @@
 use std::hash::{BuildHasher, RandomState};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use similarity_core::quantity::first_values;
 use similarity_core::score::{self, FieldScore};
-use similarity_core::{FieldChange, Policy, PreparedRecord, RecordVectors, Schema};
+use similarity_core::{
+  FieldChange, Policy, PreparedRecord, Quantities, Quantity, QuantityChange, QuantityScore, RecordVectors, Schema,
+};
 use similarity_store::{Neighbor, SearchQuery, StoreError, StoredRecord, VectorStore};
 use tokio::sync::Mutex;
 
@@ -82,7 +85,7 @@ impl From<EmbedError> for EngineError {
 }
 
 /// A record as a caller supplies it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RecordInput {
   /// The caller's identifier, if the record has one yet.
   pub id: Option<String>,
@@ -90,6 +93,8 @@ pub struct RecordInput {
   pub tenant: Option<String>,
   /// Field name and text pairs.
   pub fields: Vec<(String, String)>,
+  /// Quantity name and value pairs.
+  pub quantities: Vec<(String, Quantity)>,
 }
 
 /// What an evaluation may do to the stored baseline.
@@ -149,6 +154,10 @@ pub struct EvaluateOutput {
   pub vector: Vec<f32>,
   /// The record's revision after this call; zero if it is not stored.
   pub revision: u64,
+  /// Per-quantity detail, when there was a baseline.
+  pub quantities: Vec<QuantityScore>,
+  /// Whether the revision changed which measures the record is described by.
+  pub measure_changed: bool,
 }
 
 impl EvaluateOutput {
@@ -164,12 +173,14 @@ impl EvaluateOutput {
       reasons: Vec::new(),
       vector,
       revision: u64::from(stored),
+      quantities: Vec::new(),
+      measure_changed: false,
     }
   }
 }
 
 /// What to search around.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SimilarTo {
   /// A stored record.
   Id(String),
@@ -211,6 +222,15 @@ pub fn store_layout(schema: &Schema, embedder: &impl TextEmbedder) -> (String, u
     schema.layout_id(embedder.fingerprint()),
     schema.composite_dimension(embedder.dimension()),
   )
+}
+
+/// A proposed revision of a stored record, embedded and validated: everything `revise` judges and may write.
+#[derive(Debug)]
+struct Revision {
+  id: String,
+  tenant: Option<String>,
+  vectors: RecordVectors,
+  quantities: Quantities,
 }
 
 /// The service's behavior.
@@ -297,7 +317,11 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
 
   fn prepare(&self, record: &RecordInput) -> Result<PreparedRecord, EngineError> {
     let fields = record.fields.iter().map(|(name, text)| (name.as_str(), text.as_str()));
-    Ok(PreparedRecord::new(&self.schema, fields)?)
+    let quantities = record
+      .quantities
+      .iter()
+      .map(|(name, quantity)| (name.as_str(), quantity.clone()));
+    Ok(PreparedRecord::new(&self.schema, fields)?.with_quantities(&self.schema, quantities)?)
   }
 
   /// Embeds a prepared record, reusing `baseline`'s vectors for fields whose text has not changed.
@@ -320,7 +344,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
   /// See [`EngineError`]. Nothing is written if an error is returned.
   pub async fn evaluate(&self, input: EvaluateInput) -> Result<EvaluateOutput, EngineError> {
     let policy = match input.threshold {
-      Some(threshold) => Policy::new(threshold, self.policy.anchor_threshold)?,
+      Some(threshold) => self.policy.with_threshold(threshold)?,
       None => self.policy,
     };
     let id = required_text("record.id", input.record.id.clone())?;
@@ -346,8 +370,15 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       .embed(&prepared, baseline.as_ref().map(|record| &record.vectors))
       .await?;
 
+    let quantities = prepared.quantities().clone();
     if let Some(baseline) = baseline {
-      return self.revise(id, tenant, input.mode, &policy, baseline, candidate).await;
+      let revision = Revision {
+        id,
+        tenant,
+        vectors: candidate,
+        quantities,
+      };
+      return self.revise(revision, input.mode, &policy, baseline).await;
     }
     let stored = input.mode != WriteMode::DryRun;
     if stored {
@@ -356,6 +387,9 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
         tenant,
         anchor: candidate.composite.clone(),
         vectors: candidate.clone(),
+        // A new record is its own point of reference, for quantities as for text.
+        anchor_quantities: quantities.clone(),
+        quantities,
         revision: 1,
         updated_at: now(),
       };
@@ -372,14 +406,18 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
   /// Judges `candidate` against `baseline` and writes it back if the policy and the mode allow.
   async fn revise(
     &self,
-    id: String,
-    tenant: Option<String>,
+    candidate: Revision,
     mode: WriteMode,
     policy: &Policy,
     baseline: StoredRecord,
-    candidate: RecordVectors,
   ) -> Result<EvaluateOutput, EngineError> {
-    let evaluation = score::evaluate(
+    let Revision {
+      id,
+      tenant,
+      vectors: candidate,
+      quantities,
+    } = candidate;
+    let mut evaluation = score::evaluate(
       &self.schema,
       policy,
       self.embedder.dimension(),
@@ -387,12 +425,23 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       Some(&baseline.anchor),
       &candidate,
     )?;
+    evaluation.judge_quantities(
+      &self.schema,
+      policy,
+      &baseline.quantities,
+      &baseline.anchor_quantities,
+      &quantities,
+    );
     let accepted = evaluation.accepted();
     // Re-submitting exactly what is stored is common (a save with no edits, a retried request) and must not churn
-    // the store or the revision counter.
+    // the store or the revision counter. A quantity rewritten in another unit (`1 g` as `1000 mg`) is the same
+    // quantity, as text re-saved with different whitespace is the same text. Any other difference in the
+    // quantities is a change to the record, even when no text moved, and has to be written.
     let unchanged = |field: &FieldScore| field.change == FieldChange::Unchanged;
+    let same_amount = |quantity: &QuantityScore| quantity.change == QuantityChange::Unchanged;
     let identical = evaluation.comparison.fields.iter().all(unchanged)
       && candidate.hashes == baseline.vectors.hashes
+      && evaluation.quantities.iter().all(same_amount)
       && tenant == baseline.tenant;
     let write = match mode {
       WriteMode::DryRun => false,
@@ -406,21 +455,24 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       // A forced write is a reviewer saying "this is the record now", so it also becomes the point of reference
       // for drift. Every other write leaves the anchor's values where they were, and only lets it take the first
       // value of a field it has never had one for.
-      let anchor = if mode == WriteMode::Force {
-        candidate.composite.clone()
+      let (anchor, anchor_quantities) = if mode == WriteMode::Force {
+        (candidate.composite.clone(), quantities.clone())
       } else {
-        score::extend_anchor(
+        let anchor = score::extend_anchor(
           &self.schema,
           self.embedder.dimension(),
           &baseline.anchor,
           &candidate.composite,
-        )?
+        )?;
+        (anchor, first_values(&baseline.anchor_quantities, &quantities))
       };
       let record = StoredRecord {
         id,
         tenant,
         anchor,
         vectors: candidate.clone(),
+        quantities,
+        anchor_quantities,
         revision,
         updated_at: now(),
       };
@@ -437,6 +489,8 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       reasons: evaluation.reasons.iter().map(ToString::to_string).collect(),
       vector: candidate.composite,
       revision,
+      quantities: evaluation.quantities,
+      measure_changed: evaluation.measure_changed,
     })
   }
 
@@ -514,7 +568,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
 mod tests {
   use std::sync::Arc;
 
-  use similarity_core::FieldSpec;
+  use similarity_core::{FieldSpec, QuantitySpec};
   use similarity_store::MemoryStore;
 
   use super::*;
@@ -538,9 +592,56 @@ mod tests {
   }
 
   fn engine_with(policy: Policy) -> TestEngine {
+    engine_over(schema(), policy)
+  }
+
+  fn engine_over(schema: Schema, policy: Policy) -> TestEngine {
     let embedder = WordBagEmbedder::new("word-bag-v1");
-    let (layout, dimension) = store_layout(&schema(), &embedder);
-    Engine::new(MemoryStore::new(layout, dimension), embedder, schema(), policy)
+    let (layout, dimension) = store_layout(&schema, &embedder);
+    Engine::new(MemoryStore::new(layout, dimension), embedder, schema, policy)
+  }
+
+  /// The usual schema plus three quantities, each with the limits given: `(factor limit, reject incomparable)`.
+  fn measured_schema(limits: (Option<f64>, bool)) -> Schema {
+    let quantity = |name: &str| QuantitySpec {
+      name: name.to_owned(),
+      reject_above_factor: limits.0,
+      reject_incomparable: limits.1,
+    };
+    schema()
+      .with_quantities(vec![quantity("weight"), quantity("volume"), quantity("thc")])
+      .unwrap()
+  }
+
+  /// An engine whose quantities are compared and reported and never reject: the shipped default.
+  fn measuring_engine() -> TestEngine {
+    engine_over(measured_schema((None, false)), Policy::new(0.75, None).unwrap())
+  }
+
+  fn grams(value: f64) -> Quantity {
+    Quantity::single(value, "g")
+  }
+
+  fn percent(min: f64, max: f64) -> Quantity {
+    Quantity::range(min, max, "%")
+  }
+
+  /// The gummies under id `p1`, with these quantities.
+  fn measured(quantities: &[(&str, Quantity)]) -> EvaluateInput {
+    EvaluateInput {
+      record: RecordInput {
+        quantities: quantities
+          .iter()
+          .map(|(name, value)| ((*name).to_owned(), value.clone()))
+          .collect(),
+        ..record(Some("p1"), &GUMMIES)
+      },
+      ..EvaluateInput::default()
+    }
+  }
+
+  fn quantity<'a>(output: &'a EvaluateOutput, name: &str) -> &'a QuantityScore {
+    output.quantities.iter().find(|score| score.field == name).unwrap()
   }
 
   fn engine() -> TestEngine {
@@ -555,6 +656,7 @@ mod tests {
         .iter()
         .map(|(name, text)| ((*name).to_owned(), (*text).to_owned()))
         .collect(),
+      quantities: Vec::new(),
     }
   }
 
@@ -1040,6 +1142,324 @@ mod tests {
     assert!(field.similarity.unwrap() < 0.01, "{field:?}");
     // (4 + 1*0) / 5: the name carries it over this engine's 0.75 threshold, and the score says what happened.
     assert!((refilled.similarity.unwrap() - 0.8).abs() < 1e-4);
+  }
+
+  #[tokio::test]
+  async fn a_change_in_a_quantity_alone_is_stored_and_bumps_the_revision() {
+    let engine = measuring_engine();
+    let created = engine
+      .evaluate(measured(&[("weight", grams(3.5)), ("thc", percent(18.0, 22.0))]))
+      .await
+      .unwrap();
+    assert_eq!((created.verdict, created.revision), (Verdict::Created, 1));
+    assert!(created.quantities.is_empty(), "nothing to compare a new record with");
+    let record = stored(&engine, "p1").await.unwrap();
+    assert_eq!(record.quantities["weight"], grams(3.5));
+    assert_eq!(
+      record.anchor_quantities, record.quantities,
+      "a new record is its own anchor"
+    );
+
+    // Eight times the weight and not a word of text changed. Report-only, so it is accepted; and written.
+    let resized = engine
+      .evaluate(measured(&[("weight", grams(28.0)), ("thc", percent(18.0, 22.0))]))
+      .await
+      .unwrap();
+    assert_eq!(resized.verdict, Verdict::Accepted);
+    assert!(resized.stored && resized.reasons.is_empty());
+    assert_eq!(resized.revision, 2);
+    assert!((resized.similarity.unwrap() - 1.0).abs() < f32::EPSILON);
+    let weight = quantity(&resized, "weight");
+    assert_eq!(weight.change, QuantityChange::Modified);
+    assert!((weight.factor.unwrap() - 8.0).abs() < 1e-9);
+    assert!(!weight.beyond_limit && !resized.measure_changed);
+    assert_eq!(quantity(&resized, "thc").change, QuantityChange::Unchanged);
+
+    let record = stored(&engine, "p1").await.unwrap();
+    assert_eq!(record.quantities["weight"], grams(28.0), "the baseline moved");
+    assert_eq!(
+      record.anchor_quantities["weight"],
+      grams(3.5),
+      "the anchor keeps the first value"
+    );
+    assert_eq!(engine.embedder.embedded(), 3, "and no text was embedded for it");
+  }
+
+  #[tokio::test]
+  async fn resubmitting_the_same_quantities_is_not_a_write_even_in_other_units() {
+    let engine = measuring_engine();
+    let original = [("weight", grams(1.0)), ("thc", percent(18.0, 22.0))];
+    engine.evaluate(measured(&original)).await.unwrap();
+    let before = stored(&engine, "p1").await.unwrap();
+
+    for same in [
+      original.clone(),
+      [("weight", Quantity::single(1000.0, "mg")), ("thc", percent(18.0, 22.0))],
+      [
+        ("weight", Quantity::single(1.0, " G ")),
+        ("thc", Quantity::range(18.0, 22.0, "percent")),
+      ],
+    ] {
+      let output = engine.evaluate(measured(&same)).await.unwrap();
+      assert_eq!(output.verdict, Verdict::Accepted);
+      assert!(!output.stored, "{same:?}");
+      assert_eq!(output.revision, 1);
+      assert_eq!(quantity(&output, "weight").change, QuantityChange::Unchanged);
+      assert_eq!(quantity(&output, "weight").factor, Some(1.0));
+    }
+    assert_eq!(stored(&engine, "p1").await.unwrap(), before);
+  }
+
+  #[tokio::test]
+  async fn a_quantity_cannot_be_swapped_by_removing_it_and_filling_it_in_again() {
+    let engine = measuring_engine();
+    engine.evaluate(measured(&[("weight", grams(3.5))])).await.unwrap();
+
+    // Step one: the weight goes away. Reported, accepted, written.
+    let removed = engine.evaluate(measured(&[])).await.unwrap();
+    assert_eq!(quantity(&removed, "weight").change, QuantityChange::Removed);
+    assert!(removed.stored && !removed.measure_changed);
+    let record = stored(&engine, "p1").await.unwrap();
+    assert!(record.quantities.is_empty());
+    assert_eq!(
+      record.anchor_quantities["weight"],
+      grams(3.5),
+      "the anchor remembers what it was"
+    );
+
+    // Step two: another weight arrives. It is compared with the weight the record started with, exactly as if it
+    // had been changed in one step.
+    let refilled = engine.evaluate(measured(&[("weight", grams(28.0))])).await.unwrap();
+    let weight = quantity(&refilled, "weight");
+    assert_eq!(weight.change, QuantityChange::Restored);
+    assert!((weight.factor.unwrap() - 8.0).abs() < 1e-9);
+    assert_eq!(weight.previous_unit.as_deref(), Some("g"));
+    assert_eq!(
+      stored(&engine, "p1").await.unwrap().anchor_quantities["weight"],
+      grams(3.5),
+      "an accepted write never replaces a value the anchor holds"
+    );
+
+    // With a limit, the two-step swap is rejected at the second step, as the one-step swap would be.
+    let strict = engine_over(measured_schema((Some(4.0), false)), Policy::new(0.75, None).unwrap());
+    strict.evaluate(measured(&[("weight", grams(3.5))])).await.unwrap();
+    assert_eq!(strict.evaluate(measured(&[])).await.unwrap().verdict, Verdict::Accepted);
+    let before = stored(&strict, "p1").await.unwrap();
+    let refilled = strict.evaluate(measured(&[("weight", grams(28.0))])).await.unwrap();
+    assert_eq!(refilled.verdict, Verdict::Rejected);
+    assert!(quantity(&refilled, "weight").beyond_limit);
+    assert_eq!(stored(&strict, "p1").await.unwrap(), before);
+    // Putting the original weight back is not a change at all.
+    let restored = strict.evaluate(measured(&[("weight", grams(3.5))])).await.unwrap();
+    assert_eq!(restored.verdict, Verdict::Accepted);
+    assert_eq!(quantity(&restored, "weight").factor, Some(1.0));
+  }
+
+  #[tokio::test]
+  async fn a_quantity_beyond_its_limit_is_rejected_and_nothing_is_written() {
+    let engine = engine_over(measured_schema((Some(4.0), true)), Policy::new(0.75, None).unwrap());
+    engine
+      .evaluate(measured(&[("weight", grams(3.5)), ("thc", percent(18.0, 22.0))]))
+      .await
+      .unwrap();
+    let before = stored(&engine, "p1").await.unwrap();
+
+    let resized = engine
+      .evaluate(measured(&[("weight", grams(28.0)), ("thc", percent(18.0, 22.0))]))
+      .await
+      .unwrap();
+    assert_eq!(resized.verdict, Verdict::Rejected);
+    assert!(!resized.stored);
+    assert_eq!(resized.revision, 1);
+    assert!(
+      (resized.similarity.unwrap() - 1.0).abs() < f32::EPSILON,
+      "the text is identical"
+    );
+    assert_eq!(resized.reasons.len(), 1);
+    assert!(
+      resized.reasons[0].contains("`weight`") && resized.reasons[0].contains("factor of 8.00"),
+      "{:?}",
+      resized.reasons
+    );
+    assert!(quantity(&resized, "weight").beyond_limit);
+    assert!(!quantity(&resized, "thc").beyond_limit);
+
+    // A potency in milligrams is not a bigger or smaller percentage.
+    let other_kind = engine
+      .evaluate(measured(&[
+        ("weight", grams(3.5)),
+        ("thc", Quantity::single(100.0, "mg")),
+      ]))
+      .await
+      .unwrap();
+    assert_eq!(other_kind.verdict, Verdict::Rejected);
+    assert_eq!(quantity(&other_kind, "thc").change, QuantityChange::Incomparable);
+    assert!(
+      other_kind.reasons[0].contains("`%` to `mg`"),
+      "{:?}",
+      other_kind.reasons
+    );
+    assert!(other_kind.measure_changed);
+
+    assert_eq!(stored(&engine, "p1").await.unwrap(), before, "a rejection never writes");
+
+    // Within the limits, an edit goes through: a routine batch update.
+    let batch = engine
+      .evaluate(measured(&[("weight", grams(3.5)), ("thc", percent(19.0, 23.0))]))
+      .await
+      .unwrap();
+    assert_eq!(batch.verdict, Verdict::Accepted);
+    assert!(batch.stored);
+  }
+
+  #[tokio::test]
+  async fn a_change_of_measure_is_reported_and_rejects_only_under_a_policy_that_says_so() {
+    let flower = [("weight", grams(3.5)), ("thc", percent(18.0, 22.0))];
+    let beverage = [("volume", Quantity::single(355.0, "ml")), ("thc", percent(18.0, 22.0))];
+
+    let lenient = measuring_engine();
+    lenient.evaluate(measured(&flower)).await.unwrap();
+    // Filling in a quantity the record never had is not a change of measure.
+    let filled = lenient
+      .evaluate(measured(&[flower[0].clone(), flower[1].clone(), beverage[0].clone()]))
+      .await
+      .unwrap();
+    assert_eq!(quantity(&filled, "volume").change, QuantityChange::Added);
+    assert!(!filled.measure_changed);
+
+    let lenient = measuring_engine();
+    lenient.evaluate(measured(&flower)).await.unwrap();
+    let traded = lenient.evaluate(measured(&beverage)).await.unwrap();
+    assert!(traded.measure_changed);
+    assert_eq!(traded.verdict, Verdict::Accepted, "reported, not enforced");
+    assert!(traded.stored);
+
+    let mut policy = Policy::new(0.75, None).unwrap();
+    policy.reject_on_measure_change = true;
+    let strict = engine_over(measured_schema((None, false)), policy);
+    strict.evaluate(measured(&flower)).await.unwrap();
+    let before = stored(&strict, "p1").await.unwrap();
+    let traded = strict.evaluate(measured(&beverage)).await.unwrap();
+    assert_eq!(traded.verdict, Verdict::Rejected);
+    assert!(traded.measure_changed && !traded.stored);
+    assert!(traded.reasons[0].contains("measures"), "{:?}", traded.reasons);
+    assert_eq!(stored(&strict, "p1").await.unwrap(), before);
+
+    // A request that overrides the threshold is still held to the rest of the policy.
+    let overridden = EvaluateInput {
+      threshold: Some(0.1),
+      ..measured(&beverage)
+    };
+    assert_eq!(strict.evaluate(overridden).await.unwrap().verdict, Verdict::Rejected);
+  }
+
+  #[tokio::test]
+  async fn force_resets_the_anchors_quantities_and_a_dry_run_writes_none() {
+    let engine = engine_over(measured_schema((Some(4.0), false)), Policy::new(0.75, None).unwrap());
+    engine.evaluate(measured(&[("weight", grams(3.5))])).await.unwrap();
+    let before = stored(&engine, "p1").await.unwrap();
+
+    let preview = EvaluateInput {
+      mode: WriteMode::DryRun,
+      ..measured(&[("weight", grams(7.0))])
+    };
+    let previewed = engine.evaluate(preview).await.unwrap();
+    assert_eq!((previewed.verdict, previewed.stored), (Verdict::Accepted, false));
+    assert_eq!(stored(&engine, "p1").await.unwrap(), before);
+
+    let forced = EvaluateInput {
+      mode: WriteMode::Force,
+      ..measured(&[("weight", grams(28.0))])
+    };
+    let output = engine.evaluate(forced).await.unwrap();
+    assert_eq!(
+      (output.verdict, output.stored),
+      (Verdict::Rejected, true),
+      "the verdict is still reported honestly"
+    );
+    let record = stored(&engine, "p1").await.unwrap();
+    assert_eq!(record.quantities["weight"], grams(28.0));
+    assert_eq!(
+      record.anchor_quantities["weight"],
+      grams(28.0),
+      "a reviewer's override is the new point of reference"
+    );
+
+    // So a later blank-and-refill is measured from the forced value, not from the one before it.
+    engine.evaluate(measured(&[])).await.unwrap();
+    let refilled = engine.evaluate(measured(&[("weight", grams(14.0))])).await.unwrap();
+    assert_eq!(quantity(&refilled, "weight").change, QuantityChange::Restored);
+    assert!((quantity(&refilled, "weight").factor.unwrap() - 2.0).abs() < 1e-9);
+  }
+
+  #[tokio::test]
+  async fn a_record_stored_before_quantities_existed_reports_them_as_added() {
+    let old = engine();
+    old.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
+    assert!(stored(&old, "p1").await.unwrap().quantities.is_empty());
+
+    // The same store under a schema that has gained quantities: the layout id is the same, so nothing needs
+    // re-indexing and the record is readable as it is.
+    let embedder = WordBagEmbedder::new("word-bag-v1");
+    let schema = measured_schema((Some(4.0), true));
+    let (layout, dimension) = store_layout(&schema, &embedder);
+    assert_eq!(layout, store_layout(&self::schema(), &embedder).0);
+    let upgraded = Engine::new(old.store.reopened(layout, dimension), embedder, schema, old.policy);
+
+    let output = upgraded.evaluate(measured(&[("weight", grams(3.5))])).await.unwrap();
+    assert_eq!(output.verdict, Verdict::Accepted, "{:?}", output.reasons);
+    assert_eq!(quantity(&output, "weight").change, QuantityChange::Added);
+    assert!(output.stored && !output.measure_changed);
+    let record = stored(&upgraded, "p1").await.unwrap();
+    assert_eq!(record.quantities["weight"], grams(3.5));
+    assert_eq!(
+      record.anchor_quantities["weight"],
+      grams(3.5),
+      "the anchor takes the first value"
+    );
+  }
+
+  #[tokio::test]
+  async fn quantities_are_validated_wherever_a_record_is_given() {
+    let engine = measuring_engine();
+    let invalid = [
+      measured(&[("height", grams(1.0))]),
+      measured(&[("weight", grams(-1.0))]),
+      measured(&[("weight", grams(f64::NAN))]),
+      measured(&[("weight", Quantity::range(5.0, 1.0, "g"))]),
+      measured(&[("weight", Quantity::single(1.0, " "))]),
+      measured(&[("name", grams(1.0))]),
+      measured(&[("weight", grams(1.0)), ("weight", grams(2.0))]),
+    ];
+    for input in invalid {
+      let shown = format!("{input:?}");
+      assert!(
+        matches!(engine.evaluate(input).await, Err(EngineError::InvalidArgument(_))),
+        "{shown}"
+      );
+    }
+    assert_eq!(stored(&engine, "p1").await, None);
+    assert_eq!(engine.embedder.embedded(), 0, "invalid records never reach the model");
+
+    // An engine without quantities refuses them rather than dropping them silently.
+    let refused = self::engine().evaluate(measured(&[("weight", grams(1.0))])).await;
+    assert!(matches!(refused, Err(EngineError::InvalidArgument(message)) if message.contains("no quantities")));
+
+    // A search validates the record it is given, and then ignores the quantities: it compares vectors.
+    let mut search = similar_to_record(&GUMMIES);
+    search.query = SimilarTo::Record(measured(&[("height", grams(1.0))]).record);
+    assert!(matches!(
+      engine.find_similar(search).await,
+      Err(EngineError::InvalidArgument(_))
+    ));
+    engine.evaluate(measured(&[("weight", grams(3.5))])).await.unwrap();
+    let mut search = similar_to_record(&GUMMIES);
+    search.query = SimilarTo::Record(RecordInput {
+      id: None,
+      ..measured(&[("weight", grams(500.0))]).record
+    });
+    let neighbors = engine.find_similar(search).await.unwrap();
+    assert!((neighbors[0].similarity - 1.0).abs() < 1e-5);
   }
 
   #[tokio::test]

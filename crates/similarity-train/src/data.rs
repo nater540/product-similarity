@@ -81,6 +81,10 @@ struct GroupLine {
 }
 
 /// A field's text in the form the server embeds it: whitespace collapsed, `None` if absent, blank, or not a string.
+///
+/// "Not a string" is what keeps a record's quantities out of training. They are objects (`{"value": 3.5, "unit":
+/// "g"}`), the server compares them as numbers and never embeds them (docs/decisions.md, D16), and so there is
+/// nothing about them for the encoder to learn.
 fn field_text(record: &BTreeMap<String, Value>, field: &str) -> Option<String> {
   record.get(field).and_then(Value::as_str).and_then(normalize_text)
 }
@@ -400,6 +404,40 @@ mod tests {
       }]
     );
     assert_eq!((found.edits(), found.recycles()), (0, 1));
+  }
+
+  #[test]
+  fn a_records_quantities_are_never_training_text() {
+    let jsonl = concat!(
+      r#"{"label": "recycle", "before": {"name": "Blue Dream 3.5g", "weight_per_item": {"value": 3.5, "unit": "g"}, "#,
+      r#""thc_per_item": {"min": 18, "max": 22, "unit": "%"}}, "#,
+      r#""after": {"name": "Blue Dream 28g", "weight_per_item": {"value": 28, "unit": "g"}, "#,
+      r#""thc_per_item": {"min": 19, "max": 23, "unit": "%"}}}"#
+    );
+    // Even when a quantity is asked for by name, as a mistaken `--fields` would.
+    let found = pair_examples(
+      jsonl,
+      origin(),
+      &fields(&["name", "weight_per_item", "thc_per_item"]),
+      Split::Training("calibrate"),
+    )
+    .unwrap();
+    assert_eq!(
+      found.examples,
+      [PairExample {
+        before: "Blue Dream 3.5g".to_owned(),
+        after: "Blue Dream 28g".to_owned(),
+        same: false
+      }]
+    );
+
+    let groups = concat!(
+      r#"{"catalog": {"name": "Blue Dream", "weight_per_item": {"value": 3.5, "unit": "g"}}, "#,
+      r#""listings": [{"name": "Blue Dream Eighth", "weight_per_item": {"value": 0.125, "unit": "oz"}}]}"#
+    );
+    let found = group_examples(groups, origin(), &fields(&["name", "weight_per_item"])).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].listing, "Blue Dream Eighth");
   }
 
   #[test]

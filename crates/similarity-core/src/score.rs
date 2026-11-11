@@ -15,10 +15,16 @@
 //! baseline, and leaving it out of the score entirely would let a field be replaced in two steps: blank it, then
 //! fill it with something else. So a field that comes back is scored against the value it had in the anchor
 //! ([`FieldChange::Restored`]). Only a field the record has never had a value for is taken on trust.
+//!
+//! A record's **quantities** (see [`crate::quantity`]) are judged beside all of this and never inside it. They do
+//! not enter the weighted mean, so the thresholds above mean the same with or without them. Each is compared as a
+//! number and reported; it rejects only where the schema sets a limit for it, or the policy asks for a change of
+//! measure to reject ([`Evaluation::judge_quantities`]).
 
 use std::fmt;
 
 use crate::error::{Error, Result};
+use crate::quantity::{self, Quantities, QuantityChange, QuantityScore};
 use crate::record::RecordVectors;
 use crate::schema::Schema;
 use crate::vector::{cosine, normalize};
@@ -213,6 +219,9 @@ pub struct Policy {
   pub threshold: f32,
   /// If set, a revision whose overall similarity to the anchor is below this is rejected.
   pub anchor_threshold: Option<f32>,
+  /// Reject a revision that changes which measures the record is described by (see
+  /// [`Evaluation::measure_changed`]). Off unless switched on, like every quantity check.
+  pub reject_on_measure_change: bool,
 }
 
 impl Policy {
@@ -234,6 +243,19 @@ impl Policy {
     Ok(Self {
       threshold,
       anchor_threshold,
+      reject_on_measure_change: false,
+    })
+  }
+
+  /// The same policy with another overall threshold, for a request that overrides the configured one.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`Error::Schema`] if the threshold lies outside the cosine range `[-1, 1]`.
+  pub fn with_threshold(self, threshold: f32) -> Result<Self> {
+    Ok(Self {
+      threshold: Self::new(threshold, self.anchor_threshold)?.threshold,
+      ..self
     })
   }
 }
@@ -264,6 +286,26 @@ pub enum Reason {
     /// The threshold it fell below.
     threshold: f32,
   },
+  /// One quantity changed by more than its own limit.
+  QuantityBeyondFactor {
+    /// The quantity.
+    field: String,
+    /// The factor it changed by, or `None` if it moved between zero and a value above zero, where there is none.
+    factor: Option<f64>,
+    /// The limit it exceeded.
+    limit: f64,
+  },
+  /// One quantity is now in a unit that cannot be compared with the one it had, and its schema entry forbids that.
+  QuantityIncomparable {
+    /// The quantity.
+    field: String,
+    /// The unit it had.
+    previous_unit: String,
+    /// The unit it has now.
+    unit: String,
+  },
+  /// The measures the record is described by changed, and the policy forbids that.
+  MeasureChanged,
 }
 
 impl fmt::Display for Reason {
@@ -291,6 +333,39 @@ impl fmt::Display for Reason {
           "similarity to the original record {similarity:.3} is below the drift threshold {threshold:.3}"
         )
       }
+      Self::QuantityBeyondFactor {
+        field,
+        factor: Some(factor),
+        limit,
+      } => {
+        write!(
+          f,
+          "quantity `{field}` changed by a factor of {factor:.2}, above its limit {limit:.2}"
+        )
+      }
+      Self::QuantityBeyondFactor {
+        field,
+        factor: None,
+        limit,
+      } => {
+        write!(
+          f,
+          "quantity `{field}` moved between zero and a value above zero, which no factor limit ({limit:.2}) allows"
+        )
+      }
+      Self::QuantityIncomparable {
+        field,
+        previous_unit,
+        unit,
+      } => {
+        write!(
+          f,
+          "quantity `{field}` went from `{previous_unit}` to `{unit}`, which cannot be compared"
+        )
+      }
+      Self::MeasureChanged => {
+        write!(f, "the measures the record is described by changed")
+      }
     }
   }
 }
@@ -304,12 +379,74 @@ pub struct Evaluation {
   pub anchor_similarity: Option<f32>,
   /// Why the revision is rejected; empty means accepted.
   pub reasons: Vec<Reason>,
+  /// One entry per quantity that either side has a value for, in schema order. Empty until
+  /// [`Self::judge_quantities`] is called, and for a record without quantities.
+  pub quantities: Vec<QuantityScore>,
+  /// Whether the revision changed which measures the record is described by: a quantity moved to a unit of
+  /// another dimension (a potency in `%` became one in `mg`), or one quantity went away as a different one
+  /// arrived (a weight for a volume). Filling in a quantity that was simply missing does not count.
+  pub measure_changed: bool,
 }
 
 impl Evaluation {
   /// Whether the revision passed every check.
   pub fn accepted(&self) -> bool {
     self.reasons.is_empty()
+  }
+
+  /// Compares the quantities of the two versions, records the result, and adds a reason for each configured limit
+  /// that is exceeded.
+  ///
+  /// `anchor` holds the first value the record had for each quantity (see [`quantity::first_values`]); pass an
+  /// empty map when there is none. Quantities the schema does not define are ignored: the caller has validated
+  /// the candidate, and a stored value whose quantity was since removed from the configuration has nothing to be
+  /// judged by.
+  ///
+  /// This never touches the similarity scores. With no limit configured it adds no reason either, so calling it
+  /// can only reject where someone has asked for that.
+  pub fn judge_quantities(
+    &mut self,
+    schema: &Schema,
+    policy: &Policy,
+    baseline: &Quantities,
+    anchor: &Quantities,
+    candidate: &Quantities,
+  ) {
+    let mut scores = Vec::new();
+    for spec in schema.quantities() {
+      let name = spec.name.as_str();
+      let Some(mut score) = quantity::compare(name, baseline.get(name), anchor.get(name), candidate.get(name)) else {
+        continue;
+      };
+      if let Some(limit) = spec.reject_above_factor
+        && (score.zero_crossing || score.factor.is_some_and(|factor| factor > limit))
+      {
+        score.beyond_limit = true;
+        self.reasons.push(Reason::QuantityBeyondFactor {
+          field: score.field.clone(),
+          factor: score.factor,
+          limit,
+        });
+      }
+      if spec.reject_incomparable && score.incomparable {
+        score.beyond_limit = true;
+        self.reasons.push(Reason::QuantityIncomparable {
+          field: score.field.clone(),
+          previous_unit: score.previous_unit.clone().unwrap_or_default(),
+          unit: score.unit.clone().unwrap_or_default(),
+        });
+      }
+      scores.push(score);
+    }
+
+    let any = |wanted: &[QuantityChange]| scores.iter().any(|score| wanted.contains(&score.change));
+    // Two different quantities are needed for the second case, and they necessarily are: one name has one change.
+    self.measure_changed = scores.iter().any(|score| score.incomparable)
+      || (any(&[QuantityChange::Removed]) && any(&[QuantityChange::Added, QuantityChange::Restored]));
+    if self.measure_changed && policy.reject_on_measure_change {
+      self.reasons.push(Reason::MeasureChanged);
+    }
+    self.quantities = scores;
   }
 }
 
@@ -318,6 +455,9 @@ impl Evaluation {
 /// `anchor` is the composite of the record as first stored, if the caller tracks one (see [`extend_anchor`]). Its
 /// overall similarity is always reported when supplied, and only enforced when the policy sets an
 /// `anchor_threshold`. Independently of that setting, a field the baseline lacks is scored against it.
+///
+/// Quantities are not looked at here. A caller whose records have them follows this with
+/// [`Evaluation::judge_quantities`].
 ///
 /// # Errors
 ///
@@ -365,6 +505,8 @@ pub fn evaluate(
     comparison,
     anchor_similarity,
     reasons,
+    quantities: Vec::new(),
+    measure_changed: false,
   })
 }
 
@@ -373,8 +515,9 @@ mod tests {
   use std::collections::BTreeMap;
 
   use super::*;
-  use crate::schema::FieldSpec;
-  use crate::schema::testing::product_schema;
+  use crate::quantity::Quantity;
+  use crate::schema::testing::{product_schema, quantity as spec};
+  use crate::schema::{FieldSpec, QuantitySpec};
   use crate::vector::normalize;
 
   const DIM: usize = 2;
@@ -627,6 +770,287 @@ mod tests {
     assert!(Policy::new(0.8, Some(-3.0)).is_err());
     assert!(Policy::new(f32::NAN, None).is_err());
     assert!(Policy::new(-1.0, Some(1.0)).is_ok());
+  }
+
+  #[test]
+  fn overriding_the_threshold_keeps_the_rest_of_the_policy() {
+    let mut policy = Policy::new(0.8, Some(0.6)).unwrap();
+    policy.reject_on_measure_change = true;
+    let overridden = policy.with_threshold(0.95).unwrap();
+    assert!((overridden.threshold - 0.95).abs() < f32::EPSILON);
+    assert_eq!(overridden.anchor_threshold, Some(0.6));
+    assert!(overridden.reject_on_measure_change);
+    assert!(policy.with_threshold(7.0).is_err());
+  }
+
+  fn quantities(entries: &[(&str, Quantity)]) -> Quantities {
+    entries
+      .iter()
+      .map(|(name, value)| ((*name).to_owned(), value.clone()))
+      .collect()
+  }
+
+  /// An accepted, text-identical evaluation with the quantities judged: whatever it reports came from them.
+  fn judged(
+    schema: &Schema,
+    policy: &Policy,
+    before: &Quantities,
+    anchor: &Quantities,
+    after: &Quantities,
+  ) -> Evaluation {
+    let stored = record(schema, &[("name", 0.0, "n")]);
+    let mut evaluation = evaluate(schema, policy, DIM, &stored, None, &stored.clone()).unwrap();
+    assert!(evaluation.accepted());
+    evaluation.judge_quantities(schema, policy, before, anchor, after);
+    evaluation
+  }
+
+  fn measured_schema(specs: Vec<QuantitySpec>) -> Schema {
+    product_schema().with_quantities(specs).unwrap()
+  }
+
+  fn grams(value: f64) -> Quantity {
+    Quantity::single(value, "g")
+  }
+
+  #[test]
+  fn a_quantity_is_reported_and_rejects_nothing_until_a_limit_is_set() {
+    let schema = measured_schema(vec![spec("weight")]);
+    let policy = Policy::new(0.8, None).unwrap();
+    let before = quantities(&[("weight", grams(1.0))]);
+    let after = quantities(&[("weight", grams(100.0))]);
+
+    let evaluation = judged(&schema, &policy, &before, &Quantities::new(), &after);
+    assert!(evaluation.accepted(), "{:?}", evaluation.reasons);
+    let [weight] = evaluation.quantities.as_slice() else {
+      panic!("one quantity expected: {:?}", evaluation.quantities)
+    };
+    assert_eq!(weight.change, QuantityChange::Modified);
+    assert!((weight.factor.unwrap() - 100.0).abs() < 1e-9);
+    assert!(!weight.beyond_limit && !evaluation.measure_changed);
+    assert!(
+      (evaluation.comparison.similarity - 1.0).abs() < f32::EPSILON,
+      "a quantity never moves the similarity"
+    );
+  }
+
+  #[test]
+  fn a_factor_limit_rejects_what_exceeds_it_and_nothing_else() {
+    let limited = QuantitySpec {
+      reject_above_factor: Some(4.0),
+      ..spec("weight")
+    };
+    let schema = measured_schema(vec![limited]);
+    let policy = Policy::new(0.8, None).unwrap();
+    let before = quantities(&[("weight", grams(3.5))]);
+    let judge = |after: Quantity| {
+      judged(
+        &schema,
+        &policy,
+        &before,
+        &Quantities::new(),
+        &quantities(&[("weight", after)]),
+      )
+    };
+
+    let eightfold = judge(grams(28.0));
+    assert!(
+      matches!(
+        eightfold.reasons.as_slice(),
+        [Reason::QuantityBeyondFactor { field, factor: Some(factor), limit }]
+          if field == "weight" && (*factor - 8.0).abs() < 1e-9 && (*limit - 4.0).abs() < 1e-9
+      ),
+      "{:?}",
+      eightfold.reasons
+    );
+    assert!(eightfold.quantities[0].beyond_limit);
+    assert!(eightfold.reasons[0].to_string().contains("factor of 8.00"));
+
+    assert!(judge(grams(14.0)).accepted(), "exactly at the limit is within it");
+    assert!(judge(grams(7.0)).accepted());
+    assert!(
+      judge(Quantity::single(3500.0, "mg")).accepted(),
+      "a unit rewrite is no change"
+    );
+
+    // Zero to something has no factor, and so is beyond every limit.
+    let from_nothing = judged(
+      &schema,
+      &policy,
+      &quantities(&[("weight", grams(0.0))]),
+      &Quantities::new(),
+      &quantities(&[("weight", grams(1.0))]),
+    );
+    assert!(
+      matches!(
+        from_nothing.reasons.as_slice(),
+        [Reason::QuantityBeyondFactor { factor: None, .. }]
+      ),
+      "{:?}",
+      from_nothing.reasons
+    );
+    assert!(from_nothing.reasons[0].to_string().contains("zero"));
+
+    // A change of dimension has no factor either, but is a different check with its own switch.
+    assert!(judge(Quantity::single(355.0, "ml")).accepted());
+  }
+
+  #[test]
+  fn an_incomparable_quantity_rejects_only_when_its_schema_entry_says_so() {
+    let policy = Policy::new(0.8, None).unwrap();
+    let before = quantities(&[("thc", Quantity::single(22.0, "%"))]);
+    let after = quantities(&[("thc", Quantity::single(22.0, "mg"))]);
+
+    let lenient = judged(
+      &measured_schema(vec![spec("thc")]),
+      &policy,
+      &before,
+      &Quantities::new(),
+      &after,
+    );
+    assert!(lenient.accepted());
+    assert_eq!(lenient.quantities[0].change, QuantityChange::Incomparable);
+    assert!(lenient.measure_changed, "reported either way");
+
+    let strict_spec = QuantitySpec {
+      reject_incomparable: true,
+      ..spec("thc")
+    };
+    let strict = judged(
+      &measured_schema(vec![strict_spec]),
+      &policy,
+      &before,
+      &Quantities::new(),
+      &after,
+    );
+    assert!(
+      matches!(
+        strict.reasons.as_slice(),
+        [Reason::QuantityIncomparable { field, previous_unit, unit }]
+          if field == "thc" && previous_unit == "%" && unit == "mg"
+      ),
+      "{:?}",
+      strict.reasons
+    );
+    assert!(strict.quantities[0].beyond_limit);
+    assert!(strict.reasons[0].to_string().contains("`%` to `mg`"));
+  }
+
+  #[test]
+  fn a_restored_quantity_is_held_to_its_limits_against_the_original() {
+    let limited = QuantitySpec {
+      reject_above_factor: Some(4.0),
+      reject_incomparable: true,
+      ..spec("weight")
+    };
+    let schema = measured_schema(vec![limited]);
+    let policy = Policy::new(0.8, None).unwrap();
+    let anchor = quantities(&[("weight", grams(3.5))]);
+    let refill = |after: Quantity| {
+      judged(
+        &schema,
+        &policy,
+        &Quantities::new(),
+        &anchor,
+        &quantities(&[("weight", after)]),
+      )
+    };
+
+    let swapped = refill(grams(28.0));
+    assert_eq!(swapped.quantities[0].change, QuantityChange::Restored);
+    assert!(matches!(
+      swapped.reasons.as_slice(),
+      [Reason::QuantityBeyondFactor { .. }]
+    ));
+
+    let other_kind = refill(Quantity::single(355.0, "ml"));
+    assert_eq!(other_kind.quantities[0].change, QuantityChange::Restored);
+    assert!(matches!(
+      other_kind.reasons.as_slice(),
+      [Reason::QuantityIncomparable { .. }]
+    ));
+    assert!(other_kind.measure_changed);
+
+    assert!(refill(grams(3.5)).accepted(), "putting the original back is no change");
+  }
+
+  #[test]
+  fn the_measure_changes_when_a_quantity_is_incomparable_or_one_is_traded_for_another() {
+    let schema = measured_schema(vec![spec("weight"), spec("volume"), spec("thc")]);
+    let policy = Policy::new(0.8, None).unwrap();
+    let none = Quantities::new();
+    let weight = ("weight", grams(3.5));
+    let volume = ("volume", Quantity::single(355.0, "ml"));
+    let thc = ("thc", Quantity::single(22.0, "%"));
+    let (only_weight, only_volume, only_thc) = (
+      quantities(std::slice::from_ref(&weight)),
+      quantities(std::slice::from_ref(&volume)),
+      quantities(std::slice::from_ref(&thc)),
+    );
+    let flower = quantities(&[weight, thc.clone()]);
+    let beverage = quantities(&[volume, thc]);
+    let changed = |before: &Quantities, anchor: &Quantities, after: &Quantities| {
+      judged(&schema, &policy, before, anchor, after).measure_changed
+    };
+
+    // A weight disappears as a volume appears: flower becoming a beverage.
+    assert!(changed(&flower, &none, &beverage));
+    // The same trade where the volume is one the record had long ago.
+    assert!(changed(&only_weight, &only_volume, &only_volume));
+    // A unit of another dimension.
+    assert!(changed(
+      &only_thc,
+      &none,
+      &quantities(&[("thc", Quantity::single(22.0, "mg"))])
+    ));
+
+    // Filling in a quantity that was simply missing is ordinary maintenance.
+    assert!(!changed(&only_weight, &none, &flower));
+    // So is dropping one, or changing one, however much.
+    assert!(!changed(&flower, &none, &only_weight));
+    assert!(!changed(&only_weight, &none, &quantities(&[("weight", grams(28.0))])));
+    assert!(!changed(&none, &none, &none));
+  }
+
+  #[test]
+  fn a_change_of_measure_rejects_only_when_the_policy_says_so() {
+    let schema = measured_schema(vec![spec("weight"), spec("volume")]);
+    let before = quantities(&[("weight", grams(3.5))]);
+    let after = quantities(&[("volume", Quantity::single(355.0, "ml"))]);
+
+    let lenient = Policy::new(0.8, None).unwrap();
+    let reported = judged(&schema, &lenient, &before, &Quantities::new(), &after);
+    assert!(reported.measure_changed && reported.accepted());
+
+    let mut strict = lenient;
+    strict.reject_on_measure_change = true;
+    let rejected = judged(&schema, &strict, &before, &Quantities::new(), &after);
+    assert_eq!(rejected.reasons, [Reason::MeasureChanged]);
+    assert!(rejected.reasons[0].to_string().contains("measures"));
+    assert!(
+      rejected.quantities.iter().all(|score| !score.beyond_limit),
+      "no single quantity is at fault"
+    );
+  }
+
+  #[test]
+  fn quantities_are_reported_in_schema_order_and_unconfigured_ones_are_ignored() {
+    let schema = measured_schema(vec![spec("weight"), spec("thc")]);
+    let policy = Policy::new(0.8, None).unwrap();
+    let before = quantities(&[
+      ("weight", grams(3.5)),
+      ("thc", Quantity::single(22.0, "%")),
+      ("retired", Quantity::single(1.0, "each")),
+    ]);
+    let evaluation = judged(&schema, &policy, &before, &Quantities::new(), &before.clone());
+    let names: Vec<&str> = evaluation.quantities.iter().map(|score| score.field.as_str()).collect();
+    assert_eq!(names, ["thc", "weight"]);
+    assert!(
+      evaluation
+        .quantities
+        .iter()
+        .all(|score| score.change == QuantityChange::Unchanged)
+    );
   }
 
   #[test]

@@ -2,5 +2,7 @@
   "name": "Blueberry Gummies 100mg",
   "category": "Edibles > Gummies",
   "brand": "WYLD",
-  "description": "Ten vegan gummies made with real fruit and infused with indica-enhanced botanical terpenes. 10mg THC per piece, 100mg per package."
+  "description": "Ten vegan gummies made with real fruit and infused with indica-enhanced botanical terpenes. 10mg THC per piece, 100mg per package.",
+  "weight_per_item": {"value": 40, "unit": "g"},
+  "thc_per_item": {"value": 100, "unit": "mg"}
 }

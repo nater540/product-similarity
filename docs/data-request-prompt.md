@@ -26,6 +26,12 @@ a threshold. Today those thresholds are calibrated on 46 hand-written, synthetic
 pairs, with trustworthy labels, to replace them. The dataset will be used to choose thresholds and field weights,
 and to fine-tune the model.
 
+The service also compares a product's **quantities** (its weight, volume, THC, and CBD) as numbers, after
+converting units: it reports how many times larger or smaller each became, and whether its unit can still be
+compared with the old one. It can reject on those too, but ships with no limits, because nobody has measured where
+a limit belongs. This dataset is what will be measured. So the quantities matter as much as the text here, and
+they must arrive as numbers with their units, never rendered into text.
+
 One thing follows from the scope and shapes everything below: **every recycle happens inside one brand.** The
 brand does not change, and often the category does not either. The hard cases are a brand turning one of its own
 products into another of its own products, and those are the cases I most need.
@@ -37,7 +43,25 @@ Before pulling anything at scale, find out and tell me:
 - Whether there is a version history or audit log of brand product text (what a product said before and after
   each edit, with timestamps). If there is not, stop and report that: nothing below is possible without it.
 - Which fields a brand product has, which are free text and which are ids or enums, and how often each is filled
-  in.
+  in. I expect these twelve columns among them; tell me which exist, under what names, and what else is there:
+
+  ```text
+  name                        description
+  weight_per_item_value       weight_per_item_unit
+  volume_per_item_value       volume_per_item_unit
+  thc_per_item_min_value      thc_per_item_max_value      thc_per_item_unit
+  cbd_per_item_min_value      cbd_per_item_max_value      cbd_per_item_unit
+  ```
+
+- For each of the four unit columns, **every distinct value that occurs, exactly as stored, with a count** (`g`,
+  `G`, `grams`, `mg`, `oz`, `%`, `mg/g`, an empty string, and so on). The service converts the units it knows and
+  treats any other as comparable only with itself, so I need the real vocabulary to know what it must convert.
+- For the quantity columns: how often each is null, how often it is zero (and whether zero means "none" or "not
+  measured", if you can tell), how often only one of a `min` and `max` pair is set, and whether THC or CBD is ever
+  recorded per package rather than per item. Say whether there is a pack-size or item-count column as well.
+- How a product's brand and its categories are stored. I expect the brand to be a foreign key and the categories
+  to come through a join table (a root category and possibly a sub category); tell me if it is otherwise, and
+  whether a product can have more than one category row at a level.
 - How many brands and how many brand products there are, and how edits are distributed across brands (a few
   brands making most of the edits changes how the sampling below should be capped).
 - What independent evidence of recycling exists (see "Labels").
@@ -58,17 +82,36 @@ One JSON object per line, one line per edit to a brand product:
 {"pair_id": "p000123", "product": "<pseudonym>", "owner": "<pseudonym>", "edited_at": "2026-03-14T17:02:11Z",
  "label": "recycle", "label_source": "moderator_revert", "label_confidence": "high", "variant_change": null,
  "split": "calibrate", "note": "gummies product became a vape cartridge",
- "before": {"name": "...", "category": "...", "brand": "...", "description": "...", "<other field>": "..."},
- "after":  {"name": "...", "category": "...", "brand": "...", "description": "...", "<other field>": "..."}}
+ "before": {"name": "...", "category": "Edibles > Gummies", "brand": "...", "description": "...",
+            "weight_per_item": {"value": 40, "unit": "g"},
+            "thc_per_item": {"min": 100, "max": 100, "unit": "mg"}, "<other field>": "..."},
+ "after":  {"name": "...", "category": "Vape Pens > Cartridges", "brand": "...", "description": "...",
+            "weight_per_item": {"value": 1, "unit": "g"},
+            "thc_per_item": {"min": 85, "max": 90, "unit": "%"}, "<other field>": "..."}}
 ```
 
 - `before` is the version immediately preceding the edit, `after` the version it produced.
 - `owner` is the brand that owns the product, as a pseudonym (see "Handling"). It is a separate key from the
   `brand` field inside `before` and `after`, which is the brand's name as text.
-- Include **every** field that describes what the product is, as text: name, category (the human-readable path such
-  as `Edibles > Gummies`, not the id), brand name, description, and anything else we have (strain, genetics, size or
-  weight, potency, flavor, tags). Where a field is an id or enum, give its display text and add the raw id under a
-  second key with an `_id` suffix.
+- Include **every** field that describes what the product is, as text: name, category, brand name, description,
+  and anything else we have (strain, genetics, flavor, tags). Where a field is an id or enum, give its display
+  text and add the raw id under a second key with an `_id` suffix.
+- **`category` is the display path, built root first**: the root category's name, then ` > `, then the sub
+  category's name if there is one (`Edibles > Gummies`). Names, never ids. If a product has several category rows
+  at one level, join them in a fixed order (alphabetical by name) and tell me how common that is. The order has to
+  be stable, or a product whose rows merely came back in another order looks edited.
+- **`brand` is the brand's name**, looked up from the product's brand key, as text.
+- **The four quantities are objects, not text**, under exactly these keys: `weight_per_item`, `volume_per_item`,
+  `thc_per_item`, `cbd_per_item`.
+  - A single value is `{"value": 3.5, "unit": "g"}`. A range is `{"min": 18, "max": 22, "unit": "%"}`.
+  - `value`, `min`, and `max` are JSON numbers, copied from the column without rounding or conversion. `unit` is
+    the unit column's value exactly as stored. Do not convert units, and do not "fix" a unit you think is wrong.
+  - Never render a quantity into text (`"3.5 g"`), and never fold it into `name` or `description`. Whatever the
+    name already says about size or potency stays in the name as it is.
+  - If only one of `min` and `max` is set, write it as both, and add the key `"<quantity>_one_sided": true` beside
+    it so I can count them.
+  - Leave a quantity out entirely when its value column is null. A stored zero is a value: keep it.
+  - A value with no unit cannot be used. Leave it out and count how many there were, per quantity.
 - **Include the brand name even though it will almost always be the same on both sides.** The service keeps it as
   a field. If you find edits where a product's brand did change, do not drop them: count them and tell me, because
   that should be rare and I want to know what it means when it happens.
@@ -85,7 +128,12 @@ Derived from file 1 by projection. The tool rejects any line that deviates from 
 ```
 
 - Exactly these four keys. `label` is `"edit"` or `"recycle"`, lowercase.
-- `before` and `after` may contain only the keys `name`, `category`, `brand`, `description`, with string values.
+- `before` and `after` may contain only these keys:
+  - `name`, `category`, `brand`, `description`, with string values;
+  - `weight_per_item`, `volume_per_item`, `thc_per_item`, `cbd_per_item`, with object values, each either
+    `{"value": <number>, "unit": "<text>"}` or `{"min": <number>, "max": <number>, "unit": "<text>"}` and nothing
+    else. Numbers must be finite and not negative, `min` not above `max`, and `unit` not blank. Drop the
+    `_one_sided` marker here; the tool refuses keys it does not know.
 - `name` must be present and non-blank on both sides; leave out any pair where it is not, and count how many.
 - Start `note` with the `pair_id` so a line can be traced back to file 1.
 - Include only pairs with `label_confidence` of `high` or `medium`, and only `split: "calibrate"`.
@@ -136,6 +184,11 @@ training data for the model. If no such link exists, say so and skip this.
 - An estimate of the base rate: of a uniform random sample of text edits to brand products, what fraction look
   like recycling.
 - Per field: fill rate, typical and maximum length, share of non-English text.
+- Per quantity: fill rate, the table of distinct unit strings with counts, the share of zeros, the share written
+  from one end only, and the smallest and largest value per unit (outliers such as a weight of 35000 in `g` are
+  worth knowing about before a limit is chosen).
+- Among `edit` pairs and among `recycle` pairs separately: how often each quantity's unit changed, and how often a
+  quantity was present on one side only.
 - Counts of what you excluded and why.
 - Known biases in the sample, and anything you could not do.
 - Twenty borderline examples (see "Variant changes") for a human to rule on.
@@ -171,6 +224,11 @@ Some edits are a matter of policy rather than fact: the same brand and category,
 size, pack count, or potency. Set `variant_change` to one of `"flavor"`, `"strain"`, `"size"`, `"count"`,
 `"potency"` for these (otherwise `null`). Label them only if a written policy or a moderator decision settles the
 question; otherwise mark them `"unsure"`.
+
+Decide `"size"` and `"potency"` from what the product is, not from the quantity columns alone: a potency that
+moved from 21.3% to 22.8% is a routine batch update and not a variant change, while a 3.5 g product becoming a
+28 g product is one. The quantities are the evidence the service will weigh for exactly these pairs, so a size or
+potency variant whose quantity columns did not change (or were never filled in) is worth a line in the report.
 
 **These are the most valuable pairs in the dataset.** Since every recycle stays within one brand, this is where
 edits and recycles look most alike and where the threshold will actually sit. I want as many as you can find, and

@@ -14,6 +14,7 @@
 //! - [`tokenize`]: text to token ids, token ids to padded batches.
 //! - [`embed`]: [`Embedder`], text in and unit vectors out.
 //! - [`schema`]: the fields of a record, their weights, and the composite-vector layout.
+//! - [`quantity`]: the numeric fields of a record, which are compared as numbers and never embedded.
 //! - [`record`]: validating a record, reusing unchanged fields, and packing the stored form.
 //! - [`score`]: comparing a revision against its baseline and deciding whether to accept it.
 
@@ -23,6 +24,7 @@
 pub mod embed;
 pub mod error;
 pub mod model;
+pub mod quantity;
 pub mod record;
 pub mod schema;
 pub mod score;
@@ -33,8 +35,9 @@ pub mod vector;
 
 pub use embed::{Embedder, EmbedderOptions};
 pub use error::{Error, Result};
+pub use quantity::{Quantities, Quantity, QuantityChange, QuantityScore};
 pub use record::{Plan, PreparedRecord, RecordVectors};
-pub use schema::{FieldSpec, Schema};
+pub use schema::{FieldSpec, QuantitySpec, Schema};
 pub use score::{Comparison, Evaluation, FieldChange, FieldScore, Policy, Reason};
 pub use tokenize::TextTokenizer;
 

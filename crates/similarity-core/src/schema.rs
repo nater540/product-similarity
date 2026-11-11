@@ -18,6 +18,10 @@
 //!
 //! What *does* invalidate stored composites is a change to the block layout: the set of field names, or the width of
 //! a block. [`Schema::layout_id`] names the layout, and the store refuses to compare across layouts.
+//!
+//! A schema may also name **quantities** ([`QuantitySpec`]): numeric fields that are compared as numbers and never
+//! embedded (see [`crate::quantity`]). They occupy no block, so they are not part of the layout, and adding or
+//! removing one never invalidates a stored vector.
 
 use crate::error::{Error, Result};
 use crate::vector::{norm, normalize};
@@ -43,10 +47,30 @@ pub struct FieldSpec {
   pub reject_below: Option<f32>,
 }
 
-/// The ordered set of fields that make up a record.
+/// One quantity of a record: a numeric field with a unit, compared as a number.
+///
+/// With neither limit set, the quantity is compared and reported and never rejects anything. That is the default
+/// on purpose: where a limit belongs is a measurement, like a threshold, and cannot be guessed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuantitySpec {
+  /// The key callers use for this quantity (`weight_per_item`, `thc_per_item`, ...).
+  pub name: String,
+  /// If set, a revision that changes this quantity by more than this factor (in either direction) is rejected,
+  /// as is one that moves it between zero and a value above zero.
+  pub reject_above_factor: Option<f64>,
+  /// Reject a revision that puts this quantity in a unit of another dimension (`%` to `mg`).
+  pub reject_incomparable: bool,
+}
+
+/// The ordered set of fields that make up a record, and the quantities compared alongside them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Schema {
   fields: Vec<FieldSpec>,
+  quantities: Vec<QuantitySpec>,
+}
+
+fn valid_name(name: &str) -> bool {
+  !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 impl Schema {
@@ -73,8 +97,7 @@ impl Schema {
       }
     }
     for field in &fields {
-      let valid_name = !field.name.is_empty() && field.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-      if !valid_name {
+      if !valid_name(&field.name) {
         return Err(Error::Schema(format!(
           "field name `{}` must be non-empty ASCII letters, digits, and underscores",
           field.name
@@ -95,7 +118,67 @@ impl Schema {
         )));
       }
     }
-    Ok(Self { fields })
+    Ok(Self {
+      fields,
+      quantities: Vec::new(),
+    })
+  }
+
+  /// Adds the quantities this schema compares, replacing any it already had.
+  ///
+  /// A separate step from [`Self::new`] because quantities are optional and most schemas have none.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`Error::Schema`] if a name is empty, duplicated, already a text field, or contains anything other
+  /// than ASCII letters, digits, and underscores, or a factor limit is not a finite number of at least 1.
+  pub fn with_quantities(mut self, mut quantities: Vec<QuantitySpec>) -> Result<Self> {
+    quantities.sort_by(|a, b| a.name.cmp(&b.name));
+    for pair in quantities.windows(2) {
+      if let [a, b] = pair
+        && a.name == b.name
+      {
+        return Err(Error::Schema(format!("quantity `{}` is defined twice", a.name)));
+      }
+    }
+    for quantity in &quantities {
+      if !valid_name(&quantity.name) {
+        return Err(Error::Schema(format!(
+          "quantity name `{}` must be non-empty ASCII letters, digits, and underscores",
+          quantity.name
+        )));
+      }
+      // One request carries both kinds, and files written by hand keep them in one object, so a name must say
+      // which kind it is.
+      if self.field(&quantity.name).is_some() {
+        return Err(Error::Schema(format!(
+          "`{}` is defined as both a text field and a quantity",
+          quantity.name
+        )));
+      }
+      // A factor is the larger value over the smaller, so it is never below 1 and a limit below 1 could only be
+      // a mistake (a limit written as a fraction, say).
+      if let Some(limit) = quantity.reject_above_factor
+        && !(limit.is_finite() && limit >= 1.0)
+      {
+        return Err(Error::Schema(format!(
+          "quantity `{}` has `reject_above_factor` {limit}; a factor is at least 1",
+          quantity.name
+        )));
+      }
+    }
+    self.quantities = quantities;
+    Ok(self)
+  }
+
+  /// The quantities, sorted by name.
+  pub fn quantities(&self) -> &[QuantitySpec] {
+    &self.quantities
+  }
+
+  /// Looks a quantity up by name.
+  pub fn quantity(&self, name: &str) -> Option<&QuantitySpec> {
+    self.quantities.iter().find(|quantity| quantity.name == name)
   }
 
   /// The fields, sorted by name. Block `i` of a composite belongs to field `i` of this slice.
@@ -115,7 +198,8 @@ impl Schema {
 
   /// Names the block layout: which model produced the blocks and which field each block belongs to.
   ///
-  /// Weights are deliberately absent, see the module documentation.
+  /// Weights are deliberately absent, see the module documentation. So are quantities: they are stored beside
+  /// the vectors and are part of none, so records written before a quantity existed stay readable.
   pub fn layout_id(&self, model_fingerprint: &str) -> String {
     let names: Vec<&str> = self.fields.iter().map(|field| field.name.as_str()).collect();
     format!("{model_fingerprint}|{}", names.join(","))
@@ -199,7 +283,16 @@ impl Schema {
 
 #[cfg(test)]
 pub(crate) mod testing {
-  use super::{FieldSpec, Schema};
+  use super::{FieldSpec, QuantitySpec, Schema};
+
+  /// A quantity with no limits: compared and reported, never rejecting.
+  pub(crate) fn quantity(name: &str) -> QuantitySpec {
+    QuantitySpec {
+      name: name.to_owned(),
+      reject_above_factor: None,
+      reject_incomparable: false,
+    }
+  }
 
   pub(crate) fn field(name: &str, weight: f32) -> FieldSpec {
     FieldSpec {
@@ -223,7 +316,7 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-  use super::testing::{field, product_schema};
+  use super::testing::{field, product_schema, quantity};
   use super::*;
   use crate::vector::cosine;
 
@@ -327,6 +420,54 @@ mod tests {
     let wider = Schema::new(vec![field("name", 4.0), field("brand", 1.0)]).unwrap();
     assert_ne!(schema.layout_id("model-a"), schema.layout_id("model-b"));
     assert_ne!(schema.layout_id("model-a"), wider.layout_id("model-a"));
+  }
+
+  #[test]
+  fn quantities_are_sorted_by_name_and_found_by_name() {
+    let schema = product_schema()
+      .with_quantities(vec![quantity("weight_per_item"), quantity("thc_per_item")])
+      .unwrap();
+    let names: Vec<&str> = schema.quantities().iter().map(|spec| spec.name.as_str()).collect();
+    assert_eq!(names, ["thc_per_item", "weight_per_item"]);
+    assert!(schema.quantity("thc_per_item").is_some());
+    assert!(schema.quantity("name").is_none(), "a text field is not a quantity");
+    assert!(
+      product_schema().quantities().is_empty(),
+      "a schema has none unless given"
+    );
+  }
+
+  #[test]
+  fn adding_a_quantity_does_not_change_the_layout() {
+    let plain = product_schema();
+    let measured = product_schema()
+      .with_quantities(vec![quantity("weight_per_item")])
+      .unwrap();
+    assert_eq!(plain.layout_id("m"), measured.layout_id("m"));
+    assert_eq!(plain.composite_dimension(8), measured.composite_dimension(8));
+  }
+
+  #[test]
+  fn invalid_quantities_are_refused() {
+    let with = |specs: Vec<QuantitySpec>| product_schema().with_quantities(specs);
+    assert!(with(vec![quantity("weight"), quantity("weight")]).is_err(), "duplicate");
+    assert!(with(vec![quantity("")]).is_err(), "blank name");
+    assert!(with(vec![quantity("thc per item")]).is_err(), "space in name");
+    let collision = with(vec![quantity("name")]).unwrap_err();
+    assert!(
+      collision.to_string().contains("both a text field and a quantity"),
+      "{collision}"
+    );
+
+    let limited = |limit: f64| QuantitySpec {
+      reject_above_factor: Some(limit),
+      ..quantity("weight")
+    };
+    assert!(with(vec![limited(0.5)]).is_err(), "a factor below 1");
+    assert!(with(vec![limited(f64::NAN)]).is_err(), "NaN limit");
+    assert!(with(vec![limited(f64::INFINITY)]).is_err(), "infinite limit");
+    assert!(with(vec![limited(1.0)]).is_ok(), "any change at all");
+    assert!(with(vec![limited(4.0)]).is_ok());
   }
 
   #[test]

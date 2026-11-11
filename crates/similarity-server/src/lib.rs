@@ -84,7 +84,7 @@ mod tests {
 
   use std::collections::HashMap;
 
-  use similarity_core::{FieldSpec, Policy, Schema};
+  use similarity_core::{FieldSpec, Policy, QuantitySpec, Schema};
   use similarity_proto::v1 as pb;
   use similarity_proto::v1::record_similarity_client::RecordSimilarityClient;
   use similarity_store::MemoryStore;
@@ -110,10 +110,17 @@ mod tests {
       required,
       reject_below,
     };
+    let quantity = |name: &str, reject_above_factor: Option<f64>| QuantitySpec {
+      name: name.to_owned(),
+      reject_above_factor,
+      reject_incomparable: false,
+    };
     let schema = Schema::new(vec![
       field("name", 4.0, true, Some(0.3)),
       field("category", 2.0, false, None),
     ])
+    .unwrap()
+    .with_quantities(vec![quantity("weight", Some(4.0)), quantity("thc", None)])
     .unwrap();
     let embedder = WordBagEmbedder::new("word-bag-v1");
     let (layout, dimension) = store_layout(&schema, &embedder);
@@ -151,7 +158,26 @@ mod tests {
         .iter()
         .map(|(name, text)| ((*name).to_owned(), (*text).to_owned()))
         .collect::<HashMap<_, _>>(),
+      quantities: HashMap::new(),
     }
+  }
+
+  /// The gummies under `p1`, with these quantities as `(name, min, max, unit)`.
+  fn measured(quantities: &[(&str, f64, f64, &str)]) -> pb::EvaluateRequest {
+    evaluate(pb::Record {
+      quantities: quantities
+        .iter()
+        .map(|(name, min, max, unit)| {
+          let quantity = pb::Quantity {
+            min: *min,
+            max: *max,
+            unit: (*unit).to_owned(),
+          };
+          ((*name).to_owned(), quantity)
+        })
+        .collect(),
+      ..record(Some("p1"), Some("m1"), &GUMMIES)
+    })
   }
 
   fn evaluate(record: pb::Record) -> pb::EvaluateRequest {
@@ -207,6 +233,73 @@ mod tests {
     assert!(!recycled.stored && !recycled.reasons.is_empty());
     assert_eq!(recycled.revision, 2);
     assert!((recycled.threshold - 0.75).abs() < f32::EPSILON);
+  }
+
+  #[tokio::test]
+  async fn quantities_cross_the_wire_in_both_directions() {
+    let mut running = start().await;
+    let client = &mut running.client;
+    let flower = [("weight", 3.5, 3.5, "g"), ("thc", 18.0, 22.0, "%")];
+    let created = client.evaluate(measured(&flower)).await.unwrap().into_inner();
+    assert_eq!(created.verdict(), pb::Verdict::Created);
+    assert!(created.quantities.is_empty() && !created.measure_changed);
+
+    let find = |response: &pb::EvaluateResponse, name: &str| {
+      response
+        .quantities
+        .iter()
+        .find(|score| score.field == name)
+        .cloned()
+        .unwrap()
+    };
+
+    // The same weight in another unit, and a routine potency update: one unchanged, one a small factor.
+    let batch = [("weight", 3500.0, 3500.0, "mg"), ("thc", 19.0, 23.0, "%")];
+    let updated = client.evaluate(measured(&batch)).await.unwrap().into_inner();
+    assert_eq!(updated.verdict(), pb::Verdict::Accepted);
+    assert!(updated.stored, "a changed quantity is a change");
+    let weight = find(&updated, "weight");
+    assert_eq!(weight.change(), pb::QuantityChange::Unchanged);
+    assert_eq!(weight.factor, Some(1.0));
+    assert_eq!(
+      (weight.previous_unit.as_deref(), weight.unit.as_deref()),
+      (Some("g"), Some("mg"))
+    );
+    let thc = find(&updated, "thc");
+    assert_eq!(thc.change(), pb::QuantityChange::Modified);
+    assert!((thc.factor.unwrap() - 19.0 / 18.0).abs() < 1e-9);
+    assert!(!thc.beyond_limit && !thc.incomparable && !thc.zero_crossing);
+
+    // Eight times the weight is beyond the limit this server sets for it; a potency in milligrams is only reported,
+    // because this server sets no limit for that.
+    let resized = [("weight", 28.0, 28.0, "g"), ("thc", 100.0, 100.0, "mg")];
+    let rejected = client.evaluate(measured(&resized)).await.unwrap().into_inner();
+    assert_eq!(rejected.verdict(), pb::Verdict::Rejected);
+    assert!(!rejected.stored && rejected.measure_changed);
+    assert_eq!(rejected.reasons.len(), 1, "{:?}", rejected.reasons);
+    let weight = find(&rejected, "weight");
+    assert!(weight.beyond_limit && (weight.factor.unwrap() - 8.0).abs() < 1e-9);
+    let thc = find(&rejected, "thc");
+    assert_eq!(thc.change(), pb::QuantityChange::Incomparable);
+    assert!(thc.incomparable && thc.factor.is_none() && !thc.beyond_limit);
+
+    // Presence: a removed quantity has no unit of its own, an added one no previous unit.
+    let swapped = [("weight", 3.5, 3.5, "g")];
+    let removed = client.evaluate(measured(&swapped)).await.unwrap().into_inner();
+    let thc = find(&removed, "thc");
+    assert_eq!(thc.change(), pb::QuantityChange::Removed);
+    assert_eq!((thc.previous_unit.as_deref(), thc.unit), (Some("%"), None));
+    assert_eq!(thc.factor, None);
+
+    // A quantity the schema does not define, or one that is not a measurement, never gets as far as a verdict.
+    for invalid in [
+      [("height", 1.0, 1.0, "m")],
+      [("weight", 5.0, 1.0, "g")],
+      [("weight", 1.0, 1.0, "")],
+    ] {
+      let status = client.evaluate(measured(&invalid)).await.unwrap_err();
+      assert_eq!(status.code(), Code::InvalidArgument, "{invalid:?}");
+    }
   }
 
   #[tokio::test]
@@ -277,6 +370,20 @@ mod tests {
     let name = &description.fields[1];
     assert!(name.required && name.reject_below == Some(0.3));
     assert_eq!(description.fields[0].reject_below, None);
+
+    let quantities: Vec<(&str, Option<f64>, bool)> = description
+      .quantities
+      .iter()
+      .map(|quantity| {
+        (
+          quantity.name.as_str(),
+          quantity.reject_above_factor,
+          quantity.reject_incomparable,
+        )
+      })
+      .collect();
+    assert_eq!(quantities, [("thc", None, false), ("weight", Some(4.0), false)]);
+    assert!(!description.reject_on_measure_change);
   }
 
   #[tokio::test]

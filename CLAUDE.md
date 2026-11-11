@@ -3,9 +3,10 @@
 A gRPC server (tonic) that decides whether an edit to a record is still the same record, to catch "recycled"
 marketplace listings. Each revision is embedded field by field with a small BERT-class sentence encoder running on
 [Burn](https://burn.dev), compared with the stored baseline, and accepted or rejected against calibrated
-thresholds. Vectors live in Qdrant, which also provides neighbor search.
+thresholds. A record's quantities (weight, volume, potency) are compared as numbers beside that, never embedded.
+Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D15) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D16) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -49,8 +50,8 @@ changing a design. Infer conventions from the existing code first.
 - `crates/similarity-log`: the one logging setup both binaries use.
 - `crates/similarity-proto`: the `.proto` (the source of truth for the API, and where its docs live) and generated
   code.
-- `crates/similarity-core`: encoder, strict weight loading and saving, tokenization, composite vectors, scoring,
-  policy. Synchronous, no I/O beyond reading and writing a model directory, no network code ever (D11).
+- `crates/similarity-core`: encoder, strict weight loading and saving, tokenization, composite vectors, quantities,
+  scoring, policy. Synchronous, no I/O beyond reading and writing a model directory, no network code ever (D11).
 - `crates/similarity-store`: the `VectorStore` trait, `MemoryStore`, `QdrantStore`.
 - `crates/similarity-server`: config, the embedding worker thread, `Engine` (all behavior), the thin gRPC layer,
   `model fetch`, `compare`/`calibrate`, and the `record-similarity` binary. Keep `grpc.rs` free of decisions.
@@ -69,6 +70,17 @@ changing a design. Infer conventions from the existing code first.
   holds; it may only give the anchor the first value of a field it has never had (D8). Fields present on one side
   only stay out of the score, except a `Restored` field, which is scored against the anchor. Do not "simplify"
   that away: it is what stops a field being swapped by blanking it and filling it in again.
+- **Quantities never enter the weighted score or the layout id** (D16). They are compared as numbers
+  (`similarity_core::quantity`), stored in the payload beside the vectors, and judged by
+  `Evaluation::judge_quantities` after the text is scored. Do not embed one, do not fold one into `similarity`, and
+  do not add one to `Schema::layout_id`: the first changes what every threshold means, the second forces a
+  re-index for no reason. The anchor rules above apply to them unchanged (first value kept, `Restored` compared
+  against it, `FORCE` resets).
+- **Quantity limits are measurements, like thresholds.** `config.example.toml` ships every quantity with no
+  `reject_above_factor`, no `reject_incomparable`, and `reject_on_measure_change` off. Never add a limit there
+  that was not read from `just calibrate` on real labeled pairs, and never from the synthetic sample.
+- **An unknown unit is never an error.** It is its own dimension, comparable only with itself. Extend the `UNITS`
+  table in `quantity.rs` when a new unit turns up; do not make the server refuse it.
 - **A tenant, once stored, must be named by every later request for that id**, including `Delete` (D14).
 - **What a supported model directory is lives in one place**, `similarity_core::model::Pipeline`. The loader and
   `model fetch` both use it; never parse `modules.json` anywhere else.

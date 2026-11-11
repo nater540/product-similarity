@@ -39,6 +39,25 @@ fn record(id: &str, tenant: &str, fields: &[(&str, &str)]) -> pb::Record {
       .iter()
       .map(|(name, text)| ((*name).to_owned(), (*text).to_owned()))
       .collect::<HashMap<_, _>>(),
+    quantities: HashMap::new(),
+  }
+}
+
+/// `record` with quantities, each a single value: `(name, value, unit)`.
+fn measured(id: &str, tenant: &str, fields: &[(&str, &str)], quantities: &[(&str, f64, &str)]) -> pb::Record {
+  pb::Record {
+    quantities: quantities
+      .iter()
+      .map(|(name, value, unit)| {
+        let quantity = pb::Quantity {
+          min: *value,
+          max: *value,
+          unit: (*unit).to_owned(),
+        };
+        ((*name).to_owned(), quantity)
+      })
+      .collect(),
+    ..record(id, tenant, fields)
   }
 }
 
@@ -140,7 +159,20 @@ async fn the_shipped_configuration_catches_a_recycled_product_end_to_end() {
 
 async fn scenario(mut client: RecordSimilarityClient<Channel>) {
   let description = client.describe(pb::DescribeRequest {}).await.unwrap().into_inner();
-  assert_eq!((description.dimension, description.composite_dimension), (256, 1024));
+  assert_eq!(
+    (description.dimension, description.composite_dimension),
+    (256, 1024),
+    "four text fields; the quantities take no room in a vector"
+  );
+  let quantities: Vec<&str> = description
+    .quantities
+    .iter()
+    .map(|quantity| quantity.name.as_str())
+    .collect();
+  assert_eq!(
+    quantities,
+    ["cbd_per_item", "thc_per_item", "volume_per_item", "weight_per_item"]
+  );
   assert!(
     description.model_fingerprint.ends_with("-d256-t256"),
     "{}",
@@ -280,6 +312,7 @@ async fn scenario(mut client: RecordSimilarityClient<Channel>) {
       id: None,
       tenant: None,
       fields: HashMap::from([("name".to_owned(), "sour diesel 510 cart".to_owned())]),
+      quantities: HashMap::new(),
     })),
     limit: 1,
     ..pb::FindSimilarRequest::default()
@@ -309,6 +342,57 @@ async fn scenario(mut client: RecordSimilarityClient<Channel>) {
     (settled.anchor_similarity.unwrap() - 1.0).abs() < 1e-4,
     "the forced write reset the anchor"
   );
+
+  // Quantities ride along through Qdrant. The shipped configuration sets no limits, so they are reported and
+  // never reject: the same vape at half the size, with its potency rewritten in other units, is still accepted.
+  let sized = [("weight_per_item", 1.0, "g"), ("thc_per_item", 850.0, "mg")];
+  let first = client
+    .evaluate(evaluate(measured("sku-1", "merchant-1", &VAPE, &sized)))
+    .await
+    .unwrap()
+    .into_inner();
+  assert_eq!(first.verdict(), pb::Verdict::Accepted);
+  assert!(first.stored, "gaining quantities is a change worth writing");
+  assert!(
+    first
+      .quantities
+      .iter()
+      .all(|quantity| quantity.change() == pb::QuantityChange::Added),
+    "{:?}",
+    first.quantities
+  );
+  assert!(!first.measure_changed);
+
+  let resized = [("weight_per_item", 500.0, "mg"), ("thc_per_item", 0.85, "g")];
+  let halved = client
+    .evaluate(evaluate(measured("sku-1", "merchant-1", &VAPE, &resized)))
+    .await
+    .unwrap()
+    .into_inner();
+  assert_eq!(halved.verdict(), pb::Verdict::Accepted, "{halved:?}");
+  assert!((halved.similarity.unwrap() - 1.0).abs() < 1e-6, "no text changed");
+  assert!(halved.stored, "a quantity changed, so the record did");
+  let quantity = |name: &str| halved.quantities.iter().find(|score| score.field == name).unwrap();
+  let weight = quantity("weight_per_item");
+  assert_eq!(weight.change(), pb::QuantityChange::Modified);
+  assert!((weight.factor.unwrap() - 2.0).abs() < 1e-9, "{weight:?}");
+  assert_eq!(
+    (weight.previous_unit.as_deref(), weight.unit.as_deref()),
+    (Some("g"), Some("mg"))
+  );
+  assert!(!weight.beyond_limit, "no limit is shipped");
+  let thc = quantity("thc_per_item");
+  assert_eq!(thc.change(), pb::QuantityChange::Unchanged, "850 mg is 0.85 g");
+  assert_eq!(thc.factor, Some(1.0));
+
+  // What Qdrant holds is what was sent: sending it again changes nothing.
+  let again = client
+    .evaluate(evaluate(measured("sku-1", "merchant-1", &VAPE, &resized)))
+    .await
+    .unwrap()
+    .into_inner();
+  assert!(!again.stored);
+  assert_eq!(again.revision, halved.revision);
 
   // Deleting starts over.
   assert!(

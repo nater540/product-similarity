@@ -7,6 +7,9 @@ package recordsimilarity.v1;
 // Records are embedded field by field with a sentence-embedding model. The vectors of every accepted revision are
 // kept, so that the next revision of the same `id` can be compared against them and so that records can be searched
 // by similarity.
+//
+// A record may also carry quantities (a weight, a volume, a potency). Those are compared as numbers, after unit
+// conversion, and are never embedded: they do not move any similarity reported here.
 service RecordSimilarity {
   // Embeds a record and, when it has an `id`, judges it against the stored baseline for that id.
   //
@@ -16,8 +19,8 @@ service RecordSimilarity {
   //   replaces the baseline only if it is accepted. A rejected revision leaves the stored record untouched, so a
   //   retry with the original content still compares against the original.
   //
-  // Errors: `INVALID_ARGUMENT` for a record that does not fit the configured schema or a `mode` this server does
-  // not know, `FAILED_PRECONDITION` if the stored baseline belongs to a tenant the request does not name or was
+  // Errors: `INVALID_ARGUMENT` for a record that does not fit the configured schema (an unknown field or quantity,
+  // a quantity that is not a usable measurement) or a `mode` this server does not know, `FAILED_PRECONDITION` if the stored baseline belongs to a tenant the request does not name or was
   // written under a different model or schema layout, `RESOURCE_EXHAUSTED` if the embedding queue is full,
   // `UNAVAILABLE` if the vector store cannot be reached.
   rpc Evaluate(EvaluateRequest) returns (EvaluateResponse);
@@ -27,7 +30,7 @@ service RecordSimilarity {
   // For two records with values for the same fields, the similarity reported here is exactly the weighted score
   // `Evaluate` uses, so "what did this record turn into?" and "does this already exist?" are answered on the same
   // scale as the accept/reject decision. A field that only one of the two has a value for lowers the score here,
-  // whereas `Evaluate` leaves such a field out.
+  // whereas `Evaluate` leaves such a field out. Quantities play no part in a search: it compares vectors.
   rpc FindSimilar(FindSimilarRequest) returns (FindSimilarResponse);
 
   // Forgets a record. The next `Evaluate` for its id starts a new baseline.
@@ -37,6 +40,23 @@ service RecordSimilarity {
 
   // Reports the model, schema, and thresholds this server is running with.
   rpc Describe(DescribeRequest) returns (DescribeResponse);
+}
+
+// A measured amount with its unit: a weight, a volume, a potency.
+//
+// A single value is sent as a range whose ends are equal. A caller that has only one end of a range sends it as
+// both.
+message Quantity {
+  // The low end. Finite and not negative.
+  double min = 1;
+
+  // The high end. Finite and not below `min`.
+  double max = 2;
+
+  // The unit both ends are in, for example `g`, `mg`, `oz`, `ml`, `fl oz`, or `%`. Matched without regard to case
+  // or surrounding space. Mass, volume, and percentage units are converted before comparing, so `1 g` and
+  // `1000 mg` are the same quantity. Any other unit is accepted and is comparable only with itself. Not blank.
+  string unit = 3;
 }
 
 // A record to embed.
@@ -55,6 +75,10 @@ message Record {
   // Field name to text. Names must be ones the server's schema defines (see `Describe`). A missing field and a
   // blank one are the same thing: no value.
   map<string, string> fields = 3;
+
+  // Quantity name to value. Names must be ones the server's schema defines as quantities (see `Describe`); a
+  // quantity is never sent as text in `fields`. A quantity the record does not have is left out.
+  map<string, Quantity> quantities = 4;
 }
 
 // What `Evaluate` may do to the stored baseline.
@@ -141,6 +165,65 @@ message FieldScore {
   bool below_floor = 5;
 }
 
+// What happened to one quantity between the baseline and the record. The first five values mean what the
+// `FieldChange` of the same name means.
+enum QuantityChange {
+  QUANTITY_CHANGE_UNSPECIFIED = 0;
+
+  // The amounts are equal after unit conversion.
+  QUANTITY_CHANGE_UNCHANGED = 1;
+
+  // Both the baseline and the record have a value, in comparable units, and the amounts differ.
+  QUANTITY_CHANGE_MODIFIED = 2;
+
+  // Only the record has a value, and the stored record has never had one for this quantity.
+  QUANTITY_CHANGE_ADDED = 3;
+
+  // Only the baseline has a value.
+  QUANTITY_CHANGE_REMOVED = 4;
+
+  // The baseline has no value, but the record had one when it was first stored (or last force-written), and now
+  // has one again. The quantity is compared with that original value, so that removing a quantity and then
+  // filling it with another is judged like any other change to it.
+  QUANTITY_CHANGE_RESTORED = 5;
+
+  // Both the baseline and the record have a value, but in units that cannot be converted into one another (`%`
+  // and `mg`, say). This is not a bigger or smaller amount; it is a different kind of measurement.
+  QUANTITY_CHANGE_INCOMPARABLE = 6;
+}
+
+// How one quantity of the record compares with the baseline.
+message QuantityScore {
+  string field = 1;
+
+  QuantityChange change = 2;
+
+  // How many times larger or smaller the amount became, after unit conversion; for a range, whichever end moved
+  // more. Always at least 1, so "eight times bigger" and "an eighth" are both 8, and exactly 1 when nothing
+  // changed. Absent when there is no number to give: for `QUANTITY_CHANGE_ADDED` and `QUANTITY_CHANGE_REMOVED`,
+  // and when `incomparable` or `zero_crossing` is set.
+  optional double factor = 3;
+
+  // The amount moved between zero and a value above zero, so no factor describes the change.
+  bool zero_crossing = 4;
+
+  // The two values are in units that cannot be converted into one another. Always set for
+  // `QUANTITY_CHANGE_INCOMPARABLE`, and for a `QUANTITY_CHANGE_RESTORED` quantity whose original value was in such
+  // a unit.
+  bool incomparable = 5;
+
+  // The unit of the value the record was compared with: the baseline's, or the original's for
+  // `QUANTITY_CHANGE_RESTORED`. Absent for `QUANTITY_CHANGE_ADDED`.
+  optional string previous_unit = 6;
+
+  // The record's unit. Absent for `QUANTITY_CHANGE_REMOVED`.
+  optional string unit = 7;
+
+  // This quantity exceeds a limit the server's schema sets for it (see `QuantityDescription`), which rejects the
+  // record regardless of every similarity. Never set when no limit is configured.
+  bool beyond_limit = 8;
+}
+
 message EvaluateResponse {
   Verdict verdict = 1;
 
@@ -169,6 +252,16 @@ message EvaluateResponse {
 
   // How many times this record has been written, including this call if `stored`. Zero if it has never been stored.
   uint64 revision = 9;
+
+  // Per-quantity detail, for every quantity either side has a value for. Empty when there was no baseline.
+  // Quantities are reported whether or not any limit is configured; they are never part of `similarity`.
+  repeated QuantityScore quantities = 10;
+
+  // The record changed which measures it is described by: a quantity became incomparable with its old value, or
+  // one quantity was removed as a different one appeared (a weight for a volume). Filling in a quantity that was
+  // merely missing does not set this. It rejects the record only if the server's policy says so (see
+  // `DescribeResponse.reject_on_measure_change`).
+  bool measure_changed = 11;
 }
 
 message FindSimilarRequest {
@@ -228,6 +321,18 @@ message FieldDescription {
   optional float reject_below = 4;
 }
 
+// One quantity of the server's schema.
+message QuantityDescription {
+  string name = 1;
+
+  // A record that changes this quantity by more than this factor, or moves it between zero and a value above
+  // zero, is rejected. Absent if the factor is only reported.
+  optional double reject_above_factor = 2;
+
+  // A record that puts this quantity in a unit that cannot be compared with the one it had is rejected.
+  bool reject_incomparable = 3;
+}
+
 message DescribeResponse {
   // Identifies the model, tokenizer, vector width, and truncation limit. Vectors are only comparable under the
   // same fingerprint.
@@ -246,4 +351,11 @@ message DescribeResponse {
 
   // The drift threshold against the anchor, if drift is enforced.
   optional float anchor_threshold = 6;
+
+  // The quantities the schema defines. They are not part of any vector, so they do not appear in
+  // `composite_dimension` or in `model_fingerprint`.
+  repeated QuantityDescription quantities = 7;
+
+  // Whether a record whose measures changed (`EvaluateResponse.measure_changed`) is rejected.
+  bool reject_on_measure_change = 8;
 }

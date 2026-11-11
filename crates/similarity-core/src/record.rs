@@ -8,12 +8,16 @@
 //!    the stored baseline reuses the baseline's block: most edits to a record touch one field, so this skips most of
 //!    the model work on the hot path.
 //! 3. The caller embeds [`Plan::texts`] and hands the vectors to [`Plan::finish`], which packs the composite.
+//!
+//! A record's quantities take no part in any of that. [`PreparedRecord::with_quantities`] validates them against the
+//! schema and carries them alongside, for `crate::score` to compare as numbers.
 
 use std::collections::BTreeMap;
 
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
+use crate::quantity::{Quantities, Quantity};
 use crate::schema::Schema;
 use crate::vector::normalize;
 
@@ -67,10 +71,12 @@ struct PreparedField {
 }
 
 /// A record whose fields have been validated against a schema, normalized, and fingerprinted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PreparedRecord {
   /// One entry per schema field, in schema order; `None` where the record has no value.
   fields: Vec<Option<PreparedField>>,
+  /// The record's quantities, validated. Empty unless [`Self::with_quantities`] was called.
+  quantities: Quantities,
 }
 
 impl PreparedRecord {
@@ -91,6 +97,12 @@ impl PreparedRecord {
     for (name, value) in fields {
       let name = name.as_ref();
       if schema.field(name).is_none() {
+        // The commonest way to get here once quantities exist: a weight rendered into text by the caller.
+        if schema.quantity(name).is_some() {
+          return Err(Error::Record(format!(
+            "`{name}` is a quantity, not a text field; give it as a number with a unit"
+          )));
+        }
         let known: Vec<&str> = schema.fields().iter().map(|field| field.name.as_str()).collect();
         return Err(Error::Record(format!(
           "unknown field `{name}`; the schema has: {}",
@@ -122,7 +134,58 @@ impl PreparedRecord {
     if prepared.iter().all(Option::is_none) {
       return Err(Error::Record("no field has a value".to_owned()));
     }
-    Ok(Self { fields: prepared })
+    Ok(Self {
+      fields: prepared,
+      quantities: Quantities::new(),
+    })
+  }
+
+  /// Validates `quantities` against `schema` and attaches them, replacing any already attached.
+  ///
+  /// A quantity that is not sent is simply absent; there is no "blank" quantity.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`Error::Record`] naming the quantity if it is not in the schema, appears twice, or is not a usable
+  /// measurement (see [`Quantity::check`]).
+  pub fn with_quantities<K>(
+    mut self,
+    schema: &Schema,
+    quantities: impl IntoIterator<Item = (K, Quantity)>,
+  ) -> Result<Self>
+  where
+    K: AsRef<str>,
+  {
+    let mut by_name = Quantities::new();
+    for (name, quantity) in quantities {
+      let name = name.as_ref();
+      if schema.quantity(name).is_none() {
+        if schema.field(name).is_some() {
+          return Err(Error::Record(format!(
+            "`{name}` is a text field, not a quantity; give it as text"
+          )));
+        }
+        let known: Vec<&str> = schema.quantities().iter().map(|spec| spec.name.as_str()).collect();
+        return Err(Error::Record(if known.is_empty() {
+          format!("unknown quantity `{name}`; the schema has no quantities")
+        } else {
+          format!("unknown quantity `{name}`; the schema has: {}", known.join(", "))
+        }));
+      }
+      quantity
+        .check()
+        .map_err(|reason| Error::Record(format!("quantity `{name}`: {reason}")))?;
+      if by_name.insert(name.to_owned(), quantity.trimmed()).is_some() {
+        return Err(Error::Record(format!("quantity `{name}` is given twice")));
+      }
+    }
+    self.quantities = by_name;
+    Ok(self)
+  }
+
+  /// The record's validated quantities.
+  pub fn quantities(&self) -> &Quantities {
+    &self.quantities
   }
 
   /// Decides, field by field, whether to embed the text or reuse the baseline's vector.
@@ -284,7 +347,7 @@ mod tests {
   use super::testing::{fake_embedding, fake_vectors};
   use super::*;
   use crate::schema::FieldSpec;
-  use crate::schema::testing::product_schema;
+  use crate::schema::testing::{product_schema, quantity};
   use crate::vector::cosine;
 
   const DIM: usize = 8;
@@ -320,6 +383,68 @@ mod tests {
     assert!(PreparedRecord::new(&schema, [("name", "x"), ("name", "y")]).is_err());
     assert!(PreparedRecord::new(&schema, [("name", "  "), ("category", "")]).is_err());
     assert!(PreparedRecord::new(&schema, Vec::<(&str, &str)>::new()).is_err());
+  }
+
+  #[test]
+  fn quantities_are_validated_against_the_schema_and_carried_alongside() {
+    let schema = product_schema()
+      .with_quantities(vec![quantity("weight_per_item"), quantity("thc_per_item")])
+      .unwrap();
+    let prepared = PreparedRecord::new(&schema, [("name", "Blue Dream")]).unwrap();
+    assert!(prepared.quantities().is_empty());
+
+    let prepared = prepared
+      .with_quantities(
+        &schema,
+        [
+          ("weight_per_item", Quantity::single(3.5, " g ")),
+          ("thc_per_item", Quantity::range(18.0, 22.0, "%")),
+        ],
+      )
+      .unwrap();
+    assert_eq!(prepared.quantities().len(), 2);
+    assert_eq!(
+      prepared.quantities()["weight_per_item"],
+      Quantity::single(3.5, "g"),
+      "the unit is stored trimmed"
+    );
+    // Quantities are no part of the embedding work.
+    assert_eq!(prepared.plan(&schema, DIM, None).unwrap().texts(), ["Blue Dream"]);
+  }
+
+  #[test]
+  fn unknown_duplicate_and_invalid_quantities_are_refused_by_name() {
+    let schema = product_schema()
+      .with_quantities(vec![quantity("weight_per_item")])
+      .unwrap();
+    let prepared = || PreparedRecord::new(&schema, [("name", "Blue Dream")]).unwrap();
+    let refused =
+      |quantities: Vec<(&str, Quantity)>| prepared().with_quantities(&schema, quantities).unwrap_err().to_string();
+    let weight = || Quantity::single(3.5, "g");
+
+    let unknown = refused(vec![("volume_per_item", weight())]);
+    assert!(
+      unknown.contains("volume_per_item") && unknown.contains("weight_per_item"),
+      "{unknown}"
+    );
+    assert!(refused(vec![("weight_per_item", weight()), ("weight_per_item", weight())]).contains("twice"));
+    let negative = refused(vec![("weight_per_item", Quantity::single(-1.0, "g"))]);
+    assert!(
+      negative.contains("weight_per_item") && negative.contains("negative"),
+      "{negative}"
+    );
+    assert!(refused(vec![("weight_per_item", Quantity::single(1.0, ""))]).contains("blank"));
+
+    // Each kind sent as the other is the mistake worth a message of its own.
+    assert!(refused(vec![("name", weight())]).contains("text field, not a quantity"));
+    let as_text = PreparedRecord::new(&schema, [("name", "Blue Dream"), ("weight_per_item", "3.5 g")]).unwrap_err();
+    assert!(as_text.to_string().contains("quantity, not a text field"), "{as_text}");
+
+    let none = PreparedRecord::new(&product_schema(), [("name", "x")])
+      .unwrap()
+      .with_quantities(&product_schema(), [("weight_per_item", weight())])
+      .unwrap_err();
+    assert!(none.to_string().contains("no quantities"), "{none}");
   }
 
   #[test]

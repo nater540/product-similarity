@@ -5,8 +5,9 @@
 //! - `current`: the composite of the accepted baseline. HNSW-indexed; this is what searches match.
 //! - `anchor`: the composite of the record as first stored. Only ever read back by id, so it has no HNSW graph
 //!   (`m = 0`) and lives on disk, costing no memory.
-//! - payload: the caller's id, the tenant, the layout id, the per-field text fingerprints, a revision counter, and
-//!   a timestamp.
+//! - payload: the caller's id, the tenant, the layout id, the per-field text fingerprints, a revision counter, a
+//!   timestamp, and the record's quantities (current and original). Quantities are compared as numbers and are in
+//!   no vector, which is why a point written before they existed needs no migration: it reads back with none.
 //!
 //! Qdrant point ids must be integers or UUIDs, and record ids are arbitrary strings, so the point id is the UUIDv5
 //! of the record id under a fixed namespace. The mapping is deterministic, so a record is always one point no
@@ -24,7 +25,7 @@ use qdrant_client::qdrant::{
 };
 use qdrant_client::{Payload, Qdrant, QdrantError};
 use serde::{Deserialize, Serialize};
-use similarity_core::RecordVectors;
+use similarity_core::{Quantities, RecordVectors};
 use uuid::Uuid;
 
 use crate::{Neighbor, Result, SearchQuery, StoreError, StoredRecord, VectorStore};
@@ -62,6 +63,11 @@ struct PointPayload {
   revision: u64,
   #[serde(default)]
   updated_at: u64,
+  // Absent on every point written before quantities existed, and left out of a record that has none.
+  #[serde(default, skip_serializing_if = "Quantities::is_empty")]
+  quantities: Quantities,
+  #[serde(default, skip_serializing_if = "Quantities::is_empty")]
+  anchor_quantities: Quantities,
 }
 
 /// A [`VectorStore`] backed by a Qdrant collection.
@@ -328,6 +334,8 @@ impl VectorStore for QdrantStore {
         hashes: payload.hashes,
       },
       anchor: named(ANCHOR)?,
+      quantities: payload.quantities,
+      anchor_quantities: payload.anchor_quantities,
       revision: payload.revision,
       updated_at: payload.updated_at,
     }))
@@ -344,6 +352,8 @@ impl VectorStore for QdrantStore {
       hashes: record.vectors.hashes.clone(),
       revision: record.revision,
       updated_at: record.updated_at,
+      quantities: record.quantities.clone(),
+      anchor_quantities: record.anchor_quantities.clone(),
     })
     .map_err(|source| StoreError::Invalid(format!("payload does not serialize: {source}")))
     .and_then(|value| {
@@ -443,6 +453,8 @@ impl VectorStore for QdrantStore {
 
 #[cfg(test)]
 mod tests {
+  use similarity_core::Quantity;
+
   use super::*;
 
   #[test]
@@ -465,6 +477,12 @@ mod tests {
       hashes: BTreeMap::from([("name".to_owned(), "00ff".to_owned())]),
       revision: 3,
       updated_at: 1_700_000_000,
+      quantities: Quantities::from([
+        ("weight_per_item".to_owned(), Quantity::single(3.5, "g")),
+        // A whole number, which JSON and Qdrant would both happily turn into an integer.
+        ("thc_per_item".to_owned(), Quantity::range(18.0, 22.0, "%")),
+      ]),
+      anchor_quantities: Quantities::from([("weight_per_item".to_owned(), Quantity::single(1.0, "g"))]),
     };
     let encoded = Payload::try_from(serde_json::to_value(&payload).unwrap()).unwrap();
     let decoded = decode_payload("product-42", encoded.into()).unwrap();
@@ -472,6 +490,33 @@ mod tests {
     assert_eq!(decoded.tenant.as_deref(), Some("merchant-7"));
     assert_eq!(decoded.hashes["name"], "00ff");
     assert_eq!((decoded.revision, decoded.updated_at), (3, 1_700_000_000));
+    assert_eq!(decoded.quantities, payload.quantities);
+    assert_eq!(decoded.anchor_quantities, payload.anchor_quantities);
+  }
+
+  #[test]
+  fn a_payload_written_before_quantities_existed_decodes_with_none() {
+    let encoded = Payload::try_from(serde_json::json!({
+      "record_id": "p", "layout": "l", "hashes": { "name": "00ff" }, "revision": 2, "updated_at": 1_700_000_000
+    }))
+    .unwrap();
+    let decoded = decode_payload("p", encoded.into()).unwrap();
+    assert!(decoded.quantities.is_empty() && decoded.anchor_quantities.is_empty());
+
+    // And a record without quantities writes exactly the payload it always did.
+    let written = serde_json::to_value(&decoded).unwrap();
+    assert!(written.get("quantities").is_none() && written.get("anchor_quantities").is_none());
+  }
+
+  #[test]
+  fn a_whole_number_stored_as_an_integer_still_reads_as_a_quantity() {
+    let encoded = Payload::try_from(serde_json::json!({
+      "record_id": "p", "layout": "l",
+      "quantities": { "thc_per_item": { "min": 18, "max": 22, "unit": "%" } }
+    }))
+    .unwrap();
+    let decoded = decode_payload("p", encoded.into()).unwrap();
+    assert_eq!(decoded.quantities["thc_per_item"], Quantity::range(18.0, 22.0, "%"));
   }
 
   #[test]
