@@ -122,7 +122,7 @@ pub fn calibrate(offline: &Offline, pairs: Pairs) -> anyhow::Result<Calibration>
   let mut scored = Vec::with_capacity(pairs.pairs.len());
   for pair in pairs.pairs {
     let evaluation = offline
-      .compare(&pair.before, &pair.after)
+      .compare(&pair.before, &pair.after, pair.anchor.as_ref())
       .with_context(|| format!("pair `{}` ({})", pair.id, pair.note))?;
     scored.push(ScoredPair { pair, evaluation });
   }

@@ -426,7 +426,7 @@ fn offline(config_path: &Path) -> anyhow::Result<(Offline, similarity_core::Poli
 impl CompareArgs {
   fn run(self) -> anyhow::Result<()> {
     let (offline, policy) = offline(&self.config)?;
-    let evaluation = offline.compare(&read_fields(&self.before)?, &read_fields(&self.after)?)?;
+    let evaluation = offline.compare(&read_fields(&self.before)?, &read_fields(&self.after)?, None)?;
     write!(
       std::io::stdout().lock(),
       "{}\n{}",

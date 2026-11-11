@@ -288,9 +288,15 @@ pub fn render_calibration(calibration: &Calibration, policy: &Policy, seed: u64)
       "rejected"
     };
     let wrong = if scored.wrong() { "  << WRONG" } else { "" };
+    // A pair that says what the record was first created as is one step of a history, judged against that too.
+    let anchored = if scored.pair.anchor.is_some() {
+      " (anchored)"
+    } else {
+      ""
+    };
     let _ = writeln!(
       out,
-      "{:<8} {:>7.3}  {verdict:<9} {}{wrong}",
+      "{:<8} {:>7.3}  {verdict:<9} {}{anchored}{wrong}",
       scored.pair.label_text,
       scored.similarity(),
       scored.pair.note

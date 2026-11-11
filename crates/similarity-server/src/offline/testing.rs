@@ -35,6 +35,7 @@ pub(crate) fn scored_as(label: Label, similarity: f32, accepted: bool, adjust: i
     label_confidence: None,
     before: RecordFields::default(),
     after: RecordFields::default(),
+    anchor: None,
   };
   adjust(&mut pair);
   ScoredPair {

@@ -20,8 +20,9 @@
 use proptest::prelude::*;
 use proptest::test_runner::Config;
 use similarity_core::score::Evaluation;
+use similarity_core::testing::{WORDS, tiny_embedder};
 use similarity_core::vector::cosine;
-use similarity_core::{FieldSpec, Policy, Quantity, QuantitySpec, Reason, Schema};
+use similarity_core::{EmbedderOptions, FieldSpec, Policy, Quantity, QuantitySpec, Reason, Schema};
 use similarity_store::{MemoryStore, StoredRecord, VectorStore};
 
 use crate::engine::{
@@ -30,8 +31,9 @@ use crate::engine::{
 };
 use crate::offline::calibrate::suggest_threshold;
 use crate::offline::pairs::Label;
-use crate::offline::{RecordFields, Suggestion};
+use crate::offline::{Offline, RecordFields, Suggestion};
 use crate::worker::testing::{WORD_BAG_DIMENSION, WordBagEmbedder, word_bag};
+use crate::worker::{EmbedError, TextEmbedder};
 
 fn cases() -> Config {
   let cases = std::env::var("PROPTEST_CASES")
@@ -691,4 +693,134 @@ fn an_evaluation_judged_again_under_its_own_configuration_is_itself() {
       assert_eq!(kinds(&again.reasons), kinds(&output.reasons), "{name}");
     }
   });
+}
+
+/// The offline scorer's own model behind the engine's embedder interface, so that one set of weights scores a
+/// pair both ways.
+struct OfflineModel(std::sync::Arc<Offline>);
+
+impl TextEmbedder for OfflineModel {
+  async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, EmbedError> {
+    self
+      .0
+      .embedder()
+      .embed(&texts)
+      .map_err(|error| EmbedError::Failed(error.to_string()))
+  }
+
+  fn dimension(&self) -> usize {
+    self.0.dimension()
+  }
+
+  fn fingerprint(&self) -> &str {
+    self.0.fingerprint()
+  }
+}
+
+/// One version of a record: always a name, sometimes a brand, sometimes a weight in one of several units.
+fn version() -> impl Strategy<Value = RecordFields> {
+  let phrase =
+    || proptest::collection::vec(proptest::sample::select(WORDS.to_vec()), 1..=3).prop_map(|words| words.join(" "));
+  let weight = (
+    proptest::sample::select(vec![0.5, 1.0, 3.5, 28.0]),
+    proptest::sample::select(vec!["g", "mg", "oz", "ml"]),
+  );
+  (phrase(), proptest::option::of(phrase()), proptest::option::of(weight)).prop_map(|(name, brand, weight)| {
+    let mut record = RecordFields::default();
+    record.texts.insert("name".to_owned(), name);
+    if let Some(brand) = brand {
+      record.texts.insert("brand".to_owned(), brand);
+    }
+    if let Some((amount, unit)) = weight {
+      record
+        .quantities
+        .insert("weight".to_owned(), Quantity::single(amount, unit));
+    }
+    record
+  })
+}
+
+proptest! {
+  #![proptest_config(cases())]
+
+  /// D8, D20: a calibration pair that says what the record was first created as is judged exactly as the server
+  /// judges a record imported with that original version and then revised. The pair is how a blank-and-refill
+  /// swap gets into a calibration or the verdict snapshot, so the two must not come apart: every measurement,
+  /// every reason, and the verdict are the same.
+  #[test]
+  fn an_anchored_pair_is_judged_as_an_import_followed_by_an_evaluate(
+    anchor in version(),
+    before in version(),
+    after in version(),
+  ) {
+    let field = |name: &str, weight: f32, required: bool, reject_below: Option<f32>| FieldSpec {
+      name: name.to_owned(),
+      weight,
+      required,
+      reject_below,
+    };
+    let schema = Schema::new(vec![field("name", 2.0, true, Some(0.5)), field("brand", 1.0, false, None)])
+      .unwrap()
+      .with_quantities(vec![QuantitySpec {
+        name: "weight".to_owned(),
+        reject_above_factor: Some(4.0),
+        reject_incomparable: true,
+      }])
+      .unwrap();
+    let mut policy = Policy::new(0.8, Some(0.7)).unwrap();
+    policy.reject_on_measure_change = true;
+    let options = EmbedderOptions { max_tokens: 16, batch_size: 8, output_dim: None };
+    let offline = std::sync::Arc::new(Offline::new(tiny_embedder(&options), schema.clone(), policy));
+
+    let expected = offline
+      .compare(&before, &after, Some(&anchor))
+      .map_err(|error| TestCaseError::fail(format!("the offline scorer failed: {error:#}")))?;
+
+    let embedder = OfflineModel(std::sync::Arc::clone(&offline));
+    let (layout, dimension) = store_layout(&schema, &embedder);
+    let engine = Engine::new(MemoryStore::new(layout, dimension), embedder, schema, policy);
+    let fields = |record: &RecordFields| -> Vec<(String, String)> {
+      record.texts.iter().map(|(name, text)| (name.clone(), text.clone())).collect()
+    };
+    let quantities = |record: &RecordFields| -> Vec<(String, Quantity)> {
+      record.quantities.iter().map(|(name, quantity)| (name.clone(), quantity.clone())).collect()
+    };
+    let input = |record: &RecordFields| RecordInput {
+      id: Some("p".to_owned()),
+      tenant: None,
+      fields: fields(record),
+      quantities: quantities(record),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let output = runtime.block_on(async {
+      let original = Original { fields: fields(&anchor), quantities: quantities(&anchor) };
+      let imported = engine
+        .import(vec![ImportInput { record: input(&before), anchor: Some(original) }])
+        .await?;
+      assert!(matches!(imported[..], [Ok(Imported::Created)]), "{imported:?}");
+      engine
+        .evaluate(EvaluateInput { record: input(&after), mode: WriteMode::DryRun, threshold: None })
+        .await
+    });
+    let output = sound_engine(output)?;
+
+    let close = |found: Option<f32>, wanted: Option<f32>| match (found, wanted) {
+      (Some(found), Some(wanted)) => (found - wanted).abs() < 1e-5,
+      (found, wanted) => found == wanted,
+    };
+    prop_assert!(close(output.similarity, Some(expected.comparison.similarity)));
+    prop_assert!(close(output.anchor_similarity, expected.anchor_similarity));
+    prop_assert_eq!(output.fields.len(), expected.comparison.fields.len());
+    for (found, wanted) in output.fields.iter().zip(&expected.comparison.fields) {
+      prop_assert_eq!((&found.field, found.change, found.below_floor), (&wanted.field, wanted.change, wanted.below_floor));
+      prop_assert!(close(found.similarity, wanted.similarity), "{}: {:?} and {:?}", found.field, found.similarity, wanted.similarity);
+    }
+    prop_assert_eq!(&output.quantities, &expected.quantities);
+    prop_assert_eq!(output.measure_changed, expected.measure_changed);
+    let kinds = |reasons: &[Reason]| -> Vec<(&'static str, Option<String>)> {
+      reasons.iter().map(|reason| (reason.code(), reason.subject().map(str::to_owned))).collect()
+    };
+    prop_assert_eq!(kinds(&output.reasons), kinds(&expected.reasons));
+    prop_assert_eq!(output.verdict == Verdict::Rejected, !expected.accepted());
+  }
 }

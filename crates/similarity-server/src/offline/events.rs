@@ -80,6 +80,8 @@ fn emit_pairs(calibration: &Calibration) {
       accepted = scored.evaluation.accepted(),
       wrong = scored.wrong(),
       measure_changed = scored.evaluation.measure_changed,
+      anchored = pair.anchor.is_some(),
+      anchor_similarity = scored.evaluation.anchor_similarity.map(six),
       "pair"
     );
     for field in &scored.evaluation.comparison.fields {
@@ -442,6 +444,7 @@ fn reason(event: &Event<'_>, quantities: &[QuantityScore]) -> anyhow::Result<Rea
 struct Collected {
   pair: Pair,
   similarity: f32,
+  anchor_similarity: Option<f32>,
   measure_changed: bool,
   fields: Vec<FieldScore>,
   quantities: Vec<QuantityScore>,
@@ -471,8 +474,11 @@ fn collected_pair(event: &Event<'_>) -> anyhow::Result<Collected> {
       label_confidence: event.text("label_confidence")?,
       before,
       after: RecordFields::default(),
+      // The records are not in the events; what is kept of the anchor is that there was one.
+      anchor: event.flag("anchored")?.then(RecordFields::default),
     },
     similarity: narrow(event.number("similarity")?.context("`similarity` is missing")?),
+    anchor_similarity: event.number("anchor_similarity")?.map(narrow),
     measure_changed: event.flag("measure_changed")?,
     fields: Vec::new(),
     quantities: Vec::new(),
@@ -605,7 +611,7 @@ impl Reader {
             similarity: collected.similarity,
             fields: collected.fields,
           },
-          anchor_similarity: None,
+          anchor_similarity: collected.anchor_similarity,
           reasons,
           quantities: collected.quantities,
           measure_changed: collected.measure_changed,
@@ -920,6 +926,93 @@ mod tests {
       .collect::<Vec<_>>()
       .join("\n");
     (calibration, text)
+  }
+
+  #[test]
+  fn an_anchored_pair_reads_back_with_its_anchor_similarity() {
+    let (offline, policy) = offline();
+    let anchored = concat!(
+      r#"{"pair_id": "p4", "label": "recycle", "note": "category blanked, then refilled", "#,
+      r#""anchor": {"name": "blueberry gummies", "category": "edibles"}, "#,
+      r#""before": {"name": "blueberry gummies"}, "after": {"name": "blueberry gummies", "category": "flower"}}"#,
+    );
+    let pairs = parse_full_pairs(&format!("{PAIRS}\n{anchored}"), offline.schema(), Selection::default()).unwrap();
+    let calibration = calibrate(&offline, pairs).unwrap();
+    let captured = similarity_log::testing::capture("warn", || emit(&offline, &policy, &calibration, 0));
+    let events: Vec<Value> = captured
+      .results
+      .iter()
+      .map(|line| serde_json::from_str(line).unwrap())
+      .collect();
+    let pair = |id: &str| {
+      *named(&events, "pair")
+        .iter()
+        .find(|event| event["pair_id"] == id)
+        .unwrap()
+    };
+    assert_eq!(pair("p4")["anchored"], true);
+    assert!(pair("p4")["anchor_similarity"].is_number());
+    assert_eq!(pair("p1")["anchored"], false);
+    assert!(
+      pair("p1").get("anchor_similarity").is_none(),
+      "a pair with no anchor has no drift to report"
+    );
+
+    let run = read(&captured.results.join("\n")).unwrap();
+    let find = |calibration: &Calibration, id: &str| -> ScoredPair {
+      calibration
+        .pairs
+        .iter()
+        .find(|scored| scored.pair.id == id)
+        .unwrap()
+        .clone()
+    };
+    let (read_back, original) = (find(&run.calibration, "p4"), find(&calibration, "p4"));
+    assert!(
+      read_back.pair.anchor.is_some(),
+      "that there was an anchor survives; its text does not"
+    );
+    let drift = (
+      read_back.evaluation.anchor_similarity.unwrap(),
+      original.evaluation.anchor_similarity.unwrap(),
+    );
+    assert!((drift.0 - drift.1).abs() < 1e-6, "{drift:?}");
+    let category = |scored: &ScoredPair| {
+      scored
+        .evaluation
+        .comparison
+        .fields
+        .iter()
+        .find(|field| field.field == "category")
+        .unwrap()
+        .change
+    };
+    assert_eq!(
+      (category(&read_back), category(&original)),
+      (FieldChange::Restored, FieldChange::Restored)
+    );
+    assert!(find(&run.calibration, "p1").pair.anchor.is_none());
+  }
+
+  /// A committed run has its timestamps removed, so that regenerating it changes only the lines that moved.
+  #[test]
+  fn a_run_without_timestamps_reads_back_the_same() {
+    let (_, text) = written();
+    let stripped: Vec<String> = text
+      .lines()
+      .map(|line| {
+        let mut object: serde_json::Map<String, Value> = serde_json::from_str(line).unwrap();
+        assert!(object.remove("timestamp").is_some(), "every line has one to remove");
+        Value::Object(object).to_string()
+      })
+      .collect();
+    let (with, without) = (read(&text).unwrap(), read(&stripped.join("\n")).unwrap());
+    assert_eq!(
+      format!("{:?}", without.calibration.pairs),
+      format!("{:?}", with.calibration.pairs)
+    );
+    assert_eq!(without.info.fields, with.info.fields);
+    assert_eq!(without.calibration.input, with.calibration.input);
   }
 
   #[test]

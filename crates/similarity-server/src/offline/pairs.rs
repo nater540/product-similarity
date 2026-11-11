@@ -104,6 +104,10 @@ pub struct Pair {
   pub before: RecordFields,
   /// The record after the change.
   pub after: RecordFields,
+  /// The record as it was first created, if the pair says. It makes the pair one step of a history: created as
+  /// `anchor`, now stored as `before`, with `after` arriving. A field `before` lacks is then scored against it,
+  /// and drift is measured from it, as the server does for a stored record (D8).
+  pub anchor: Option<RecordFields>,
 }
 
 impl Pair {
@@ -116,11 +120,16 @@ impl Pair {
   }
 }
 
-/// A fingerprint of a pair's content: the first 16 hex digits of the SHA-256 of both records as JSON.
+/// A fingerprint of a pair's content: the first 16 hex digits of the SHA-256 of its records as JSON.
 ///
-/// Keys are written in sorted order, so the same content gives the same id however the file listed it.
-fn content_id(before: &RecordFields, after: &RecordFields) -> anyhow::Result<String> {
-  let bytes = serde_json::to_vec(&(before, after)).context("a pair does not serialize")?;
+/// Keys are written in sorted order, so the same content gives the same id however the file listed it. The anchor
+/// is hashed only when there is one, so a pair without one has the id it had before pairs could carry an anchor.
+fn content_id(before: &RecordFields, after: &RecordFields, anchor: Option<&RecordFields>) -> anyhow::Result<String> {
+  let bytes = match anchor {
+    Some(anchor) => serde_json::to_vec(&(before, after, anchor)),
+    None => serde_json::to_vec(&(before, after)),
+  }
+  .context("a pair does not serialize")?;
   Ok(hex_prefix(&Sha256::digest(&bytes), 8))
 }
 
@@ -200,10 +209,13 @@ struct StrictLine {
   note: String,
   before: RecordFields,
   after: RecordFields,
+  #[serde(default)]
+  anchor: Option<RecordFields>,
 }
 
-/// Parses a calibration file in the strict format: one JSON object per line with exactly `label`, `note`,
-/// `before`, and `after`; blank lines and `#` comments ignored.
+/// Parses a calibration file in the strict format: one JSON object per line with `label`, `note`, `before`, and
+/// `after`, optionally `anchor` (the record as first created), and nothing else; blank lines and `#` comments
+/// ignored.
 ///
 /// # Errors
 ///
@@ -214,7 +226,7 @@ pub fn parse_pairs(jsonl: &str) -> anyhow::Result<Pairs> {
     let parsed: StrictLine =
       serde_json::from_str(line).with_context(|| format!("line {number} is not a valid pair"))?;
     let pair = Pair {
-      id: content_id(&parsed.before, &parsed.after)?,
+      id: content_id(&parsed.before, &parsed.after, parsed.anchor.as_ref())?,
       label: Some(parsed.label),
       label_text: parsed.label.as_str().to_owned(),
       note: parsed.note,
@@ -225,6 +237,7 @@ pub fn parse_pairs(jsonl: &str) -> anyhow::Result<Pairs> {
       label_confidence: None,
       before: parsed.before,
       after: parsed.after,
+      anchor: parsed.anchor,
     };
     pairs.push((number, pair));
   }
@@ -259,6 +272,8 @@ struct FullLine {
   label_confidence: Option<String>,
   before: BTreeMap<String, Value>,
   after: BTreeMap<String, Value>,
+  #[serde(default)]
+  anchor: Option<BTreeMap<String, Value>>,
 }
 
 /// Which pairs of a full file to score.
@@ -352,9 +367,14 @@ pub fn parse_full_pairs(jsonl: &str, schema: &Schema, selection: Selection<'_>) 
 
     let before = project(parsed.before, schema, &mut input.ignored).with_context(invalid)?;
     let after = project(parsed.after, schema, &mut input.ignored).with_context(invalid)?;
+    let anchor = parsed
+      .anchor
+      .map(|anchor| project(anchor, schema, &mut input.ignored))
+      .transpose()
+      .with_context(invalid)?;
     let id = match parsed.pair_id.filter(|id| !id.trim().is_empty()) {
       Some(id) => id,
-      None => content_id(&before, &after)?,
+      None => content_id(&before, &after, anchor.as_ref())?,
     };
     let pair = Pair {
       id,
@@ -368,6 +388,7 @@ pub fn parse_full_pairs(jsonl: &str, schema: &Schema, selection: Selection<'_>) 
       label_confidence: parsed.label_confidence,
       before,
       after,
+      anchor,
     };
     pairs.push((number, pair));
   }
@@ -612,6 +633,77 @@ mod tests {
   }
 
   #[test]
+  fn a_pair_may_carry_the_record_as_it_was_first_created() {
+    let line = concat!(
+      r#"{"label": "recycle", "note": "blanked, then refilled", "anchor": {"name": "Gummies", "description": "ten"}, "#,
+      r#""before": {"name": "Gummies"}, "after": {"name": "Gummies", "description": "one gram"}}"#,
+    );
+    let strict = parse_pairs(line).unwrap();
+    let anchor = strict.pairs[0].anchor.as_ref().unwrap();
+    assert_eq!(anchor.texts["description"], "ten");
+
+    let full = parse_full_pairs(line, &schema(), everything()).unwrap();
+    assert_eq!(full.pairs[0].anchor, strict.pairs[0].anchor);
+    assert_eq!(
+      full.pairs[0].id, strict.pairs[0].id,
+      "both formats hash the same content"
+    );
+
+    // The anchor is part of what the pair is: the same step from another first version is another pair.
+    let other = parse_pairs(&line.replace(r#""description": "ten""#, r#""description": "twenty""#)).unwrap();
+    assert_ne!(other.pairs[0].id, strict.pairs[0].id);
+    let none = parse_pairs(r#"{"label": "edit", "before": {"name": "a"}, "after": {"name": "b"}}"#).unwrap();
+    assert_eq!(none.pairs[0].anchor, None);
+  }
+
+  /// Runs are compared by pair id. An id that changed because anchors exist now would make every pair of every
+  /// earlier run look new.
+  #[test]
+  fn a_pair_without_an_anchor_keeps_the_id_it_had() {
+    let sample = include_str!("../../../../data/calibration.sample.jsonl");
+    let parsed = parse_pairs(sample).unwrap();
+    assert_eq!(parsed.pairs[0].note, "potency added to the name");
+    assert_eq!(
+      parsed.pairs[0].id, "408d16dda7b0501e",
+      "the id this pair had before pairs could carry an anchor"
+    );
+  }
+
+  #[test]
+  fn an_anchor_is_reduced_to_the_schema_and_its_dropped_keys_counted() {
+    let line = concat!(
+      r#"{"label": "edit", "anchor": {"name": "a", "sku": "x1", "weight_per_item": "heavy"}, "#,
+      r#""before": {"name": "a"}, "after": {"name": "b"}}"#,
+    );
+    let parsed = parse_full_pairs(line, &schema(), everything()).unwrap();
+    let anchor = parsed.pairs[0].anchor.as_ref().unwrap();
+    assert_eq!(anchor.texts.len(), 1);
+    assert!(anchor.quantities.is_empty());
+    assert_eq!(parsed.input.ignored[&("sku".to_owned(), Ignored::NotInSchema)], 1);
+    assert_eq!(
+      parsed.input.ignored[&("weight_per_item".to_owned(), Ignored::WrongKind)],
+      1
+    );
+
+    let malformed = line.replace(r#""heavy""#, r#"{"value": 1}"#);
+    let error = format!(
+      "{:#}",
+      parse_full_pairs(&malformed, &schema(), everything()).unwrap_err()
+    );
+    assert!(error.contains("line 1") && error.contains("weight_per_item"), "{error}");
+  }
+
+  #[test]
+  fn a_strict_pair_with_any_fifth_key_but_anchor_is_refused() {
+    let with = |key: &str| {
+      format!(r#"{{"label": "edit", "{key}": {{"name": "a"}}, "before": {{"name": "a"}}, "after": {{"name": "b"}}}}"#)
+    };
+    assert!(parse_pairs(&with("anchor")).is_ok());
+    let error = format!("{:#}", parse_pairs(&with("anchr")).unwrap_err());
+    assert!(error.contains("unknown field `anchr`"), "{error}");
+  }
+
+  #[test]
   fn the_top_level_category_is_the_text_before_the_first_separator() {
     let pair = |category: Option<&str>| {
       let mut before = RecordFields::default();
@@ -630,6 +722,7 @@ mod tests {
         label_confidence: None,
         before,
         after: RecordFields::default(),
+        anchor: None,
       }
     };
     assert_eq!(pair(Some("Edibles > Gummies > Vegan")).category(), Some("Edibles"));

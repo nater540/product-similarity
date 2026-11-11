@@ -34,6 +34,7 @@ use std::collections::BTreeMap;
 
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use similarity_core::quantity::first_values;
 use similarity_core::score::{self, Evaluation};
 use similarity_core::{
   Embedder, FieldChange, Policy, PreparedRecord, Quantities, Quantity, QuantityChange, RecordVectors, Schema,
@@ -177,6 +178,12 @@ impl Offline {
     &self.schema
   }
 
+  /// The model itself, so that a test can put the same weights behind an engine and compare the two.
+  #[cfg(test)]
+  pub(crate) fn embedder(&self) -> &Embedder {
+    &self.embedder
+  }
+
   /// Embeds a record's text and validates its quantities, as the server does for a request.
   fn prepared(
     &self,
@@ -197,26 +204,50 @@ impl Offline {
 
   /// Judges `after` as a revision of `before`, exactly as the server would for a baseline it had just stored.
   ///
+  /// Without an `anchor` the pair has no history: nothing can be "restored", and drift is not measured. With one,
+  /// the pair is a record created as `anchor` whose stored version is now `before`: the anchor is built as an
+  /// import with an original version builds it (D20), a field or quantity `before` lacks is compared with it, and
+  /// the similarity to it is reported and held to the policy's `anchor_threshold`.
+  ///
   /// # Errors
   ///
-  /// Returns an error if either record does not fit the schema or the model fails.
-  pub fn compare(&self, before: &RecordFields, after: &RecordFields) -> anyhow::Result<Evaluation> {
+  /// Returns an error if a record does not fit the schema or the model fails.
+  pub fn compare(
+    &self,
+    before: &RecordFields,
+    after: &RecordFields,
+    anchor: Option<&RecordFields>,
+  ) -> anyhow::Result<Evaluation> {
+    let dimension = self.embedder.dimension();
     let (baseline, old_quantities) = self.prepared(before, None)?;
     let (candidate, new_quantities) = self.prepared(after, Some(&baseline))?;
+    let first = anchor
+      .map(|anchor| -> anyhow::Result<(Vec<f32>, Quantities)> {
+        let (original, original_quantities) = self.prepared(anchor, None)?;
+        Ok((
+          // The original's values, plus the stored value of anything the original did not have.
+          score::extend_anchor(&self.schema, dimension, &original.composite, &baseline.composite)?,
+          first_values(&original_quantities, &old_quantities),
+        ))
+      })
+      .transpose()?;
+    let (anchor_composite, anchor_quantities) = match first {
+      Some((composite, quantities)) => (Some(composite), quantities),
+      None => (None, Quantities::new()),
+    };
     let mut evaluation = score::evaluate(
       &self.schema,
       &self.policy,
-      self.embedder.dimension(),
+      dimension,
       &baseline,
-      None,
+      anchor_composite.as_deref(),
       &candidate,
     )?;
-    // A pair has no history, so there is no anchor and nothing can be "restored".
     evaluation.judge_quantities(
       &self.schema,
       &self.policy,
       &old_quantities,
-      &Quantities::new(),
+      &anchor_quantities,
       &new_quantities,
     );
     Ok(evaluation)
@@ -225,7 +256,123 @@ impl Offline {
 
 #[cfg(test)]
 mod tests {
+  use similarity_core::score::Reason;
+  use similarity_core::testing::tiny_embedder;
+  use similarity_core::{EmbedderOptions, FieldSpec, QuantitySpec};
+
   use super::*;
+
+  /// A scorer on the tiny model: two optional text fields and a weight, with drift held to `anchor_threshold`.
+  fn offline(anchor_threshold: Option<f32>) -> Offline {
+    let field = |name: &str| FieldSpec {
+      name: name.to_owned(),
+      weight: 1.0,
+      required: false,
+      reject_below: None,
+    };
+    let schema = Schema::new(vec![field("name"), field("brand")])
+      .unwrap()
+      .with_quantities(vec![QuantitySpec {
+        name: "weight".to_owned(),
+        reject_above_factor: Some(4.0),
+        reject_incomparable: false,
+      }])
+      .unwrap();
+    let options = EmbedderOptions {
+      max_tokens: 16,
+      batch_size: 8,
+      output_dim: None,
+    };
+    let policy = Policy::new(0.0, anchor_threshold).unwrap();
+    Offline::new(tiny_embedder(&options), schema, policy)
+  }
+
+  fn fields(json: &str) -> RecordFields {
+    serde_json::from_str(json).unwrap()
+  }
+
+  /// D8's two-step swap, as one pair: the brand was blanked in an earlier, accepted step, and now comes back as
+  /// something else. Without the anchor that is a field being filled in; with it, it is a field being replaced.
+  #[test]
+  fn a_field_blanked_and_refilled_is_scored_against_the_anchor() {
+    let offline = offline(None);
+    let anchor = fields(r#"{"name": "blueberry gummies", "brand": "indica"}"#);
+    let before = fields(r#"{"name": "blueberry gummies"}"#);
+    let after = fields(r#"{"name": "blueberry gummies", "brand": "vape cartridge"}"#);
+    let brand = |evaluation: &Evaluation| {
+      let score = evaluation
+        .comparison
+        .fields
+        .iter()
+        .find(|score| score.field == "brand")
+        .unwrap();
+      (score.change, score.similarity)
+    };
+
+    let unanchored = offline.compare(&before, &after, None).unwrap();
+    assert_eq!(brand(&unanchored), (FieldChange::Added, None));
+    assert_eq!(unanchored.anchor_similarity, None);
+
+    let anchored = offline.compare(&before, &after, Some(&anchor)).unwrap();
+    let (change, similarity) = brand(&anchored);
+    assert_eq!(change, FieldChange::Restored);
+    assert!(
+      similarity.unwrap() < 0.999,
+      "another brand is not the first one: {similarity:?}"
+    );
+    assert!(anchored.comparison.similarity < unanchored.comparison.similarity);
+    assert!(anchored.anchor_similarity.is_some());
+
+    // Refilled with what it first held, it is the record it always was.
+    let restored = offline.compare(&before, &anchor, Some(&anchor)).unwrap();
+    assert!((restored.comparison.similarity - 1.0).abs() < 1e-5);
+  }
+
+  #[test]
+  fn a_quantity_removed_and_refilled_is_compared_with_the_anchor() {
+    let offline = offline(None);
+    let anchor = fields(r#"{"name": "flower", "weight": {"value": 3.5, "unit": "g"}}"#);
+    let before = fields(r#"{"name": "flower"}"#);
+    let after = fields(r#"{"name": "flower", "weight": {"value": 28, "unit": "g"}}"#);
+
+    let unanchored = offline.compare(&before, &after, None).unwrap();
+    assert_eq!(unanchored.quantities[0].change, QuantityChange::Added);
+    assert!(unanchored.accepted(), "{:?}", unanchored.reasons);
+
+    let anchored = offline.compare(&before, &after, Some(&anchor)).unwrap();
+    let weight = &anchored.quantities[0];
+    assert_eq!(weight.change, QuantityChange::Restored);
+    assert!((weight.factor.unwrap() - 8.0).abs() < 1e-9 && weight.beyond_limit);
+    assert!(
+      matches!(&anchored.reasons[..], [Reason::QuantityBeyondFactor { field, .. }] if field == "weight"),
+      "{:?}",
+      anchored.reasons
+    );
+  }
+
+  #[test]
+  fn an_anchored_pair_is_held_to_the_anchor_threshold() {
+    let anchor = fields(r#"{"name": "blueberry gummies"}"#);
+    let now = fields(r#"{"name": "vape cartridge"}"#);
+
+    // The stored version and the new one are identical; only the distance from the first version can reject.
+    let strict = offline(Some(0.999)).compare(&now, &now, Some(&anchor)).unwrap();
+    assert!(
+      strict.anchor_similarity.unwrap() < 0.999,
+      "{:?}",
+      strict.anchor_similarity
+    );
+    assert!(
+      matches!(&strict.reasons[..], [Reason::AnchorDrift { .. }]),
+      "{:?}",
+      strict.reasons
+    );
+
+    let reporting = offline(None).compare(&now, &now, Some(&anchor)).unwrap();
+    assert!(reporting.anchor_similarity.is_some() && reporting.accepted());
+    let unanchored = offline(Some(0.999)).compare(&now, &now, None).unwrap();
+    assert!(unanchored.anchor_similarity.is_none() && unanchored.accepted());
+  }
 
   #[test]
   fn a_record_file_holds_text_and_quantities_in_one_object_told_apart_by_type() {
