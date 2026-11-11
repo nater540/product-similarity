@@ -44,7 +44,8 @@ Seven things in the suggestions needed correcting or deciding, and each is now r
    never modified in place. `provenance.json` records what produced a model, not what it scored.
 5. **The store trait did not have to grow for a resumable import.** An import that only creates is resumable by
    being run again.
-6. **A build inside Docker has no `.git`.** The commit is passed in as a build argument.
+6. **A build inside Docker has no `.git`.** The commit is passed in as a build argument. The image was built
+   once that way to check: the `provenance.json` of the model baked into it names the commit.
 7. **Very long fields were a CPU cost risk: verified, and fixed.** One 1 MB field cost about 0.7 s of the single
    embedding thread, and 3 MB about 2 s, because the tokenizer walks the whole field before truncating to
    `max_tokens`. Only the part that could be read is tokenized now (D21).
@@ -65,8 +66,6 @@ Still open, noticed along the way and not acted on:
   rounded where that helps, and every other event now does. Round it when feature 10 touches that line.
 - **Quantities have no drift check.** A factor limit applies to each revision against the one before it. Feature
   11 is where real histories would show whether that matters.
-- **The Docker image build with the new build argument has not been run.** The change is two lines in the
-  `Dockerfile` and one in the `justfile`. Run `just image` once before relying on it.
 
 ## Decisions that were taken
 
