@@ -4,29 +4,44 @@ Paste everything below the line into a Claude session that has read access to th
 
 ---
 
-I need your help assembling a labeled dataset from our product listing data. You will be working inside our
+I need your help assembling a labeled dataset from our brand product data. You will be working inside our
 environment with read access to it; I cannot move this data elsewhere, so everything you produce stays here.
+
+## Scope
+
+This is about **brand products**: the catalog entries a brand owns and maintains. It is not about retailers' menu
+items. Menu items appear in exactly two places below, both optional: as evidence for a label, and as examples
+linked to a brand product (section 4). Wherever this says "product" it means a brand product, and wherever it says
+"brand" it means the brand that owns one.
 
 ## Why
 
-We have a service, `record-similarity`, that decides whether an edit to a product listing is still the same product.
-The problem it targets is "recycling": a merchant takes an existing listing (say a blueberry gummy) and edits it
-into an entirely different product, keeping the listing's id, reviews, and history.
+We have a service, `record-similarity`, that decides whether an edit to a brand product is still the same product.
+The problem it targets is "recycling": a brand takes an existing product (say a blueberry gummy) and edits it into
+an entirely different product, keeping the product's id, its reviews, its history, and whatever is linked to it.
 
-The service embeds each text field of a listing with a small sentence-embedding model, compares the new version
+The service embeds each text field of a product with a small sentence-embedding model, compares the new version
 with the stored one field by field (cosine similarity), and rejects the edit if the weighted similarity falls below
 a threshold. Today those thresholds are calibrated on 46 hand-written, synthetic examples. I need real before/after
 pairs, with trustworthy labels, to replace them. The dataset will be used to choose thresholds and field weights,
-and possibly later to fine-tune the model.
+and to fine-tune the model.
+
+One thing follows from the scope and shapes everything below: **every recycle happens inside one brand.** The
+brand does not change, and often the category does not either. The hard cases are a brand turning one of its own
+products into another of its own products, and those are the cases I most need.
 
 ## Start by finding out what exists
 
 Before pulling anything at scale, find out and tell me:
 
-- Whether there is a version history or audit log of product listing text (what a listing said before and after
+- Whether there is a version history or audit log of brand product text (what a product said before and after
   each edit, with timestamps). If there is not, stop and report that: nothing below is possible without it.
-- Which fields a listing has, which are free text and which are ids or enums, and how often each is filled in.
+- Which fields a brand product has, which are free text and which are ids or enums, and how often each is filled
+  in.
+- How many brands and how many brand products there are, and how edits are distributed across brands (a few
+  brands making most of the edits changes how the sampling below should be capped).
 - What independent evidence of recycling exists (see "Labels").
+- Whether retailers' menu items are linked to brand products, and how (see section 4).
 
 If you cannot find where something lives, ask me rather than guessing. If reaching a source needs access you do not
 have, stop and tell me; do not work around it.
@@ -37,21 +52,26 @@ Write everything into one new directory outside any git repository.
 
 ### 1. `pairs.full.jsonl`: labeled before/after pairs (the source of truth)
 
-One JSON object per line, one line per edit:
+One JSON object per line, one line per edit to a brand product:
 
 ```json
-{"pair_id": "p000123", "product": "<pseudonym>", "merchant": "<pseudonym>", "edited_at": "2026-03-14T17:02:11Z",
+{"pair_id": "p000123", "product": "<pseudonym>", "owner": "<pseudonym>", "edited_at": "2026-03-14T17:02:11Z",
  "label": "recycle", "label_source": "moderator_revert", "label_confidence": "high", "variant_change": null,
- "split": "calibrate", "note": "gummies listing became a vape cartridge",
+ "split": "calibrate", "note": "gummies product became a vape cartridge",
  "before": {"name": "...", "category": "...", "brand": "...", "description": "...", "<other field>": "..."},
  "after":  {"name": "...", "category": "...", "brand": "...", "description": "...", "<other field>": "..."}}
 ```
 
 - `before` is the version immediately preceding the edit, `after` the version it produced.
+- `owner` is the brand that owns the product, as a pseudonym (see "Handling"). It is a separate key from the
+  `brand` field inside `before` and `after`, which is the brand's name as text.
 - Include **every** field that describes what the product is, as text: name, category (the human-readable path such
   as `Edibles > Gummies`, not the id), brand name, description, and anything else we have (strain, genetics, size or
   weight, potency, flavor, tags). Where a field is an id or enum, give its display text and add the raw id under a
   second key with an `_id` suffix.
+- **Include the brand name even though it will almost always be the same on both sides.** The service keeps it as
+  a field. If you find edits where a product's brand did change, do not drop them: count them and tell me, because
+  that should be rare and I want to know what it means when it happens.
 - Omit a field that has no value. Do not write `null` or an empty string.
 - **Do not clean the text.** No trimming, lowercasing, HTML stripping, translation, de-duplication of whitespace, or
   encoding repair. The service must be calibrated on exactly what it will receive.
@@ -73,29 +93,48 @@ Derived from file 1 by projection. The tool rejects any line that deviates from 
 
 ### 3. `sequences.jsonl`: whole edit histories
 
-For about 200 listings that have had at least five text edits, every version in order. Include listings known to
-have been recycled if any exist. This is used to measure how far a legitimate listing drifts over its lifetime.
+For about 200 brand products that have had at least five text edits, every version in order, spread across as
+many brands as you can. Include products known to have been recycled if any exist. This is used to measure how far
+a legitimate product drifts over its lifetime.
 
 ```json
-{"product": "<pseudonym>", "label": "edit", "versions": [{"at": "2025-11-02T09:00:00Z", "fields": {"name": "..."}}]}
+{"product": "<pseudonym>", "owner": "<pseudonym>", "label": "edit",
+ "versions": [{"at": "2025-11-02T09:00:00Z", "fields": {"name": "..."}}]}
 ```
 
-### 4. `catalog-groups.jsonl` (only if this link exists)
+### 4. `catalog-groups.jsonl` (only if menu items are linked to brand products)
 
-If merchant listings are linked to a shared catalog or verified brand product, export about 2,000 groups: the
-catalog product's fields plus the fields of up to ten merchant listings linked to it. Different merchants describing
-the same product are naturally occurring paraphrases, which is training data for the model. If no such link exists,
-say so and skip this.
+If retailers' menu items are linked to the brand product they are a listing of, export about 2,000 groups: one
+brand product's fields, plus the fields of up to ten menu items linked to it, preferably from ten different
+retailers. Different retailers describing the same product are naturally occurring paraphrases of it, which is
+training data for the model. If no such link exists, say so and skip this.
 
 ```json
-{"group": "<pseudonym>", "catalog": {"name": "..."}, "listings": [{"name": "..."}, {"name": "..."}]}
+{"group": "<pseudonym>", "owner": "<pseudonym>", "catalog": {"name": "..."},
+ "listings": [{"name": "..."}, {"name": "..."}]}
 ```
+
+- `catalog` is the brand product and `listings` are the menu items. Keep those two key names; the training tool
+  reads them.
+- Use the same fields and the same no-cleaning rule as file 1, for both the product and the menu items.
+- Take the product's text as it was when the menu items were linked to it, if that can be determined. A product
+  that was recycled after its menu items were linked would otherwise be paired with listings of what it used to be.
+  If it cannot be determined, leave out products with a `recycle` label in file 1 and say that you did.
+- Only use links you have reason to trust (made by the retailer or verified, not guessed by a matching job), and
+  tell me which kind they are.
+- Spread the groups across brands: no brand should supply more than about 5% of them. Include several products
+  from the same brand and category where you can (three flavors of one gummy line, say). Telling those apart is
+  the skill the model most needs.
+- Leave out any brand whose pairs are in the `holdout` split of file 1 (see "Sampling"), so that the model is not
+  trained on the brands it is tested on.
 
 ### 5. `REPORT.md`
 
 - What you found in "Start by finding out what exists", including the queries you ran.
 - Counts by label, label source, confidence, top-level category, and split.
-- An estimate of the base rate: of a uniform random sample of text edits, what fraction look like recycling.
+- How the pairs are distributed across brands: how many brands contribute, and the largest share any one has.
+- An estimate of the base rate: of a uniform random sample of text edits to brand products, what fraction look
+  like recycling.
 - Per field: fill rate, typical and maximum length, share of non-English text.
 - Counts of what you excluded and why.
 - Known biases in the sample, and anything you could not do.
@@ -103,22 +142,24 @@ say so and skip this.
 
 ## Labels
 
-- `edit`: after the change the listing still describes the same physical product (reworded, corrected,
-  reformatted, extended, potency or batch updated).
-- `recycle`: after the change the listing describes a different product.
+- `edit`: after the change the product is still the same physical product (reworded, corrected, reformatted,
+  extended, potency or batch updated).
+- `recycle`: after the change the product entry describes a different product.
 
 **The label must come from evidence independent of how different the text looks.** If you label by reading the two
 versions and judging how much changed, the calibration becomes circular and worthless. Acceptable evidence, roughly
 from strongest to weakest:
 
-1. A moderator or support action: the edit was reverted or the listing was flagged or removed for this reason.
+1. A moderator or support action: the edit was reverted or the product was flagged or removed for this reason.
 2. A change of identity in structured data at the same time: barcode, SKU, lab batch or product registration id,
-   linked catalog product, product type.
-3. Customer evidence: reviews or tickets after the edit saying the listing is not the product it used to be.
-4. A discontinuity around the edit in orders, price, or product photos.
+   product type.
+3. What happened to the menu items linked to the product: retailers unlinking them after the edit, or linked
+   menu items that still plainly describe what the product used to be.
+4. Customer or retailer evidence: reviews or tickets after the edit saying the product is not what it used to be.
+5. A discontinuity around the edit in orders, price, or product photos.
 
-For `edit` labels use positive evidence too where you can (identifiers unchanged, no complaints, no moderation
-action), not merely the absence of a recycle signal.
+For `edit` labels use positive evidence too where you can (identifiers unchanged, linked menu items still linked
+and still matching, no complaints, no moderation action), not merely the absence of a recycle signal.
 
 Record which evidence you used in `label_source` and how strong it is in `label_confidence` (`high`, `medium`,
 `low`). If the evidence is absent or conflicting, set `label` to `"unsure"` in file 1 and leave the pair out of
@@ -129,30 +170,40 @@ file 2. Never guess, and never invent or synthesize pairs to fill a quota.
 Some edits are a matter of policy rather than fact: the same brand and category, but a different flavor, strain,
 size, pack count, or potency. Set `variant_change` to one of `"flavor"`, `"strain"`, `"size"`, `"count"`,
 `"potency"` for these (otherwise `null`). Label them only if a written policy or a moderator decision settles the
-question; otherwise mark them `"unsure"`. I want as many of these as you can find, because they are where the
-threshold will actually sit.
+question; otherwise mark them `"unsure"`.
+
+**These are the most valuable pairs in the dataset.** Since every recycle stays within one brand, this is where
+edits and recycles look most alike and where the threshold will actually sit. I want as many as you can find, and
+I would rather have a hundred of them marked `unsure` than have them left out.
 
 ## Sampling
 
-- Edits from the last 12 months. Only edits that changed the text of at least one descriptive field; skip edits to
-  price, stock, or photos alone, and edits whose text is identical apart from whitespace. Count what you skip.
+- Edits to brand products from the last 12 months. Only edits that changed the text of at least one descriptive
+  field; skip edits to price, stock, or photos alone, and edits whose text is identical apart from whitespace.
+  Count what you skip.
 - Aim for at least 300 `edit` and 300 `recycle` pairs at `high` or `medium` confidence. Recycles are rare: take
   every well-evidenced one you can find, up to about 1,000, and tell me if you fall short.
 - Spread across every top-level category roughly in proportion to edit volume, with a minimum of 20 pairs for any
   category that has them.
-- At most five pairs per merchant and one pair per listing in files 1 and 2, so that no single merchant's writing
-  style dominates.
-- In addition, a uniform random sample of 500 text edits, labeled as well as the evidence allows, tagged
-  `"label_source": "random_sample"` plus the evidence used. This is what the base-rate estimate comes from.
-- Assign `split`: 80% `"calibrate"`, 20% `"holdout"`, decided by a hash of the merchant so that no merchant appears
-  in both.
+- One pair per product in files 1 and 2. Cap what any one brand contributes so that no brand supplies more than
+  about 5% of the pairs of either label, and no single brand's writing style or product line dominates. If there
+  are too few brands for that cap to leave enough pairs, relax it only as far as you must and tell me the cap you
+  ended up with.
+- In addition, a uniform random sample of 500 text edits to brand products, labeled as well as the evidence
+  allows, tagged `"label_source": "random_sample"` plus the evidence used. This is what the base-rate estimate
+  comes from. The per-brand cap does not apply to it.
+- Assign `split`: 80% `"calibrate"`, 20% `"holdout"`, decided by a hash of the brand so that no brand appears in
+  both. Check that the holdout ended up with enough recycles to measure anything (at least 40); if one large
+  brand's hash tipped the balance, change the salt and say so.
 
 ## Handling
 
 - Read-only. Do not write to any production system.
-- Keep the data inside this environment. Do not send listing text to any external service, API, or tool.
-- Replace product and merchant ids with a salted hash, stable across all files, and do not write the salt into any
-  output. No customer names, emails, or other personal data in any file; use review and ticket text as evidence for
+- Keep the data inside this environment. Do not send product text to any external service, API, or tool.
+- Replace product, brand, and retailer ids with a salted hash, stable across all files, and do not write the salt
+  into any output. Brand names will still appear inside the text fields themselves; that is expected, and is one
+  more reason the files stay here.
+- No customer names, emails, or other personal data in any file; use review and ticket text as evidence for
   labels, but do not export it.
 - If anything here conflicts with our data-handling policy, follow the policy and tell me what you changed.
 
