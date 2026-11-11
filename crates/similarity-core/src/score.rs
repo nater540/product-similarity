@@ -648,6 +648,35 @@ mod tests {
   const DIM: usize = 2;
 
   /// A unit vector at `degrees` in the plane, so the cosine between two of them is the cosine of the difference.
+  /// "Below the threshold" means below it. A revision that scores exactly the threshold is accepted, for the
+  /// overall similarity and for the similarity to the anchor alike: the documented rule, and the one a caller who
+  /// sets a threshold from a measured score is relying on.
+  #[test]
+  fn a_score_exactly_at_a_threshold_is_accepted_and_one_step_below_it_is_not() {
+    let schema = product_schema();
+    let policy = Policy::new(0.9, Some(0.85)).unwrap();
+    let scored = |similarity: f32| Comparison {
+      similarity,
+      fields: Vec::new(),
+    };
+
+    assert_eq!(judge(&schema, &policy, &scored(0.9), Some(0.85)), []);
+    assert_eq!(
+      judge(&schema, &policy, &scored(0.9_f32.next_down()), Some(0.85)),
+      [Reason::BelowThreshold {
+        similarity: 0.9_f32.next_down(),
+        threshold: 0.9
+      }]
+    );
+    assert_eq!(
+      judge(&schema, &policy, &scored(0.9), Some(0.85_f32.next_down())),
+      [Reason::AnchorDrift {
+        similarity: 0.85_f32.next_down(),
+        threshold: 0.85
+      }]
+    );
+  }
+
   fn at(degrees: f32) -> Vec<f32> {
     let radians = degrees.to_radians();
     let mut vector = vec![radians.cos(), radians.sin()];
