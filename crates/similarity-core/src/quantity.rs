@@ -237,6 +237,10 @@ pub struct QuantityScore {
 ///
 /// `Some(1.0)` when they are equal within tolerance (two zeros included), `None` when exactly one of them is zero,
 /// since no finite factor takes zero to anything else.
+///
+/// Always finite. Two valid amounts can be so far apart that their quotient overflows (`1e-300 g` against
+/// `1e300 g`), and an infinite factor cannot be written as a JSON number: an event carrying it would hold `null`
+/// and the run could not be read back. Such a pair gets the largest number there is, which is beyond every limit.
 fn ratio(left: f64, right: f64) -> Option<f64> {
   let (low, high) = if left <= right { (left, right) } else { (right, left) };
   if high - low <= RELATIVE_TOLERANCE * high {
@@ -244,7 +248,7 @@ fn ratio(left: f64, right: f64) -> Option<f64> {
   } else if low <= 0.0 {
     None
   } else {
-    Some(high / low)
+    Some((high / low).min(f64::MAX))
   }
 }
 
@@ -340,6 +344,23 @@ mod tests {
 
   fn grams(value: f64) -> Quantity {
     Quantity::single(value, "g")
+  }
+
+  /// Both amounts pass `check`, and their quotient overflows. An infinite factor would be written to an event as
+  /// `null`, and the run could not be read back.
+  #[test]
+  fn a_factor_too_large_to_write_down_is_still_a_number() {
+    let (tiny, huge) = (grams(1e-300), grams(1e300));
+    assert!(tiny.check().is_ok() && huge.check().is_ok());
+    for score in [compared(&tiny, &huge), compared(&huge, &tiny)] {
+      let factor = score.factor.unwrap();
+      assert!(factor.is_finite() && factor > 1e300, "{factor}");
+      let written = serde_json::to_string(&factor).unwrap();
+      assert_eq!(
+        serde_json::from_str::<f64>(&written).unwrap().to_bits(),
+        factor.to_bits()
+      );
+    }
   }
 
   #[test]

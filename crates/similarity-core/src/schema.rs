@@ -32,6 +32,15 @@ use crate::vector::{norm, normalize};
 /// an absent block is exactly zero before the `f32` round trip through storage and still far below this after it.
 const ABSENT_BLOCK_NORM: f64 = 1e-6;
 
+/// The smallest share of the total weight a field may have.
+///
+/// A field's block in a composite has length `sqrt(w / total)`. Below [`ABSENT_BLOCK_NORM`], that is a share of
+/// one part in a million million, the block reads back as "no value" and the field silently leaves every score.
+/// Each weight on its own would be valid, so the schema is where it has to be caught. This bound keeps every
+/// block a thousand times longer than the cut-off, which is room for the `f32` round trip through storage, and
+/// no weighting anyone means comes near it: it is a million to one.
+const MIN_WEIGHT_SHARE: f64 = 1e-6;
+
 /// One field of a record.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldSpec {
@@ -115,6 +124,16 @@ impl Schema {
         return Err(Error::Schema(format!(
           "field `{}` has `reject_below` {floor}, outside the cosine range [-1, 1]",
           field.name
+        )));
+      }
+    }
+    let total: f64 = fields.iter().map(|field| f64::from(field.weight)).sum();
+    for field in &fields {
+      if f64::from(field.weight) < MIN_WEIGHT_SHARE * total {
+        return Err(Error::Schema(format!(
+          "field `{}` has weight {}, less than a millionth of the total {total}: its part of a record's vector \
+           would be too small to tell from a field with no value",
+          field.name, field.weight
         )));
       }
     }
@@ -331,6 +350,26 @@ mod tests {
     let schema = product_schema();
     let names: Vec<&str> = schema.fields().iter().map(|field| field.name.as_str()).collect();
     assert_eq!(names, ["category", "description", "name"]);
+  }
+
+  /// Each weight alone is valid. Together, the small one's share of a vector is below what counts as "has a
+  /// value", so the field would be read back as absent and any change to it would leave the score.
+  #[test]
+  fn a_weight_too_small_to_survive_in_a_vector_is_refused() {
+    let error = Schema::new(vec![field("name", 1.0), field("brand", 1e-7)])
+      .unwrap_err()
+      .to_string();
+    assert!(error.contains("`brand`") && error.contains("millionth"), "{error}");
+
+    // A hundred thousand to one is lopsided and still sound: the light field is seen in a composite.
+    let schema = Schema::new(vec![field("name", 1.0), field("brand", 1e-5)]).unwrap();
+    // In field order: brand, then name.
+    let vectors = [unit([1.0, 0.0, 0.0]), unit([0.0, 1.0, 0.0])];
+    let composite = schema
+      .compose(3, vectors.iter().map(|vector| Some(vector.as_slice())))
+      .unwrap();
+    let blocks = schema.blocks(3, &composite).unwrap();
+    assert!(blocks.iter().all(Option::is_some), "both fields are present");
   }
 
   #[test]

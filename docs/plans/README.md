@@ -17,8 +17,9 @@ the plans found, where they meet, and an order. Delete a plan when its feature l
    `split` value for choosing; plan 3's `pairs carve` is the tool that would write it.
 3. **`anchor_threshold = 0.85` ships enforced and nothing records how it was chosen.** D8 explains the anchor, not
    the number. Plan 11 is how it would be measured.
-4. **Predicted, not run:** a quantity factor can be infinite (`1e-300 g` against `1e300 g`), which an event cannot
-   carry; and a weight below about `1e-12` of the total makes a field read as absent. Both in `14-fuzzing.md`.
+4. **Fixed: two more that the fuzzing plan predicted.** A quantity factor could be infinite (`1e-300 g` against
+   `1e300 g`), which an event cannot carry; it is now the largest finite number. A weight below about `1e-12` of
+   the total made a field read as absent; `Schema::new` now refuses a weighting that lopsided.
 
 `Evaluation::rejudge` reuses the anchor similarity as measured, so it is not exact under other weights when a
 record has an anchor (plans 11 and 18). `calibrate-diff --config-b` is not affected: a pair has no anchor.

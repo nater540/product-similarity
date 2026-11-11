@@ -140,6 +140,12 @@ unaffected. Search rankings are skewed toward records with the same set of fille
 matters most for ad hoc queries that supply only a name. The fix, if it matters in practice, is to over-fetch
 candidates and re-rank them with the exact weighted score.
 
+**A field's weight may not be less than a millionth of the total.** A field's block in a composite has length
+`sqrt(w / total)`, and a block shorter than `1e-6` is read as "this record has no value for the field". A weight
+below one part in a million million of the total would therefore make a field vanish from every score, although
+each weight on its own is valid. `Schema::new` refuses a weighting a million times more lopsided than that
+cut-off allows, which no real configuration is near.
+
 ## D6. What Qdrant is, and is not, doing here
 
 The honest assessment, since the question was asked:
@@ -488,6 +494,11 @@ revision that carries a quantity reports it as `ADDED` and the anchor takes it.
   item is a piece are simply two numbers; the caller has to be consistent.
 - It cannot say where a limit belongs, or whether zero means "none" or "not measured". Those are questions for
   the real data.
+
+**A factor is always a number that can be written down.** Two valid amounts can be so far apart that their
+quotient overflows (`1e-300 g` against `1e300 g`). An infinite factor is not a JSON number: a calibration event
+carrying it would hold `null`, and the run could not be read back. Such a change gets the largest finite number,
+which is beyond every limit, as it should be.
 
 ## D17. A calibration is also data: flat events, intervals over owners
 
