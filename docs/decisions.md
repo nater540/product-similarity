@@ -879,3 +879,63 @@ the one). The `before` line stays: the base model is not a choice.
 model. It does not score again the checkpoints an earlier process wrote, so its choice is among what this
 process saw. Results are never written into a checkpoint directory (D18); they are in the run's events (D23).
 Whether a validation split of a given size ranks checkpoints reliably can only be seen on real data.
+
+## D25. The tests are tested: mutation testing on the files whose boundaries are verdicts
+
+A test suite says what the code does on the inputs someone thought of. It does not say which of the code's
+comparisons could be changed without any test noticing. For most code that is a curiosity. Here a comparison is
+a verdict: `<` against `<=` at a threshold decides whether a record is rejected.
+
+`just mutants` runs cargo-mutants over eight files: `score.rs`, `quantity.rs`, `schema.rs`, `vector.rs`, and
+`record.rs` in `similarity-core`, and `engine.rs`, `offline/stats.rs`, and `offline/calibrate.rs` in
+`similarity-server`. Each crate's mutants are tested by that crate's own library tests, which is stricter than
+letting the engine's scenarios vouch for the core's arithmetic, and much faster.
+
+**What the first runs found.** Eighteen survivors in 392 mutants, each a real gap:
+
+- A score exactly at the overall threshold, and at the anchor threshold, was held by no test.
+- Nothing tested that two requests for one id are judged one after the other. The lock was there; a test with a
+  store that yields on read now fails without it, because both requests then create the record.
+- `field_range`, which a field's floor is read from, had only been tested on input where it returns nothing.
+- The threshold suggestion used the midpoint of two neighboring scores. Between two scores one float apart the
+  midpoint rounds to the lower one, and two scores that a threshold does separate were reported as an error. The
+  candidate is now the upper score in that case.
+- A bootstrap interval was never checked to lie between 0 and 1.
+
+After a test for each, 400 mutants: 333 caught, 67 that do not compile, none surviving, in 14 minutes at three
+jobs on a 12-core machine.
+
+**Why an allowlist of files.** The alternative, excluding what should not be mutated, grows a list of everything
+whose only tests need the model or Qdrant, and a new file is mutated by default whether or not its tests can run.
+The eight files are where a mutant that survives means a wrong verdict.
+
+**Why one fixed proptest seed.** The property tests draw a new seed each run. A mutant that one seed catches and
+another misses would make the survivors differ from run to run, and a gate that changes its mind is ignored. The
+recipe fixes the seed and turns off the regression files, which would otherwise be written into a copy that is
+thrown away.
+
+**Why it is not in `just ci`.** A quarter of an hour of twelve cores. It is run by hand after a change to what
+it covers, as the thorough property pass is. The repository has no remote, so there is no scheduled job to give
+it to.
+
+**Excluding a mutant is for one case only:** the change cannot alter behavior. One is excluded, with its reason:
+`>` against `>=` at a block length that no block can have, since `Schema::new` now refuses the weighting that
+could produce one. Where a survivor showed code that was redundant (a filter that the next comparison repeats),
+the code was simplified instead, which removes the mutant with it.
+
+**The tool copies the tree for each job as the job starts.** The first run was made while another change was
+being edited, two of its three copies did not compile, and it reported 206 mutants as failing to build. That
+reads like a result. A run is made from a clean checkout.
+
+**The trainer's checkpoint rules are a second set** (`just mutants-train`, `checkpoint.rs`), kept apart because
+its tests take real optimizer steps and the trainer changes rarely. Its tests are in the library and in the
+binary, so both are run. Ten of its 59 mutants survived at first. Eight were gaps: nothing tested that a
+checkpoint which says it is at or past the end of its run, or which records the wrong number of parameters, is
+refused; that a directory is written under parents that do not exist yet; or that a link to a checkpoint
+directory is that directory. Each has a test now. The other two replace the functions that flush a file and a
+directory to disk, which changes what survives a power cut and nothing a test can observe; they are excluded,
+with that reason. After that: 58 mutants, 39 caught, 19 that do not compile, none surviving, in four minutes.
+
+**What it cannot see.** cargo-mutants swaps operators and replaces function bodies. It never changes a constant
+or a method call, so the tolerance in `quantity.rs`, every `saturating_*`, and `min`, `max`, and `clamp` are
+beyond it. Those stay with the named tests and the properties (D19).

@@ -1990,6 +1990,88 @@ mod tests {
     assert!(!captured.results.last().unwrap().contains("best_"));
   }
 
+  /// A checkpoint says how far its run had got and what it holds. One whose account does not add up is refused
+  /// before a step is taken, with what is wrong: resuming from it would train something other than the run.
+  #[test]
+  fn a_checkpoint_whose_own_account_does_not_add_up_is_refused_and_says_why() {
+    let (dir, base, pairs) = workspace();
+    let first = dir.path().join("first");
+    let path = |path: &Path| path.to_str().unwrap().to_owned();
+    train(&["--base", &path(&base), "--out", &path(&first), "--pairs", &path(&pairs)]);
+    let checkpoint = dir.path().join("first.checkpoints/step-000002");
+    let state_path = checkpoint.join(checkpoint::STATE_FILE);
+    let original = std::fs::read_to_string(&state_path).unwrap();
+    let total = serde_json::from_str::<serde_json::Value>(&original).unwrap()["total_steps"]
+      .as_u64()
+      .unwrap();
+
+    let mut attempt = 0;
+    let mut resume = |edit: &dyn Fn(&mut serde_json::Value)| -> String {
+      let mut state: serde_json::Value = serde_json::from_str(&original).unwrap();
+      edit(&mut state);
+      std::fs::write(&state_path, state.to_string()).unwrap();
+      attempt += 1;
+      let out = dir.path().join(format!("resumed-{attempt}"));
+      let arguments = [
+        "x",
+        "--epochs",
+        "2",
+        "--batch-size",
+        "2",
+        "--max-tokens",
+        "16",
+        "--dims",
+        "24",
+        "--fields",
+        "name",
+        "--no-dropout",
+        "--no-checkpoints",
+      ];
+      let resume = [
+        "--resume",
+        &path(&checkpoint),
+        "--out",
+        &path(&out),
+        "--pairs",
+        &path(&pairs),
+      ];
+      let outcome = Cli::parse_from(arguments.iter().chain(&resume)).run(None);
+      assert!(!out.exists(), "nothing was written");
+      format!("{:#}", outcome.unwrap_err())
+    };
+
+    let at_the_end = resume(&|state| state["step"] = total.into());
+    assert!(at_the_end.contains("the end of its run"), "{at_the_end}");
+    let past_the_end = resume(&|state| state["step"] = (total + 1).into());
+    assert!(past_the_end.contains(&format!("steps, not {total}")), "{past_the_end}");
+    let another_length = resume(&|state| state["total_steps"] = (total + 2).into());
+    assert!(
+      another_length.contains(&format!("{} steps, not {total}", total + 2)),
+      "{another_length}"
+    );
+
+    let too_few = resume(&|state| {
+      state["param_ids"].as_array_mut().unwrap().pop();
+    });
+    assert!(too_few.contains("not how many this model has"), "{too_few}");
+    let too_many = resume(&|state| state["param_ids"].as_array_mut().unwrap().push("7".into()));
+    assert!(too_many.contains("not how many this model has"), "{too_many}");
+
+    // Put back as it was, it resumes.
+    std::fs::write(&state_path, &original).unwrap();
+    let out = dir.path().join("resumed");
+    train(&[
+      "--resume",
+      &path(&checkpoint),
+      "--out",
+      &path(&out),
+      "--pairs",
+      &path(&pairs),
+      "--no-checkpoints",
+    ]);
+    assert!(out.is_dir());
+  }
+
   fn provenance(dir: &Path) -> (Provenance, Trained) {
     let provenance = Provenance::read(dir).unwrap().expect("a provenance file");
     let trained = provenance.trained.clone().expect("a trained model");

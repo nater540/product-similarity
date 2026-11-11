@@ -38,7 +38,7 @@ record has an anchor (plans 11 and 18). `calibrate-diff --config-b` is not affec
 | 11 | [Drift calibration](11-drift-calibration.md) | medium | `sequences.jsonl` | Replaying in `ENFORCE` makes up everything after the first rejection |
 | 12 | [Latency and load test](12-latency-load-test.md) | medium | | Batch sizes are invisible to a client; the worker needs counters |
 | 14 | [Fuzzing](14-fuzzing.md) | medium | | Does not need nightly; the state machine is private and index-driven |
-| 15 | [Mutation testing](15-mutation-testing.md) | small | | The tool never mutates method calls or constants; proptest seeds must be fixed |
+| 15 | [Mutation testing](15-mutation-testing.md) | small, **built** | | The tool never mutates method calls or constants; proptest seeds must be fixed |
 | 17 | [Reviewer feedback](17-reviewer-feedback.md) | medium | | A feedback event cannot nest a pair; a restored field replays differently |
 | 18 | [Shadow evaluation](18-shadow-evaluation.md) | large | 12 helps | A low-priority thread does nothing: Burn runs on the global rayon pool |
 | 19 | [Reason codes](19-reason-codes.md) | small, **built** | | Mostly exists; a server-side word diff is impossible (only hashes are stored) |
@@ -76,7 +76,7 @@ Each plan ends with its full list of decisions and a recommended default for eac
 1. Fix the D21 cut, and correct the README's holdout advice. Both done.
 2. Run `calibrate --full` on the real pairs (nothing to build).
 3. **19** and **9**: both built. Both small to medium, and 9 turns "run `just test-real`" from a rule into a check.
-4. **15** and **14**, at any point. 14's first targets confirm the two predicted findings above.
+4. **15** (built) and **14**, at any point. 14's first targets confirm the two predicted findings above.
 5. **11**, once `sequences.jsonl` exists.
 6. Before real fine-tuning: **2** and **3** (both built), then **4** and **5**. **6** last; it is large and builds on 3.
 7. Before production: **10** and **12**. In production: **17**, then **18** (its policy-only half is a day or two).

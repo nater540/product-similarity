@@ -1,7 +1,7 @@
 # Feature suggestions
 
 Twenty features that could be added to this project, with what each is, why it matters here, how it would fit the
-code, and what it would cost. **Features 1, 2, 3, 7, 8, 9, 13, 16, and 19 are built** (D17 to D24, and the README); the rest are not. They were proposed in November 2026 from a read of the
+code, and what it would cost. **Features 1, 2, 3, 7, 8, 9, 13, 15, 16, and 19 are built** (D17 to D25, and the README); the rest are not. They were proposed in November 2026 from a read of the
 repository as it stood then (`README.md`, `docs/decisions.md`, and the crates); check a suggestion against the
 code before starting on it, since the code will have moved. It has moved once already: records now carry
 quantities, compared as numbers (D16), and the features that touch a verdict or a report say below what that
@@ -414,6 +414,11 @@ internals may need a public entry point behind a `fuzzing` feature.
 **Effort.** M. **Needs real data:** no.
 
 ### 15. Mutation testing
+
+**Built** (D25). What came out differently: an allowlist of eight files, not a list of exclusions; a fixed
+proptest seed, without which the survivors change from run to run; no CI job, since there is no remote; and a
+full run takes a quarter of an hour, not hours. It found 18 unguarded boundaries, among them a real bug in the
+threshold suggestion.
 
 **What.** `cargo mutants` over `similarity-core` (`score.rs`, `record.rs`, `schema.rs`, `vector.rs`),
 `engine.rs`, `offline.rs`, and `checkpoint.rs`:

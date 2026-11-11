@@ -1546,6 +1546,35 @@ it did not name. Each property runs 64 cases by default so that the suite stays 
 `PROPTEST_CASES=5000 just test` is the thorough run. A failure is shrunk to a small input and saved under the
 crate's `proptest-regressions/`, which is checked in, so the case is replayed first from then on.
 
+**Mutation testing.** `just mutants` changes the code a little at a time (a `<` to a `<=`, a function's body to
+a constant) and runs the tests against each change. A change the tests do not notice is a boundary nothing
+holds. It covers the eight files whose boundaries are verdicts: scoring, quantities, the schema, the engine, and
+the calibration statistics. It needs `cargo install --locked cargo-mutants@27.1.0`, which is a tool on the
+machine and not a dependency of the project.
+
+```sh
+just mutants -j 3          # every mutant; about a quarter of an hour
+just mutants-diff          # only the mutants in what changed since the last commit
+just mutants --list        # what would be tested, without building anything
+just mutants-train -j 3    # the trainer's checkpoint rules, a set of its own; four minutes
+```
+
+The last full run tested 400 mutants in 14 minutes at three jobs: 333 were caught, 67 did not compile, and none
+survived; the trainer's set is 58 more, 39 caught and 19 that did not compile. It is not part of `just ci`. Run it after changing the scoring, the quantity comparison, the engine's
+write path, or the calibration statistics.
+
+- **A survivor is answered with a test,** an example that states the boundary as a sentence, or a property if
+  the rule holds for every input. It is excluded in `.cargo/mutants.toml` only when the change cannot alter any
+  behavior, with the reason beside it. Three are excluded today: one comparison at a value nothing can have,
+  and the trainer's two functions that flush files to disk, which no test can observe.
+- **Do not edit the tree while it runs.** The tool copies the source tree for each job as that job starts. A copy
+  taken in the middle of an edit does not compile, and every mutant in it is then reported as one that did not
+  build, which looks like a result and is not one. Run it from a clean checkout:
+  `git worktree add ../mutants HEAD && cd ../mutants && just mutants -j 3`.
+- **It tests what it can change.** It swaps operators and replaces function bodies. It does not change a
+  constant, a method call such as `saturating_add`, or `min` and `max`, so a wrong tolerance or a wrong clamp is
+  still the property tests' to find.
+
 ### Project layout
 
 ```text
@@ -1563,7 +1592,7 @@ data/
   regression.snapshot.ndjson      what the pinned model and the example config make of them
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D24)
+  decisions.md               why things are the way they are (D1 to D25)
   data-request-prompt.md     a brief for collecting labeled production data
   feature-suggestions.md     twenty features that could be added, none built yet
   plan-features.md           a plan for the first five of them

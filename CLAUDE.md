@@ -6,7 +6,7 @@ marketplace listings. Each revision is embedded field by field with a small BERT
 thresholds. A record's quantities (weight, volume, potency) are compared as numbers beside that, never embedded.
 Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D24) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D25) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -44,6 +44,11 @@ changing a design. Infer conventions from the existing code first.
   proptest, D19), beside the example tests and not in place of them. After changing the engine's write path, the
   anchor, or the scoring, run `PROPTEST_CASES=5000 just test` once. When a property fails, fix the code or the
   rule, keep the shrunk case as an ordinary named test, and commit the `proptest-regressions/` file it wrote.
+- **The tests of the verdict-deciding files are themselves tested** (D25). After changing the scoring, the
+  quantity comparison, the schema, the engine's write path, or the calibration statistics, run `just mutants -j 3`
+  (a quarter of an hour; `just mutants-diff` for a quick look) from a clean checkout, never from a tree being
+  edited. A surviving mutant gets a test that states the boundary. Exclude one in `.cargo/mutants.toml` only if
+  the change cannot alter behavior, with the reason, and never because it is hard to kill.
 - **Verdicts on curated hard cases are pinned** (D22). `data/regression.jsonl` is synthetic and stays that way;
   `data/regression.snapshot.ndjson` is what the pinned model and `config.example.toml` make of it. A change to the
   config or the scoring code that moves any case fails `cargo test` (the snapshot is judged again, with no model);
@@ -153,6 +158,8 @@ changing a design. Infer conventions from the existing code first.
 - Model: `just fetch-model`; Qdrant: `just qdrant-up` / `just qdrant-down`
 - Slow tests: `just test-parity`, `just test-snapshot`, `just test-qdrant`, `just test-real`; `just snapshot` rewrites
   the pinned verdicts
+- Mutation testing (needs `cargo install cargo-mutants`): `just mutants -j 3`, `just mutants-diff`,
+  `just mutants-train`
 - Run: `just serve` (needs Qdrant) or `just serve-in-memory`; then `just client describe`
 - Load a catalog: `just import export.jsonl config.toml` (`--check` validates only)
 - Measure: `just throughput`, `just calibrate`, `just calibrate-diff`, `just verdict-gate old.ndjson pairs.full.jsonl`

@@ -100,7 +100,7 @@ Not planned in detail. What the review would add to each when its turn comes:
 | 11 | Drift-threshold calibration | Replays `sequences.jsonl` through the engine; `Engine::import` with `anchor` is the way to seed each history. Also report, per history, the largest factor each quantity reaches against its first value. |
 | 12 | Latency tracking and a load test | Would replace the last unmeasured throughput figure. |
 | 14 | Fuzzing | The state machine in `similarity-server`'s `properties` module is the structure-aware target, ready to be driven by a fuzzer. Add a target for `RecordFields` and `Quantity` parsing. |
-| 15 | Mutation testing | Add `quantity.rs` and `offline/stats.rs`; their boundaries (`>` against `>=` at a limit, the tolerance) are verdicts. |
+| 15 | Mutation testing | **Built** (D25): `just mutants` over eight files; 400 mutants, none surviving, after a test for each of the 18 the first runs found. |
 | 17 | Reviewer feedback capture | "`before` matches the stored baseline" has to include the quantities. The event it emits should be a line `calibrate --full` reads. |
 | 18 | Shadow evaluation | The shadow collection is filled with `import`; disagreements are a `calibrate-diff`. |
 | 19 | Structured reason codes | **Built** (D17, "The API carries the same codes"): `EvaluateResponse.reason_details`. The word diff and the neighbor lookup were left out, for the reasons given there. |

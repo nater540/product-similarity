@@ -175,6 +175,12 @@ fn sync_dir(_dir: &Path) -> std::io::Result<()> {
   Ok(())
 }
 
+/// The directory `path` is in, if it names one. A bare name such as `out` is in the working directory, which has
+/// no name of its own here: there is nothing to create and nothing that can be opened.
+fn parent_of(path: &Path) -> Option<&Path> {
+  path.parent().filter(|parent| !parent.as_os_str().is_empty())
+}
+
 /// Creates the directory `dir` with whatever `fill` writes into it, whole or not at all.
 ///
 /// `fill` writes into a sibling directory, which is flushed to disk and only then renamed to `dir`. `dir` must
@@ -194,7 +200,7 @@ fn write_whole(dir: &Path, fill: impl FnOnce(&Path) -> Result<()>) -> Result<()>
   if partial.exists() {
     std::fs::remove_dir_all(&partial).map_err(io(&partial))?;
   }
-  if let Some(parent) = partial.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+  if let Some(parent) = parent_of(&partial) {
     std::fs::create_dir_all(parent).map_err(io(parent))?;
   }
 
@@ -206,7 +212,7 @@ fn write_whole(dir: &Path, fill: impl FnOnce(&Path) -> Result<()>) -> Result<()>
   }
   std::fs::rename(&partial, dir).map_err(io(dir))?;
   // The rename is an edit to the parent directory, so that is what makes it durable.
-  if let Some(parent) = dir.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+  if let Some(parent) = parent_of(dir) {
     sync_dir(parent).map_err(io(parent))?;
   }
   Ok(())
@@ -531,6 +537,41 @@ mod tests {
     })
     .unwrap();
     assert!(failing.is_dir());
+  }
+
+  #[test]
+  fn a_directory_is_written_under_parents_that_do_not_exist_yet() {
+    let scratch = tempfile::tempdir().unwrap();
+    let target = scratch.path().join("models/run-1/out");
+    write_whole(&target, |partial| {
+      std::fs::create_dir_all(partial).map_err(|source| failure(partial, source.to_string()))
+    })
+    .unwrap();
+    assert!(target.is_dir());
+
+    assert_eq!(parent_of(Path::new("models/out")), Some(Path::new("models")));
+    assert_eq!(
+      parent_of(Path::new("out")),
+      None,
+      "a bare name has no directory to create or flush"
+    );
+    assert_eq!(parent_of(Path::new("/out")), Some(Path::new("/")));
+  }
+
+  /// A checkpoint is resumed only by a model loaded from that very directory, however the directory was named.
+  #[cfg(unix)]
+  #[test]
+  fn two_names_for_one_directory_are_the_same_directory() {
+    let scratch = tempfile::tempdir().unwrap();
+    let (real, link) = (scratch.path().join("step-000002"), scratch.path().join("latest"));
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert!(same_directory(&real, &link), "a link to it is it");
+    assert!(same_directory(&real, &scratch.path().join("./step-000002/")));
+    assert!(!same_directory(&real, scratch.path()));
+    // Neither exists: only the spelling can be compared.
+    assert!(same_directory(Path::new("gone/a"), Path::new("gone/a/")));
+    assert!(!same_directory(Path::new("gone/a"), Path::new("gone/b")));
   }
 
   #[test]
