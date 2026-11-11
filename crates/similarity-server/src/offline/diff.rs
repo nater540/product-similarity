@@ -21,9 +21,20 @@ use super::calibrate::{Calibration, ScoredPair, summarize};
 use super::events::{Run, six};
 use super::pairs::{Input, Label};
 use super::stats::{self, Range};
+use super::{change_name, quantity_change_name};
 
 /// Two bounds closer than this are the same bound: it is half of the last digit the reports print.
 const MOVED: f64 = 0.0005;
+
+/// How far a similarity may differ between two runs before it counts as having moved, unless a caller says
+/// otherwise. The same model gives the same similarity to about five decimals on another machine (the parity
+/// tests hold an embedding to a cosine of 0.99999 with PyTorch's), so this is some way above noise and some way
+/// below any change worth the name.
+pub const TOLERANCE: f32 = 0.001;
+
+/// How far two factors may differ, relative to their size, and still be the same factor. A factor is arithmetic
+/// on the record, not a model's output, so only the rounding of a conversion can separate two runs.
+const FACTOR_TOLERANCE: f64 = 1e-9;
 
 /// What a changed verdict means, given the pair's label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +140,49 @@ pub struct RangeShift {
   pub new: Option<Range>,
 }
 
+/// One thing about a pair that is not what it was in the earlier run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Movement {
+  /// What moved: `overall`, `anchor`, `field`, `quantity`, `reason_added`, or `reason_removed`.
+  pub what: &'static str,
+  /// The field or quantity, or for a reason its code (followed by what it is about, if it is about one thing).
+  pub subject: Option<String>,
+  /// The similarity or factor in the old run, where there was one.
+  pub old: Option<f64>,
+  /// The similarity or factor in the new run, where there is one.
+  pub new: Option<f64>,
+  /// The kind of change a field or quantity showed in the old run (`modified`, `restored`, ...).
+  pub old_change: Option<&'static str>,
+  /// The kind of change it shows in the new run.
+  pub new_change: Option<&'static str>,
+}
+
+/// A pair both runs have, and everything about it that moved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Moved {
+  /// The pair.
+  pub id: String,
+  /// Its note, as the new run has it.
+  pub note: String,
+  /// What moved, in the order: overall, anchor, fields, quantities, reasons.
+  pub movements: Vec<Movement>,
+}
+
+/// A score that sits so close to the limit it is judged against that noise could put it on the other side.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Border {
+  /// The pair.
+  pub id: String,
+  /// Which score: `overall`, `anchor`, `field`, or `quantity`.
+  pub what: &'static str,
+  /// The field or quantity, for those two.
+  pub subject: Option<String>,
+  /// The score.
+  pub value: f64,
+  /// The threshold, floor, or factor limit it is next to.
+  pub limit: f64,
+}
+
 /// Everything that differs between two runs over the pairs they share.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Diff {
@@ -148,6 +202,11 @@ pub struct Diff {
   pub slices: Vec<SliceChange>,
   /// Fields whose ranges moved.
   pub fields: Vec<RangeShift>,
+  /// How far a similarity had to move to be listed in `moved`.
+  pub tolerance: f32,
+  /// Every pair with a score that moved by more than `tolerance`, or a kind of change or a reason that is not
+  /// what it was, in the order of the new run. A verdict can stay the same through all of these.
+  pub moved: Vec<Moved>,
 }
 
 /// Whether two runs scored the same selection of the same file.
@@ -176,7 +235,7 @@ fn flip_of(new: &ScoredPair) -> Flip {
   }
 }
 
-fn moved(old: Option<Range>, new: Option<Range>) -> bool {
+fn range_moved(old: Option<Range>, new: Option<Range>) -> bool {
   match (old, new) {
     (None, None) => false,
     (Some(old), Some(new)) => {
@@ -186,10 +245,187 @@ fn moved(old: Option<Range>, new: Option<Range>) -> bool {
   }
 }
 
-/// Compares two calibrations over the pairs both have.
+/// A reason as one string: its code, and what it is about if it is about one field or quantity.
+fn reason_name(reason: &similarity_core::Reason) -> String {
+  match reason.subject() {
+    Some(subject) => format!("{} {subject}", reason.code()),
+    None => reason.code().to_owned(),
+  }
+}
+
+fn apart(old: Option<f32>, new: Option<f32>, tolerance: f32) -> bool {
+  match (old, new) {
+    (Some(old), Some(new)) => (old - new).abs() > tolerance,
+    (None, None) => false,
+    _ => true,
+  }
+}
+
+fn factors_apart(old: Option<f64>, new: Option<f64>) -> bool {
+  match (old, new) {
+    (Some(old), Some(new)) => (old - new).abs() > FACTOR_TOLERANCE * old.abs().max(new.abs()),
+    (None, None) => false,
+    _ => true,
+  }
+}
+
+/// What about one pair is not what it was. Similarities are compared within `tolerance`; kinds of change and
+/// reasons must be the same; factors must agree to rounding.
+fn movements(old: &ScoredPair, new: &ScoredPair, tolerance: f32) -> Vec<Movement> {
+  let wide = |value: Option<f32>| value.map(f64::from);
+  let mut found = Vec::new();
+  if apart(Some(old.similarity()), Some(new.similarity()), tolerance) {
+    found.push(Movement {
+      what: "overall",
+      subject: None,
+      old: wide(Some(old.similarity())),
+      new: wide(Some(new.similarity())),
+      old_change: None,
+      new_change: None,
+    });
+  }
+  let (before, after) = (&old.evaluation, &new.evaluation);
+  if apart(before.anchor_similarity, after.anchor_similarity, tolerance) {
+    found.push(Movement {
+      what: "anchor",
+      subject: None,
+      old: wide(before.anchor_similarity),
+      new: wide(after.anchor_similarity),
+      old_change: None,
+      new_change: None,
+    });
+  }
+
+  let names: BTreeSet<&str> = before
+    .comparison
+    .fields
+    .iter()
+    .chain(&after.comparison.fields)
+    .map(|score| score.field.as_str())
+    .collect();
+  for name in names {
+    let find = |evaluation: &similarity_core::score::Evaluation| {
+      let score = evaluation.comparison.fields.iter().find(|score| score.field == name)?;
+      Some((score.change, score.similarity))
+    };
+    let (was, is) = (find(before), find(after));
+    let kinds = (was.map(|found| found.0), is.map(|found| found.0));
+    let scores = (was.and_then(|found| found.1), is.and_then(|found| found.1));
+    if kinds.0 != kinds.1 || apart(scores.0, scores.1, tolerance) {
+      found.push(Movement {
+        what: "field",
+        subject: Some(name.to_owned()),
+        old: wide(scores.0),
+        new: wide(scores.1),
+        old_change: kinds.0.map(change_name),
+        new_change: kinds.1.map(change_name),
+      });
+    }
+  }
+
+  let names: BTreeSet<&str> = before
+    .quantities
+    .iter()
+    .chain(&after.quantities)
+    .map(|score| score.field.as_str())
+    .collect();
+  for name in names {
+    let find = |evaluation: &similarity_core::score::Evaluation| {
+      let score = evaluation.quantities.iter().find(|score| score.field == name)?;
+      Some((score.change, score.factor))
+    };
+    let (was, is) = (find(before), find(after));
+    let kinds = (was.map(|found| found.0), is.map(|found| found.0));
+    let factors = (was.and_then(|found| found.1), is.and_then(|found| found.1));
+    if kinds.0 != kinds.1 || factors_apart(factors.0, factors.1) {
+      found.push(Movement {
+        what: "quantity",
+        subject: Some(name.to_owned()),
+        old: factors.0,
+        new: factors.1,
+        old_change: kinds.0.map(quantity_change_name),
+        new_change: kinds.1.map(quantity_change_name),
+      });
+    }
+  }
+
+  let reasons = |evaluation: &similarity_core::score::Evaluation| -> BTreeSet<String> {
+    evaluation.reasons.iter().map(reason_name).collect()
+  };
+  let (had, has) = (reasons(before), reasons(after));
+  for (what, names) in [
+    ("reason_removed", had.difference(&has)),
+    ("reason_added", has.difference(&had)),
+  ] {
+    found.extend(names.map(|name| Movement {
+      what,
+      subject: Some(name.clone()),
+      old: None,
+      new: None,
+      old_change: None,
+      new_change: None,
+    }));
+  }
+  found
+}
+
+/// The scores of `calibration` that sit within `margin` of the limit they are judged against: the overall
+/// similarity and the threshold, a field and its floor, the anchor similarity and the drift threshold, and a
+/// factor and its limit (there, `margin` is relative to the limit).
+///
+/// A pinned case must not be one of these. It would change verdict on the noise between two machines, and a gate
+/// that fails for no reason is a gate that gets switched off.
+pub fn borderline(calibration: &Calibration, schema: &Schema, policy: &Policy, margin: f32) -> Vec<Border> {
+  let near = |value: f32, limit: f32| (value - limit).abs() <= margin;
+  let mut found = Vec::new();
+  for scored in &calibration.pairs {
+    let mut border = |what: &'static str, subject: Option<&str>, value: f64, limit: f64| {
+      found.push(Border {
+        id: scored.pair.id.clone(),
+        what,
+        subject: subject.map(str::to_owned),
+        value,
+        limit,
+      });
+    };
+    if near(scored.similarity(), policy.threshold) {
+      border(
+        "overall",
+        None,
+        f64::from(scored.similarity()),
+        f64::from(policy.threshold),
+      );
+    }
+    if let (Some(similarity), Some(threshold)) = (scored.evaluation.anchor_similarity, policy.anchor_threshold)
+      && near(similarity, threshold)
+    {
+      border("anchor", None, f64::from(similarity), f64::from(threshold));
+    }
+    for score in &scored.evaluation.comparison.fields {
+      let floor = schema.field(&score.field).and_then(|spec| spec.reject_below);
+      if let (Some(similarity), Some(floor)) = (score.similarity, floor)
+        && near(similarity, floor)
+      {
+        border("field", Some(&score.field), f64::from(similarity), f64::from(floor));
+      }
+    }
+    for score in &scored.evaluation.quantities {
+      let limit = schema.quantity(&score.field).and_then(|spec| spec.reject_above_factor);
+      if let (Some(factor), Some(limit)) = (score.factor, limit)
+        && (factor - limit).abs() <= f64::from(margin) * limit
+      {
+        border("quantity", Some(&score.field), factor, limit);
+      }
+    }
+  }
+  found
+}
+
+/// Compares two calibrations over the pairs both have. A similarity that differs by more than `tolerance` is
+/// listed as moved ([`TOLERANCE`] is the usual value).
 ///
 /// The new run's label is the one used for a pair, should the two disagree; the pairs are matched by id alone.
-pub fn diff(old: &Calibration, new: &Calibration) -> Diff {
+pub fn diff(old: &Calibration, new: &Calibration, tolerance: f32) -> Diff {
   let ids = |calibration: &Calibration| -> BTreeSet<String> {
     calibration.pairs.iter().map(|scored| scored.pair.id.clone()).collect()
   };
@@ -214,6 +450,19 @@ pub fn diff(old: &Calibration, new: &Calibration) -> Diff {
         flip: flip_of(after),
         similarity: (before.similarity(), after.similarity()),
         accepted: (before.evaluation.accepted(), after.evaluation.accepted()),
+      })
+    })
+    .collect();
+  let moved = new
+    .pairs
+    .iter()
+    .filter_map(|after| {
+      let before = by_id.get(after.pair.id.as_str())?;
+      let movements = movements(before, after, tolerance);
+      (!movements.is_empty()).then(|| Moved {
+        id: after.pair.id.clone(),
+        note: after.pair.note.clone(),
+        movements,
       })
     })
     .collect();
@@ -249,7 +498,7 @@ pub fn diff(old: &Calibration, new: &Calibration) -> Diff {
         stats::field_range(&old, field, label),
         stats::field_range(&new, field, label),
       );
-      if moved(before, after) {
+      if range_moved(before, after) {
         fields.push(RangeShift {
           field: field.to_owned(),
           label,
@@ -269,6 +518,8 @@ pub fn diff(old: &Calibration, new: &Calibration) -> Diff {
     new: Totals::of(&new),
     slices,
     fields,
+    tolerance,
+    moved,
   }
 }
 
@@ -320,6 +571,9 @@ pub enum FailOn {
   AnyFlip,
   /// The new run gets more pairs wrong than the old.
   ErrorsUp,
+  /// A score moved by more than the tolerance, or a kind of change or a reason is not what it was, whether or
+  /// not a verdict changed with it.
+  Moved,
 }
 
 /// Why `diff` fails the gate `on`, or `None` if it passes.
@@ -338,6 +592,13 @@ pub fn failure(diff: &Diff, on: FailOn) -> Option<String> {
         diff.old.errors()
       )
     }),
+    FailOn::Moved => (!diff.moved.is_empty()).then(|| {
+      format!(
+        "{} pair(s) have a score that moved by more than {}, or a kind of change or a reason that changed",
+        diff.moved.len(),
+        diff.tolerance
+      )
+    }),
   }
 }
 
@@ -350,6 +611,40 @@ fn describe_range(range: Option<Range>) -> String {
     || "-".to_owned(),
     |range| format!("{:.3} to {:.3} ({})", range.low, range.high, range.count),
   )
+}
+
+/// The pairs with a score, a kind of change, or a reason that is not what it was, one line for each such thing.
+fn render_moved(out: &mut String, diff: &Diff) {
+  if diff.moved.is_empty() {
+    return;
+  }
+  let _ = writeln!(
+    out,
+    "\nscores that moved by more than {}, and kinds of change and reasons that changed",
+    diff.tolerance
+  );
+  let number = |value: Option<f64>| value.map_or_else(|| "-".to_owned(), |value| format!("{value:.3}"));
+  for moved in &diff.moved {
+    let _ = writeln!(out, "{} {}", moved.id, moved.note);
+    for movement in &moved.movements {
+      let subject = movement.subject.as_deref().unwrap_or("");
+      let kinds = match (movement.old_change, movement.new_change) {
+        (old, new) if old == new => String::new(),
+        (old, new) => format!("  ({} -> {})", old.unwrap_or("-"), new.unwrap_or("-")),
+      };
+      let _ = if movement.what.starts_with("reason") {
+        writeln!(out, "  {:<15} {subject}", movement.what.replace('_', " "))
+      } else {
+        writeln!(
+          out,
+          "  {:<15} {} -> {}{kinds}",
+          format!("{} {subject}", movement.what).trim_end(),
+          number(movement.old),
+          number(movement.new)
+        )
+      };
+    }
+  }
 }
 
 /// Renders a comparison as a report, for a terminal. `old` and `new` are one line each saying what the runs were.
@@ -449,10 +744,12 @@ pub fn render_diff(diff: &Diff, old: &str, new: &str) -> String {
       );
     }
   }
+  render_moved(&mut out, diff);
   out
 }
 
-/// Writes a comparison as result events: one `flip` line per changed verdict, then a `diff` line with the totals.
+/// Writes a comparison as result events: one `flip` line per changed verdict, one `moved` line per thing that
+/// moved about a pair, then a `diff` line with the totals.
 pub fn emit(diff: &Diff) {
   for flipped in &diff.flips {
     tracing::info!(
@@ -467,6 +764,21 @@ pub fn emit(diff: &Diff) {
       "flip"
     );
   }
+  for moved in &diff.moved {
+    for movement in &moved.movements {
+      tracing::info!(
+        target: RESULT,
+        pair_id = moved.id.as_str(),
+        what = movement.what,
+        subject = movement.subject.as_deref(),
+        old = movement.old,
+        new = movement.new,
+        old_change = movement.old_change,
+        new_change = movement.new_change,
+        "moved"
+      );
+    }
+  }
   let count = |flip: Flip| diff.flips.iter().filter(|flipped| flipped.flip == flip).count();
   let threshold = |suggestion: Option<(f32, f32)>| suggestion.map(|found| six(found.0));
   tracing::info!(
@@ -475,6 +787,8 @@ pub fn emit(diff: &Diff) {
     only_old = diff.only_old.len(),
     only_new = diff.only_new.len(),
     flips = diff.flips.len(),
+    moved = diff.moved.len(),
+    tolerance = six(diff.tolerance),
     new_false_rejects = count(Flip::NewFalseReject),
     new_false_accepts = count(Flip::NewFalseAccept),
     fixed = count(Flip::Fixed),
@@ -491,11 +805,11 @@ pub fn emit(diff: &Diff) {
 #[cfg(test)]
 mod tests {
   use similarity_core::testing::tiny_embedder;
-  use similarity_core::{EmbedderOptions, FieldSpec, QuantitySpec};
+  use similarity_core::{EmbedderOptions, FieldChange, FieldSpec, QuantitySpec, Reason};
 
   use super::*;
   use crate::offline::events;
-  use crate::offline::testing::{scored, scored_as};
+  use crate::offline::testing::{amount, measured, scored, scored_as};
   use crate::offline::{Offline, Selection, calibrate, parse_full_pairs};
 
   fn summarized(pairs: Vec<ScoredPair>) -> Calibration {
@@ -520,7 +834,7 @@ mod tests {
       pair("p1", Label::Edit, 0.95, true),
       pair("p2", Label::Recycle, 0.2, false),
     ]);
-    let diff = diff(&run, &run.clone());
+    let diff = diff(&run, &run.clone(), TOLERANCE);
     assert_eq!((diff.compared, diff.flips.len()), (2, 0));
     assert!(diff.only_old.is_empty() && diff.only_new.is_empty());
     assert!(diff.slices.is_empty() && diff.fields.is_empty());
@@ -552,7 +866,7 @@ mod tests {
       pair("recycle-fixed", Label::Recycle, 0.80, false),
       pair("steady", Label::Edit, 0.98, true),
     ]);
-    let diff = diff(&old, &new);
+    let diff = diff(&old, &new, TOLERANCE);
 
     let flips: Vec<(&str, Flip)> = diff
       .flips
@@ -608,7 +922,7 @@ mod tests {
       pair("p1", Label::Edit, 0.6, false),
       pair("p2", Label::Recycle, 0.2, false),
     ]);
-    let diff = diff(&old, &new);
+    let diff = diff(&old, &new, TOLERANCE);
     assert!(
       failure(&diff, FailOn::ErrorsUp)
         .unwrap()
@@ -643,7 +957,7 @@ mod tests {
       pair("both", Label::Edit, 0.95, true),
       pair("arrived", Label::Recycle, 0.9, true),
     ]);
-    let diff = diff(&old, &new);
+    let diff = diff(&old, &new, TOLERANCE);
     assert_eq!(diff.compared, 1);
     assert_eq!(
       (diff.only_old.as_slice(), diff.only_new.as_slice()),
@@ -665,7 +979,11 @@ mod tests {
         pair.label_text = "unsure".to_owned();
       })
     };
-    let diff = diff(&summarized(vec![unsure(true)]), &summarized(vec![unsure(false)]));
+    let diff = diff(
+      &summarized(vec![unsure(true)]),
+      &summarized(vec![unsure(false)]),
+      TOLERANCE,
+    );
     assert_eq!(diff.flips[0].flip, Flip::Unlabeled);
     assert_eq!(failure(&diff, FailOn::ErrorsUp), None);
     assert!(failure(&diff, FailOn::AnyFlip).is_some());
@@ -737,7 +1055,7 @@ mod tests {
   fn a_run_judged_again_under_its_own_configuration_is_the_same_run() {
     let (_, run) = run();
     let again = rejudge(&run, &schema(1.0, None, None), &Policy::new(-1.0, None).unwrap()).unwrap();
-    let diff = diff(&run.calibration, &again);
+    let diff = diff(&run.calibration, &again, TOLERANCE);
     assert_eq!((diff.compared, diff.flips.len()), (3, 0));
     assert_eq!(
       (diff.old.false_rejects, diff.old.false_accepts),
@@ -792,7 +1110,7 @@ mod tests {
     );
     // The edit whose name changed fails the new floor on the name, and is now an error.
     assert!(from_events.false_rejects >= 1);
-    let diff = diff(&run.calibration, &from_events);
+    let diff = diff(&run.calibration, &from_events, TOLERANCE);
     assert!(diff.flips.iter().any(|flipped| flipped.flip == Flip::NewFalseReject));
     assert!(
       diff.flips.iter().any(|flipped| flipped.flip == Flip::Fixed),
@@ -832,14 +1150,24 @@ mod tests {
       pair("p1", Label::Edit, 0.6, false),
       scored(Label::Recycle, 0.2, false),
     ]);
-    let diff = diff(&old, &new);
+    let diff = diff(&old, &new, TOLERANCE);
     let captured = similarity_log::testing::capture("warn", || emit(&diff));
     let events: Vec<serde_json::Value> = captured
       .results
       .iter()
       .map(|line| serde_json::from_str(line).unwrap())
       .collect();
-    assert_eq!(events.len(), 2);
+    // The flip, the two things that moved about that pair (its score and its reason), then the totals.
+    assert_eq!(events.len(), 4);
+    let moved: Vec<(&str, Option<&str>)> = events[1..3]
+      .iter()
+      .map(|event| {
+        assert_eq!((&event["message"], &event["pair_id"]), (&"moved".into(), &"p1".into()));
+        (event["what"].as_str().unwrap(), event["subject"].as_str())
+      })
+      .collect();
+    assert_eq!(moved, [("overall", None), ("reason_added", Some("below_threshold"))]);
+    assert!((events[1]["old"].as_f64().unwrap() - 0.95).abs() < 1e-6);
     assert_eq!(
       (&events[0]["message"], &events[0]["pair_id"], &events[0]["what"]),
       (&"flip".into(), &"p1".into(), &"new_false_reject".into())
@@ -848,8 +1176,9 @@ mod tests {
       (&events[0]["accepted_old"], &events[0]["accepted_new"]),
       (&true.into(), &false.into())
     );
-    let summary = &events[1];
+    let summary = &events[3];
     assert_eq!(summary["message"], "diff");
+    assert_eq!(summary["moved"], 1, "pairs, not lines");
     assert_eq!(
       (
         &summary["compared"],
@@ -859,5 +1188,181 @@ mod tests {
       ),
       (&2.into(), &1.into(), &1.into(), &1.into())
     );
+  }
+
+  fn only(diff: &Diff) -> &Moved {
+    assert_eq!(diff.moved.len(), 1, "{:?}", diff.moved);
+    &diff.moved[0]
+  }
+
+  #[test]
+  fn a_similarity_within_the_tolerance_has_not_moved() {
+    let old = summarized(vec![pair("p1", Label::Edit, 0.95, true)]);
+    let new = summarized(vec![pair("p1", Label::Edit, 0.950_6, true)]);
+    let diff = diff(&old, &new, TOLERANCE);
+    assert!(diff.moved.is_empty(), "{:?}", diff.moved);
+    assert_eq!(failure(&diff, FailOn::Moved), None);
+    assert!(!render_diff(&diff, "a", "b").contains("moved by more than"));
+  }
+
+  #[test]
+  fn a_similarity_beyond_the_tolerance_is_reported_with_both_values() {
+    let old = summarized(vec![pair("p1", Label::Edit, 0.95, true)]);
+    let new = summarized(vec![pair("p1", Label::Edit, 0.93, true)]);
+    let diff = diff(&old, &new, TOLERANCE);
+    assert!(diff.flips.is_empty(), "the verdict is the same");
+    let movement = &only(&diff).movements[0];
+    assert_eq!((movement.what, &movement.subject), ("overall", &None));
+    assert!((movement.old.unwrap() - 0.95).abs() < 1e-6 && (movement.new.unwrap() - 0.93).abs() < 1e-6);
+    assert_eq!(failure(&diff, FailOn::AnyFlip), None);
+    assert!(failure(&diff, FailOn::Moved).unwrap().contains("1 pair(s)"));
+    let report = render_diff(&diff, "a", "b");
+    assert!(
+      report.contains("p1 note of p1") && report.contains("overall         0.950 -> 0.930"),
+      "{report}"
+    );
+
+    // A wider tolerance is a caller's to choose.
+    assert!(super::diff(&old, &new, 0.05).moved.is_empty());
+  }
+
+  #[test]
+  fn a_verdict_rejected_for_another_reason_has_moved() {
+    let rejected = |reason: Reason| {
+      let mut scored = pair("p1", Label::Recycle, 0.6, false);
+      scored.evaluation.reasons = vec![reason];
+      summarized(vec![scored])
+    };
+    let old = rejected(Reason::BelowThreshold {
+      similarity: 0.6,
+      threshold: 0.8,
+    });
+    let new = rejected(Reason::FieldBelowFloor {
+      field: "name".to_owned(),
+      similarity: 0.4,
+      floor: 0.5,
+    });
+    let diff = diff(&old, &new, TOLERANCE);
+    assert!(diff.flips.is_empty(), "rejected both times");
+    let found: Vec<(&str, &str)> = only(&diff)
+      .movements
+      .iter()
+      .map(|movement| (movement.what, movement.subject.as_deref().unwrap()))
+      .collect();
+    assert_eq!(
+      found,
+      [
+        ("reason_removed", "below_threshold"),
+        ("reason_added", "field_below_floor name")
+      ]
+    );
+    let report = render_diff(&diff, "a", "b");
+    assert!(report.contains("reason added    field_below_floor name"), "{report}");
+  }
+
+  #[test]
+  fn a_field_that_became_restored_has_moved() {
+    let with = |change: FieldChange, similarity: Option<f32>| {
+      let mut scored = pair("p1", Label::Edit, 0.95, true);
+      scored.evaluation.comparison.fields = vec![similarity_core::score::FieldScore {
+        field: "brand".to_owned(),
+        weight: 1.0,
+        change,
+        similarity,
+        below_floor: false,
+      }];
+      summarized(vec![scored])
+    };
+    let diff = diff(
+      &with(FieldChange::Added, None),
+      &with(FieldChange::Restored, Some(0.4)),
+      TOLERANCE,
+    );
+    let movement = &only(&diff).movements[0];
+    assert_eq!((movement.what, movement.subject.as_deref()), ("field", Some("brand")));
+    assert_eq!(
+      (movement.old_change, movement.new_change),
+      (Some("added"), Some("restored"))
+    );
+    assert_eq!(movement.old, None);
+    assert!(render_diff(&diff, "a", "b").contains("(added -> restored)"));
+  }
+
+  #[test]
+  fn a_quantity_factor_is_compared_almost_exactly() {
+    let weighing = |after: f64| {
+      let mut scored = measured(
+        Label::Edit,
+        &[("weight", Some(amount(1.0, "g")), Some(amount(after, "g")))],
+      );
+      scored.pair.id = "p1".to_owned();
+      summarized(vec![scored])
+    };
+    assert!(
+      diff(&weighing(2.0), &weighing(2.0 + 1e-13), TOLERANCE).moved.is_empty(),
+      "rounding is not a change"
+    );
+    let diff = diff(&weighing(2.0), &weighing(2.000_001), TOLERANCE);
+    let movement = &only(&diff).movements[0];
+    assert_eq!(
+      (movement.what, movement.subject.as_deref()),
+      ("quantity", Some("weight"))
+    );
+  }
+
+  #[test]
+  fn two_gates_can_be_asked_for_at_once() {
+    let old = summarized(vec![
+      pair("p1", Label::Edit, 0.95, true),
+      pair("p2", Label::Recycle, 0.2, false),
+    ]);
+    let new = summarized(vec![
+      pair("p1", Label::Edit, 0.90, true),
+      pair("p2", Label::Recycle, 0.2, false),
+    ]);
+    let diff = diff(&old, &new, TOLERANCE);
+    let failures: Vec<String> = [FailOn::AnyFlip, FailOn::Moved]
+      .into_iter()
+      .filter_map(|on| failure(&diff, on))
+      .collect();
+    assert_eq!(failures.len(), 1, "it moved without flipping: {failures:?}");
+  }
+
+  #[test]
+  fn a_pair_within_the_margin_of_a_threshold_or_floor_is_on_a_border() {
+    let policy = Policy::new(0.8, Some(0.7)).unwrap();
+    let schema = schema(1.0, Some(0.5), Some(4.0));
+    let mut near = pair("near", Label::Edit, 0.800_4, true);
+    near.evaluation.anchor_similarity = Some(0.699_5);
+    near.evaluation.comparison.fields = vec![similarity_core::score::FieldScore {
+      field: "name".to_owned(),
+      weight: 1.0,
+      change: FieldChange::Modified,
+      similarity: Some(0.500_9),
+      below_floor: false,
+    }];
+    let mut far = pair("far", Label::Edit, 0.95, true);
+    far.evaluation.anchor_similarity = Some(0.9);
+    let mut heavy = measured(
+      Label::Edit,
+      &[("weight", Some(amount(1.0, "g")), Some(amount(4.002, "g")))],
+    );
+    heavy.pair.id = "heavy".to_owned();
+
+    let found = borderline(&summarized(vec![near, far, heavy]), &schema, &policy, TOLERANCE);
+    let named: Vec<(&str, &str, Option<&str>)> = found
+      .iter()
+      .map(|border| (border.id.as_str(), border.what, border.subject.as_deref()))
+      .collect();
+    assert_eq!(
+      named,
+      [
+        ("near", "overall", None),
+        ("near", "anchor", None),
+        ("near", "field", Some("name")),
+        ("heavy", "quantity", Some("weight")),
+      ]
+    );
+    assert!((found[0].limit - 0.8).abs() < 1e-6 && (found[3].limit - 4.0).abs() < 1e-9);
   }
 }

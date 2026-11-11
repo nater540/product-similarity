@@ -167,9 +167,12 @@ struct CalibrateDiffArgs {
   /// Compare the pairs both runs have, where the runs were not made from the same selection of the same file.
   #[arg(long)]
   intersect: bool,
-  /// Fail (exit status 1) if the comparison shows this.
+  /// Fail (exit status 1) if the comparison shows this. May be given more than once; any one of them fails it.
   #[arg(long, value_enum)]
-  fail_on: Option<FailOn>,
+  fail_on: Vec<FailOn>,
+  /// How far a similarity may differ between the two runs before it is listed as moved.
+  #[arg(long, default_value_t = diff::TOLERANCE)]
+  tolerance: f32,
   /// Write the comparison as NDJSON events on stdout in place of the report.
   #[arg(long)]
   ndjson: bool,
@@ -184,6 +187,8 @@ enum FailOn {
   AnyFlip,
   /// The new run gets more pairs wrong than the old.
   ErrorsUp,
+  /// A score moved by more than `--tolerance`, or a kind of change or a reason changed, with or without a verdict.
+  Moved,
 }
 
 impl From<FailOn> for diff::FailOn {
@@ -192,6 +197,7 @@ impl From<FailOn> for diff::FailOn {
       FailOn::NewFalseAccepts => Self::NewFalseAccepts,
       FailOn::AnyFlip => Self::AnyFlip,
       FailOn::ErrorsUp => Self::ErrorsUp,
+      FailOn::Moved => Self::Moved,
     }
   }
 }
@@ -593,7 +599,7 @@ impl CalibrateDiffArgs {
       (None, None) => anyhow::bail!("give a second run, or --config-b"),
     };
 
-    let difference = diff::diff(&old.calibration, &new);
+    let difference = diff::diff(&old.calibration, &new, self.tolerance);
     if self.ndjson {
       diff::emit(&difference);
     } else {
@@ -603,8 +609,13 @@ impl CalibrateDiffArgs {
         diff::render_diff(&difference, &describe_run(&old), &new_line)
       )?;
     }
-    if let Some(reason) = self.fail_on.and_then(|on| diff::failure(&difference, on.into())) {
-      anyhow::bail!("the comparison fails the gate: {reason}");
+    let failures: Vec<String> = self
+      .fail_on
+      .iter()
+      .filter_map(|on| diff::failure(&difference, (*on).into()))
+      .collect();
+    if !failures.is_empty() {
+      anyhow::bail!("the comparison fails the gate: {}", failures.join("; "));
     }
     Ok(())
   }
