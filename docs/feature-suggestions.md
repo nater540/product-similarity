@@ -1,7 +1,8 @@
 # Feature suggestions
 
 Twenty features that could be added to this project, with what each is, why it matters here, how it would fit the
-code, and what it would cost. **None of them is built.** They were proposed in November 2026 from a read of the
+code, and what it would cost. **Feature 7 is built** (D17, and "Choosing thresholds" in the README); the rest are
+not. They were proposed in November 2026 from a read of the
 repository as it stood then (`README.md`, `docs/decisions.md`, and the crates); check a suggestion against the
 code before starting on it, since the code will have moved. It has moved once already: records now carry
 quantities, compared as numbers (D16), and the features that touch a verdict or a report say below what that
@@ -55,7 +56,7 @@ and because each would put a Python service in the loop.
 | 4 | Model registry and promotion gate | Tracking | M | No |
 | 5 | Run report and compare | Tracking | M | No |
 | 6 | Hyperparameter sweeps | Tracking | M to L | Yes |
-| 7 | Structured calibration output with slices | Regression | M | For the slices |
+| 7 | Structured calibration output with slices (built) | Regression | M | For the slices |
 | 8 | Calibration diff | Regression | M | No |
 | 9 | Pinned verdict snapshot gated in CI | Regression | M | No |
 | 10 | Production score telemetry and drift report | Regression | M | Real traffic |
@@ -203,6 +204,11 @@ pairs would mostly tune to noise.
 ## B. Regression reporting
 
 ### 7. Structured calibration output with slices
+
+**Built.** `calibrate --full` and `--ndjson`, as described in the README and D17. Two things came out differently
+from the description below: the per-pair events are flat (`pair`, `pair_field`, `pair_quantity`, `pair_reason`
+lines joined on `pair_id`) because the logging layer cannot write a nested object, and a quantity limit is
+suggested from the largest factor among edits, not from a gap between the two labels.
 
 **What.**
 

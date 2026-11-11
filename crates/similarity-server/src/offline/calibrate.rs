@@ -1,63 +1,39 @@
-//! Labeled pairs, and what scoring a file of them shows.
+//! Scoring a file of labeled pairs.
 //!
 //! A calibration file holds before/after pairs that someone has labeled as an ordinary edit or as a recycled
-//! record. Scoring them all with the configured schema and policy shows where the two groups sit, which is where
-//! a threshold belongs, and how many pairs the configuration as it stands gets wrong.
+//! record (see [`super::pairs`]). Scoring them all with the configured schema and policy shows where the two
+//! groups sit, which is where a threshold belongs, and how many pairs the configuration as it stands gets wrong.
 
 use anyhow::Context;
-use serde::Deserialize;
 use similarity_core::score::Evaluation;
 
-use super::{Offline, RecordFields};
-
-/// What a labeled pair is an example of.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Label {
-  /// The same record, legitimately edited. Should be accepted.
-  Edit,
-  /// A different record under the old id. Should be rejected.
-  Recycle,
-}
-
-/// One line of a calibration file.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LabeledPair {
-  /// What this pair is an example of.
-  pub label: Label,
-  /// A short description, shown in the report.
-  #[serde(default)]
-  pub note: String,
-  /// The record before the change.
-  pub before: RecordFields,
-  /// The record after the change.
-  pub after: RecordFields,
-}
-
-/// Parses a calibration file: one JSON [`LabeledPair`] per line, blank lines and `#` comments ignored.
-///
-/// # Errors
-///
-/// Returns an error naming the line if a line is not a valid pair.
-pub fn parse_pairs(jsonl: &str) -> anyhow::Result<Vec<LabeledPair>> {
-  jsonl
-    .lines()
-    .enumerate()
-    .filter(|(_, line)| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
-    .map(|(index, line)| {
-      serde_json::from_str(line).with_context(|| format!("line {} is not a valid pair", index.saturating_add(1)))
-    })
-    .collect()
-}
+use super::Offline;
+use super::pairs::{Input, Label, Pair, Pairs};
 
 /// A labeled pair with its score.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScoredPair {
   /// The pair.
-  pub pair: LabeledPair,
+  pub pair: Pair,
   /// How the configured schema and policy judge it.
   pub evaluation: Evaluation,
+}
+
+impl ScoredPair {
+  /// The pair's overall similarity.
+  pub fn similarity(&self) -> f32 {
+    self.evaluation.comparison.similarity
+  }
+
+  /// Whether the configured policy gets this pair wrong: rejects an edit, or accepts a recycle. A pair with any
+  /// other label cannot be wrong.
+  pub fn wrong(&self) -> bool {
+    match self.pair.label {
+      Some(Label::Edit) => !self.evaluation.accepted(),
+      Some(Label::Recycle) => self.evaluation.accepted(),
+      None => false,
+    }
+  }
 }
 
 /// The overall threshold that best separates edits from recycles.
@@ -84,6 +60,20 @@ pub struct Calibration {
   pub false_rejects: usize,
   /// Recycles the configured policy accepts.
   pub false_accepts: usize,
+  /// What the pairs were read from.
+  pub input: Input,
+}
+
+impl Calibration {
+  /// The scored pairs carrying `label`.
+  pub fn labeled(&self, label: Label) -> impl Iterator<Item = &ScoredPair> + Clone {
+    self.pairs.iter().filter(move |scored| scored.pair.label == Some(label))
+  }
+
+  /// The scored pairs with any label other than `edit` and `recycle`. They are shown and never counted.
+  pub fn unlabeled(&self) -> impl Iterator<Item = &ScoredPair> + Clone {
+    self.pairs.iter().filter(|scored| scored.pair.label.is_none())
+  }
 }
 
 /// Finds the overall threshold that misclassifies the fewest pairs, preferring the widest margin among ties.
@@ -128,33 +118,36 @@ pub fn suggest_threshold(scores: &[(Label, f32)]) -> Option<Suggestion> {
 /// # Errors
 ///
 /// Returns an error naming the pair if a record does not fit the schema or the model fails.
-pub fn calibrate(offline: &Offline, pairs: Vec<LabeledPair>) -> anyhow::Result<Calibration> {
-  let mut scored = Vec::with_capacity(pairs.len());
-  for (index, pair) in pairs.into_iter().enumerate() {
+pub fn calibrate(offline: &Offline, pairs: Pairs) -> anyhow::Result<Calibration> {
+  let mut scored = Vec::with_capacity(pairs.pairs.len());
+  for pair in pairs.pairs {
     let evaluation = offline
       .compare(&pair.before, &pair.after)
-      .with_context(|| format!("pair {} ({})", index.saturating_add(1), pair.note))?;
+      .with_context(|| format!("pair `{}` ({})", pair.id, pair.note))?;
     scored.push(ScoredPair { pair, evaluation });
   }
-  Ok(summarize(scored))
+  Ok(summarize(scored, pairs.input))
 }
 
-pub(super) fn summarize(pairs: Vec<ScoredPair>) -> Calibration {
+/// Summarizes pairs that have been scored: what the configured policy gets wrong, and the threshold that would
+/// separate the two labels best. Pairs with any other label take no part in either.
+pub fn summarize(pairs: Vec<ScoredPair>, input: Input) -> Calibration {
   let scores: Vec<(Label, f32)> = pairs
     .iter()
-    .map(|scored| (scored.pair.label, scored.evaluation.comparison.similarity))
+    .filter_map(|scored| Some((scored.pair.label?, scored.similarity())))
     .collect();
-  let wrong = |label: Label, accepted: bool| {
+  let wrong = |label: Label| {
     pairs
       .iter()
-      .filter(|scored| scored.pair.label == label && scored.evaluation.accepted() == accepted)
+      .filter(|scored| scored.pair.label == Some(label) && scored.wrong())
       .count()
   };
   Calibration {
     suggestion: suggest_threshold(&scores),
-    false_rejects: wrong(Label::Edit, false),
-    false_accepts: wrong(Label::Recycle, true),
+    false_rejects: wrong(Label::Edit),
+    false_accepts: wrong(Label::Recycle),
     pairs,
+    input,
   }
 }
 
@@ -197,28 +190,5 @@ mod tests {
   fn one_label_alone_suggests_nothing() {
     assert_eq!(suggest_threshold(&[(Label::Edit, 0.9), (Label::Edit, 0.8)]), None);
     assert_eq!(suggest_threshold(&[]), None);
-  }
-
-  #[test]
-  fn pairs_parse_from_jsonl_with_comments_and_blank_lines() {
-    let text = r#"
-      # ordinary edits
-      {"label": "edit", "note": "potency added", "before": {"name": "Gummies"}, "after": {"name": "Gummies 100mg"}}
-
-      {"label": "recycle", "before": {"name": "Gummies"}, "after": {"name": "Vape"}}
-    "#;
-    let pairs = parse_pairs(text).unwrap();
-    assert_eq!(pairs.len(), 2);
-    assert_eq!((pairs[0].label, pairs[0].note.as_str()), (Label::Edit, "potency added"));
-    assert_eq!(pairs[1].after.texts["name"], "Vape");
-    assert!(pairs[1].after.quantities.is_empty());
-  }
-
-  #[test]
-  fn a_bad_line_is_reported_by_number() {
-    let text = "{\"label\": \"edit\", \"before\": {}, \"after\": {}}\n{\"label\": \"sideways\"}";
-    let error = parse_pairs(text).unwrap_err();
-    assert!(format!("{error:#}").contains("line 2"), "{error:#}");
-    assert!(parse_pairs(r#"{"label": "edit", "before": {}, "after": {}, "extra": 1}"#).is_err());
   }
 }

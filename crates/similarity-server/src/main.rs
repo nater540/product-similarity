@@ -19,7 +19,7 @@ use similarity_core::{Device, Embedder};
 use similarity_server::config::{Config, DeviceChoice};
 use similarity_server::engine::{Engine, store_layout};
 use similarity_server::fetch::{self, FetchRequest};
-use similarity_server::offline::{self, Offline, RecordFields};
+use similarity_server::offline::{self, Confidence, Offline, RecordFields, Selection};
 use similarity_server::worker::EmbedWorker;
 use similarity_store::{MemoryStore, QdrantStore, VectorStore};
 
@@ -98,6 +98,22 @@ struct CalibrateArgs {
   config: PathBuf,
   /// Labeled pairs, one JSON object per line: {"label": "edit" | "recycle", "note": ..., "before": {...}, "after": {...}}.
   pairs: PathBuf,
+  /// Read the full format (`pairs.full.jsonl`): extra keys are allowed, each record is reduced to what the schema
+  /// defines, and `pair_id`, `owner`, `split`, and `variant_change` are used in the report.
+  #[arg(long)]
+  full: bool,
+  /// With --full, score only the pairs of this split (for example `holdout`).
+  #[arg(long, requires = "full")]
+  split: Option<String>,
+  /// With --full, leave out labeled pairs whose `label_confidence` is below this: high, medium, or low.
+  #[arg(long, requires = "full", default_value = "medium")]
+  min_confidence: Confidence,
+  /// Write the calibration as NDJSON events on stdout, for tools, in place of the report.
+  #[arg(long)]
+  ndjson: bool,
+  /// Fixes the resampling behind the intervals, so that a run can be reproduced.
+  #[arg(long, default_value_t = 0)]
+  seed: u64,
 }
 
 fn device(choice: DeviceChoice) -> anyhow::Result<Device> {
@@ -308,14 +324,27 @@ impl CalibrateArgs {
   fn run(self) -> anyhow::Result<()> {
     let (offline, policy) = offline(&self.config)?;
     let text = std::fs::read_to_string(&self.pairs).with_context(|| format!("cannot read {}", self.pairs.display()))?;
-    let pairs = offline::parse_pairs(&text).with_context(|| format!("in {}", self.pairs.display()))?;
+    let pairs = if self.full {
+      let selection = Selection {
+        split: self.split.as_deref(),
+        min_confidence: Some(self.min_confidence),
+      };
+      offline::parse_full_pairs(&text, offline.schema(), selection)
+    } else {
+      offline::parse_pairs(&text)
+    }
+    .with_context(|| format!("in {}", self.pairs.display()))?;
     let calibration = offline::calibrate(&offline, pairs)?;
-    write!(
-      std::io::stdout().lock(),
-      "{}\n{}",
-      offline.model_line(),
-      offline::render_calibration(&calibration, &policy)
-    )?;
+    if self.ndjson {
+      offline::events::emit(&offline, &policy, &calibration, self.seed);
+    } else {
+      write!(
+        std::io::stdout().lock(),
+        "{}\n{}",
+        offline.model_line(),
+        offline::render_calibration(&calibration, &policy, self.seed)
+      )?;
+    }
     Ok(())
   }
 }

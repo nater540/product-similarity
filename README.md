@@ -98,7 +98,7 @@ Optional, by task:
 | [`uv`](https://docs.astral.sh/uv/) | Only for regenerating the PyTorch reference fixtures (`just golden`) and the optional `just verify-model`. Building, testing, serving, and fine-tuning are all Rust and need no Python. It installs PyTorch itself on first use, a download of several hundred megabytes or more. | `brew install uv` |
 | `cargo-deny` | `just deny` and `just ci`. | `cargo install cargo-deny --locked` |
 | `grpcurl` | Calling the server from a shell. | `brew install grpcurl` |
-| `jq` | One step of the fine-tuning workflow. | `brew install jq` |
+| `jq` | Reading NDJSON logs and results at a terminal. | `brew install jq` |
 
 Disk and hardware: the model is about 100 MB, and Rust build artifacts for this workspace run to several gigabytes.
 No GPU is needed to serve. Fine-tuning on long texts is much faster with one
@@ -161,7 +161,7 @@ The binary is `record-similarity` (`target/release/record-similarity` after `jus
 | `record-similarity serve [--config config.toml] [--listen ADDR] [--in-memory]` | Runs the gRPC server. |
 | `record-similarity model fetch [--repo R] [--revision REV] [--dir DIR]` | Downloads and verifies a model directory. `--dir` defaults to `models/<repository name>`, so two models never share a directory. |
 | `record-similarity compare [--config config.toml] BEFORE.json AFTER.json` | Scores one before/after pair offline. |
-| `record-similarity calibrate [--config config.toml] PAIRS.jsonl` | Scores labeled pairs and suggests a threshold. |
+| `record-similarity calibrate [--config config.toml] PAIRS.jsonl [--full] [--split S] [--ndjson]` | Scores labeled pairs and suggests a threshold. See [Choosing thresholds](#choosing-thresholds). |
 
 Environment variables:
 
@@ -612,15 +612,34 @@ measured, on labeled examples:
 ```sh
 just calibrate                                            # the bundled sample pairs, the example config
 just calibrate path/to/pairs.jsonl config.toml            # your pairs, your config
+just calibrate path/to/pairs.full.jsonl config.toml --full --split holdout     # a data export; flags go last
 ```
 
 The input is one JSON object per line, labeled `edit` (should be accepted) or `recycle` (should be rejected).
 Blank lines and lines starting with `#` are ignored. `before` and `after` are records in the shape the bundled
-client reads: a string is a text field, an object is a quantity, and every name must be one the schema defines.
+client reads: a string is a text field, an object is a quantity. There are two formats:
 
-```json
-{"label": "recycle", "note": "an eighth becomes an ounce", "before": {"name": "...", "weight_per_item": {"value": 3.5, "unit": "g"}}, "after": {"name": "...", "weight_per_item": {"value": 28, "unit": "g"}}}
-```
+- **Strict**, the default, for pairs written by hand. Exactly four keys per line, and every name in a record must
+  be one the schema defines, so a typo is an error.
+
+  ```json
+  {"label": "recycle", "note": "an eighth becomes an ounce", "before": {"name": "...", "weight_per_item": {"value": 3.5, "unit": "g"}}, "after": {"name": "...", "weight_per_item": {"value": 28, "unit": "g"}}}
+  ```
+
+- **Full** (`--full`), for a data export: the `pairs.full.jsonl` that
+  [`docs/data-request-prompt.md`](docs/data-request-prompt.md) asks for. Extra keys are allowed. Each record is
+  reduced to what the schema defines, and what that leaves out is counted by key in the report, so a misspelled
+  key shows up as a number and not as a quietly weaker score. `pair_id`, `owner`, `split`, `variant_change`,
+  `label_source`, and `label_confidence` are used when present. A pair with any label other than `edit` or
+  `recycle` (an `unsure`) is scored and listed, and counted nowhere.
+
+| Flag | Meaning |
+|---|---|
+| `--full` | Read the full format. |
+| `--split NAME` | With `--full`: score only the pairs of this split. |
+| `--min-confidence high\|medium\|low` | With `--full`: leave out labeled pairs whose `label_confidence` is lower. Default `medium`. |
+| `--ndjson` | Write the calibration as NDJSON events in place of the report ([below](#the-calibration-as-data)). |
+| `--seed N` | Fixes the resampling behind the intervals. Default 0. |
 
 The report starts with the model and the width it ran at, lists every pair with its score and verdict, flags the
 ones the current config gets wrong, and ends with a summary. On the bundled sample:
@@ -643,9 +662,22 @@ thc_per_item         1.01 to 1.14 ( 4)                      1.04 to 10.00 ( 6), 
 volume_per_item      1.01 to 1.01 ( 1)                      -
 weight_per_item      1.01 to 1.01 ( 1)                      2.00 to 40.00 ( 5)
 measures changed in 0 of 26 edit(s) and 4 of 20 recycle(s)
+cbd_per_item: 1 edit(s) move it to or from zero, which any factor limit rejects
+a limit of 1.16 on thc_per_item is above every edit (largest 1.14) and rejects 5 of the 6 recycle(s) that change it
+a limit of 1.42 on weight_per_item is above every edit (largest 1.01) and rejects 5 of the 5 recycle(s) that change it
+
+by category               edits  recycles  wrongly rejected  wrongly accepted
+Concentrates                  2         2                 0                 0
+Edibles                      15         8                 0                 0
+Flower                        4         4                 0                 0
+Pre-Rolls                     2         2                 0                 0
+Tinctures                     1         2                 0                 0
+Vape Pens                     2         2                 0                 0
 
 configured policy (threshold 0.900 plus field floors and any quantity limits): 0 edit(s) wrongly rejected, 0 recycle(s) wrongly accepted, of 46 pairs
 best overall threshold for this data: 0.895 (margin 0.046; 0 edit(s) rejected, 0 recycle(s) accepted)
+to accept at most 1.0% of recycles on the overall score alone: threshold 0.895, rejecting 0.0% of edits
+to accept at most 5.0% of recycles on the overall score alone: threshold 0.846, rejecting 0.0% of edits
 ```
 
 Reading it:
@@ -659,19 +691,121 @@ Reading it:
   Change them in the config and re-run; nothing needs re-indexing.
 - **`policy.anchor_threshold`** is chosen from whole edit histories rather than pairs: it should sit below how far
   a legitimate record drifts over its lifetime.
-- **`reject_above_factor` for a quantity** belongs above the largest factor that quantity shows in edits and below
-  the smallest it shows in recycles, if those leave a gap. Each cell is the range of factors over the pairs that
-  changed the amount, with their count; the same amount in another unit is no change and is not counted. In the
-  sample, `weight_per_item` has such a gap (1.01 against 2.00) and `thc_per_item` does not: one recycle changes
-  the potency by 1.04, less than an ordinary batch update.
+- **`reject_above_factor` for a quantity** belongs above the largest factor that quantity shows in any edit. A
+  quantity limit is an extra way to reject, beside the text checks, so what matters is that it rejects no edit;
+  most recycles leave a quantity alone (another strain at the same weight) and are for the text to catch. Each
+  cell is the range of factors over the pairs that changed the amount, with their count; the same amount in
+  another unit is no change and is not counted. The `a limit of ...` line does the arithmetic: the midpoint
+  between the largest factor in edits and the next factor above it in recycles, and how many recycles that would
+  reject. In the sample, one recycle changes the potency by 1.04, less than an ordinary batch update, and no
+  limit on `thc_per_item` would catch it.
 - **`reject_incomparable`** is safe for a quantity when `incomparable` never appears for it under `in edits`.
-- **`policy.reject_on_measure_change`** is safe when the last line counts no edits.
+- **`policy.reject_on_measure_change`** is safe when the `measures changed` line counts no edits.
 - **`to or from zero`** deserves a look before any factor limit is set, because such a change is beyond every
   limit. In the sample it is an edit: a CBD content that went from 0 to 0.1%.
+- **The slices** show where the errors are. `by category` is always there. With `--full` the pairs are also
+  sliced by `variant_change`, `label_source`, and `owner` (the ten largest, to show one brand dominating).
+- **`to accept at most N% of recycles`** is the trade the overall threshold makes: the lowest threshold that lets
+  through no more than that share of recycles, and the share of edits it rejects. It looks at the overall score
+  only, without floors or quantity limits. A line is left out when it allows no more recycles than the one before
+  it, which with fewer than a hundred recycles is most of them.
 
 **The quantity lines of the sample are there to show the report, not to be read from.** Nineteen of the 46
 synthetic pairs carry quantities, written by hand. That is why `config.example.toml` sets no quantity limit at
 all, and why none should be set until this section has been produced from labeled production edits.
+
+### A data export, with intervals
+
+`data/calibration.sample.full.jsonl` is the same sample in the full format, with invented owners, splits, and
+label sources, three `unsure` variant changes, and a `strain` key the schema does not define. Its report has more
+in it (shortened here):
+
+```text
+$ just calibrate data/calibration.sample.full.jsonl config.example.toml --full
+...
+unsure     0.973  accepted  gummies doubled in potency, same flavor
+unsure     0.938  accepted  an eighth becomes a quarter
+unsure     0.911  accepted  a single pre-roll becomes a two pack
+...
+others    overall similarity from 0.911 to 0.973 (3 pair(s) with another label, 3 of which would be accepted; counted nowhere below)
+...
+by variant change         edits  recycles  wrongly rejected  wrongly accepted
+count                         0         1                 0                 0
+flavor                        0         1                 0                 0
+strain                        0         4                 0                 0
+...
+by owner (largest)        edits  recycles  wrongly rejected  wrongly accepted
+brand-1                      13         6                 0                 0
+brand-2                       4         4                 0                 0
+...
+configured policy (threshold 0.900 plus field floors and any quantity limits): 0 edit(s) wrongly rejected, 0 recycle(s) wrongly accepted, of 45 pairs
+false-reject rate 0.0% (0.0% to 0.0%), false-accept rate 0.0% (0.0% to 0.0%) (95% intervals from resampling 7 owners)
+best overall threshold for this data: 0.895 (margin 0.046; 0 edit(s) rejected, 0 recycle(s) accepted)
+to accept at most 1.0% of recycles on the overall score alone: threshold 0.895, rejecting 0.0% (0.0% to 0.0%) of edits
+to accept at most 5.0% of recycles on the overall score alone: threshold 0.846, rejecting 0.0% (0.0% to 0.0%) of edits
+
+record keys that were not compared: strain (29, not in the schema)
+left out: 0 pair(s) of another split, 1 labeled pair(s) below the confidence asked for
+```
+
+- **The intervals** are the middle 95% of each rate when the **owners** are resampled, 1,000 times, with all
+  their pairs. Pairs from one brand are not independent of each other, so resampling pairs would make the
+  intervals too narrow, and narrower the more one brand contributed. They need every labeled pair to name an
+  owner and at least two owners, which is why the strict format has none. Zero errors give a zero-width
+  interval, which says nothing about the pairs that were not sampled: with 45 pairs, treat it as no evidence.
+- **The `unsure` pairs** are the ones to look at by hand. Here all three same-brand variant changes score above
+  the threshold and would be accepted, which is the case the data request calls the hardest.
+- **`record keys that were not compared`** should hold only keys you expect. A field you meant to compare turning
+  up here is a misspelling in the export or a field missing from the config.
+
+### The calibration as data
+
+`--ndjson` writes the same calibration as events, one JSON object per line on stdout, for anything that is not a
+person: a later run to compare against, a chart, a table. They go through the same logging as every other result,
+so each line has `timestamp`, `level`, `message`, and `target` as well as the fields below, and `RUST_LOG` cannot
+filter them out.
+
+```sh
+just calibrate data/calibration.sample.full.jsonl config.example.toml --full --ndjson > calibration.ndjson
+jq -r 'select(.message == "pair" and .label == "unsure") | [.pair_id, .variant_change, .similarity, .accepted] | @tsv' calibration.ndjson
+```
+
+```text
+p047	potency	0.973413	true
+p048	size	0.938342	true
+p049	count	0.910539	true
+```
+
+The events are flat: a pair is one `pair` line and then one line per field, quantity, and reason, all carrying
+its `pair_id`. One recycle from the sample, with the envelope fields removed:
+
+```json
+{"message":"pair","pair_id":"p030","label":"recycle","split":"calibrate","owner":"brand-1","variant_change":"flavor","label_source":"moderator_revert","label_confidence":"high","category":"Edibles","note":"gummies become a different candy, same category and brand","similarity":0.808716,"accepted":false,"wrong":false,"measure_changed":false}
+{"message":"pair_field","pair_id":"p030","field":"name","change":"modified","similarity":0.65489,"weight":4.0,"below_floor":true}
+{"message":"pair_quantity","pair_id":"p030","quantity":"thc_per_item","change":"modified","factor":2.0,"zero_crossing":false,"incomparable":false,"previous_unit":"mg","unit":"mg","beyond_limit":false}
+{"message":"pair_reason","pair_id":"p030","code":"field_below_floor","field":"name","value":0.65489,"limit":0.8}
+```
+
+| `message` | One per | Fields |
+|---|---|---|
+| `calibration` | run, first | `fingerprint`, `dimension`, `max_tokens`, `threshold`, `anchor_threshold`, `reject_on_measure_change`, `pairs_sha256`, `pairs`, `split`, `min_confidence`, `seed` |
+| `pair` | pair | `pair_id`, `label`, `split`, `owner`, `variant_change`, `label_source`, `label_confidence`, `category`, `note`, `similarity`, `accepted`, `wrong`, `measure_changed` |
+| `pair_field` | pair and field | `pair_id`, `field`, `change`, `similarity`, `weight`, `below_floor` |
+| `pair_quantity` | pair and quantity | `pair_id`, `quantity`, `change`, `factor`, `zero_crossing`, `incomparable`, `previous_unit`, `unit`, `beyond_limit` |
+| `pair_reason` | pair and reason for rejecting it | `pair_id`, `code`, `field`, `value`, `limit` |
+| `field_range` | field and label | `field`, `label`, `count`, `low`, `high` |
+| `quantity_range` | quantity and label | `quantity`, `label`, `count`, `low`, `high`, `incomparable`, `zero_crossings` |
+| `suggestion` | run | `threshold`, `margin`, `false_rejects`, `false_accepts` |
+| `quantity_suggestion` | quantity | `quantity`, `reject_above_factor`, `edits_high`, `recycles_next`, `recycles_caught`, `recycles_changed`, `edit_zero_crossings` |
+| `slice` | attribute and value | `by`, `value`, `edits`, `recycles`, `false_rejects`, `false_accepts`, `edits_low`, `edits_high`, `recycles_low`, `recycles_high` |
+| `operating_point` | target | `false_accept_target`, `threshold`, `false_accept_rate`, `false_reject_rate`, `false_reject_low`, `false_reject_high` |
+| `ignored_key` | key and reason | `key`, `reason`, `count` |
+| `summary` | run, last | `pairs`, `edits`, `recycles`, `unlabeled`, both error counts and rates with `_low` and `_high`, `owners`, `skipped_split`, `skipped_confidence` |
+
+A value that does not apply is left out, never `null`. The reason codes are `below_threshold`,
+`field_below_floor`, `anchor_drift`, `quantity_beyond_factor`, `quantity_incomparable`, and `measure_changed`.
+A pair's `pair_id` is the one the file gave it; a pair without one gets a fingerprint of its content, so the same
+pair has the same id in every run. Similarities are rounded to six places.
 
 If the two overall ranges overlap on real data, there are three things to try, in order of cost: weights and
 floors, [a different model](#using-a-different-model), and [fine-tuning](#fine-tuning-the-model).
@@ -889,22 +1023,12 @@ when the CPU's memory use is a problem.
 
 ### 3. Measure whether it helped
 
-Evaluate on pairs the model did not train on, with the full policy. Project the holdout pairs into the calibration
-format:
+Evaluate on pairs the model did not train on, with the full policy: calibrate on the holdout split, with the base
+model and with the fine-tuned one, using two configs that differ only in `model.dir`.
 
 ```sh
-jq -c 'select(.split == "holdout" and (.label == "edit" or .label == "recycle"))
-  | def keep: with_entries(select(.key | IN("name", "category", "brand", "description",
-      "weight_per_item", "volume_per_item", "thc_per_item", "cbd_per_item")));
-    {label, note: "\(.pair_id) \(.note)", before: (.before | keep), after: (.after | keep)}' \
-  pairs.full.jsonl > holdout.jsonl
-```
-
-Then calibrate with the base model and with the fine-tuned one, using two configs that differ only in `model.dir`:
-
-```sh
-just calibrate holdout.jsonl config.toml             # base model
-just calibrate holdout.jsonl config-finetuned.toml   # dir = "models/mdbr-leaf-mt-ft"
+just calibrate pairs.full.jsonl config.toml --full --split holdout             # base model
+just calibrate pairs.full.jsonl config-finetuned.toml --full --split holdout   # dir = "models/mdbr-leaf-mt-ft"
 ```
 
 Keep the fine-tuned model only if the gap between the two overall ranges is clearly wider, or the number of
@@ -1081,10 +1205,11 @@ crates/
   similarity-server/    config, embedding worker thread, engine, gRPC service, and the `record-similarity` binary
   similarity-train/     fine-tuning: data, losses, the training loop, and the `record-similarity-train` binary
 data/
-  calibration.sample.jsonl   synthetic labeled pairs
+  calibration.sample.jsonl        synthetic labeled pairs, in the strict format
+  calibration.sample.full.jsonl   the same pairs in the full format a data export uses
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D16)
+  decisions.md               why things are the way they are (D1 to D17)
   data-request-prompt.md     a brief for collecting labeled production data
   feature-suggestions.md     twenty features that could be added, none built yet
   plan-features.md           a plan for the first five of them

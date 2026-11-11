@@ -2,8 +2,12 @@
 
 A review of `docs/feature-suggestions.md` against the code as it stands after the quantity work (D16), and a plan
 for the five features that document lists under "What to build first". Written so that a session with no memory
-of the conversation that produced it can carry it out. **Nothing in it is built.** Delete each section as its
-feature lands, and the file when the last one does.
+of the conversation that produced it can carry it out. Each section is deleted as its feature lands, and the file
+when the last one does.
+
+**Done so far:** step 0 (measuring separated from judging: `Comparison::weigh`, `score::judge`,
+`Evaluation::rejudge`, `Reason::code`) and feature 7 (`calibrate --full`, `--ndjson`, slices, intervals; D17).
+What remains is below.
 
 Read `CLAUDE.md` first (conventions, invariants, commands), then `docs/feature-suggestions.md` for what each
 feature is and why, then this file for how. The feature numbers here are that document's.
@@ -14,8 +18,6 @@ feature is and why, then this file for how. The feature numbers here are that do
 - [What the review found](#what-the-review-found)
 - [Decisions needed from the owner](#decisions-needed-from-the-owner)
 - [Order](#order)
-- [Step 0. Separate measuring from judging](#step-0-separate-measuring-from-judging)
-- [Feature 7. Structured calibration output with slices](#feature-7-structured-calibration-output-with-slices)
 - [Feature 8. Calibration diff](#feature-8-calibration-diff)
 - [Feature 1. Lineage file in every model directory](#feature-1-lineage-file-in-every-model-directory)
 - [Feature 13. Property-based and state-machine tests](#feature-13-property-based-and-state-machine-tests)
@@ -27,7 +29,7 @@ feature is and why, then this file for how. The feature numbers here are that do
 
 - Branch `initial-implementation`. The quantity work (`docs/plan-quantity-fields.md`, D16) is finished, verified,
   and committed. The owner asked for the features below to be carried out on best judgment, one commit each.
-- `just ci` passes with 251 fast tests. `just test-parity`, `just test-qdrant`, and the full-stack test behind
+- `just ci` passes. `just test-parity`, `just test-qdrant`, and the full-stack test behind
   `just test-real` pass. Docker (OrbStack) is off by default on the owner's machine; `orbctl start` and
   `orbctl stop` around anything that needs Qdrant.
 - Settled by the owner, and binding on everything below: Rust end to end, NDJSON-only logging through
@@ -104,9 +106,9 @@ None of these blocks starting. Each has the default that will be used if no answ
 
 ## Order
 
-1. Step 0, the small refactor that features 7, 8, and 19 all stand on.
-2. Feature 7, then feature 8. Real labeled pairs are about to exist, and nearly everything else consumes these
-   events.
+1. Step 0, the small refactor that features 7, 8, and 19 all stand on. Done.
+2. Feature 7 (done), then feature 8. Real labeled pairs are about to exist, and nearly everything else consumes
+   these events.
 3. Feature 1. A day's work, and it has to exist before the first real fine-tuning run, not before the first
    calibration.
 4. Feature 13. Independent of the others; it can be done at any point, and is worth doing before feature 16
@@ -114,123 +116,6 @@ None of these blocks starting. Each has the default that will be used if no answ
 5. Feature 16.
 
 Each step should leave `just ci` green. Tests first where practical; test names are sentences.
-
-## Step 0. Separate measuring from judging
-
-`score::evaluate` measures (per-field cosines) and judges (thresholds, floors) in one call, and
-`Evaluation::judge_quantities` does both for quantities. Re-scoring a cached calibration under another config
-(feature 8) needs the judging half alone, and structured reasons (features 7, 10, 19) need a stable name for each
-reason.
-
-In `crates/similarity-core/src/score.rs`:
-
-- `Reason::code(&self) -> &'static str`: `below_threshold`, `field_below_floor`, `anchor_drift`,
-  `quantity_beyond_factor`, `quantity_incomparable`, `measure_changed`. Add accessors for the field or quantity
-  name, the measured value, and the limit, each `Option`. These six strings become API; a test pins them.
-- `judge(schema, policy, comparison: &mut Comparison, anchor_similarity) -> Vec<Reason>`: recomputes
-  `similarity` from the field scores and the schema's current weights, resets and sets `below_floor`, and returns
-  the reasons. `evaluate` becomes `compare` followed by `judge`.
-- The same split for quantities: a function that only measures (what `quantity::compare` does per quantity, over
-  a schema) and one that only judges a slice of `QuantityScore` (resets and sets `beyond_limit`, derives
-  `measure_changed`, returns reasons). `Evaluation::judge_quantities` keeps its signature and calls both.
-
-Tests: judging a comparison twice gives the same result; judging under other weights equals comparing from
-scratch under those weights; `evaluate` is unchanged (every existing test still passes untouched).
-
-`crates/similarity-server/src/offline.rs` is 927 lines after the quantity work. Before adding to it, turn it into
-a module directory: `offline/mod.rs` (`Offline`, `RecordFields`, `LabeledPair`, parsing), `offline/calibrate.rs`
-(scoring and summarizing), `offline/report.rs` (the text renderers). No behavior change; the tests move with the
-code.
-
-## Feature 7. Structured calibration output with slices
-
-### Design
-
-**Input.** `calibrate` gains `--full`, which reads `pairs.full.jsonl` as the data request defines it:
-
-- A lenient line type beside the strict `LabeledPair`: `pair_id`, `label` (any string), `split`, `owner`,
-  `variant_change`, `label_source`, `label_confidence`, `note`, `before`, `after`. Unknown keys are ignored.
-- `before` and `after` are projected onto the schema: a key the schema defines as a text field is kept if its
-  value is a string, a key it defines as a quantity is kept if its value is a quantity object, and every other
-  key is dropped. The dropped keys are **counted by name and reported**, so a misspelled `descripton` shows up as
-  812 ignored values and not as a quietly weaker score.
-- `--split NAME` (default: all) and `--min-confidence high|medium|low` (default `medium`, matching what the data
-  request puts in `pairs.jsonl`).
-- Pairs labeled anything but `edit` or `recycle` are scored and reported as a distribution, and never counted as
-  errors or used for a suggestion.
-
-The strict format keeps working unchanged, and its `deny_unknown_fields` stays.
-
-**Pair ids.** `pair_id` from the line when present; otherwise the first 16 hex digits of the SHA-256 of the
-pair's canonical `before` and `after` (keys sorted, as `serde_json` writes a `BTreeMap`).
-
-**Output.** `--ndjson` replaces the text report with result events (`target: similarity_log::RESULT`, stdout,
-never filtered). All values are numbers, booleans, or short strings; an absent optional is left out.
-
-| `message` | One per | Fields |
-|---|---|---|
-| `calibration` | run | `fingerprint`, `dimension`, `max_tokens`, `threshold`, `anchor_threshold`, `pairs_sha256`, `pairs`, `split`, `min_confidence` |
-| `pair` | pair | `pair_id`, `label`, `split`, `owner`, `variant_change`, `label_source`, `label_confidence`, `category`, `similarity`, `accepted`, `wrong`, `measure_changed` |
-| `pair_field` | pair and field | `pair_id`, `field`, `change`, `similarity`, `weight`, `below_floor` |
-| `pair_quantity` | pair and quantity | `pair_id`, `quantity`, `change`, `factor`, `zero_crossing`, `incomparable`, `previous_unit`, `unit`, `beyond_limit` |
-| `pair_reason` | pair and reason | `pair_id`, `code`, `field`, `value`, `limit` |
-| `field_range` | field and label | `field`, `label`, `count`, `low`, `high` |
-| `quantity_range` | quantity and label | `quantity`, `label`, `count`, `low`, `high`, `incomparable`, `zero_crossings` |
-| `suggestion` | run | `threshold`, `margin`, `false_rejects`, `false_accepts` |
-| `quantity_suggestion` | quantity | `quantity`, `reject_above_factor`, `edits_high`, `recycles_low`, or `overlap: true` |
-| `slice` | slice value | `by` (`variant_change`, `category`, `label_source`, `owner`), `value`, `edits`, `recycles`, `false_rejects`, `false_accepts`, score lows and highs |
-| `operating_point` | target | `false_accept_rate`, `threshold`, `false_reject_rate`, `low`, `high` (the interval) |
-| `ignored_key` | key | `key`, `count` |
-| `summary` | run | `pairs`, `edits`, `recycles`, `unsure`, `false_rejects`, `false_accepts` |
-
-`category` on a `pair` event is the top-level category: the text of `before.category` up to the first ` > `,
-which is the separator the README tells callers to build the path with.
-
-**Slices and intervals.**
-
-- Slices by `variant_change`, top-level category, `label_source`, and `owner`. The `owner` slice prints only the
-  ten largest, since it exists to show one brand dominating.
-- Intervals on the two error rates by bootstrap, **resampling owners and not pairs**: pairs from one brand are
-  not independent, and resampling pairs would understate the spread. 1,000 resamples, seeded, default seed 0.
-  Without `owner` (the strict format) the report says intervals need `--full`.
-- Operating points: the threshold and false-reject rate at 1%, 2%, and 5% false-accept rate, from the overall
-  score alone, with the same intervals.
-- A `reject_above_factor` suggestion per quantity: the midpoint (geometric, since factors are ratios) of the gap
-  between the largest factor in edits and the smallest in recycles, or a statement that they overlap.
-
-The bootstrap needs a seeded generator. The trainer has one (`SplitMix64` in `similarity-train/src/data.rs`), and
-the server must not depend on the trainer (D13). Move it to `similarity-core` (a small `rng` module) and have the
-trainer use it from there. `just test-parity` must still pass, since the batch order depends on it.
-
-**The text report** stays the default and gains the slices, the operating points, and the quantity suggestions
-when the input has what they need.
-
-### The work, in order
-
-1. Step 0.
-2. The lenient reader and the projection, with the ignored-key count. Tests: unknown keys counted; a quantity
-   under a text field's name is dropped and counted; `_id` and `_one_sided` companions are ignored; a strict file
-   still refuses an unknown key.
-3. Pair ids, and `--split` and `--min-confidence`.
-4. `unsure` pairs: scored, excluded from errors and suggestions. Test with a file that is all `unsure`.
-5. The events. Test by capturing the result stream (`similarity_log::testing` does this for the trainer) and
-   parsing each line: every number is a JSON number, no line has a `null`, and `pair_field` similarities re-add
-   to the `pair` similarity under the schema's weights.
-6. Slices, the generator move, the bootstrap, operating points, quantity suggestions. Tests: a bootstrap with one
-   owner has zero width; the same seed gives the same interval; a slice's counts sum to the whole.
-7. Text report additions.
-
-### Documentation and verification
-
-- README, "Choosing thresholds": `--full`, `--ndjson`, reading slices and intervals. Replace the `jq` projection
-  in "Fine-tuning the model", step 3, with `calibrate --full --split holdout`.
-- `docs/data-request-prompt.md`: the final check becomes `calibrate --full` on file 1, and file 2 can be dropped
-  from the request if the owner agrees (it exists only because the tool could not read file 1).
-- A new decision record for the event shapes and the brand-clustered bootstrap.
-- A small synthetic `data/calibration.sample.full.jsonl`, saying it is synthetic, so that the README's examples
-  can be run. `just calibrate` on the existing sample must print the numbers it prints today.
-
-**Effort:** M. **Needs real data:** the slices and intervals are only meaningful on it.
 
 ## Feature 8. Calibration diff
 

@@ -42,6 +42,10 @@ tracing.workspace = true
 ureq.workspace = true
 
 [dev-dependencies]
+# The tiny in-memory encoder, so that the offline tools are tested end to end without a model directory.
+similarity-core = { workspace = true, features = ["testing"] }
+# Capturing the result stream, to test what `calibrate --ndjson` writes.
+similarity-log = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 # The example client is a single-threaded program; the server itself never uses the current-thread runtime.
 tokio = { workspace = true, features = ["rt"] }

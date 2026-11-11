@@ -270,6 +270,10 @@ I would rather have a hundred of them marked `unsure` than have them left out.
 - Verify that every line of every `.jsonl` file parses and has exactly the keys specified, and that every line of
   `pairs.jsonl` meets the strict rules above.
 - If the `record-similarity` binary and its model are available here, run
-  `record-similarity calibrate --config config.example.toml pairs.jsonl` and paste its output into the report.
+  `record-similarity calibrate --config config.example.toml --full pairs.full.jsonl` and paste its output into the
+  report. It reads file 1 directly. Look at its last lines first: `record keys that were not compared` lists every
+  key of a record that the service's schema does not define, with a count. A field you expected to be compared
+  appearing there is a naming mismatch to fix or to tell me about. Then run it once more on file 2 without
+  `--full`, which checks the strict format line by line.
 - Finish with a short summary: what you produced, the counts, what fell short of the targets, and the decisions you
   need from me.

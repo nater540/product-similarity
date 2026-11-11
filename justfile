@@ -97,9 +97,10 @@ verify-model dir:
 throughput model="models/mdbr-leaf-mt":
     cargo run --release -p similarity-core --example throughput -- {{ model }}
 
-# Score the labeled pairs and report the threshold that separates edits from recycled records
-calibrate pairs="data/calibration.sample.jsonl" config="config.example.toml":
-    RUST_LOG=warn cargo run --release -p similarity-server -- calibrate --config {{ config }} {{ pairs }}
+# Score the labeled pairs and report the threshold that separates edits from recycled records.
+# Flags go last: `just calibrate data/calibration.sample.full.jsonl config.example.toml --full --split holdout`
+calibrate pairs="data/calibration.sample.jsonl" config="config.example.toml" *flags:
+    RUST_LOG=warn cargo run --release -q -p similarity-server -- calibrate --config {{ config }} {{ pairs }} {{ flags }}
 
 # --- run --------------------------------------------------------------------
 

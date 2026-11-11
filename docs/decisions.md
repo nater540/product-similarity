@@ -488,3 +488,56 @@ revision that carries a quantity reports it as `ADDED` and the anchor takes it.
   item is a piece are simply two numbers; the caller has to be consistent.
 - It cannot say where a limit belongs, or whether zero means "none" or "not measured". Those are questions for
   the real data.
+
+## D17. A calibration is also data: flat events, intervals over owners
+
+`calibrate` printed a report for a person and nothing else, and read only a four-key format that drops everything
+a data export knows about a pair (its id, its owner, its split, whether it is a variant change). Real labeled
+pairs make three more things necessary: reading the export as it is, saying how sure an error rate is, and
+keeping a run in a form another run can be compared with.
+
+**Two input formats, one pair.** The strict format stays what it was, for pairs written by hand: four keys, and a
+typo is an error. `--full` reads `pairs.full.jsonl` leniently. Each record is reduced to what the schema defines,
+and what that leaves out is **counted by key and reported**. Leniency without the count would turn a misspelled
+`descripton` into a slightly weaker score that nobody could trace. A pair labeled anything but `edit` or
+`recycle` is scored and shown, and takes part in no count, no suggestion, and no rate: the data request expects
+many same-brand variant changes to come back `unsure`, and those are the pairs most worth looking at.
+
+**Every pair has an id.** The export's `pair_id`, or else a hash of the pair's content, so that the same pair in
+two runs can be matched up even from a file that never had ids. Two pairs with one id are refused.
+
+**The events are flat.** `--ndjson` writes the calibration through `similarity-log` as result events (D15): one
+`pair` line, then one `pair_field`, `pair_quantity`, and `pair_reason` line per item, all carrying the `pair_id`.
+A single nested event per pair was the first design and cannot be written: `tracing` records scalar values under
+names fixed at the call site, so a map keyed by field name, or a list of reasons, could only be a preformatted
+string, which D15 forbids for good reason. Flat lines are also what `jq` and a table loader want. Each reason has
+a stable code (`Reason::code`), so nothing has to parse the sentence. Similarities are written to six decimal
+places, below what a 32-bit cosine resolves, so that judging the lines again under another configuration gives
+what scoring afresh would.
+
+**One source for every number.** The text report and the events are both rendered from `offline::stats`. Two
+renderers that each computed their own ranges would drift apart, as the trainer's two log formats once did (D15).
+
+**Intervals resample owners, not pairs.** The two error rates and the operating points carry a 95% interval from
+1,000 seeded bootstrap resamples. What is resampled is the owner, with all of its pairs: edits by one brand are
+written by the same people about the same product line and are not independent, so resampling pairs would give an
+interval that is too narrow, and narrower the more one brand dominates. That needs every labeled pair to name an
+owner and at least two owners; otherwise no interval is printed, which is honest for a file that cannot support
+one. A rate with no errors has a zero-width interval. That is a limit of the method on small data and the README
+says so; it is not evidence of a zero rate.
+
+**Operating points** answer the question a threshold poses: to let through at most 1%, 2%, or 5% of recycles, how
+many edits are rejected? They use the overall score alone. A target that allows no more recycles than the one
+before it is left out, since it would repeat it.
+
+**A quantity limit is suggested from the edits.** The first reading of the quantity lines was "the limit belongs
+between the two ranges". That is the logic of a threshold and it is wrong here: most recycles do not change a
+quantity at all (another strain at the same weight), so the smallest factor among recycles is always about 1 and
+there is never a gap. A quantity limit is an *additional* way to reject. What it must not do is reject an edit,
+so the suggestion is the geometric midpoint (factors are ratios) between the largest factor any edit shows and
+the next factor above it among recycles, with the number of recycles it would catch. A quantity no edit changes
+gets no suggestion: there is nothing to place a limit above.
+
+The generator behind the bootstrap is the trainer's `SplitMix64`, moved to `similarity-core` so that the server
+can use it without depending on the trainer (D13). Its sequence is pinned by a test, since a trained model and a
+reported interval are both reproducible only while it does not change.

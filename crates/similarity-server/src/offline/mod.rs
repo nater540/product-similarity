@@ -14,22 +14,55 @@
 //! Modules:
 //!
 //! - this one: a record as a file holds it ([`RecordFields`]), and [`Offline`], which scores one pair.
-//! - [`calibrate`]: labeled pairs, scoring a file of them, and the threshold that separates the two labels.
+//! - [`pairs`]: labeled pairs, as the strict and the full file formats hold them.
+//! - [`calibrate`]: scoring a file of pairs, and the threshold that separates the two labels.
+//! - [`stats`]: what the scored pairs show beyond their totals: ranges, slices, error rates with intervals.
 //! - [`report`]: the reports a person reads at a terminal.
+//! - [`events`]: the same calibration as a stream of result events, for tools.
 
 pub mod calibrate;
+pub mod events;
+pub mod pairs;
 pub mod report;
+pub mod stats;
+#[cfg(test)]
+pub(crate) mod testing;
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Deserializer};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use similarity_core::score::{self, Evaluation};
-use similarity_core::{Embedder, Policy, PreparedRecord, Quantities, Quantity, RecordVectors, Schema};
-
-pub use calibrate::{
-  Calibration, Label, LabeledPair, ScoredPair, Suggestion, calibrate, parse_pairs, suggest_threshold,
+use similarity_core::{
+  Embedder, FieldChange, Policy, PreparedRecord, Quantities, Quantity, QuantityChange, RecordVectors, Schema,
 };
+
+pub use calibrate::{Calibration, ScoredPair, Suggestion, calibrate, suggest_threshold};
+pub use pairs::{Confidence, Label, Pair, Pairs, Selection, parse_full_pairs, parse_pairs};
 pub use report::{render_calibration, render_comparison};
+
+/// A field's change as the reports and events spell it.
+pub(crate) fn change_name(change: FieldChange) -> &'static str {
+  match change {
+    FieldChange::Unchanged => "unchanged",
+    FieldChange::Modified => "modified",
+    FieldChange::Added => "added",
+    FieldChange::Removed => "removed",
+    FieldChange::Restored => "restored",
+  }
+}
+
+/// A quantity's change as the reports and events spell it.
+pub(crate) fn quantity_change_name(change: QuantityChange) -> &'static str {
+  match change {
+    QuantityChange::Unchanged => "unchanged",
+    QuantityChange::Modified => "modified",
+    QuantityChange::Incomparable => "incomparable",
+    QuantityChange::Added => "added",
+    QuantityChange::Removed => "removed",
+    QuantityChange::Restored => "restored",
+  }
+}
 
 /// A record as it appears in a JSON file: one object holding its text fields and its quantities together.
 ///
@@ -46,6 +79,20 @@ pub struct RecordFields {
   pub texts: BTreeMap<String, String>,
   /// Quantity name to value.
   pub quantities: Quantities,
+}
+
+// Written as it is read: one object, text fields as strings and quantities as objects, keys in order.
+impl Serialize for RecordFields {
+  fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    let mut map = serializer.serialize_map(Some(self.texts.len().saturating_add(self.quantities.len())))?;
+    for (key, text) in &self.texts {
+      map.serialize_entry(key, text)?;
+    }
+    for (key, quantity) in &self.quantities {
+      map.serialize_entry(key, quantity)?;
+    }
+    map.end()
+  }
 }
 
 impl<'de> Deserialize<'de> for RecordFields {
@@ -106,6 +153,26 @@ impl Offline {
       self.embedder.dimension(),
       self.embedder.max_tokens()
     )
+  }
+
+  /// The fingerprint of the model in use.
+  pub fn fingerprint(&self) -> &str {
+    self.embedder.fingerprint()
+  }
+
+  /// The width of one field's vector.
+  pub fn dimension(&self) -> usize {
+    self.embedder.dimension()
+  }
+
+  /// The token limit texts are truncated to.
+  pub fn max_tokens(&self) -> usize {
+    self.embedder.max_tokens()
+  }
+
+  /// The schema records are scored under.
+  pub fn schema(&self) -> &Schema {
+    &self.schema
   }
 
   /// Embeds a record's text and validates its quantities, as the server does for a request.
@@ -178,7 +245,7 @@ mod tests {
     ))
     .unwrap();
     assert_eq!(
-      pairs[0].after.quantities["weight_per_item"],
+      pairs.pairs[0].after.quantities["weight_per_item"],
       Quantity::single(1000.0, "mg")
     );
   }

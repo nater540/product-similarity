@@ -17,6 +17,8 @@ use std::path::Path;
 use serde::Deserialize;
 use serde_json::Value;
 use similarity_core::record::normalize_text;
+// The generator that orders examples. Re-exported because it has always been part of this module's interface.
+pub use similarity_core::rng::Rng;
 
 use crate::error::{Result, TrainError};
 
@@ -199,43 +201,6 @@ pub fn group_examples(jsonl: &str, origin: &Path, fields: &[String]) -> Result<V
     }
   }
   Ok(examples)
-}
-
-/// A small, seedable random number generator (`SplitMix64`).
-///
-/// Used only to order examples. It is written out here, rather than taken from a crate, so that a seed reproduces
-/// the same batches on every platform and across dependency upgrades.
-#[derive(Debug, Clone)]
-pub struct Rng(u64);
-
-impl Rng {
-  /// A generator whose whole sequence is determined by `seed`.
-  pub fn new(seed: u64) -> Self {
-    Self(seed)
-  }
-
-  fn next(&mut self) -> u64 {
-    self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut mixed = self.0;
-    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    mixed ^ (mixed >> 31)
-  }
-
-  /// A number in `0..bound` (zero if `bound` is zero).
-  fn below(&mut self, bound: usize) -> usize {
-    let bound = u64::try_from(bound).unwrap_or(u64::MAX);
-    // The modulo bias is below 2^-40 for any list that fits in memory, which is irrelevant for shuffling.
-    let drawn = self.next().checked_rem(bound).unwrap_or(0);
-    usize::try_from(drawn).unwrap_or(0)
-  }
-
-  /// Shuffles `items` in place (Fisher-Yates).
-  pub fn shuffle<T>(&mut self, items: &mut [T]) {
-    for last in (1..items.len()).rev() {
-      items.swap(last, self.below(last.saturating_add(1)));
-    }
-  }
 }
 
 /// One training step's worth of examples, as indexes into the example lists.

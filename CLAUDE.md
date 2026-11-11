@@ -6,7 +6,7 @@ marketplace listings. Each revision is embedded field by field with a small BERT
 thresholds. A record's quantities (weight, volume, potency) are compared as numbers beside that, never embedded.
 Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D16) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D17) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -54,7 +54,8 @@ changing a design. Infer conventions from the existing code first.
   scoring, policy. Synchronous, no I/O beyond reading and writing a model directory, no network code ever (D11).
 - `crates/similarity-store`: the `VectorStore` trait, `MemoryStore`, `QdrantStore`.
 - `crates/similarity-server`: config, the embedding worker thread, `Engine` (all behavior), the thin gRPC layer,
-  `model fetch`, `compare`/`calibrate`, and the `record-similarity` binary. Keep `grpc.rs` free of decisions.
+  `model fetch`, `compare`/`calibrate` (the `offline` module), and the `record-similarity` binary. Keep `grpc.rs`
+  free of decisions.
 - `crates/similarity-train`: fine-tuning (data, losses, schedule, training loop) and the `record-similarity-train`
   binary. The only crate that enables Burn's `autodiff` and `optim`; the server must never depend on it (D13).
 
@@ -81,6 +82,12 @@ changing a design. Infer conventions from the existing code first.
   that was not read from `just calibrate` on real labeled pairs, and never from the synthetic sample.
 - **An unknown unit is never an error.** It is its own dimension, comparable only with itself. Extend the `UNITS`
   table in `quantity.rs` when a new unit turns up; do not make the server refuse it.
+- **Calibration events are flat, and their names are an interface** (D17). `calibrate --ndjson` writes one `pair`
+  line and then one line per field, quantity, and reason, joined on `pair_id`, through `similarity-log`. Do not
+  nest an object or a list into an event (it could only be a preformatted string), and do not rename an event, a
+  field, or a `Reason::code`: other tools read them. Add fields; never repurpose one.
+- **Every number in the text report and in the events comes from `offline::stats`**, so the two cannot disagree.
+  Put a new statistic there, not in a renderer.
 - **A tenant, once stored, must be named by every later request for that id**, including `Delete` (D14).
 - **What a supported model directory is lives in one place**, `similarity_core::model::Pipeline`. The loader and
   `model fetch` both use it; never parse `modules.json` anywhere else.

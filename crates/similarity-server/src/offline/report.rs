@@ -4,31 +4,13 @@
 
 use std::fmt::Write as _;
 
+use similarity_core::Policy;
 use similarity_core::score::Evaluation;
-use similarity_core::{FieldChange, Policy, QuantityChange, QuantityScore};
 
-use super::calibrate::{Calibration, Label, ScoredPair};
-
-fn change_mark(change: FieldChange) -> &'static str {
-  match change {
-    FieldChange::Unchanged => "unchanged",
-    FieldChange::Modified => "modified",
-    FieldChange::Added => "added",
-    FieldChange::Removed => "removed",
-    FieldChange::Restored => "restored",
-  }
-}
-
-fn quantity_mark(change: QuantityChange) -> &'static str {
-  match change {
-    QuantityChange::Unchanged => "unchanged",
-    QuantityChange::Modified => "modified",
-    QuantityChange::Incomparable => "incomparable",
-    QuantityChange::Added => "added",
-    QuantityChange::Removed => "removed",
-    QuantityChange::Restored => "restored",
-  }
-}
+use super::calibrate::{Calibration, ScoredPair};
+use super::pairs::Label;
+use super::stats::{self, Interval, QuantityRange, Range, Rate};
+use super::{change_name as change_mark, quantity_change_name as quantity_mark};
 
 /// Appends how each quantity changed, if the record has any. Says nothing at all for a record without quantities,
 /// so a report on text-only records reads as it always did.
@@ -100,27 +82,8 @@ pub fn render_comparison(evaluation: &Evaluation, policy: &Policy) -> String {
 /// This is what a field's `reject_below` floor is chosen from: it belongs in the gap between the two ranges, if
 /// there is one.
 fn render_field_ranges(calibration: &Calibration, out: &mut String) {
-  let field_range = |field: &str, label: Label| {
-    let mut scores = calibration
-      .pairs
-      .iter()
-      .filter(|scored| scored.pair.label == label)
-      .flat_map(|scored| &scored.evaluation.comparison.fields)
-      .filter(|score| score.field == field && score.change == FieldChange::Modified)
-      .filter_map(|score| score.similarity);
-    let first = scores.next()?;
-    Some(scores.fold((1_usize, first, first), |(count, low, high), score| {
-      (count.saturating_add(1), low.min(score), high.max(score))
-    }))
-  };
-  let field_names: std::collections::BTreeSet<&str> = calibration
-    .pairs
-    .iter()
-    .flat_map(|scored| &scored.evaluation.comparison.fields)
-    .map(|score| score.field.as_str())
-    .collect();
-  let describe = |range: Option<(usize, f32, f32)>| match range {
-    Some((count, low, high)) => format!("{low:.3} to {high:.3} ({count:>2})"),
+  let describe = |range: Option<Range>| match range {
+    Some(range) => format!("{:.3} to {:.3} ({:>2})", range.low, range.high, range.count),
     None => "-".to_owned(),
   };
   let _ = writeln!(
@@ -128,101 +91,58 @@ fn render_field_ranges(calibration: &Calibration, out: &mut String) {
     "\n{:<20} {:<22} {:<22}",
     "field (if modified)", "in edits", "in recycles"
   );
-  for field in field_names {
+  for field in stats::field_names(calibration) {
     let _ = writeln!(
       out,
       "{field:<20} {:<22} {:<22}",
-      describe(field_range(field, Label::Edit)),
-      describe(field_range(field, Label::Recycle))
+      describe(stats::field_range(calibration, field, Label::Edit)),
+      describe(stats::field_range(calibration, field, Label::Recycle))
     );
   }
 }
 
-/// What one quantity did across the pairs of one label.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-struct QuantityRange {
-  /// How many pairs changed the amount by a finite factor, and the smallest and largest of those factors.
-  factors: Option<(usize, f64, f64)>,
-  /// How many pairs put it in a unit of another dimension.
-  incomparable: usize,
-  /// How many pairs moved it between zero and a value above zero.
-  zero_crossings: usize,
-}
-
-impl QuantityRange {
-  fn of<'a>(scores: impl Iterator<Item = &'a QuantityScore>) -> Self {
-    let mut range = Self::default();
-    for score in scores {
-      range.incomparable = range.incomparable.saturating_add(usize::from(score.incomparable));
-      range.zero_crossings = range.zero_crossings.saturating_add(usize::from(score.zero_crossing));
-      // A factor of exactly 1 is "no change" (the same amount, perhaps in another unit), which no limit can
-      // reject and which would only drag every range down to 1.
-      if let Some(factor) = score.factor.filter(|factor| *factor > 1.0) {
-        range.factors = Some(match range.factors {
-          Some((count, low, high)) => (count.saturating_add(1), low.min(factor), high.max(factor)),
-          None => (1, factor, factor),
-        });
-      }
-    }
-    range
+fn describe_quantity_range(range: &QuantityRange) -> String {
+  let mut parts = Vec::new();
+  if let Some(factors) = range.factors {
+    parts.push(format!(
+      "{:.2} to {:.2} ({:>2})",
+      factors.low, factors.high, factors.count
+    ));
   }
-
-  fn describe(&self) -> String {
-    let mut parts = Vec::new();
-    if let Some((count, low, high)) = self.factors {
-      parts.push(format!("{low:.2} to {high:.2} ({count:>2})"));
-    }
-    if self.incomparable > 0 {
-      parts.push(format!("{} incomparable", self.incomparable));
-    }
-    if self.zero_crossings > 0 {
-      parts.push(format!("{} to or from zero", self.zero_crossings));
-    }
-    if parts.is_empty() {
-      "-".to_owned()
-    } else {
-      parts.join(", ")
-    }
+  if range.incomparable > 0 {
+    parts.push(format!("{} incomparable", range.incomparable));
+  }
+  if range.zero_crossings > 0 {
+    parts.push(format!("{} to or from zero", range.zero_crossings));
+  }
+  if parts.is_empty() {
+    "-".to_owned()
+  } else {
+    parts.join(", ")
   }
 }
 
-/// Appends, per quantity, the factors it changed by among edits and among recycles, and how often the measures
-/// changed under each label. Says nothing if no pair has a quantity.
+/// Appends, per quantity, the factors it changed by among edits and among recycles, how often the measures
+/// changed under each label, and where a factor limit could go. Says nothing if no pair has a quantity.
 ///
-/// This is what a quantity's `reject_above_factor` is chosen from: it belongs above the largest factor seen in
-/// edits and below the smallest seen in recycles, if the two leave a gap. `reject_incomparable` and
-/// `reject_on_measure_change` are safe to switch on when the counts under `in edits` are zero.
+/// `reject_incomparable` and `reject_on_measure_change` are safe to switch on when the counts under `in edits`
+/// are zero. A suggested limit sits above every edit; see [`stats::QuantitySuggestion`].
 fn render_quantity_ranges(calibration: &Calibration, out: &mut String) {
-  let labeled = |label: Label| {
-    calibration
-      .pairs
-      .iter()
-      .filter(move |scored| scored.pair.label == label)
-  };
-  let names: std::collections::BTreeSet<&str> = calibration
-    .pairs
-    .iter()
-    .flat_map(|scored| &scored.evaluation.quantities)
-    .map(|score| score.field.as_str())
-    .collect();
+  let names = stats::quantity_names(calibration);
   if names.is_empty() {
     return;
   }
   let _ = writeln!(out, "\n{:<20} {:<38} in recycles", "quantity (factor)", "in edits");
   for name in names {
-    let range = |label: Label| {
-      let scores = labeled(label)
-        .flat_map(|scored| &scored.evaluation.quantities)
-        .filter(|score| score.field == name);
-      QuantityRange::of(scores).describe()
-    };
+    let range = |label: Label| describe_quantity_range(&stats::quantity_range(calibration, name, label));
     let _ = writeln!(out, "{name:<20} {:<38} {}", range(Label::Edit), range(Label::Recycle));
   }
   let measures = |label: Label| {
-    let changed = labeled(label)
+    let changed = calibration
+      .labeled(label)
       .filter(|scored| scored.evaluation.measure_changed)
       .count();
-    format!("{changed} of {}", labeled(label).count())
+    format!("{changed} of {}", calibration.labeled(label).count())
   };
   let _ = writeln!(
     out,
@@ -230,65 +150,192 @@ fn render_quantity_ranges(calibration: &Calibration, out: &mut String) {
     measures(Label::Edit),
     measures(Label::Recycle)
   );
+  for suggestion in stats::quantity_suggestions(calibration) {
+    if let (Some(limit), Some(largest)) = (suggestion.reject_above_factor, suggestion.edits_high) {
+      let _ = writeln!(
+        out,
+        "a limit of {limit:.2} on {} is above every edit (largest {largest:.2}) and rejects {} of the {} recycle(s) \
+         that change it",
+        suggestion.quantity, suggestion.recycles_caught, suggestion.recycles_changed
+      );
+    }
+    if suggestion.edit_zero_crossings > 0 {
+      let _ = writeln!(
+        out,
+        "{}: {} edit(s) move it to or from zero, which any factor limit rejects",
+        suggestion.quantity, suggestion.edit_zero_crossings
+      );
+    }
+  }
+}
+
+/// Appends one table per attribute the pairs can be sliced by. An attribute no pair has a value for is left out,
+/// which for a file in the strict format is every one but the category.
+fn render_slices(calibration: &Calibration, out: &mut String) {
+  let slices = stats::slices(calibration);
+  for (by, title) in [
+    ("variant_change", "by variant change"),
+    ("category", "by category"),
+    ("label_source", "by label source"),
+    ("owner", "by owner (largest)"),
+  ] {
+    let mut of_attribute = slices.iter().filter(|slice| slice.by == by).peekable();
+    if of_attribute.peek().is_none() {
+      continue;
+    }
+    let _ = writeln!(
+      out,
+      "\n{title:<24} {:>6} {:>9} {:>17} {:>17}",
+      "edits", "recycles", "wrongly rejected", "wrongly accepted"
+    );
+    for slice in of_attribute {
+      let _ = writeln!(
+        out,
+        "{:<24} {:>6} {:>9} {:>17} {:>17}",
+        slice.value, slice.edits, slice.recycles, slice.false_rejects, slice.false_accepts
+      );
+    }
+  }
+}
+
+fn percent(rate: f64) -> String {
+  format!("{:.1}%", rate * 100.0)
+}
+
+fn percent_interval(interval: Option<Interval>) -> String {
+  interval.map_or_else(String::new, |interval| {
+    format!(" ({} to {})", percent(interval.low), percent(interval.high))
+  })
+}
+
+fn describe_rate(rate: &Rate) -> String {
+  match rate.rate {
+    Some(value) => format!("{}{}", percent(value), percent_interval(rate.interval)),
+    None => "-".to_owned(),
+  }
+}
+
+/// Appends the two error rates with their intervals, when the pairs name enough owners to resample.
+fn render_error_rates(calibration: &Calibration, seed: u64, out: &mut String) {
+  let rates = stats::error_rates(calibration, seed);
+  let Some(owners) = rates.owners else {
+    return;
+  };
+  let _ = writeln!(
+    out,
+    "false-reject rate {}, false-accept rate {} (95% intervals from resampling {owners} owners)",
+    describe_rate(&rates.false_reject),
+    describe_rate(&rates.false_accept)
+  );
+}
+
+/// Appends what it costs in rejected edits to let through at most 1%, 2%, and 5% of recycles.
+fn render_operating_points(calibration: &Calibration, seed: u64, out: &mut String) {
+  for point in stats::operating_points(calibration, seed) {
+    let target = percent(point.target);
+    match (point.threshold, point.false_reject) {
+      (Some(threshold), Some(rejected)) => {
+        let _ = writeln!(
+          out,
+          "to accept at most {target} of recycles on the overall score alone: threshold {threshold:.3}, rejecting {} \
+           of edits",
+          describe_rate(&rejected)
+        );
+      }
+      _ => {
+        let _ = writeln!(
+          out,
+          "to accept at most {target} of recycles: no threshold does it, because a recycle scores as high as \
+           anything else here"
+        );
+      }
+    }
+  }
+}
+
+/// Appends what was read and not compared: record keys the schema could not use, and pairs that were not selected.
+fn render_input(calibration: &Calibration, out: &mut String) {
+  let input = &calibration.input;
+  if !input.ignored.is_empty() {
+    let keys: Vec<String> = input
+      .ignored
+      .iter()
+      .map(|((key, reason), count)| format!("{key} ({count}, {reason})"))
+      .collect();
+    let _ = writeln!(out, "\nrecord keys that were not compared: {}", keys.join("; "));
+  }
+  if input.skipped_split > 0 || input.skipped_confidence > 0 {
+    let _ = writeln!(
+      out,
+      "left out: {} pair(s) of another split, {} labeled pair(s) below the confidence asked for",
+      input.skipped_split, input.skipped_confidence
+    );
+  }
 }
 
 /// Renders a calibration as a report, for a terminal.
-pub fn render_calibration(calibration: &Calibration, policy: &Policy) -> String {
+///
+/// `seed` fixes the resampling behind the intervals, so the same pairs give the same report.
+pub fn render_calibration(calibration: &Calibration, policy: &Policy, seed: u64) -> String {
   let mut out = String::new();
   let _ = writeln!(out, "{:<8} {:>7}  {:<9} note", "label", "overall", "verdict");
   let mut ordered: Vec<&ScoredPair> = calibration.pairs.iter().collect();
-  ordered.sort_by(|a, b| {
-    b.evaluation
-      .comparison
-      .similarity
-      .total_cmp(&a.evaluation.comparison.similarity)
-  });
+  ordered.sort_by(|a, b| b.similarity().total_cmp(&a.similarity()));
   for scored in ordered {
-    let label = match scored.pair.label {
-      Label::Edit => "edit",
-      Label::Recycle => "recycle",
-    };
-    let accepted = scored.evaluation.accepted();
-    let verdict = if accepted { "accepted" } else { "rejected" };
-    let wrong = if accepted == (scored.pair.label == Label::Edit) {
-      ""
+    let verdict = if scored.evaluation.accepted() {
+      "accepted"
     } else {
-      "  << WRONG"
+      "rejected"
     };
+    let wrong = if scored.wrong() { "  << WRONG" } else { "" };
     let _ = writeln!(
       out,
-      "{label:<8} {:>7.3}  {verdict:<9} {}{wrong}",
-      scored.evaluation.comparison.similarity, scored.pair.note
+      "{:<8} {:>7.3}  {verdict:<9} {}{wrong}",
+      scored.pair.label_text,
+      scored.similarity(),
+      scored.pair.note
     );
   }
 
-  let range = |label: Label| {
-    let mut scores = calibration
-      .pairs
-      .iter()
-      .filter(|scored| scored.pair.label == label)
-      .map(|scored| scored.evaluation.comparison.similarity);
-    let first = scores.next()?;
-    Some(scores.fold((first, first), |(low, high), score| (low.min(score), high.max(score))))
-  };
   let _ = writeln!(out);
   for (name, label) in [("edits", Label::Edit), ("recycles", Label::Recycle)] {
-    if let Some((low, high)) = range(label) {
-      let _ = writeln!(out, "{name:<9} overall similarity from {low:.3} to {high:.3}");
+    if let Some(range) = stats::score_range(calibration, Some(label)) {
+      let _ = writeln!(
+        out,
+        "{name:<9} overall similarity from {:.3} to {:.3}",
+        range.low, range.high
+      );
     }
+  }
+  // Pairs with any other label (`unsure`) are scored so that they can be looked at, and counted nowhere below.
+  if let Some(range) = stats::score_range(calibration, None) {
+    let accepted = calibration
+      .unlabeled()
+      .filter(|scored| scored.evaluation.accepted())
+      .count();
+    let _ = writeln!(
+      out,
+      "{:<9} overall similarity from {:.3} to {:.3} ({} pair(s) with another label, {accepted} of which would be \
+       accepted; counted nowhere below)",
+      "others", range.low, range.high, range.count
+    );
   }
   render_field_ranges(calibration, &mut out);
   render_quantity_ranges(calibration, &mut out);
+  render_slices(calibration, &mut out);
 
+  let labeled = calibration
+    .pairs
+    .iter()
+    .filter(|scored| scored.pair.label.is_some())
+    .count();
   let _ = writeln!(
     out,
     "\nconfigured policy (threshold {:.3} plus field floors and any quantity limits): {} edit(s) wrongly rejected, \
-     {} recycle(s) wrongly accepted, of {} pairs",
-    policy.threshold,
-    calibration.false_rejects,
-    calibration.false_accepts,
-    calibration.pairs.len()
+     {} recycle(s) wrongly accepted, of {labeled} pairs",
+    policy.threshold, calibration.false_rejects, calibration.false_accepts
   );
+  render_error_rates(calibration, seed, &mut out);
   match calibration.suggestion {
     Some(suggestion) => {
       let _ = writeln!(
@@ -304,94 +351,29 @@ pub fn render_calibration(calibration: &Calibration, policy: &Policy) -> String 
       );
     }
   }
+  render_operating_points(calibration, seed, &mut out);
+  render_input(calibration, &mut out);
   out
 }
 
 #[cfg(test)]
 mod tests {
-  use similarity_core::score::{Comparison, Reason};
-  use similarity_core::{Quantities, Quantity, Schema};
-
   use super::*;
-  use crate::offline::RecordFields;
-  use crate::offline::calibrate::{LabeledPair, summarize};
+  use crate::offline::calibrate::summarize;
+  use crate::offline::pairs::{Ignored, Input};
+  use crate::offline::testing::{amount, measured, scored, scored_as};
 
-  fn scored(label: Label, similarity: f32, accepted: bool) -> ScoredPair {
-    let reasons = if accepted {
-      Vec::new()
-    } else {
-      vec![Reason::BelowThreshold {
-        similarity,
-        threshold: 0.8,
-      }]
-    };
-    ScoredPair {
-      pair: LabeledPair {
-        label,
-        note: format!("{label:?} at {similarity}"),
-        before: RecordFields::default(),
-        after: RecordFields::default(),
-      },
-      evaluation: Evaluation {
-        comparison: Comparison {
-          similarity,
-          fields: Vec::new(),
-        },
-        anchor_similarity: None,
-        reasons,
-        quantities: Vec::new(),
-        measure_changed: false,
-      },
-    }
+  fn summarized(pairs: Vec<ScoredPair>) -> Calibration {
+    summarize(pairs, Input::default())
   }
 
-  /// One quantity's change: `(name, before, after)`, either side possibly absent.
-  type Change<'a> = (&'a str, Option<Quantity>, Option<Quantity>);
-
-  /// An accepted pair whose quantities changed as given.
-  fn measured(label: Label, changes: &[Change<'_>]) -> ScoredPair {
-    let schema = Schema::new(vec![similarity_core::FieldSpec {
-      name: "name".to_owned(),
-      weight: 1.0,
-      required: false,
-      reject_below: None,
-    }])
-    .unwrap()
-    .with_quantities(
-      changes
-        .iter()
-        .map(|(name, ..)| similarity_core::QuantitySpec {
-          name: (*name).to_owned(),
-          reject_above_factor: Some(4.0),
-          reject_incomparable: false,
-        })
-        .collect(),
-    )
-    .unwrap();
-    let side = |pick: fn(&Change<'_>) -> Option<Quantity>| -> Quantities {
-      changes
-        .iter()
-        .filter_map(|change| Some((change.0.to_owned(), pick(change)?)))
-        .collect()
-    };
-    let mut pair = scored(label, 0.95, true);
-    pair.evaluation.judge_quantities(
-      &schema,
-      &Policy::new(0.8, None).unwrap(),
-      &side(|change| change.1.clone()),
-      &Quantities::new(),
-      &side(|change| change.2.clone()),
-    );
-    pair
-  }
-
-  fn amount(value: f64, unit: &str) -> Quantity {
-    Quantity::single(value, unit)
+  fn policy() -> Policy {
+    Policy::new(0.8, None).unwrap()
   }
 
   #[test]
   fn the_summary_counts_what_the_configured_policy_gets_wrong() {
-    let calibration = summarize(vec![
+    let calibration = summarized(vec![
       scored(Label::Edit, 0.95, true),
       scored(Label::Edit, 0.70, false),
       scored(Label::Recycle, 0.85, true),
@@ -399,7 +381,7 @@ mod tests {
     ]);
     assert_eq!((calibration.false_rejects, calibration.false_accepts), (1, 1));
 
-    let report = render_calibration(&calibration, &Policy::new(0.8, None).unwrap());
+    let report = render_calibration(&calibration, &policy(), 0);
     assert_eq!(report.matches("<< WRONG").count(), 2, "{report}");
     assert!(
       report.contains("1 edit(s) wrongly rejected, 1 recycle(s) wrongly accepted, of 4 pairs"),
@@ -411,13 +393,13 @@ mod tests {
   #[test]
   fn a_comparison_renders_its_reasons() {
     let evaluation = scored(Label::Recycle, 0.2, false).evaluation;
-    let report = render_comparison(&evaluation, &Policy::new(0.8, None).unwrap());
+    let report = render_comparison(&evaluation, &policy());
     assert!(
       report.contains("verdict: REJECTED") && report.contains("below the threshold"),
       "{report}"
     );
     let accepted = scored(Label::Edit, 0.9, true).evaluation;
-    let report = render_comparison(&accepted, &Policy::new(0.8, None).unwrap());
+    let report = render_comparison(&accepted, &policy());
     assert!(report.contains("verdict: ACCEPTED"));
     assert!(
       !report.contains("quantity"),
@@ -438,7 +420,7 @@ mod tests {
         ("count", Some(amount(10.0, "each")), None),
       ],
     );
-    let report = render_comparison(&pair.evaluation, &Policy::new(0.8, None).unwrap());
+    let report = render_comparison(&pair.evaluation, &policy());
     let line = |name: &str| {
       report
         .lines()
@@ -466,7 +448,7 @@ mod tests {
 
   #[test]
   fn the_calibration_report_sets_each_quantitys_factors_in_edits_beside_those_in_recycles() {
-    let calibration = summarize(vec![
+    let calibration = summarized(vec![
       measured(
         Label::Edit,
         &[("thc", Some(amount(21.3, "%")), Some(amount(22.8, "%")))],
@@ -498,7 +480,7 @@ mod tests {
       ),
       scored(Label::Edit, 0.97, true),
     ]);
-    let report = render_calibration(&calibration, &Policy::new(0.8, None).unwrap());
+    let report = render_calibration(&calibration, &policy(), 0);
     let line = |name: &str| {
       report
         .lines()
@@ -525,14 +507,174 @@ mod tests {
 
   #[test]
   fn a_calibration_without_quantities_reports_none() {
-    let calibration = summarize(vec![
+    let calibration = summarized(vec![
       scored(Label::Edit, 0.95, true),
       scored(Label::Recycle, 0.2, false),
     ]);
-    let report = render_calibration(&calibration, &Policy::new(0.8, None).unwrap());
+    let report = render_calibration(&calibration, &policy(), 0);
     assert!(
       !report.contains("quantity (factor)") && !report.contains("measures changed"),
       "{report}"
     );
+  }
+
+  #[test]
+  fn a_limit_is_suggested_above_every_edit_with_what_it_would_catch() {
+    let change = |label: Label, before: f64, after: f64| {
+      measured(
+        label,
+        &[("weight", Some(amount(before, "g")), Some(amount(after, "g")))],
+      )
+    };
+    let calibration = summarized(vec![
+      change(Label::Edit, 1.0, 1.25),
+      change(Label::Edit, 0.0, 1.0),
+      change(Label::Recycle, 1.0, 1.1),
+      change(Label::Recycle, 1.0, 5.0),
+    ]);
+    let report = render_calibration(&calibration, &policy(), 0);
+    assert!(
+      report.contains(
+        "a limit of 2.50 on weight is above every edit (largest 1.25) and rejects 1 of the 2 recycle(s) that change it"
+      ),
+      "{report}"
+    );
+    assert!(
+      report.contains("weight: 1 edit(s) move it to or from zero, which any factor limit rejects"),
+      "{report}"
+    );
+  }
+
+  #[test]
+  fn pairs_with_another_label_are_shown_and_counted_nowhere() {
+    let unsure = |similarity: f32, accepted: bool| {
+      scored_as(Label::Edit, similarity, accepted, |pair| {
+        pair.label = None;
+        pair.label_text = "unsure".to_owned();
+      })
+    };
+    let calibration = summarized(vec![
+      scored(Label::Edit, 0.95, true),
+      scored(Label::Recycle, 0.2, false),
+      unsure(0.9, true),
+      unsure(0.6, false),
+    ]);
+    assert_eq!((calibration.false_rejects, calibration.false_accepts), (0, 0));
+
+    let report = render_calibration(&calibration, &policy(), 0);
+    assert_eq!(
+      report.lines().filter(|line| line.starts_with("unsure ")).count(),
+      2,
+      "{report}"
+    );
+    assert!(!report.contains("WRONG"), "{report}");
+    assert!(
+      report.contains("others    overall similarity from 0.600 to 0.900 (2 pair(s) with another label, 1 of which"),
+      "{report}"
+    );
+    assert!(
+      report.contains("0 edit(s) wrongly rejected, 0 recycle(s) wrongly accepted, of 2 pairs"),
+      "{report}"
+    );
+    // The suggestion comes from the labeled pairs alone: the midpoint of 0.2 and 0.95.
+    assert!(
+      report.contains("best overall threshold for this data: 0.575"),
+      "{report}"
+    );
+  }
+
+  #[test]
+  fn slices_rates_and_what_was_left_out_are_reported_when_the_pairs_carry_them() {
+    let pair = |label: Label, similarity: f32, accepted: bool, owner: &str, variant: Option<&str>| {
+      scored_as(label, similarity, accepted, |pair| {
+        pair.owner = Some(owner.to_owned());
+        pair.variant_change = variant.map(str::to_owned);
+        pair
+          .before
+          .texts
+          .insert("category".to_owned(), "Edibles > Gummies".to_owned());
+      })
+    };
+    let mut input = Input {
+      skipped_split: 12,
+      skipped_confidence: 3,
+      ..Input::default()
+    };
+    input.ignored.insert(("strain".to_owned(), Ignored::NotInSchema), 40);
+    input
+      .ignored
+      .insert(("weight_per_item".to_owned(), Ignored::WrongKind), 2);
+    let calibration = summarize(
+      vec![
+        pair(Label::Edit, 0.95, true, "b1", None),
+        pair(Label::Edit, 0.70, false, "b2", Some("flavor")),
+        pair(Label::Recycle, 0.85, true, "b2", Some("flavor")),
+        pair(Label::Recycle, 0.20, false, "b1", None),
+      ],
+      input,
+    );
+    let report = render_calibration(&calibration, &policy(), 0);
+    let squeezed = |line: &str| line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lines: Vec<String> = report.lines().map(squeezed).collect();
+    let has = |wanted: &str| lines.iter().any(|line| line == wanted);
+
+    assert!(
+      has("by variant change edits recycles wrongly rejected wrongly accepted"),
+      "{report}"
+    );
+    assert!(has("flavor 1 1 1 1"), "{report}");
+    assert!(has("Edibles 2 2 1 1"), "{report}");
+    assert!(has("b1 1 1 0 0") && has("b2 1 1 1 1"), "{report}");
+    assert!(!report.contains("by label source"), "no pair has one: {report}");
+
+    assert!(
+      report.contains("false-reject rate 50.0% (0.0% to 100.0%), false-accept rate 50.0% (0.0% to 100.0%) (95% intervals from resampling 2 owners)"),
+      "{report}"
+    );
+    assert!(
+      report.contains("record keys that were not compared: strain (40, not in the schema); weight_per_item (2, the wrong kind of value)"),
+      "{report}"
+    );
+    assert!(
+      report.contains("left out: 12 pair(s) of another split, 3 labeled pair(s) below the confidence asked for"),
+      "{report}"
+    );
+  }
+
+  #[test]
+  fn a_strict_file_reports_no_rates_and_no_slices_but_the_category() {
+    let calibration = summarized(vec![
+      scored(Label::Edit, 0.95, true),
+      scored(Label::Recycle, 0.2, false),
+    ]);
+    let report = render_calibration(&calibration, &policy(), 0);
+    assert!(
+      !report.contains("false-reject rate") && !report.contains("by ") && !report.contains("left out"),
+      "{report}"
+    );
+  }
+
+  #[test]
+  fn operating_points_say_what_a_cap_on_accepted_recycles_costs() {
+    let calibration = summarized(vec![
+      scored(Label::Edit, 0.95, true),
+      scored(Label::Edit, 0.60, false),
+      scored(Label::Recycle, 0.70, false),
+      scored(Label::Recycle, 0.30, false),
+    ]);
+    let report = render_calibration(&calibration, &policy(), 0);
+    assert!(
+      report.contains(
+        "to accept at most 1.0% of recycles on the overall score alone: threshold 0.825, rejecting 50.0% of edits"
+      ),
+      "{report}"
+    );
+
+    let tied = summarized(vec![
+      scored(Label::Edit, 0.95, true),
+      scored(Label::Recycle, 0.95, true),
+    ]);
+    let report = render_calibration(&tied, &policy(), 0);
+    assert!(report.contains("no threshold does it"), "{report}");
   }
 }

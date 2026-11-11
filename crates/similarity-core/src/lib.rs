@@ -16,6 +16,7 @@
 //! - [`schema`]: the fields of a record, their weights, and the composite-vector layout.
 //! - [`quantity`]: the numeric fields of a record, which are compared as numbers and never embedded.
 //! - [`record`]: validating a record, reusing unchanged fields, and packing the stored form.
+//! - [`rng`]: a small seeded generator, for results that must be reproducible from a seed.
 //! - [`score`]: comparing a revision against its baseline and deciding whether to accept it.
 
 // Tests compute expected values with ordinary arithmetic and compare exact floats where exactness is the point.
@@ -26,6 +27,7 @@ pub mod error;
 pub mod model;
 pub mod quantity;
 pub mod record;
+pub mod rng;
 pub mod schema;
 pub mod score;
 #[cfg(any(test, feature = "testing"))]
