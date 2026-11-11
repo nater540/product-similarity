@@ -564,26 +564,32 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     let mut ready = Vec::with_capacity(inputs.len());
     let mut texts: Vec<String> = Vec::new();
     for input in inputs {
-      ready.push(self.prepare_import(input).map(|prepared| {
-        let take = |record: &PreparedRecord, texts: &mut Vec<String>| -> Result<usize, EngineError> {
-          let wanted = record.plan(&self.schema, dimension, None)?.texts();
-          texts.extend(wanted.iter().map(|text| (*text).to_owned()));
-          Ok(wanted.len())
+      ready.push(self.prepare_import(input).and_then(|prepared| {
+        let wanted = |record: &PreparedRecord| -> Result<Vec<String>, EngineError> {
+          let plan = record.plan(&self.schema, dimension, None)?;
+          Ok(plan.texts().into_iter().map(str::to_owned).collect())
         };
-        let record_texts = take(&prepared.record, &mut texts)?;
-        let anchor_texts = match &prepared.anchor {
-          Some(anchor) => take(anchor, &mut texts)?,
-          None => 0,
-        };
-        Ok::<_, EngineError>((prepared, record_texts, anchor_texts))
+        // Both lists are worked out before either is queued: the vectors that come back are told apart by
+        // position alone, so a record must put in all of its texts or none.
+        let record_texts = wanted(&prepared.record)?;
+        let anchor_texts = prepared.anchor.as_ref().map(wanted).transpose()?.unwrap_or_default();
+        let counts = (record_texts.len(), anchor_texts.len());
+        texts.extend(record_texts);
+        texts.extend(anchor_texts);
+        Ok((prepared, counts.0, counts.1))
       }));
     }
-    let embedded = self.embedder.embed(texts).await?;
+    // Nothing to embed (every record was refused) is not a reason to wake the model.
+    let embedded = if texts.is_empty() {
+      Vec::new()
+    } else {
+      self.embedder.embed(texts).await?
+    };
 
     let mut vectors = embedded.iter();
     let mut outcomes = Vec::with_capacity(ready.len());
     for prepared in ready {
-      let outcome = match prepared.and_then(|counted| counted) {
+      let outcome = match prepared {
         Err(error) => Err(error),
         Ok((prepared, record_texts, anchor_texts)) => {
           // Each record's vectors are the next ones in line, whether or not the record ends up being written.

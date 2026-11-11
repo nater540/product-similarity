@@ -1265,7 +1265,9 @@ What it does, and what it will not do:
   any. `--stop-on-error` stops at the first one instead. `--check` finds the same problems in a second or two,
   before anything is embedded.
 - **It needs the model and a connection to Qdrant**, like the server, and reads the same config. It does not
-  need the server, and can run while the server does: both only ever write whole records.
+  need the server. Run it before the server takes edits for the records being imported: like two replicas
+  ([Limitations](#limitations)), an import and a server that both see a new id at the same instant do not
+  coordinate, and whichever writes second wins.
 
 Progress is logged after every batch (`--batch-records`, 64 by default), and the outcome is a `finished` result
 on stdout. This is an export of 48 synthetic records, two of them flawed, with the envelope fields removed:

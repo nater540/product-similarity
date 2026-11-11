@@ -417,6 +417,26 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn an_export_with_nothing_importable_never_reaches_the_model() {
+    let engine = engine();
+    let nothing = "not json\n{\"id\": \"x\", \"record\": {\"category\": \"edibles\"}}\n";
+    let (summary, failures, _) = import(&engine, nothing, TWO_AT_A_TIME).await;
+    assert_eq!(
+      summary.unwrap(),
+      Summary {
+        records: 2,
+        imported: 0,
+        skipped: 0,
+        failed: 2
+      }
+    );
+    assert_eq!(failures.len(), 2);
+
+    let (empty, ..) = import(&engine, "# only a comment\n\n", TWO_AT_A_TIME).await;
+    assert_eq!(empty.unwrap(), Summary::default());
+  }
+
+  #[tokio::test]
   async fn stopping_on_the_first_error_keeps_what_was_imported_before_it() {
     let engine = engine();
     let options = Options {
