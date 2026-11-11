@@ -4,7 +4,8 @@
 //! hold for *every* input and let the machine look for one that breaks it. The rules they cover are the ones a
 //! verdict rests on: that a composite's cosine is the weighted mean it is documented to be (D5), that the anchor
 //! never loses a value it holds (D8), that judging again equals judging afresh (D17), and that a quantity's
-//! factor means the same thing whichever way round, and in whatever unit, it is asked (D16).
+//! factor means the same thing whichever way round, and in whatever unit, it is asked (D16), and that a long text
+//! is tokenized as if all of it had been read (D21).
 //!
 //! Each property runs a modest number of cases so that the fast suite stays fast. A failure is shrunk to a small
 //! input and saved under `proptest-regressions/`, which is checked in: the case is then replayed first on every
@@ -14,13 +15,15 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
+use tokenizers::normalizers::BertNormalizer;
 
 use crate::embed::EmbedderOptions;
 use crate::quantity::{self, Quantities, Quantity, QuantityChange, first_values};
 use crate::record::{RecordVectors, normalize_text, text_hash};
 use crate::schema::{FieldSpec, QuantitySpec, Schema};
 use crate::score::{self, FieldChange, Policy, Reason};
-use crate::testing::{WORDS, tiny_embedder};
+use crate::testing::{WORDS, tiny_embedder, tiny_tokenizer};
+use crate::tokenize::TextTokenizer;
 use crate::vector::{cosine, norm, normalize};
 
 /// The width of one generated field vector. Small, so that a shrunk failure is readable.
@@ -502,4 +505,42 @@ fn a_text_embeds_the_same_alone_and_in_any_batch() {
       Ok(())
     })
     .unwrap();
+}
+
+/// A stretch of a field's text: a word, or a run of one thing repeated, long enough to outgrow the part of a text
+/// that is tokenized first. The runs are what padding is made of: characters BERT's normalizer deletes
+/// (zero-width space, word joiner, form feed), ones it strips (a combining accent), an unbroken word, and every
+/// kind of gap.
+fn stretch() -> impl Strategy<Value = String> {
+  let repeated = vec![
+    "\u{200b}", "\u{2060}", "\u{c}", "\u{301}", "\u{a0}", "a", "é", "ブ", ".", " ", "\t", "\n",
+  ];
+  prop_oneof![
+    proptest::sample::select(WORDS.to_vec()).prop_map(str::to_owned),
+    Just("unheard".to_owned()),
+    proptest::sample::select(vec![" ", "\t", "\n", "\r", "\u{c}", "\u{a0}", ""]).prop_map(str::to_owned),
+    (proptest::sample::select(repeated), 0..400_usize).prop_map(|(unit, times)| unit.repeat(times)),
+  ]
+}
+
+proptest! {
+  #![proptest_config(cases())]
+
+  /// D21: only a head of a long text is handed to the tokenizer, and the tokens must be the ones the whole text
+  /// gives, whatever the text is made of. The first version of the cut counted bytes, and padding a field with
+  /// characters that come to no tokens pushed its words out of what was read.
+  #[test]
+  fn a_text_is_tokenized_as_if_all_of_it_had_been_read(
+    stretches in proptest::collection::vec(stretch(), 0..12),
+    max_tokens in 3..9_usize,
+    bert in any::<bool>(),
+  ) {
+    let mut tokenizer = tiny_tokenizer();
+    if bert {
+      let _ = tokenizer.with_normalizer(Some(BertNormalizer::default()));
+    }
+    let tokenizer = TextTokenizer::new(tokenizer, max_tokens).unwrap();
+    let text = stretches.concat();
+    prop_assert_eq!(tokenizer.encode(&text).unwrap(), tokenizer.encode_whole(&text).unwrap());
+  }
 }

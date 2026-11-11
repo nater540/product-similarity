@@ -662,34 +662,50 @@ server's queue (D9). On a laptop CPU 2,000 four-field records import in 19 secon
 Not built: a streaming `Import` RPC. The command covers the need as long as it can run next to Qdrant, and an RPC
 that writes without judging is a larger thing to expose than a command an operator runs.
 
-## D21. Only the part of a field that could be read is tokenized
+## D21. A long field is tokenized a part at a time, until the token limit is full
 
 A tokenizer walks the whole of a text before it truncates to `max_tokens`. Only the first 256 tokens of a field
 are ever used, but the cost of a field grew with its full length: scoring one record whose description was 1 MB
-of text took 0.90 s where an ordinary one takes 0.22 s, and 3 MB took 2.2 s (measured with `compare`, on ordinary
-and on unbroken text alike). There is one embedding thread (D9), and a gRPC message may be 4 MB, so a handful of
-such requests held up every other caller.
+of text took 0.90 s where an ordinary one takes 0.22 s, and 3 MB took 2.2 s (measured with `compare`). There is
+one embedding thread (D9), and a gRPC message may be 4 MB, so a handful of such requests held up every other
+caller.
 
-`TextTokenizer::encode` now hands the tokenizer at most `max_tokens * 64` bytes of a text, cut at a character
-boundary: 16 KB at the default limit. The same measurements are 0.28 s and 0.29 s.
+`TextTokenizer::encode` now hands the tokenizer a head of a long text: at least `max_tokens * 64` bytes (16 KB at
+the default limit), ending just before the next space, tab, or line break. If that fills the token limit, it is
+the answer, since whatever follows could only have been truncated away. If it does not, a head four times as long
+is tried, and so on up to the whole text. Comparing two records that each carry a 1 MB description now takes
+0.33 s, and with 3 MB each 0.34 s, where two ordinary records take 0.24 s.
 
 **Why this and not a size limit on requests.** Refusing a long field would make requests fail that succeed
-today, for a caller who has done nothing wrong but store a long description. Cutting what the tokenizer is given
-changes nothing a caller can see.
+today, for a caller who has done nothing wrong but store a long description. Reading less of the text changes
+nothing a caller can see, so long as the tokens are the same.
 
-**Why it changes no embedding that matters.** A token of ordinary text is four or five bytes, and no vocabulary
-entry is anywhere near 64, so the first 256 tokens of a text lie well inside its first 16 KB: what is cut off was
-never going to be read. A test encodes a megabyte of text with and without the cut and requires the same tokens.
-The parity tests against PyTorch pass unchanged, and `just calibrate` prints the numbers it printed before. The
-exception is text made of unbroken runs longer than 64 bytes each, for example a base64 blob: it is a row of
-unknown tokens either way, only a shorter one. The fingerprint is not changed for that (D12), since no vector of
-a real field means anything different.
+**Why the tokens are the same, for every text.** A head that stops at a space, a tab, or a line break stops
+between two words for every tokenizer, so its tokens are exactly the first tokens of the whole text. The head is
+accepted only when the tokenizer itself reports the limit full. Nothing is assumed about how many bytes a token
+takes. A property test (`a_text_is_tokenized_as_if_all_of_it_had_been_read`) compares the two on generated text,
+and the parity tests against PyTorch pass unchanged.
 
-**What is not cut.** The text's fingerprint is still taken over the whole of it, so an edit beyond the first
-16 KB is still an edit: the field is reported as modified, at a similarity of 1, exactly as an edit beyond the
+**The first version assumed, and was wrong.** It cut every text at `max_tokens * 64` bytes, on the reasoning that
+a token is a few bytes and 256 of them lie well inside 16 KB. That holds for ordinary text and not for text built
+to break it: 16 KB of zero-width spaces or combining accents come to no tokens at all, and one unbroken
+20,000-letter word comes to one. Put in front of every field, each pushed the real text out of what was read, so
+two unrelated products embedded identically, scored 1.000, and were accepted, where without the padding they score
+0.519 and are rejected. The first two paddings cannot be seen on a page. It was found while planning the fuzz
+targets (`docs/plans/14-fuzzing.md`) and reproduced with `compare` on the real model; the same three inputs now
+score 0.519, 0.519, and 0.583. `padding_cannot_push_a_text_out_of_what_is_read` and
+`padding_a_text_does_not_hide_it_from_the_encoder` (real model) keep them as tests. The lesson is the one D19
+records: a claim that holds "for any text" needs a test that generates text.
+
+**What it does not bound.** A text with no space, tab, or line break anywhere is read whole, as before: two
+records with 1 MB of unbroken letters each take 1.51 s. A text whose heads never fill the limit is read in parts
+that add up to a third more than the text. So this makes long ordinary fields cheap; it is not a defense against
+a caller who wants to be slow. That is the job of a limit on message size.
+
+**What is not cut.** The text's fingerprint is still taken over the whole of it, so an edit beyond the tokens that
+are kept is still an edit: the field is reported as modified, at a similarity of 1, exactly as an edit beyond the
 256th token always was. Whitespace normalization and hashing still read the whole field; they are linear and
-cheap, and are what the remaining 0.07 s of a 3 MB field goes on.
+cheap.
 
-The cut is in the tokenizer wrapper that serving and training share, so a model is still fine-tuned on exactly
+The logic is in the tokenizer wrapper that serving and training share, so a model is still fine-tuned on exactly
 the token sequences it is served with.
-

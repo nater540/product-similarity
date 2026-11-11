@@ -48,7 +48,8 @@ Seven things in the suggestions needed correcting or deciding, and each is now r
    once that way to check: the `provenance.json` of the model baked into it names the commit.
 7. **Very long fields were a CPU cost risk: verified, and fixed.** One 1 MB field cost about 0.7 s of the single
    embedding thread, and 3 MB about 2 s, because the tokenizer walks the whole field before truncating to
-   `max_tokens`. Only the part that could be read is tokenized now (D21).
+   `max_tokens`. A long field is now tokenized a part at a time, until the token limit is full (D21). The first
+   version of that fix cut at a byte count and let padding hide a field; see D21.
 
 Building them turned up three more:
 
@@ -78,10 +79,10 @@ The owner asked for these to be taken on best judgment. Each is easy to reverse.
    first version decides whether drift history can be carried over; the data request asks.
 5. **The import is a command, named `import`**, not `reindex` as first planned: loading a catalog for the first
    time is the same operation. No streaming RPC.
-6. **A field too long to be worth tokenizing is cut, not refused.** The tokenizer is given the first
-   `max_tokens * 64` bytes; the whole text is still hashed. No request that succeeds today fails, and no
-   embedding of ordinary text changes (D21). The alternative, refusing the request above a size, is a one-line
-   policy change if that is preferred.
+6. **A field too long to be worth tokenizing whole is read in parts, not refused.** The tokenizer is given a
+   head of the text and a longer one only if the first did not fill the token limit; the whole text is still
+   hashed. No request that succeeds today fails, and no embedding changes (D21). The alternative, refusing the
+   request above a size, is a one-line policy change if that is preferred.
 
 ## The other fifteen, briefly
 

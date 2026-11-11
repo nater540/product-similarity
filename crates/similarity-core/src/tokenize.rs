@@ -15,26 +15,37 @@ use crate::error::{Error, Result};
 /// The file a model directory keeps its tokenizer in.
 pub const TOKENIZER_FILE: &str = "tokenizer.json";
 
-/// How many bytes of a text are handed to the tokenizer for every token it is allowed to keep.
+/// How many bytes of a long text the tokenizer is given at first, for every token it may keep.
 ///
 /// A tokenizer walks the whole of a text before truncating it, so the cost of a field grows with its length even
 /// though only the first `max_tokens` tokens are ever used: a megabyte of text took most of a second, on the one
-/// thread every request shares. A token of ordinary text is four or five bytes, and no vocabulary entry is
-/// anywhere near this long, so the first `max_tokens` tokens of a text lie well inside its first
-/// `max_tokens * BYTES_PER_TOKEN` bytes and what is cut off was never going to be read. (The exception is text
-/// made of unbroken runs longer than this, which is a row of unknown tokens with or without the cut.)
+/// thread every request shares. A long text is therefore handed over a part at a time (see
+/// [`TextTokenizer::encode`]), and this sets the size of the first part. A token of ordinary text is four or five
+/// bytes, so the first part nearly always holds every token that will be kept.
 const BYTES_PER_TOKEN: usize = 64;
 
-/// The part of `text` worth tokenizing when at most `max_tokens` tokens are kept: all of it, unless it is longer
-/// than any text that could need more. The cut falls on a character boundary.
-fn head(text: &str, max_tokens: usize) -> &str {
-  let limit = max_tokens.saturating_mul(BYTES_PER_TOKEN);
-  if text.len() <= limit {
-    return text;
-  }
-  // A UTF-8 character is at most four bytes, so a boundary is never more than three steps back.
-  let end = (0..=limit).rev().find(|end| text.is_char_boundary(*end)).unwrap_or(0);
-  text.get(..end).unwrap_or(text)
+/// How many times longer the next part of a text is, when the part before it did not fill the token limit.
+///
+/// The parts tried add up to at most a third more than the text itself, so the worst a text built to defeat the
+/// first part can do is cost a third more than it did before parts existed.
+const GROWTH: usize = 4;
+
+/// The shortest head of `text` that is at least `at_least` bytes long and stops just before a space, a tab, or a
+/// line break; the whole text when there is no such place.
+///
+/// Those four bytes separate words for every tokenizer, so the tokens of a head that stops at one are exactly the
+/// first tokens of the whole text. No other character is trusted to: BERT's normalizer deletes a form feed, which
+/// joins the words on either side of it, and it deletes zero-width characters outright.
+fn head(text: &str, at_least: usize) -> &str {
+  let gap = text.as_bytes().get(at_least..).and_then(|rest| {
+    rest
+      .iter()
+      .position(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+  });
+  // An ASCII byte is never part of a longer character, so this is a character boundary.
+  gap
+    .and_then(|offset| text.get(..at_least.saturating_add(offset)))
+    .unwrap_or(text)
 }
 
 /// A model's tokenizer with this crate's truncation and padding policy applied.
@@ -82,13 +93,37 @@ impl TextTokenizer {
 
   /// The token ids of `text`, special tokens included, at most [`Self::max_tokens`] of them.
   ///
+  /// The result is what the tokenizer makes of the whole text, but a long text is not read to its end to get it.
+  /// The tokenizer is given a head of the text that stops between two words, and that is the answer as soon as it
+  /// fills the limit: whatever follows could only have been truncated away. A head that does not fill the limit
+  /// says nothing about what follows it, so a longer one is tried, up to the whole text. How many bytes it takes
+  /// to fill the limit is never guessed: sixteen kilobytes of zero-width characters, of combining accents, or of
+  /// one unbroken word come to no tokens or to one, and the words after them are still read (D21).
+  ///
   /// # Errors
   ///
   /// Returns [`Error::Tokenizer`] if the text cannot be encoded.
   pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
+    let mut at_least = self.max_tokens.saturating_mul(BYTES_PER_TOKEN);
+    loop {
+      let part = head(text, at_least);
+      let ids = self.encode_whole(part)?;
+      if part.len() >= text.len() || ids.len() >= self.max_tokens {
+        return Ok(ids);
+      }
+      at_least = part.len().max(1).saturating_mul(GROWTH);
+    }
+  }
+
+  /// What the tokenizer makes of all of `text`, read to its end. The reference [`Self::encode`] must agree with.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`Error::Tokenizer`] if the text cannot be encoded.
+  pub(crate) fn encode_whole(&self, text: &str) -> Result<Vec<u32>> {
     let encoding = self
       .inner
-      .encode_fast(head(text, self.max_tokens), true)
+      .encode_fast(text, true)
       .map_err(|source| Error::Tokenizer(format!("cannot encode text: {source}")))?;
     Ok(encoding.get_ids().to_vec())
   }
@@ -130,6 +165,8 @@ pub fn pad_batch(rows: &[&[u32]], device: &Device) -> Option<(Tensor<2, Int>, Te
 
 #[cfg(test)]
 mod tests {
+  use tokenizers::normalizers::BertNormalizer;
+
   use super::*;
   use crate::testing::tiny_tokenizer;
 
@@ -165,59 +202,115 @@ mod tests {
     assert_eq!(tokenizer.max_tokens(), 4);
   }
 
-  #[test]
-  fn only_the_part_of_a_text_that_could_be_read_is_tokenized() {
-    assert_eq!(
-      head("blueberry gummies", 4),
-      "blueberry gummies",
-      "a short text is handed over whole"
-    );
-    let long = "blueberry gummies ".repeat(1000);
-    let kept = head(&long, 4);
-    assert_eq!(kept.len(), 4 * BYTES_PER_TOKEN);
-    assert!(long.starts_with(kept));
-    assert_eq!(head(&long, 1000), long, "a text within the limit is not cut");
-    assert_eq!(head(&long, 0), "", "nothing is kept, so nothing is read");
+  /// The tiny tokenizer with BERT's normalizer in front of it, which deletes control and format characters and
+  /// strips accents, as the real model's does.
+  fn bert_like(max_tokens: usize) -> TextTokenizer {
+    let mut tokenizer = tiny_tokenizer();
+    let _ = tokenizer.with_normalizer(Some(BertNormalizer::default()));
+    TextTokenizer::new(tokenizer, max_tokens).unwrap()
   }
 
   #[test]
-  fn the_cut_never_splits_a_character() {
-    // Two bytes each, so an odd limit falls in the middle of one; three and four bytes each likewise.
-    for (character, max_tokens) in [("é", 1), ("ブ", 1), ("🍇", 1), ("é", 3)] {
-      let long = character.repeat(200);
-      let kept = head(&long, max_tokens);
-      let limit = max_tokens * BYTES_PER_TOKEN;
-      assert!(
-        kept.len() <= limit && kept.len() > limit - 4,
-        "{character}: {}",
-        kept.len()
-      );
+  fn a_long_text_is_cut_only_between_two_words() {
+    assert_eq!(
+      head("blueberry gummies", 64),
+      "blueberry gummies",
+      "a short text is whole"
+    );
+    assert_eq!(
+      head("blueberry gummies", 0),
+      "blueberry",
+      "the first gap at or after the mark"
+    );
+    assert_eq!(head("blueberry gummies", 9), "blueberry");
+    assert_eq!(
+      head("blueberry gummies", 10),
+      "blueberry gummies",
+      "no gap is left, so all of it"
+    );
+    assert_eq!(head("blueberry\tgummies\nvape\rcartridge", 10), "blueberry\tgummies");
+    // A form feed, a no-break space, and a zero-width space are not gaps every tokenizer agrees on.
+    for joined in [
+      "blueberry\u{c}gummies",
+      "blueberry\u{a0}gummies",
+      "blueberry\u{200b}gummies",
+    ] {
+      assert_eq!(head(joined, 0), joined);
+    }
+    // The mark may fall inside a character; the cut never does.
+    let accented = format!("{} gummies", "é".repeat(40));
+    assert_eq!(head(&accented, 41), "é".repeat(40));
+    assert_eq!(head("", 0), "");
+  }
+
+  #[test]
+  fn a_form_feed_joins_two_words_for_a_bert_tokenizer_so_it_is_no_place_to_cut() {
+    let tokenizer = bert_like(8);
+    assert_eq!(tokenizer.encode("blueberry gummies").unwrap(), [2, 4, 5, 3]);
+    assert_eq!(
+      tokenizer.encode("blueberry\u{c}gummies").unwrap(),
+      [2, 1, 3],
+      "one unknown word"
+    );
+  }
+
+  /// D21 as first built cut a text at a number of bytes, and these all slipped the real text past the cut: two
+  /// different products, padded alike, embedded identically and scored 1.0.
+  #[test]
+  fn padding_cannot_push_a_text_out_of_what_is_read() {
+    let tokenizer = bert_like(4);
+    let limit = 4 * BYTES_PER_TOKEN;
+    let paddings = [
+      ("zero-width spaces", "\u{200b}".repeat(limit), vec![2, 4, 5, 3]),
+      ("word joiners", "\u{2060}".repeat(limit), vec![2, 4, 5, 3]),
+      ("combining accents", "\u{301}".repeat(limit), vec![2, 4, 5, 3]),
+      (
+        "one unbroken word",
+        format!("{} ", "a".repeat(limit * 3)),
+        vec![2, 1, 4, 3],
+      ),
+      ("spaces", " ".repeat(limit * 3), vec![2, 4, 5, 3]),
+    ];
+    for (name, padding, expected) in paddings {
+      let text = format!("{padding}blueberry gummies");
+      assert_eq!(tokenizer.encode(&text).unwrap(), expected, "{name}");
       assert_eq!(
-        kept.len() % character.len(),
-        0,
-        "{character}: a whole number of characters"
+        tokenizer.encode_whole(&text).unwrap(),
+        expected,
+        "{name}: the reference"
       );
-      assert!(long.starts_with(kept));
+      let other = tokenizer.encode(&format!("{padding}vape cartridge")).unwrap();
+      assert_ne!(other, expected, "{name}: another product is another row of tokens");
     }
   }
 
   #[test]
-  fn a_very_long_text_encodes_to_the_same_tokens_as_before_the_cut_existed() {
+  fn a_very_long_text_encodes_to_the_same_tokens_as_reading_all_of_it() {
     let tokenizer = TextTokenizer::new(tiny_tokenizer(), 16).unwrap();
     let megabyte = "blueberry gummies vape cartridge edibles flower ".repeat(22_000);
     assert!(megabyte.len() > 1_000_000);
-    // What the tokenizer itself makes of the whole text: the reference the cut must not change.
-    let whole = tokenizer
-      .inner
-      .encode_fast(megabyte.as_str(), true)
-      .unwrap()
-      .get_ids()
-      .to_vec();
+    let whole = tokenizer.encode_whole(&megabyte).unwrap();
     assert_eq!(whole.len(), 16);
     assert_eq!(tokenizer.encode(&megabyte).unwrap(), whole);
 
-    // Unbroken text has no word boundary to cut at, and must not be a problem either.
+    // Unbroken text has no gap to stop at, so all of it is read.
     let unbroken = "a".repeat(1_000_000);
     assert_eq!(tokenizer.encode(&unbroken).unwrap(), [2, 1, 3], "[CLS] [UNK] [SEP]");
+  }
+
+  #[test]
+  fn a_long_ordinary_text_is_not_read_to_its_end() {
+    // The tokenizer refuses nothing, so reading is observed through what a head has to contain: the first part of
+    // an ordinary text already fills the limit, and the head is all that `encode` hands over.
+    let tokenizer = TextTokenizer::new(tiny_tokenizer(), 4).unwrap();
+    let long = "blueberry gummies ".repeat(1000);
+    let first = head(&long, 4 * BYTES_PER_TOKEN);
+    assert!(first.len() < 4 * BYTES_PER_TOKEN + "blueberry".len() + 1);
+    assert_eq!(
+      tokenizer.encode_whole(first).unwrap().len(),
+      4,
+      "the first part fills the limit"
+    );
+    assert_eq!(tokenizer.encode(&long).unwrap(), tokenizer.encode_whole(first).unwrap());
   }
 }

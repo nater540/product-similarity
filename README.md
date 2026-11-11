@@ -1449,9 +1449,9 @@ what that field says.
   can still be moved a long way in steps that each stay under the limit; the text drift check
   (`anchor_threshold`) does not see quantities.
 - **Quantities play no part in search.** `FindSimilar` compares vectors, which hold text only.
-- **Truncation.** Text beyond `max_tokens` (256 by default) is ignored. Text beyond 64 bytes per allowed token
-  (16 KB by default) is not even tokenized, so that one enormous field cannot hold up the encoder; ordinary text
-  reaches its token limit long before that. The whole text still decides whether a field counts as changed.
+- **Truncation.** Text beyond `max_tokens` (256 by default) is ignored. A long field is tokenized a part at a
+  time and no further than it takes to fill that limit, so an enormous description costs little more than an
+  ordinary one (D21). The whole text still decides whether a field counts as changed.
 - **No transport security or authentication** in the server itself.
 
 ## Acknowledgements
