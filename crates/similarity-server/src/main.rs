@@ -20,9 +20,10 @@ use similarity_core::{Device, Embedder, Provenance};
 use similarity_server::config::{Config, DeviceChoice};
 use similarity_server::engine::{Engine, store_layout};
 use similarity_server::fetch::{self, FetchRequest};
+use similarity_server::import::{self, Failure, Summary};
 use similarity_server::offline::events::{self, Run};
 use similarity_server::offline::{self, Confidence, Offline, RecordFields, Selection, diff};
-use similarity_server::worker::EmbedWorker;
+use similarity_server::worker::{DirectEmbedder, EmbedWorker};
 use similarity_store::{MemoryStore, QdrantStore, VectorStore};
 
 /// What this binary knows about itself, for the provenance of a model directory it fetches.
@@ -54,6 +55,8 @@ enum Command {
   Calibrate(CalibrateArgs),
   /// Compare two calibrations written with `calibrate --ndjson`, or one of them under a second configuration.
   CalibrateDiff(CalibrateDiffArgs),
+  /// Load a whole catalog into the store: every record of an export that is not stored yet becomes a baseline.
+  Import(ImportArgs),
 }
 
 #[derive(Debug, Args)]
@@ -126,6 +129,28 @@ struct CalibrateArgs {
   /// Fixes the resampling behind the intervals, so that a run can be reproduced.
   #[arg(long, default_value_t = 0)]
   seed: u64,
+}
+
+#[derive(Debug, Args)]
+struct ImportArgs {
+  /// The configuration file (for the model, schema, and collection to import into).
+  #[arg(long, short, default_value = "config.toml")]
+  config: PathBuf,
+  /// The export, one JSON object per line: {"id": ..., "tenant": ..., "record": {...}, "anchor": {...}}. `tenant`
+  /// and `anchor` (the record as it was first created) are optional.
+  export: PathBuf,
+  /// How many records are embedded and written at a time.
+  #[arg(long, default_value_t = 64)]
+  batch_records: usize,
+  /// Stop at the first record that cannot be imported, instead of reporting it and going on.
+  #[arg(long)]
+  stop_on_error: bool,
+  /// Only check every record against the schema. Loads no model, connects to nothing, and writes nothing.
+  #[arg(long)]
+  check: bool,
+  /// The Qdrant API key.
+  #[arg(long, env = "QDRANT_API_KEY", hide_env_values = true)]
+  qdrant_api_key: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -441,6 +466,90 @@ impl CalibrateArgs {
   }
 }
 
+/// A duration in seconds to one decimal place, as a number: precise enough to compare two runs, and readable.
+fn tenths(elapsed: std::time::Duration) -> f64 {
+  (elapsed.as_secs_f64() * 10.0).round() / 10.0
+}
+
+fn report_failure(failure: &Failure) {
+  tracing::warn!(
+    line = failure.line,
+    id = failure.id.as_deref(),
+    reason = failure.reason.as_str(),
+    "record not imported"
+  );
+}
+
+impl ImportArgs {
+  fn run(self) -> anyhow::Result<()> {
+    let config = Config::load(&self.config)?;
+    let schema = config.schema()?;
+    let open = || -> anyhow::Result<std::io::BufReader<std::fs::File>> {
+      let file = std::fs::File::open(&self.export).with_context(|| format!("cannot read {}", self.export.display()))?;
+      Ok(std::io::BufReader::new(file))
+    };
+    let started = std::time::Instant::now();
+
+    let summary = if self.check {
+      import::check(&schema, open()?, report_failure)
+    } else {
+      let embedder = DirectEmbedder(load_embedder(&config)?);
+      let (layout, dimension) = store_layout(&schema, &embedder);
+      let options = import::Options {
+        batch_records: self.batch_records,
+        stop_on_error: self.stop_on_error,
+      };
+      let progress = |summary: &Summary| {
+        tracing::info!(
+          records = summary.records,
+          imported = summary.imported,
+          skipped = summary.skipped,
+          failed = summary.failed,
+          elapsed_s = tenths(started.elapsed()),
+          "importing"
+        );
+      };
+      let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("cannot start tokio")?;
+      runtime.block_on(async {
+        let settings = config.qdrant.settings(self.qdrant_api_key.clone());
+        let store = QdrantStore::connect(&settings, layout, dimension)
+          .await
+          .with_context(|| {
+            format!(
+              "cannot use Qdrant collection `{}` at {}",
+              settings.collection, settings.url
+            )
+          })?;
+        tracing::info!(url = %settings.url, collection = %settings.collection, dimension, "connected to Qdrant");
+        let engine = Engine::new(store, embedder, schema, config.policy()?);
+        import::run(&engine, open()?, options, report_failure, progress).await
+      })?
+    };
+
+    // What the run did is its result, on stdout whatever the log level (D15).
+    tracing::info!(
+      target: similarity_log::RESULT,
+      checked_only = self.check,
+      records = summary.records,
+      imported = summary.imported,
+      skipped = summary.skipped,
+      failed = summary.failed,
+      elapsed_s = tenths(started.elapsed()),
+      "finished"
+    );
+    anyhow::ensure!(
+      summary.failed == 0,
+      "{} of {} record(s) could not be imported; each is reported above with its line",
+      summary.failed,
+      summary.records
+    );
+    Ok(())
+  }
+}
+
 fn read_run(path: &Path) -> anyhow::Result<Run> {
   let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
   events::read(&text).with_context(|| format!("{} is not a calibration run", path.display()))
@@ -513,6 +622,7 @@ fn main() -> ExitCode {
     Command::Compare(args) => args.run(),
     Command::Calibrate(args) => args.run(),
     Command::CalibrateDiff(args) => args.run(),
+    Command::Import(args) => args.run(),
   };
   match outcome {
     Ok(()) => ExitCode::SUCCESS,
@@ -543,6 +653,20 @@ mod tests {
     };
     assert_eq!(args.config, PathBuf::from("config.toml"));
     assert!(!args.in_memory && args.listen.is_none());
+  }
+
+  #[test]
+  fn import_defaults_to_batches_of_64_and_goes_on_past_bad_records() {
+    let cli = Cli::parse_from(["record-similarity", "import", "export.jsonl"]);
+    let Command::Import(args) = cli.command else {
+      panic!("expected import")
+    };
+    assert_eq!(args.config, PathBuf::from("config.toml"));
+    assert_eq!((args.batch_records, args.stop_on_error, args.check), (64, false, false));
+    assert!(
+      Cli::try_parse_from(["record-similarity", "import"]).is_err(),
+      "an export is required"
+    );
   }
 
   #[test]

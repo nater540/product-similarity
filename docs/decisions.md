@@ -627,3 +627,38 @@ reused blocks are normalized again). The composite identity does not hold otherw
 **Cost.** Each property runs 64 cases by default, and the whole of it adds well under a second to `just test`.
 `PROPTEST_CASES` raises the count for a thorough run; 5,000 cases of everything take a few seconds.
 
+## D20. A catalog is imported by a command that only creates
+
+Loading a catalog was one `Evaluate` call per record, and so was every re-index, which D12 makes necessary after
+any change of model. Worse, a re-index reset every record's drift history: the anchor became whatever the record
+said on the day of the re-index, because the service stores vectors and never the text, and so could not rebuild
+the original anchor under a new model.
+
+`record-similarity import` reads an export (one record per line) and writes through the store, a batch per call
+to the model. Three choices in it:
+
+**It only creates.** `Engine::import` writes an id that is not stored, at revision 1, and leaves an id that is
+stored exactly as it is, down to its timestamp. An import that could update would be a way to replace a baseline
+and an anchor without a verdict, which is everything D7 and D8 exist to prevent; and "which records did the
+interrupted run get to?" would need an answer. Creating only, it is safe to run twice and is resumed by running
+it again, with no bookkeeping. The same request rule holds as anywhere else: an id stored under another tenant
+is an error for that record, not a skip (D14).
+
+**The original version, where the caller still has it, becomes the anchor.** A line may carry `anchor`: the
+record as it was first created. Its text is embedded under the current model and its quantities are kept, and
+anything it lacks takes the record's current value, which is exactly what `extend_anchor` and `first_values`
+would have made of the anchor over the record's life. Drift is then measured from where the record really began,
+and a field or quantity that was removed before the import is still guarded against being refilled with
+something else. Only the caller's database can supply this; the service cannot.
+
+**A bad record fails alone.** It is reported with its line, id, and reason, the rest is imported, and the command
+exits non-zero at the end. `--check` runs the schema's validation over the whole export with no model and no
+store, since the usual problems (a misnamed field, a quantity sent as text) are all visible there.
+
+Everything is embedded before anything is written, and nothing is written if the model fails. The records of a
+batch are embedded in one call, on the calling thread: a command that is the model's only user has no use for the
+server's queue (D9). On a laptop CPU 2,000 four-field records import in 19 seconds.
+
+Not built: a streaming `Import` RPC. The command covers the need as long as it can run next to Qdrant, and an RPC
+that writes without judging is a larger thing to expose than a command an operator runs.
+

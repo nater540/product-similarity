@@ -1,7 +1,7 @@
 # Feature suggestions
 
 Twenty features that could be added to this project, with what each is, why it matters here, how it would fit the
-code, and what it would cost. **Features 1, 7, 8, and 13 are built** (D17, D18, D19, and the README); the rest are not. They were proposed in November 2026 from a read of the
+code, and what it would cost. **Features 1, 7, 8, 13, and 16 are built** (D17 to D20, and the README); the rest are not. They were proposed in November 2026 from a read of the
 repository as it stood then (`README.md`, `docs/decisions.md`, and the crates); check a suggestion against the
 code before starting on it, since the code will have moved. It has moved once already: records now carry
 quantities, compared as numbers (D16), and the features that touch a verdict or a report say below what that
@@ -64,7 +64,7 @@ and because each would put a Python service in the loop.
 | 13 | Property-based and state-machine tests (built) | Testing | M | No |
 | 14 | Fuzzing | Testing | M | No |
 | 15 | Mutation testing | Testing | S to start | No |
-| 16 | Bulk import and re-index that keeps drift history | Serving | M to L | No |
+| 16 | Bulk import and re-index that keeps drift history (built) | Serving | M to L | No |
 | 17 | Reviewer feedback capture | Serving | M | No (it produces it) |
 | 18 | Shadow evaluation of a candidate model | Serving | L | Real traffic |
 | 19 | Structured reason codes and explanations | Serving | M | No |
@@ -422,6 +422,9 @@ arithmetic). A surviving mutant there is an untested boundary, and a boundary is
 
 ### 16. Bulk import and re-index that keeps drift history
 
+**Built** (D20), as `record-similarity import`. It only creates, which is what makes it resumable, so the store
+trait did not have to grow. The streaming `Import` RPC was not built.
+
 **What.** `record-similarity reindex --config new.toml export.jsonl` writes straight to a new collection
 through the store, bypassing the gRPC queue. It embeds in full batches, resumes by skipping ids already stored
 under the target layout, and reports progress as NDJSON. Each input line is
@@ -531,10 +534,11 @@ probably wants its own field configuration, since menu items do not have the sam
 
 Not features, but found while preparing this list:
 
-- **A README figure is derived, not measured end to end.** "Roughly 375 field texts per second when requests
-  arrive concurrently" comes from the batch throughput measurement (32 fields in about 86 ms), not from a test
-  through the gRPC queue. Feature 12 would replace it with a real measurement.
+- **A README figure was derived, not measured end to end.** "Roughly 375 field texts per second when requests
+  arrive concurrently" came from the batch throughput measurement, not from a test through the gRPC queue. It has
+  been replaced by a measured figure for the bulk import (2,000 four-field records in 19 seconds). Throughput
+  through the gRPC queue is still unmeasured, and feature 12 would measure it.
 - **Choosing a checkpoint on the holdout contaminates the holdout.** See the caveat under feature 3.
-- **Very long fields may be a CPU cost risk (unverified).** If the tokenizer processes a whole field before
-  truncating it to `max_tokens`, megabyte-sized fields would be expensive under the default 4 MB gRPC message
-  limit. Worth confirming, and fuzz target 3 would show it.
+- **Very long fields are a CPU cost risk (verified).** The tokenizer processes a whole field before truncating
+  it to `max_tokens`: one 1 MB field costs about 0.7 s of the single embedding thread, and 3 MB about 2 s, under
+  the default 4 MB gRPC message limit. See `docs/plan-features.md` for the fix that is proposed.

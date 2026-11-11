@@ -50,6 +50,31 @@ pub trait TextEmbedder: Send + Sync + 'static {
   fn fingerprint(&self) -> &str;
 }
 
+/// An embedder that runs the model on the calling thread, with no queue in front of it.
+///
+/// For a command that is the model's only user (`import`): everything it embeds is one large batch after another,
+/// so there is nothing to merge and nobody to keep waiting. The server never uses this; a forward pass on a
+/// runtime thread would stall every other request.
+#[derive(Debug)]
+pub struct DirectEmbedder(pub Embedder);
+
+impl TextEmbedder for DirectEmbedder {
+  async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, EmbedError> {
+    self
+      .0
+      .embed(&texts)
+      .map_err(|error| EmbedError::Failed(error.to_string()))
+  }
+
+  fn dimension(&self) -> usize {
+    self.0.dimension()
+  }
+
+  fn fingerprint(&self) -> &str {
+    self.0.fingerprint()
+  }
+}
+
 struct Job {
   texts: Vec<String>,
   reply: oneshot::Sender<Result<Vec<Vec<f32>>, EmbedError>>,

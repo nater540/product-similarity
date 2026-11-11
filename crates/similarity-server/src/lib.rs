@@ -8,6 +8,7 @@
 //! - [`engine`]: the service's behavior: validate, embed, compare, decide, write.
 //! - [`grpc`]: protobuf translation and status codes around the engine.
 //! - [`fetch`]: downloading and verifying a model directory.
+//! - [`import`]: loading a whole catalog into the store, a batch at a time.
 //! - [`offline`]: comparing and calibrating from the command line, without a store.
 
 // Tests compute expected values with ordinary arithmetic and compare exact floats where exactness is the point.
@@ -17,6 +18,7 @@ pub mod config;
 pub mod engine;
 pub mod fetch;
 pub mod grpc;
+pub mod import;
 pub mod offline;
 #[cfg(test)]
 mod properties;

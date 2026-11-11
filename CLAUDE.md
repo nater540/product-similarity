@@ -6,7 +6,7 @@ marketplace listings. Each revision is embedded field by field with a small BERT
 thresholds. A record's quantities (weight, volume, potency) are compared as numbers beside that, never embedded.
 Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D19) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D20) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -58,8 +58,8 @@ changing a design. Infer conventions from the existing code first.
   scoring, policy. Synchronous, no I/O beyond reading and writing a model directory, no network code ever (D11).
 - `crates/similarity-store`: the `VectorStore` trait, `MemoryStore`, `QdrantStore`.
 - `crates/similarity-server`: config, the embedding worker thread, `Engine` (all behavior), the thin gRPC layer,
-  `model fetch`, `compare`/`calibrate` (the `offline` module), and the `record-similarity` binary. Keep `grpc.rs`
-  free of decisions.
+  `model fetch`, `import`, `compare`/`calibrate` (the `offline` module), and the `record-similarity` binary. Keep
+  `grpc.rs` free of decisions.
 - `crates/similarity-train`: fine-tuning (data, losses, schedule, training loop) and the `record-similarity-train`
   binary. The only crate that enables Burn's `autodiff` and `optim`; the server must never depend on it (D13).
 
@@ -92,6 +92,9 @@ changing a design. Infer conventions from the existing code first.
   field, or a `Reason::code`: other tools read them. Add fields; never repurpose one.
 - **Every number in the text report and in the events comes from `offline::stats`**, so the two cannot disagree.
   Put a new statistic there, not in a renderer.
+- **An import only creates** (D20). `Engine::import` writes an id that is not stored and leaves one that is
+  exactly alone, timestamp included. That is what makes it safe to run twice and unable to replace an anchor.
+  Never give it an update path; an update is an `Evaluate`, which judges.
 - **A tenant, once stored, must be named by every later request for that id**, including `Delete` (D14).
 - **What a supported model directory is lives in one place**, `similarity_core::model::Pipeline`. The loader and
   `model fetch` both use it; never parse `modules.json` anywhere else.
@@ -129,7 +132,8 @@ changing a design. Infer conventions from the existing code first.
 - Model: `just fetch-model`; Qdrant: `just qdrant-up` / `just qdrant-down`
 - Slow tests: `just test-parity`, `just test-qdrant`, `just test-real`
 - Run: `just serve` (needs Qdrant) or `just serve-in-memory`; then `just client describe`
-- Measure: `just throughput`, `just calibrate`
+- Load a catalog: `just import export.jsonl config.toml` (`--check` validates only)
+- Measure: `just throughput`, `just calibrate`, `just calibrate-diff`
 - Fine-tune: `just finetune --base ... --out ... --pairs ...` (CPU); GPU: `just release-train metal`, then
   `./target/release/record-similarity-train --device metal ...`. Continue an interrupted run with `--resume
   <out>.checkpoints/step-NNNNNN` in place of `--base`. Results are NDJSON on stdout, logs NDJSON on stderr.

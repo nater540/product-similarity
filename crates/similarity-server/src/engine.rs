@@ -179,6 +179,34 @@ impl EvaluateOutput {
   }
 }
 
+/// One record to import: what it is now and, if the caller still has it, what it was when it was created.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ImportInput {
+  /// The record as it is now. Its `id` is required.
+  pub record: RecordInput,
+  /// The record as it was first created: its text fields and quantities then. `None` if that is not known, in
+  /// which case the record as it is now becomes its own point of reference, as for any new record.
+  pub anchor: Option<Original>,
+}
+
+/// An earlier version of a record: fields and quantities, with no id or tenant of its own.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Original {
+  /// Field name and text pairs.
+  pub fields: Vec<(String, String)>,
+  /// Quantity name and value pairs.
+  pub quantities: Vec<(String, Quantity)>,
+}
+
+/// What importing one record did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Imported {
+  /// The id was not stored. It is now, at revision 1.
+  Created,
+  /// The id was already stored, and was left exactly as it was.
+  Skipped,
+}
+
 /// What to search around.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SimilarTo {
@@ -231,6 +259,15 @@ struct Revision {
   tenant: Option<String>,
   vectors: RecordVectors,
   quantities: Quantities,
+}
+
+/// One record of an import, validated: everything needed to write it once its texts are embedded.
+#[derive(Debug)]
+struct PreparedImport {
+  id: String,
+  tenant: Option<String>,
+  record: PreparedRecord,
+  anchor: Option<PreparedRecord>,
 }
 
 /// The service's behavior.
@@ -498,6 +535,149 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       quantities: evaluation.quantities,
       measure_changed: evaluation.measure_changed,
     })
+  }
+
+  /// Imports records that are not stored yet, embedding all of them in one call to the model.
+  ///
+  /// This is how a catalog is loaded, and how it is loaded again after a change of model (D12), without one
+  /// request per record. It **only ever creates**. An id that is already stored is left exactly as it is and
+  /// reported as [`Imported::Skipped`], so an import can never replace an anchor value (D8), running one twice is
+  /// harmless, and an interrupted one is resumed by running it again.
+  ///
+  /// With an `anchor`, the record's point of reference for drift is its original version instead of its current
+  /// one: the anchor holds the original's value for every field and quantity the original had, and the current
+  /// value for anything it lacked, which is what the anchor would have become had the record lived here all along.
+  /// That is what lets a re-index keep a record's drift history.
+  ///
+  /// Returns one outcome per input, in order. A record that cannot be imported (it does not fit the schema, or
+  /// its id is stored under a tenant it does not name) fails by itself and stops nothing else.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error for the whole call only if the model fails: nothing is written in that case. Everything
+  /// else is reported per record.
+  pub async fn import(&self, inputs: Vec<ImportInput>) -> Result<Vec<Result<Imported, EngineError>>, EngineError> {
+    let dimension = self.embedder.dimension();
+
+    // Everything that does not need the store, for every record: validate, and work out what to embed. Records
+    // are embedded from scratch (there is no baseline to reuse), so this does not depend on what is stored.
+    let mut ready = Vec::with_capacity(inputs.len());
+    let mut texts: Vec<String> = Vec::new();
+    for input in inputs {
+      ready.push(self.prepare_import(input).map(|prepared| {
+        let take = |record: &PreparedRecord, texts: &mut Vec<String>| -> Result<usize, EngineError> {
+          let wanted = record.plan(&self.schema, dimension, None)?.texts();
+          texts.extend(wanted.iter().map(|text| (*text).to_owned()));
+          Ok(wanted.len())
+        };
+        let record_texts = take(&prepared.record, &mut texts)?;
+        let anchor_texts = match &prepared.anchor {
+          Some(anchor) => take(anchor, &mut texts)?,
+          None => 0,
+        };
+        Ok::<_, EngineError>((prepared, record_texts, anchor_texts))
+      }));
+    }
+    let embedded = self.embedder.embed(texts).await?;
+
+    let mut vectors = embedded.iter();
+    let mut outcomes = Vec::with_capacity(ready.len());
+    for prepared in ready {
+      let outcome = match prepared.and_then(|counted| counted) {
+        Err(error) => Err(error),
+        Ok((prepared, record_texts, anchor_texts)) => {
+          // Each record's vectors are the next ones in line, whether or not the record ends up being written.
+          let record: Vec<Vec<f32>> = vectors.by_ref().take(record_texts).cloned().collect();
+          let anchor: Vec<Vec<f32>> = vectors.by_ref().take(anchor_texts).cloned().collect();
+          self.store_import(prepared, &record, &anchor).await
+        }
+      };
+      outcomes.push(outcome);
+    }
+    Ok(outcomes)
+  }
+
+  fn prepare_import(&self, input: ImportInput) -> Result<PreparedImport, EngineError> {
+    let Some(id) = required_text("record.id", input.record.id.clone())? else {
+      return Err(EngineError::InvalidArgument(
+        "`record.id` is required: a record without an id cannot be stored".to_owned(),
+      ));
+    };
+    let tenant = required_text("record.tenant", input.record.tenant.clone())?;
+    let record = self.prepare(&input.record)?;
+    let anchor = input
+      .anchor
+      .map(|original| {
+        self.prepare(&RecordInput {
+          id: None,
+          tenant: None,
+          fields: original.fields,
+          quantities: original.quantities,
+        })
+      })
+      .transpose()
+      // The same message would otherwise read as a complaint about the record itself.
+      .map_err(|error| match error {
+        EngineError::InvalidArgument(message) => {
+          EngineError::InvalidArgument(format!("the original version: {message}"))
+        }
+        other => other,
+      })?;
+    Ok(PreparedImport {
+      id,
+      tenant,
+      record,
+      anchor,
+    })
+  }
+
+  /// Writes one prepared import, unless its id is already stored.
+  async fn store_import(
+    &self,
+    prepared: PreparedImport,
+    record: &[Vec<f32>],
+    anchor: &[Vec<f32>],
+  ) -> Result<Imported, EngineError> {
+    let dimension = self.embedder.dimension();
+    let _serialized = self.lock_for(&prepared.id)?.lock().await;
+    if let Some(stored) = self.store.get(&prepared.id).await? {
+      // Naming another tenant is the mistake the tenant rule exists for, here as anywhere (D14).
+      same_tenant(&stored, prepared.tenant.as_deref())?;
+      return Ok(Imported::Skipped);
+    }
+
+    let vectors = prepared
+      .record
+      .plan(&self.schema, dimension, None)?
+      .finish(&self.schema, dimension, record)?;
+    let quantities = prepared.record.quantities().clone();
+    let (anchor, anchor_quantities) = match &prepared.anchor {
+      Some(original) => {
+        let original_vectors = original
+          .plan(&self.schema, dimension, None)?
+          .finish(&self.schema, dimension, anchor)?;
+        (
+          // The original's values, plus the current value of anything the original did not have.
+          score::extend_anchor(&self.schema, dimension, &original_vectors.composite, &vectors.composite)?,
+          first_values(original.quantities(), &quantities),
+        )
+      }
+      None => (vectors.composite.clone(), quantities.clone()),
+    };
+    self
+      .store
+      .put(&StoredRecord {
+        id: prepared.id,
+        tenant: prepared.tenant,
+        vectors,
+        anchor,
+        quantities,
+        anchor_quantities,
+        revision: 1,
+        updated_at: now(),
+      })
+      .await?;
+    Ok(Imported::Created)
   }
 
   /// Finds stored records similar to a stored or ad hoc record, most similar first.
@@ -1466,6 +1646,253 @@ mod tests {
     });
     let neighbors = engine.find_similar(search).await.unwrap();
     assert!((neighbors[0].similarity - 1.0).abs() < 1e-5);
+  }
+
+  fn import_of(id: &str, fields: &[(&str, &str)], anchor: Option<&[(&str, &str)]>) -> ImportInput {
+    let pairs = |fields: &[(&str, &str)]| -> Vec<(String, String)> {
+      fields
+        .iter()
+        .map(|(name, text)| ((*name).to_owned(), (*text).to_owned()))
+        .collect()
+    };
+    ImportInput {
+      record: record(Some(id), fields),
+      anchor: anchor.map(|fields| Original {
+        fields: pairs(fields),
+        quantities: Vec::new(),
+      }),
+    }
+  }
+
+  #[tokio::test]
+  async fn an_import_creates_what_is_not_stored_and_leaves_what_is() {
+    let engine = engine();
+    engine.evaluate(evaluate_input(Some("kept"), &GUMMIES)).await.unwrap();
+    let before = stored(&engine, "kept").await.unwrap();
+
+    let outcomes = engine
+      .import(vec![
+        import_of("new-1", &GUMMIES, None),
+        import_of("kept", &VAPE, None),
+        import_of("new-2", &VAPE, None),
+        // The same id twice in one import: the first one wins, as it would across two imports.
+        import_of("new-1", &VAPE, None),
+      ])
+      .await
+      .unwrap();
+    assert_eq!(
+      outcomes,
+      [
+        Ok(Imported::Created),
+        Ok(Imported::Skipped),
+        Ok(Imported::Created),
+        Ok(Imported::Skipped)
+      ]
+    );
+    assert_eq!(
+      stored(&engine, "kept").await.unwrap(),
+      before,
+      "an import never updates: not even the timestamp moved"
+    );
+
+    let created = stored(&engine, "new-1").await.unwrap();
+    assert_eq!(created.revision, 1);
+    assert_eq!(
+      created.anchor, created.vectors.composite,
+      "with no original, a record is its own anchor"
+    );
+    // It is an ordinary baseline from here on.
+    let edited = engine
+      .evaluate(evaluate_input(Some("new-1"), &GUMMIES_EDITED))
+      .await
+      .unwrap();
+    assert_eq!((edited.verdict, edited.revision), (Verdict::Accepted, 2));
+
+    // Running the same import again changes nothing at all.
+    let again = engine.import(vec![import_of("new-2", &VAPE, None)]).await.unwrap();
+    assert_eq!(again, [Ok(Imported::Skipped)]);
+  }
+
+  #[tokio::test]
+  async fn an_imported_original_version_is_the_anchor_drift_is_measured_from() {
+    let engine = engine_with(Policy::new(0.75, Some(0.5)).unwrap());
+    // What the record says today, and what it said when it was created, several edits ago.
+    let today = [("name", DRIFT[3]), ("category", "Vape Pens")];
+    let created_as = [("name", DRIFT[0])];
+    let outcomes = engine
+      .import(vec![import_of("p1", &today, Some(&created_as))])
+      .await
+      .unwrap();
+    assert_eq!(outcomes, [Ok(Imported::Created)]);
+
+    let record = stored(&engine, "p1").await.unwrap();
+    assert_ne!(
+      record.anchor, record.vectors.composite,
+      "the anchor is not today's record"
+    );
+    let schema = schema();
+    let anchor = schema.blocks(64, &record.anchor).unwrap();
+    let current = schema.blocks(64, &record.vectors.composite).unwrap();
+    // Schema order: category, description, name.
+    assert!(
+      similarity_core::vector::cosine(anchor[0].unwrap(), current[0].unwrap()).unwrap() > 0.9999,
+      "a field the original lacked takes today's value, as it would have when it was first filled in"
+    );
+    assert!(anchor[1].is_none());
+    assert!(
+      similarity_core::vector::cosine(anchor[2].unwrap(), current[2].unwrap()).unwrap() < 0.7,
+      "the name is the original name"
+    );
+
+    // Resubmitting today's record: nothing changed since the import, and it is already two steps from where it
+    // began.
+    let same = engine.evaluate(evaluate_input(Some("p1"), &today)).await.unwrap();
+    assert!((same.similarity.unwrap() - 1.0).abs() < 1e-5);
+    assert!(!same.stored);
+    let drift = same.anchor_similarity.unwrap();
+    assert!(drift < 0.9, "drift history survived the import: {drift}");
+
+    // One more step in the same direction is small against the baseline and too far from the original. Imported
+    // without the original, the same edit would have been measured from today and accepted.
+    let next = [("name", DRIFT[5]), ("category", "Vape Pens")];
+    let step = engine.evaluate(evaluate_input(Some("p1"), &next)).await.unwrap();
+    assert!(
+      step.reasons.iter().any(|reason| reason.contains("original record")),
+      "{:?}",
+      step.reasons
+    );
+
+    let forgetful = engine_with(Policy::new(0.75, Some(0.5)).unwrap());
+    forgetful.import(vec![import_of("p1", &today, None)]).await.unwrap();
+    let step = forgetful.evaluate(evaluate_input(Some("p1"), &next)).await.unwrap();
+    assert!(
+      !step.reasons.iter().any(|reason| reason.contains("original record")),
+      "{:?}",
+      step.reasons
+    );
+  }
+
+  #[tokio::test]
+  async fn an_imported_original_guards_fields_and_quantities_the_record_no_longer_has() {
+    let engine = measuring_engine();
+    let mut input = import_of("p1", &[GUMMIES[0]], Some(&[GUMMIES[0], GUMMIES[1]]));
+    input.record.quantities = vec![("thc".to_owned(), percent(18.0, 22.0))];
+    input.anchor.as_mut().unwrap().quantities = vec![("weight".to_owned(), grams(3.5))];
+    assert_eq!(engine.import(vec![input]).await.unwrap(), [Ok(Imported::Created)]);
+
+    let record = stored(&engine, "p1").await.unwrap();
+    assert_eq!(record.quantities.keys().collect::<Vec<_>>(), ["thc"]);
+    assert_eq!(
+      record.anchor_quantities.keys().collect::<Vec<_>>(),
+      ["thc", "weight"],
+      "the original's weight, and the potency the original never had"
+    );
+
+    // The category and the weight were removed at some point before the import. Bringing them back as something
+    // else is the two-step swap, and is judged against the original (D8, D16).
+    let mut refill = measured(&[("thc", percent(18.0, 22.0)), ("weight", grams(28.0))]);
+    refill.record.fields = vec![
+      ("name".to_owned(), GUMMIES[0].1.to_owned()),
+      ("category".to_owned(), "Vape Pens".to_owned()),
+    ];
+    let output = engine.evaluate(refill).await.unwrap();
+    let category = output.fields.iter().find(|field| field.field == "category").unwrap();
+    assert_eq!(category.change, FieldChange::Restored);
+    assert!(category.similarity.unwrap() < 0.01);
+    let weight = quantity(&output, "weight");
+    assert_eq!(weight.change, QuantityChange::Restored);
+    assert!((weight.factor.unwrap() - 8.0).abs() < 1e-9);
+  }
+
+  #[tokio::test]
+  async fn a_record_that_cannot_be_imported_fails_alone() {
+    let engine = measuring_engine();
+    let owned = |id: &str, tenant: &str, fields: &[(&str, &str)]| ImportInput {
+      record: RecordInput {
+        tenant: Some(tenant.to_owned()),
+        ..record(Some(id), fields)
+      },
+      anchor: None,
+    };
+    engine.import(vec![owned("taken", "brand-1", &GUMMIES)]).await.unwrap();
+    let embedded_before = engine.embedder.embedded();
+
+    let mut negative = import_of("negative", &GUMMIES, None);
+    negative.record.quantities = vec![("weight".to_owned(), grams(-1.0))];
+    let outcomes = engine
+      .import(vec![
+        import_of("unknown-field", &[("name", "Gummies"), ("colour", "blue")], None),
+        owned("good", "brand-1", &VAPE),
+        import_of("no-name", &[("category", "Edibles")], None),
+        negative,
+        import_of("bad-original", &GUMMIES, Some(&[("category", "Edibles")])),
+        owned("taken", "brand-2", &GUMMIES),
+        ImportInput {
+          record: record(None, &GUMMIES),
+          anchor: None,
+        },
+        import_of("  ", &GUMMIES, None),
+      ])
+      .await
+      .unwrap();
+
+    let invalid = |outcome: &Result<Imported, EngineError>, wanted: &str| {
+      assert!(
+        matches!(outcome, Err(EngineError::InvalidArgument(message)) if message.contains(wanted)),
+        "{outcome:?} should mention `{wanted}`"
+      );
+    };
+    invalid(&outcomes[0], "colour");
+    assert_eq!(
+      outcomes[1],
+      Ok(Imported::Created),
+      "the good record between two bad ones is imported"
+    );
+    invalid(&outcomes[2], "name");
+    invalid(&outcomes[3], "negative");
+    invalid(&outcomes[4], "the original version");
+    assert!(
+      matches!(&outcomes[5], Err(EngineError::FailedPrecondition(message)) if message.contains("brand-1")),
+      "{:?}",
+      outcomes[5]
+    );
+    invalid(&outcomes[6], "`record.id` is required");
+    invalid(&outcomes[7], "blank");
+
+    for id in ["unknown-field", "no-name", "negative", "bad-original"] {
+      assert_eq!(stored(&engine, id).await, None, "{id}");
+    }
+    assert_eq!(
+      stored(&engine, "taken").await.unwrap().tenant.as_deref(),
+      Some("brand-1")
+    );
+    assert_eq!(
+      stored(&engine, "good").await.unwrap().tenant.as_deref(),
+      Some("brand-1")
+    );
+    assert_eq!(
+      engine.embedder.embedded() - embedded_before,
+      6,
+      "only records that fit the schema reach the model: `good` and the second `taken`, three fields each"
+    );
+  }
+
+  #[tokio::test]
+  async fn a_model_failure_fails_the_import_and_writes_nothing() {
+    let embedder = WordBagEmbedder {
+      fail_with: Some(EmbedError::Overloaded),
+      ..WordBagEmbedder::new("word-bag-v1")
+    };
+    let (layout, dimension) = store_layout(&schema(), &embedder);
+    let engine = Engine::new(
+      MemoryStore::new(layout, dimension),
+      embedder,
+      schema(),
+      Policy::new(0.75, None).unwrap(),
+    );
+    let outcome = engine.import(vec![import_of("p1", &GUMMIES, None)]).await;
+    assert!(matches!(outcome, Err(EngineError::Overloaded(_))), "{outcome:?}");
+    assert_eq!(stored(&engine, "p1").await, None);
   }
 
   #[tokio::test]

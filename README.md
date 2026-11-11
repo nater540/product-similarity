@@ -160,6 +160,7 @@ The binary is `record-similarity` (`target/release/record-similarity` after `jus
 |---|---|
 | `record-similarity serve [--config config.toml] [--listen ADDR] [--in-memory]` | Runs the gRPC server. |
 | `record-similarity model fetch [--repo R] [--revision REV] [--dir DIR]` | Downloads and verifies a model directory. `--dir` defaults to `models/<repository name>`, so two models never share a directory. |
+| `record-similarity import [--config config.toml] EXPORT.jsonl [--check]` | Loads a whole catalog into the store. See [Importing a catalog](#importing-a-catalog). |
 | `record-similarity compare [--config config.toml] BEFORE.json AFTER.json` | Scores one before/after pair offline. |
 | `record-similarity calibrate [--config config.toml] PAIRS.jsonl [--full] [--split S] [--ndjson]` | Scores labeled pairs and suggests a threshold. See [Choosing thresholds](#choosing-thresholds). |
 | `record-similarity calibrate-diff OLD.ndjson (NEW.ndjson \| --config-b CONFIG) [--fail-on WHAT]` | Compares two calibrations, or one under a second configuration. See [Comparing two calibrations](#comparing-two-calibrations). |
@@ -511,11 +512,12 @@ Nothing is written when an error is returned.
 
 ## Integrating it
 
-**Bootstrapping an existing catalog.** Call `Evaluate` once for every existing record, in the default mode. Each
-call returns `VERDICT_CREATED` and stores the baseline. On a laptop CPU the encoder gets through roughly 375 field
-texts per second when requests arrive concurrently and are batched, so 50,000 four-field records take on the order
-of ten minutes. Keep
-fewer requests in flight than `model.queue_depth` (256 by default) and back off on `RESOURCE_EXHAUSTED`.
+**Bootstrapping an existing catalog.** Export every record as one JSON object per line and load the file with
+`record-similarity import` ([Importing a catalog](#importing-a-catalog)). Every record that is not stored yet
+becomes a baseline. On a laptop CPU, 2,000 four-field records were imported in 19 seconds, so 50,000 take about
+eight minutes. Calling `Evaluate` once per record does the same thing one request at a time, for a caller that
+cannot run a command next to Qdrant: each call returns `VERDICT_CREATED`. Keep fewer requests in flight than
+`model.queue_depth` (256 by default) and back off on `RESOURCE_EXHAUSTED`.
 
 **At edit time.**
 
@@ -1232,6 +1234,60 @@ What a change costs:
 
 ## Operations
 
+### Importing a catalog
+
+`record-similarity import` loads an export straight into the store, a batch at a time, without going through the
+gRPC API. It is how a catalog is loaded for the first time and how it is loaded again after a change of model.
+
+```sh
+just import export.jsonl config.toml --check     # only validate every line against the schema: no model, no Qdrant
+just import export.jsonl config.toml             # import into the collection the config names
+```
+
+The export is one JSON object per line. `record` is the record as it is now, in the shape every other tool reads
+(a string is a text field, an object is a quantity). `tenant` and `anchor` are optional:
+
+```json
+{"id": "sku-1", "tenant": "brand-7", "record": {"name": "Blueberry Gummies 100mg - Indica", "category": "Edibles > Gummies", "weight_per_item": {"value": 40, "unit": "g"}}, "anchor": {"name": "Blueberry Gummies 100mg", "category": "Edibles > Gummies"}}
+```
+
+What it does, and what it will not do:
+
+- **It only creates.** An id that is already stored is skipped and left exactly as it is. An import can therefore
+  never overwrite a baseline, running one twice is harmless, and an import that was interrupted is resumed by
+  running it again.
+- **`anchor` is the record as it was first created**, if your database still has that version. With it, the
+  record's drift is measured from where it really began, as if it had lived here all along: the anchor holds the
+  original value of every field and quantity the original had, and today's value for anything it lacked. Without
+  it, the record as imported is its own point of reference, as for any new record.
+- **A record that cannot be imported fails by itself.** It is logged with its line, its id, and the reason, the
+  rest of the export goes in, and the command ends with a `failed` line and a non-zero exit status if there was
+  any. `--stop-on-error` stops at the first one instead. `--check` finds the same problems in a second or two,
+  before anything is embedded.
+- **It needs the model and a connection to Qdrant**, like the server, and reads the same config. It does not
+  need the server, and can run while the server does: both only ever write whole records.
+
+Progress is logged after every batch (`--batch-records`, 64 by default), and the outcome is a `finished` result
+on stdout. This is an export of 48 synthetic records, two of them flawed, with the envelope fields removed:
+
+```json
+{"level":"INFO","message":"importing","records":32,"imported":32,"skipped":0,"failed":0,"elapsed_s":1}
+{"level":"WARN","message":"record not imported","line":49,"id":"p900","reason":"invalid record: `weight_per_item` is a quantity, not a text field; give it as a number with a unit"}
+{"level":"WARN","message":"record not imported","line":50,"id":"p901","reason":"invalid record: required field `name` is missing or blank"}
+{"level":"INFO","message":"finished","checked_only":false,"records":48,"imported":46,"skipped":0,"failed":2,"elapsed_s":1}
+```
+
+Running it again imports nothing and skips the 46. One of those records was imported with the version it was
+created as. Asked about its current content, the server answers that nothing has changed since the import, and
+that the record has already moved from where it started:
+
+```text
+$ just client evaluate p026 p026.json --tenant brand-1 --dry-run
+verdict   Accepted (stored: false, revision 1)
+overall   1.000 against a threshold of 0.900
+drift     0.963 similarity to the original record
+```
+
 ### Re-indexing
 
 Needed after changing the model, `output_dim`, `max_tokens`, or the set of fields. Stored vectors carry an identifier
@@ -1239,12 +1295,14 @@ of the model and field layout that produced them, and the server will not compar
 record returns `FAILED_PRECONDITION`, and a collection whose vectors have the wrong width stops the server at
 start-up.
 
-1. Point `qdrant.collection` at a new, empty collection and restart.
-2. Replay every record from your own database through `Evaluate`, as in
-   [bootstrapping](#integrating-it). Each becomes a new baseline.
-3. Drop the old collection when you are satisfied.
+1. Point `qdrant.collection` at a new, empty collection.
+2. Export every record from your own database and [import](#importing-a-catalog) it. The service stores vectors
+   and never the text, so the text has to come from you.
+3. Restart the server on the new collection, and drop the old one when you are satisfied.
 
-Re-indexing resets drift history: each record's anchor becomes its content at the time of the re-index.
+**Drift history survives a re-index only if the export carries it.** Give each record's original version as
+`anchor` and its drift is measured from there, as before. Leave it out and each record's anchor becomes its
+content at the time of the import.
 
 ### Health and shutdown
 
@@ -1322,14 +1380,14 @@ crates/
   similarity-proto/     the .proto file and generated gRPC code
   similarity-core/      the encoder (Burn), tokenization, composite vectors, quantities, scoring, policy. No network, no async.
   similarity-store/     the VectorStore trait, an in-memory implementation, and the Qdrant one
-  similarity-server/    config, embedding worker thread, engine, gRPC service, and the `record-similarity` binary
+  similarity-server/    config, embedding worker thread, engine, gRPC service, import, calibration, and the `record-similarity` binary
   similarity-train/     fine-tuning: data, losses, the training loop, and the `record-similarity-train` binary
 data/
   calibration.sample.jsonl        synthetic labeled pairs, in the strict format
   calibration.sample.full.jsonl   the same pairs in the full format a data export uses
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D19)
+  decisions.md               why things are the way they are (D1 to D20)
   data-request-prompt.md     a brief for collecting labeled production data
   feature-suggestions.md     twenty features that could be added, none built yet
   plan-features.md           a plan for the first five of them
@@ -1380,7 +1438,8 @@ what that field says.
   records that are identical except that one has no description score 1.0 in `Evaluate` but about 0.89 in
   `FindSimilar`. Verdicts are unaffected; rankings favor records with the same fields filled in as the query,
   which is most visible when searching by a name alone. See D5.
-- **No bulk API.** Bootstrapping and re-indexing are one `Evaluate` call per record.
+- **No bulk RPC.** A catalog is loaded with the `import` command, which has to run where it can reach the model
+  and Qdrant. Over gRPC it is still one `Evaluate` call per record.
 - **English only.** The default model is English. Other languages need another model and a new calibration.
 - **Text and quantities only.** Images are not considered. A recycler who changes only the photo is invisible to
   this service.

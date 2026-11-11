@@ -120,6 +120,10 @@ qdrant-down:
 serve config="config.example.toml":
     cargo run --release -p similarity-server -- serve --config {{ config }}
 
+# Load an export into the configured collection: `just import export.jsonl config.toml` (add `--check` to only validate)
+import export config="config.example.toml" *flags:
+    cargo run --release -q -p similarity-server -- import --config {{ config }} {{ export }} {{ flags }}
+
 # Run the server with no Qdrant at all; nothing is persisted
 serve-in-memory config="config.example.toml":
     cargo run --release -p similarity-server -- serve --config {{ config }} --in-memory

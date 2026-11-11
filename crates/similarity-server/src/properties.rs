@@ -10,6 +10,8 @@
 //! - a forced write makes the record its own anchor;
 //! - the revision counter moves by exactly one, exactly when something was stored;
 //! - a record with a tenant is touched only by a request that names it (D14);
+//! - an import creates a record or leaves it exactly alone, and what it creates has the original version, where
+//!   one was given, as its anchor;
 //! - nothing ever happens to a record other than the one a request is about.
 //!
 //! It runs on the in-memory store and the bag-of-words embedder, so it needs no model and no Qdrant. See
@@ -23,12 +25,13 @@ use similarity_core::{FieldSpec, Policy, Quantity, QuantitySpec, Schema};
 use similarity_store::{MemoryStore, StoredRecord, VectorStore};
 
 use crate::engine::{
-  Engine, EngineError, EvaluateInput, FindSimilarInput, RecordInput, SimilarTo, Verdict, WriteMode, store_layout,
+  Engine, EngineError, EvaluateInput, FindSimilarInput, ImportInput, Imported, Original, RecordInput, SimilarTo,
+  Verdict, WriteMode, store_layout,
 };
 use crate::offline::calibrate::suggest_threshold;
 use crate::offline::pairs::Label;
 use crate::offline::{RecordFields, Suggestion};
-use crate::worker::testing::{WORD_BAG_DIMENSION, WordBagEmbedder};
+use crate::worker::testing::{WORD_BAG_DIMENSION, WordBagEmbedder, word_bag};
 
 fn cases() -> Config {
   let cases = std::env::var("PROPTEST_CASES")
@@ -74,6 +77,15 @@ enum Request {
   Delete {
     id: usize,
     tenant: Option<usize>,
+  },
+  /// A bulk import of one record, with or without the version it was created as.
+  Import {
+    id: usize,
+    tenant: Option<usize>,
+    name: usize,
+    category: Option<usize>,
+    weight: Option<(f64, &'static str)>,
+    original: Option<(usize, Option<(f64, &'static str)>)>,
   },
   Search {
     id: usize,
@@ -124,7 +136,24 @@ fn request() -> impl Strategy<Value = Request> {
   let delete =
     (0..IDS.len(), proptest::option::of(0..TENANTS.len())).prop_map(|(id, tenant)| Request::Delete { id, tenant });
   let search = (0..IDS.len()).prop_map(|id| Request::Search { id });
-  prop_oneof![12 => evaluate, 2 => delete, 1 => search]
+  let name = || prop_oneof![9 => 0..NAMES.len() - 1, 1 => Just(NAMES.len() - 1)];
+  let import = (
+    0..IDS.len(),
+    proptest::option::of(0..TENANTS.len()),
+    name(),
+    proptest::option::of(0..CATEGORIES.len()),
+    proptest::option::of(quantity()),
+    proptest::option::of((name(), proptest::option::of(quantity()))),
+  )
+    .prop_map(|(id, tenant, name, category, weight, original)| Request::Import {
+      id,
+      tenant,
+      name,
+      category,
+      weight,
+      original,
+    });
+  prop_oneof![12 => evaluate, 2 => delete, 3 => import, 1 => search]
 }
 
 fn schema() -> Schema {
@@ -179,6 +208,10 @@ fn is_invalid(name: usize, weight: Option<(f64, &str)>, thc: Option<(f64, &str)>
 /// A failure of the code under test that is not the rule being checked: the case fails with what went wrong.
 fn sound<T>(result: similarity_core::Result<T>) -> Result<T, TestCaseError> {
   result.map_err(|error| TestCaseError::fail(error.to_string()))
+}
+
+fn sound_engine<T>(result: Result<T, EngineError>) -> Result<T, TestCaseError> {
+  result.map_err(|error| TestCaseError::fail(format!("the engine failed: {error:?}")))
 }
 
 /// D8 and D16, for one accepted ordinary write: everything the anchor held is still there, unchanged, and what it
@@ -379,6 +412,102 @@ async fn step(engine: &TestEngine, request: &Request) -> Result<(), TestCaseErro
       } else {
         prop_assert_eq!(outcome, Ok(before[id].is_some()));
         prop_assert!(after[id].is_none());
+      }
+    }
+    Request::Import {
+      id,
+      tenant,
+      name,
+      category,
+      weight,
+      original,
+    } => {
+      let tenant = tenant.map(|index| TENANTS[index].to_owned());
+      let mut fields = vec![("name".to_owned(), NAMES[name].to_owned())];
+      fields.extend(category.map(|index| ("category".to_owned(), CATEGORIES[index].to_owned())));
+      let weigh = |weight: Option<(f64, &str)>| -> Vec<(String, Quantity)> {
+        weight
+          .map(|(value, unit)| ("weight".to_owned(), Quantity::single(value, unit)))
+          .into_iter()
+          .collect()
+      };
+      let input = ImportInput {
+        record: RecordInput {
+          id: Some(IDS[id].to_owned()),
+          tenant: tenant.clone(),
+          fields,
+          quantities: weigh(weight),
+        },
+        anchor: original.map(|(name, weight)| Original {
+          fields: vec![("name".to_owned(), NAMES[name].to_owned())],
+          quantities: weigh(weight),
+        }),
+      };
+      let mut outcomes = sound_engine(engine.import(vec![input]).await)?;
+      let outcome = outcomes
+        .pop()
+        .ok_or_else(|| TestCaseError::fail("one record, no outcome"))?;
+      let after = stored(engine).await;
+      for (index, (was, is)) in before.iter().zip(&after).enumerate() {
+        if index != id {
+          prop_assert_eq!(was, is);
+        }
+      }
+      let (was, is) = (before[id].as_ref(), after[id].as_ref());
+
+      let invalid = is_invalid(name, weight, None, None)
+        || original.is_some_and(|(name, weight)| is_invalid(name, weight, None, None));
+      let owner = was.and_then(|record| record.tenant.as_ref());
+      if invalid {
+        prop_assert!(matches!(outcome, Err(EngineError::InvalidArgument(_))), "{:?}", outcome);
+        prop_assert_eq!(was, is);
+      } else if let Some(was) = was {
+        // An import never updates. Not the record, not its anchor, not its timestamp.
+        prop_assert_eq!(Some(was), is, "an import changed a record that was already stored");
+        if owner.is_some_and(|owner| Some(owner) != tenant.as_ref()) {
+          prop_assert!(
+            matches!(outcome, Err(EngineError::FailedPrecondition(_))),
+            "D14: {:?}",
+            outcome
+          );
+        } else {
+          prop_assert_eq!(outcome, Ok(Imported::Skipped));
+        }
+      } else {
+        prop_assert_eq!(outcome, Ok(Imported::Created));
+        let Some(is) = is else {
+          return Err(TestCaseError::fail("created, and nothing is stored"));
+        };
+        prop_assert_eq!((is.revision, &is.tenant), (1, &tenant));
+        let schema = schema();
+        let anchor = sound(schema.blocks(WORD_BAG_DIMENSION, &is.anchor))?;
+        let current = sound(schema.blocks(WORD_BAG_DIMENSION, &is.vectors.composite))?;
+        match original {
+          None => {
+            prop_assert_eq!(&is.anchor, &is.vectors.composite);
+            prop_assert_eq!(&is.anchor_quantities, &is.quantities);
+          }
+          Some((original_name, original_weight)) => {
+            // Schema order: category, description, name. The name is the original's; the category, which the
+            // original version here never has, is today's.
+            let (Some(Some(kept)), Some(category)) = (anchor.get(2), anchor.first()) else {
+              return Err(TestCaseError::fail("the anchor has no name"));
+            };
+            prop_assert!(
+              sound(cosine(kept, &word_bag(NAMES[original_name])))? > 0.9999,
+              "the original name"
+            );
+            prop_assert_eq!(category.is_some(), current.first().is_some_and(Option::is_some));
+            let expected = original_weight
+              .or(weight)
+              .map(|(value, unit)| Quantity::single(value, unit.trim()));
+            prop_assert_eq!(
+              is.anchor_quantities.get("weight"),
+              expected.as_ref(),
+              "the first weight it had"
+            );
+          }
+        }
       }
     }
     Request::Search { id } => {

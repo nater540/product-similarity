@@ -25,9 +25,10 @@ use similarity_core::{Device, Embedder};
 use similarity_proto::v1 as pb;
 use similarity_proto::v1::record_similarity_client::RecordSimilarityClient;
 use similarity_server::config::Config;
-use similarity_server::engine::{Engine, store_layout};
-use similarity_server::worker::EmbedWorker;
-use similarity_store::QdrantStore;
+use similarity_server::engine::{Engine, EvaluateInput, RecordInput, WriteMode, store_layout};
+use similarity_server::import::{self, Options, Summary};
+use similarity_server::worker::{DirectEmbedder, EmbedWorker};
+use similarity_store::{QdrantStore, VectorStore};
 use tokio::sync::oneshot;
 use tonic::transport::Channel;
 
@@ -412,4 +413,149 @@ async fn scenario(mut client: RecordSimilarityClient<Channel>) {
     .unwrap()
     .into_inner();
   assert_eq!(reborn.verdict(), pb::Verdict::Created);
+}
+
+/// One line of an export: the gummies as they are now, and optionally as they were created.
+fn export_line(id: &str, name: &str, original_name: Option<&str>) -> String {
+  let record = |name: &str, weight: f64| {
+    serde_json::json!({
+      "name": name,
+      "category": GUMMIES[1].1,
+      "brand": GUMMIES[2].1,
+      "description": GUMMIES[3].1,
+      "weight_per_item": {"value": weight, "unit": "g"},
+    })
+  };
+  let mut line = serde_json::json!({"id": id, "tenant": "brand-1", "record": record(name, 40.0)});
+  if let Some(original) = original_name {
+    line["anchor"] = record(original, 20.0);
+  }
+  line.to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs ./models/mdbr-leaf-mt and a Qdrant server at $QDRANT_URL; run with `just test-real`"]
+async fn a_catalog_is_imported_into_qdrant_with_its_original_versions_and_a_second_run_resumes() {
+  let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+  let mut config = Config::parse(include_str!("../../../config.example.toml")).unwrap();
+  config.model.dir = root.join(&config.model.dir);
+  config.qdrant.url = std::env::var("QDRANT_URL").unwrap_or(config.qdrant.url);
+  config.qdrant.collection = format!(
+    "import_{}_{}",
+    std::process::id(),
+    std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .unwrap()
+      .as_nanos()
+  );
+  let embedder =
+    DirectEmbedder(Embedder::load(&config.model.dir, Device::flex(), &config.model.embedder_options()).unwrap());
+  let schema = config.schema().unwrap();
+  let (layout, dimension) = store_layout(&schema, &embedder);
+  let store = QdrantStore::connect(
+    &config.qdrant.settings(std::env::var("QDRANT_API_KEY").ok()),
+    layout,
+    dimension,
+  )
+  .await
+  .unwrap();
+  let engine = Engine::new(store.clone(), embedder, schema, config.policy().unwrap());
+
+  let export = [
+    export_line("sku-1", "Blueberry Gummies 100mg", None),
+    // This one has been edited since it was created, and the export still knows what it was.
+    export_line("sku-2", "Blueberry Gummies 100mg (Indica)", Some("Blueberry Gummies")),
+    export_line("sku-3", "Raspberry Gummies 100mg", None),
+    r#"{"id": "bad", "record": {"category": "no name"}}"#.to_owned(),
+  ]
+  .join("\n");
+  let options = Options {
+    batch_records: 2,
+    stop_on_error: false,
+  };
+  let reader = store.clone();
+  let outcome = tokio::spawn(async move {
+    let run = || async {
+      let mut failures = Vec::new();
+      let summary = import::run(
+        &engine,
+        export.as_bytes(),
+        options,
+        |failure| failures.push(failure.line),
+        |_| {},
+      )
+      .await
+      .unwrap();
+      (summary, failures)
+    };
+    let (first, failures) = run().await;
+    assert_eq!(
+      first,
+      Summary {
+        records: 4,
+        imported: 3,
+        skipped: 0,
+        failed: 1
+      }
+    );
+    assert_eq!(failures, [4]);
+
+    // What Qdrant holds: a plain record is its own anchor, and one with an original version is not.
+    let plain = reader.get("sku-1").await.unwrap().unwrap();
+    assert_eq!((plain.revision, plain.tenant.as_deref()), (1, Some("brand-1")));
+    assert!(similarity_core::vector::cosine(&plain.anchor, &plain.vectors.composite).unwrap() > 0.9999);
+    let edited = reader.get("sku-2").await.unwrap().unwrap();
+    let agreement = similarity_core::vector::cosine(&edited.anchor, &edited.vectors.composite).unwrap();
+    assert!(agreement < 0.999, "the anchor is the original version: {agreement}");
+    assert_eq!(edited.quantities["weight_per_item"].max, 40.0);
+    assert_eq!(
+      edited.anchor_quantities["weight_per_item"].max, 20.0,
+      "and so is its weight"
+    );
+
+    // Through the engine, the record reports the drift it had already accumulated before it was imported.
+    let preview = EvaluateInput {
+      record: RecordInput {
+        id: Some("sku-2".to_owned()),
+        tenant: Some("brand-1".to_owned()),
+        fields: vec![
+          ("name".to_owned(), "Blueberry Gummies 100mg (Indica)".to_owned()),
+          ("category".to_owned(), GUMMIES[1].1.to_owned()),
+          ("brand".to_owned(), GUMMIES[2].1.to_owned()),
+          ("description".to_owned(), GUMMIES[3].1.to_owned()),
+        ],
+        quantities: Vec::new(),
+      },
+      mode: WriteMode::DryRun,
+      threshold: None,
+    };
+    let output = engine.evaluate(preview).await.unwrap();
+    assert!(
+      (output.similarity.unwrap() - 1.0).abs() < 1e-5,
+      "nothing changed since the import"
+    );
+    assert!(
+      output.anchor_similarity.unwrap() < 0.999,
+      "{:?}",
+      output.anchor_similarity
+    );
+
+    // Running it again is how an interrupted import is resumed: everything stored is skipped.
+    let (second, _) = run().await;
+    assert_eq!(
+      second,
+      Summary {
+        records: 4,
+        imported: 0,
+        skipped: 3,
+        failed: 1
+      }
+    );
+    assert_eq!(reader.get("sku-2").await.unwrap().unwrap(), edited);
+  })
+  .await;
+
+  // Clean up before reporting, so a failed assertion does not leave a collection behind.
+  store.delete_collection().await.unwrap();
+  outcome.unwrap();
 }
