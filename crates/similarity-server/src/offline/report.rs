@@ -357,6 +357,14 @@ pub fn render_calibration(calibration: &Calibration, policy: &Policy, seed: u64)
       );
     }
   }
+  if let Some(area) = stats::area_under_curve(calibration) {
+    let _ = writeln!(
+      out,
+      "an edit scores above a recycle in {:.1}% of pairings (AUC {area:.4}): the number to compare two models by, \
+       since it needs no threshold",
+      area * 100.0
+    );
+  }
   render_operating_points(calibration, seed, &mut out);
   render_input(calibration, &mut out);
   out

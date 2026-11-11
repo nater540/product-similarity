@@ -29,7 +29,7 @@ record has an anchor (plans 11 and 18). `calibrate-diff --config-b` is not affec
 | # | Plan | Size | Needs first | The main correction to the suggestion |
 |---|---|---|---|---|
 | 2 | [Run registry](02-run-registry.md) | medium, **built** | | Loss lines are filterable logs, so a tee loses them; a killed run is worked out on read |
-| 3 | [Checkpoint evaluation](03-checkpoint-evaluation.md) | medium | | Results cannot go in a checkpoint (D18); catalog groups leak validation brands |
+| 3 | [Checkpoint evaluation](03-checkpoint-evaluation.md) | medium, **built** | | Results cannot go in a checkpoint (D18); catalog groups leak validation brands |
 | 4 | [Model registry and gate](04-model-registry.md) | medium | | A model has a digest, not a fingerprint; the server cannot read a local registry |
 | 5 | [Run report and compare](05-run-report.md) | medium | 2, 3 for curves | Comparing calibrations is already `calibrate-diff`; resumes need a chain |
 | 6 | [Sweeps](06-hyperparameter-sweeps.md) | large | 3 | Calibration code is not in core; epochs cannot be swept by picking checkpoints |
@@ -78,6 +78,6 @@ Each plan ends with its full list of decisions and a recommended default for eac
 3. **19** and **9**: both built. Both small to medium, and 9 turns "run `just test-real`" from a rule into a check.
 4. **15** and **14**, at any point. 14's first targets confirm the two predicted findings above.
 5. **11**, once `sequences.jsonl` exists.
-6. Before real fine-tuning: **2** (built), then **3**, then **4** and **5**. **6** last; it is large and builds on 3.
+6. Before real fine-tuning: **2** and **3** (both built), then **4** and **5**. **6** last; it is large and builds on 3.
 7. Before production: **10** and **12**. In production: **17**, then **18** (its policy-only half is a day or two).
 8. **20** when the matching question is taken up; it is a separate product question.

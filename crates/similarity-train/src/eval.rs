@@ -48,6 +48,10 @@ pub struct Separation {
   pub edits: Option<Spread>,
   /// Examples from recycled listings, if there are any.
   pub recycles: Option<Spread>,
+  /// How often an edit scores above a recycle, a tie counting half: 1.0 is perfectly separated, 0.5 is not at
+  /// all. It needs no threshold, which is what makes it fit for choosing between models. `None` unless both
+  /// labels are present.
+  pub auc: Option<f64>,
 }
 
 impl Separation {
@@ -132,6 +136,7 @@ pub fn separation(
         width: *width,
         edits: Spread::of(&edits),
         recycles: Spread::of(&recycles),
+        auc: similarity_core::separation::area_under_curve(&edits, &recycles),
       })
     })
     .collect()

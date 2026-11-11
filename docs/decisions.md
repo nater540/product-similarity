@@ -834,3 +834,48 @@ command line may one day carry a secret, which a manifest must not keep.
 
 The crate is `similarity-runs`. It depends on `similarity-core` for the two types a manifest shares with a
 model's provenance, the build stamp and a data file; both binaries link `similarity-core` already.
+
+## D24. A model is chosen on a validation split, by a score that needs no threshold
+
+The README told the reader to pick thresholds, and to tune the learning rate, by looking at the holdout. Anything
+chosen that way has been fitted to the holdout, and the error rates it reports afterwards are better than
+production will be. Two planners found this independently. The export has two splits, and one of them cannot
+both choose and judge.
+
+**A third split, carved from the first.** `pairs carve` moves a share of one split's owners (by default from
+`calibrate` to `validation`). Whole owners move, because pairs of one brand are not independent. Which owners is
+decided by a hash of the owner's name and a salt, with no randomness and no state: the same command moves the
+same owners, carving twice moves nothing more, and a larger share keeps every owner a smaller one moved. The
+share has no default. It is not a threshold, but it is a judgment about how many labeled pairs a comparison
+needs, and that depends on the data.
+
+**Both binaries select by `split` alone.** The trainer trains on `calibrate`, compares on `validation`, and
+reports on `holdout`; `calibrate --split` reads any of them. The alternative was a fold computed in memory from
+an owner hash in each binary (which would allow k folds). One carved split was chosen because the two binaries
+then cannot disagree about which pairs are which, and a file is something a person can look at.
+
+**Catalog groups of measured owners are left out of training.** A catalog group has no split of its own. One
+whose owner is in the validation or holdout split is skipped, or the brand held back for measuring would be
+learned from by another route. A group that names no owner is kept and counted.
+
+**The trainer compares by AUC, not by errors at a threshold.** The area under the curve is how often an edit
+scores above a recycle: it depends only on order. "Errors at the configured threshold" was the obvious measure
+and is wrong for this, because the threshold was measured on the base model and does not transfer (D3): a
+fine-tuned model that moved every score would be judged on a scale that is no longer its own. The function is in
+`similarity-core`, pure, with a property that checks it against counting every pairing. `calibrate` reports the
+same number over the overall similarity, so the two can be compared.
+
+**Every candidate is a model on disk, scored as it would be served.** The model the run started from, each
+checkpoint (loaded back from what was just written), and the final model. The base is a candidate because
+training can make a model worse, and on the bundled sample, which the base already separates completely, it is
+the one chosen. A tie goes to the earlier step. `--keep-checkpoints` keeps the newest few and the best.
+`--out` is still the final model, saved the moment training ends (D13); the best is named, not copied.
+
+**The holdout is consulted once.** With validation pairs, the only held-out line the trainer prints after
+training is for the model that was chosen (`stage: "selected"`, or the usual `after` line when the final model is
+the one). The `before` line stays: the base model is not a choice.
+
+**What was left out.** A resumed run scores the checkpoint it resumed from, its later checkpoints, and its final
+model. It does not score again the checkpoints an earlier process wrote, so its choice is among what this
+process saw. Results are never written into a checkpoint directory (D18); they are in the run's events (D23).
+Whether a validation split of a given size ranks checkpoints reliably can only be seen on real data.

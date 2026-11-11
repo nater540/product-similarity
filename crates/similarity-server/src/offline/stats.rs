@@ -73,6 +73,17 @@ pub fn score_range(calibration: &Calibration, label: Option<Label>) -> Option<Ra
   )
 }
 
+/// How often an edit's overall similarity is above a recycle's, a tie counting half: 1.0 when the two are
+/// perfectly separated, 0.5 when the score says nothing.
+///
+/// It asks only about order, so it needs no threshold. That makes it the number to compare two models by: a
+/// threshold belongs to the model it was measured on (D3), and "errors at the configured threshold" would judge
+/// every other model on a scale that is not its own. `None` unless both labels are present.
+pub fn area_under_curve(calibration: &Calibration) -> Option<f64> {
+  let scores = |label: Label| -> Vec<f32> { calibration.labeled(label).map(ScoredPair::similarity).collect() };
+  similarity_core::separation::area_under_curve(&scores(Label::Edit), &scores(Label::Recycle))
+}
+
 /// Every text field that some pair compared, in name order.
 pub fn field_names(calibration: &Calibration) -> BTreeSet<&str> {
   calibration
@@ -600,6 +611,22 @@ mod tests {
       point.false_reject.unwrap().errors,
       0,
       "an edit at the threshold is accepted"
+    );
+  }
+
+  #[test]
+  fn the_area_under_the_curve_is_over_the_overall_similarity_of_labeled_pairs() {
+    let calibration = summarized(vec![
+      scored(Label::Edit, 0.95, true),
+      scored(Label::Edit, 0.60, false),
+      scored(Label::Recycle, 0.70, false),
+      scored(Label::Recycle, 0.20, false),
+    ]);
+    // Of the four pairings, the edit at 0.60 loses one.
+    assert_eq!(area_under_curve(&calibration), Some(0.75));
+    assert_eq!(
+      area_under_curve(&summarized(vec![scored(Label::Edit, 0.9, true)])),
+      None
     );
   }
 

@@ -34,6 +34,7 @@ pub mod record;
 pub mod rng;
 pub mod schema;
 pub mod score;
+pub mod separation;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod tokenize;

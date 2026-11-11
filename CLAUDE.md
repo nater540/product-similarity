@@ -6,7 +6,7 @@ marketplace listings. Each revision is embedded field by field with a small BERT
 thresholds. A record's quantities (weight, volume, potency) are compared as numbers beside that, never embedded.
 Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D23) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D24) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -119,6 +119,12 @@ changing a design. Infer conventions from the existing code first.
   editing it, and never quote a figure that was not produced by `just throughput` or `just calibrate`.
 - **Rust end to end, by the owner's choice** (D13): training is `similarity-train`, in Burn. Do not add Python to
   any pipeline. `tools/*.py` are referees that write PyTorch fixtures for the parity tests and nothing else.
+- **The holdout chooses nothing** (D24). A checkpoint, a threshold, or a setting is chosen on the `validation`
+  split (`record-similarity pairs carve` makes one), and the holdout is measured once, for what was chosen. Do
+  not add a code path, a recipe, or a sentence in the README that picks anything by its holdout numbers. Models
+  are compared by AUC (`similarity_core::separation`), never by errors at a configured threshold, which belongs
+  to the model it was measured on. Catalog groups of an owner in the validation or holdout split are not trained
+  on.
 - **A run is recorded by `main`, never by the code it calls** (D23). `calibrate` and the trainer start a
   `similarity_runs::Run` before any work and pass it down as an `Option`; tests pass `None`, so no test writes
   into `runs/`. The record is a third layer in `similarity-log`, built by the same function as the two streams:
@@ -152,6 +158,7 @@ changing a design. Infer conventions from the existing code first.
 - Measure: `just throughput`, `just calibrate`, `just calibrate-diff`, `just verdict-gate old.ndjson pairs.full.jsonl`
 - See what was run: `just runs` (`calibrate` and the trainer each leave a directory under `runs/`; `--no-run`
   turns that off)
+- Make a validation split: `record-similarity pairs carve pairs.full.jsonl --fraction F > pairs.carved.jsonl`
 - Fine-tune: `just finetune --base ... --out ... --pairs ...` (CPU); GPU: `just release-train metal`, then
   `./target/release/record-similarity-train --device metal ...`. Continue an interrupted run with `--resume
   <out>.checkpoints/step-NNNNNN` in place of `--base`. Results are NDJSON on stdout, logs NDJSON on stderr.

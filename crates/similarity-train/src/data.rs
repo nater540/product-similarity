@@ -11,7 +11,7 @@
 //!
 //! Everything here is plain data and deterministic given a seed; no tensors are involved.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 use serde::Deserialize;
@@ -72,12 +72,16 @@ struct PairLine {
   label: String,
   #[serde(default)]
   split: Option<String>,
+  #[serde(default)]
+  owner: Option<String>,
   before: BTreeMap<String, Value>,
   after: BTreeMap<String, Value>,
 }
 
 #[derive(Deserialize)]
 struct GroupLine {
+  #[serde(default)]
+  owner: Option<String>,
   catalog: BTreeMap<String, Value>,
   listings: Vec<BTreeMap<String, Value>>,
 }
@@ -174,16 +178,61 @@ pub fn pair_examples(jsonl: &str, origin: &Path, fields: &[String], split: Split
   Ok(found)
 }
 
+/// The owners of every pair assigned to one of `splits`.
+///
+/// These are the brands a model is to be measured on, so nothing of theirs may be trained on: not their pairs,
+/// which the split already keeps out, and not their catalog groups, which have no split of their own.
+///
+/// # Errors
+///
+/// Returns [`TrainError::Data`] naming the line if a line is not a JSON object with `label`, `before`, and `after`.
+pub fn owners_in(jsonl: &str, origin: &Path, splits: &[&str]) -> Result<BTreeSet<String>> {
+  Ok(
+    parse_lines::<PairLine>(jsonl, origin)?
+      .into_iter()
+      .filter(|line| line.split.as_deref().is_some_and(|split| splits.contains(&split)))
+      .filter_map(|line| line.owner)
+      .collect(),
+  )
+}
+
+/// What a catalog-groups file yielded, and what was left out of it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupExamples {
+  /// The usable examples.
+  pub examples: Vec<GroupExample>,
+  /// Groups left out because their owner is one a model is measured on.
+  pub excluded_groups: usize,
+  /// Groups that name no owner. They are trained on, since there is nothing to check them against.
+  pub groups_without_owner: usize,
+}
+
 /// Turns catalog groups into per-field (catalog text, listing text) examples.
 ///
-/// A listing whose text is identical to the catalog's is left out: it is already at similarity 1.
+/// A listing whose text is identical to the catalog's is left out: it is already at similarity 1. A group whose
+/// `owner` is in `exclude` is left out whole: a brand whose pairs are held back for measuring must not be learned
+/// from through its catalog either, or the measurement is of something the model has seen.
 ///
 /// # Errors
 ///
 /// Returns [`TrainError::Data`] naming the line if a line is not a JSON object with `catalog` and `listings`.
-pub fn group_examples(jsonl: &str, origin: &Path, fields: &[String]) -> Result<Vec<GroupExample>> {
-  let mut examples = Vec::new();
+pub fn group_examples(
+  jsonl: &str,
+  origin: &Path,
+  fields: &[String],
+  exclude: &BTreeSet<String>,
+) -> Result<GroupExamples> {
+  let mut found = GroupExamples::default();
   for line in parse_lines::<GroupLine>(jsonl, origin)? {
+    match &line.owner {
+      Some(owner) if exclude.contains(owner) => {
+        found.excluded_groups = found.excluded_groups.saturating_add(1);
+        continue;
+      }
+      Some(_) => {}
+      None => found.groups_without_owner = found.groups_without_owner.saturating_add(1),
+    }
+    let examples = &mut found.examples;
     for field in fields {
       let Some(catalog) = field_text(&line.catalog, field) else {
         continue;
@@ -200,7 +249,7 @@ pub fn group_examples(jsonl: &str, origin: &Path, fields: &[String]) -> Result<V
       }
     }
   }
-  Ok(examples)
+  Ok(found)
 }
 
 /// One training step's worth of examples, as indexes into the example lists.
@@ -400,7 +449,14 @@ mod tests {
       r#"{"catalog": {"name": "Blue Dream", "weight_per_item": {"value": 3.5, "unit": "g"}}, "#,
       r#""listings": [{"name": "Blue Dream Eighth", "weight_per_item": {"value": 0.125, "unit": "oz"}}]}"#
     );
-    let found = group_examples(groups, origin(), &fields(&["name", "weight_per_item"])).unwrap();
+    let found = group_examples(
+      groups,
+      origin(),
+      &fields(&["name", "weight_per_item"]),
+      &BTreeSet::new(),
+    )
+    .unwrap()
+    .examples;
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].listing, "Blue Dream Eighth");
   }
@@ -440,7 +496,9 @@ mod tests {
       r#"{"group": "g1", "catalog": {"name": "Wyld Blueberry Gummies"}, "#,
       r#""listings": [{"name": "WYLD blueberry"}, {"name": "Wyld Blueberry Gummies"}, {"brand": "Wyld"}]}"#
     );
-    let examples = group_examples(jsonl, Path::new("groups.jsonl"), &fields(&["name"])).unwrap();
+    let examples = group_examples(jsonl, Path::new("groups.jsonl"), &fields(&["name"]), &BTreeSet::new())
+      .unwrap()
+      .examples;
     // The second listing is identical to the catalog entry and the third has no name.
     assert_eq!(
       examples,
@@ -574,5 +632,40 @@ mod tests {
   #[test]
   fn an_epoch_of_nothing_is_empty() {
     assert!(epoch(&[], &[], 8, &mut Rng::new(0)).is_empty());
+  }
+
+  /// A brand held back for measuring must not be learned from through its catalog either.
+  #[test]
+  fn catalog_groups_of_an_owner_that_is_measured_on_are_left_out_whole() {
+    let pairs = concat!(
+      r#"{"label": "edit", "split": "calibrate", "owner": "brand-1", "before": {"name": "a"}, "after": {"name": "b"}}"#,
+      "\n",
+      r#"{"label": "edit", "split": "validation", "owner": "brand-2", "before": {"name": "a"}, "after": {"name": "b"}}"#,
+      "\n",
+      r#"{"label": "recycle", "split": "holdout", "owner": "brand-3", "before": {"name": "a"}, "after": {"name": "b"}}"#,
+      "\n",
+      r#"{"label": "edit", "split": "holdout", "before": {"name": "a"}, "after": {"name": "b"}}"#,
+    );
+    let measured_on = owners_in(pairs, Path::new("pairs.jsonl"), &["validation", "holdout"]).unwrap();
+    assert_eq!(
+      measured_on.iter().map(String::as_str).collect::<Vec<_>>(),
+      ["brand-2", "brand-3"]
+    );
+
+    let group = |owner: Option<&str>, name: &str| {
+      let owner = owner.map_or_else(String::new, |owner| format!(r#""owner": "{owner}", "#));
+      format!(r#"{{{owner}"catalog": {{"name": "{name}"}}, "listings": [{{"name": "{name} 100mg"}}]}}"#)
+    };
+    let groups = [
+      group(Some("brand-1"), "gummies"),
+      group(Some("brand-2"), "flower"),
+      group(Some("brand-3"), "vape"),
+      group(None, "tincture"),
+    ]
+    .join("\n");
+    let found = group_examples(&groups, Path::new("groups.jsonl"), &fields(&["name"]), &measured_on).unwrap();
+    let kept: Vec<&str> = found.examples.iter().map(|example| example.catalog.as_str()).collect();
+    assert_eq!(kept, ["gummies", "tincture"]);
+    assert_eq!((found.excluded_groups, found.groups_without_owner), (2, 1));
   }
 }

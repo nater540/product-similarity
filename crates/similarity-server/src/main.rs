@@ -65,6 +65,33 @@ enum Command {
   /// Look at the runs that were recorded.
   #[command(subcommand)]
   Runs(RunsCommand),
+  /// Work on a file of labeled pairs.
+  #[command(subcommand)]
+  Pairs(PairsCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum PairsCommand {
+  /// Give a share of one split's owners a split of their own, for choosing a model without using the holdout.
+  Carve(CarveArgs),
+}
+
+#[derive(Debug, Args)]
+struct CarveArgs {
+  /// The pairs file, in the full format (each pair with `split` and `owner`). The result is written to stdout.
+  pairs: PathBuf,
+  /// The split to take owners from.
+  #[arg(long, default_value = "calibrate")]
+  from: String,
+  /// The split to give them.
+  #[arg(long, default_value = "validation")]
+  into: String,
+  /// The share of the owners to move, between 0 and 1.
+  #[arg(long)]
+  fraction: f64,
+  /// Decides, with each owner's name, which owners move. The same salt always moves the same owners.
+  #[arg(long, default_value = "validation")]
+  salt: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -156,6 +183,10 @@ struct CalibrateArgs {
   /// Fixes the resampling behind the intervals, so that a run can be reproduced.
   #[arg(long, default_value_t = 0)]
   seed: u64,
+  /// Score with the model in this directory in place of the config's `model.dir`: a checkpoint, typically.
+  /// Everything else (the schema, the thresholds, the width and token limit) still comes from the config.
+  #[arg(long)]
+  model: Option<PathBuf>,
   /// Where runs are recorded: this calibration gets a directory there with its manifest, its events (with or
   /// without --ndjson), and its report.
   #[arg(long, env = "RECORD_SIMILARITY_RUNS", default_value = "runs")]
@@ -512,7 +543,10 @@ impl CalibrateArgs {
 
   /// Calibrates. `run` is the record being kept of it, if one is.
   fn run(self, run: Option<&similarity_runs::Run>) -> anyhow::Result<()> {
-    let config = Config::load(&self.config)?;
+    let mut config = Config::load(&self.config)?;
+    if let Some(model) = &self.model {
+      config.model.dir.clone_from(model);
+    }
     let (offline, policy) = offline(&config)?;
     let text = std::fs::read_to_string(&self.pairs).with_context(|| format!("cannot read {}", self.pairs.display()))?;
     let pairs = if self.full {
@@ -591,6 +625,33 @@ fn duration(seconds: f64) -> String {
     format!("{hours}h{minutes:02}m")
   } else {
     format!("{minutes}m{seconds:02}s")
+  }
+}
+
+impl CarveArgs {
+  fn run(self) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(&self.pairs).with_context(|| format!("cannot read {}", self.pairs.display()))?;
+    let carved = similarity_server::carve::carve(&text, &self.from, &self.into, self.fraction, &self.salt)
+      .with_context(|| format!("in {}", self.pairs.display()))?;
+    write!(std::io::stdout().lock(), "{}", carved.text)?;
+    tracing::info!(
+      from = self.from.as_str(),
+      into = self.into.as_str(),
+      owners = carved.owners,
+      owners_moved = carved.owners_moved,
+      pairs_moved = carved.pairs_moved,
+      edits_moved = carved.edits_moved,
+      recycles_moved = carved.recycles_moved,
+      without_owner = carved.without_owner,
+      "carved"
+    );
+    if carved.edits_moved == 0 || carved.recycles_moved == 0 {
+      tracing::warn!(
+        "the new split does not have both edits and recycles, so no model can be compared on it; take a larger \
+         fraction or another salt"
+      );
+    }
+    Ok(())
   }
 }
 
@@ -834,6 +895,7 @@ fn main() -> ExitCode {
     Command::CalibrateDiff(args) => args.run(),
     Command::Import(args) => args.run(),
     Command::Runs(RunsCommand::List(args)) => args.run(),
+    Command::Pairs(PairsCommand::Carve(args)) => args.run(),
   }
   .map_err(|error| format!("{error:#}"));
   if let Err(error) = &outcome {

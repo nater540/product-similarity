@@ -14,6 +14,7 @@
 // Tests compute expected values with ordinary arithmetic and compare exact floats where exactness is the point.
 #![cfg_attr(test, allow(clippy::arithmetic_side_effects, clippy::float_cmp))]
 
+pub mod carve;
 pub mod config;
 pub mod engine;
 pub mod fetch;

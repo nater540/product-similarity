@@ -278,6 +278,7 @@ pub fn emit(offline: &Offline, policy: &Policy, calibration: &Calibration, seed:
     false_accept_low,
     false_accept_high,
     owners = rates.owners,
+    auc = stats::area_under_curve(calibration).map(|area| (area * 1e6).round() / 1e6),
     skipped_split = input.skipped_split,
     skipped_confidence = input.skipped_confidence,
     "summary"

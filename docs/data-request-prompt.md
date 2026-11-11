@@ -253,6 +253,9 @@ I would rather have a hundred of them marked `unsure` than have them left out.
 - Assign `split`: 80% `"calibrate"`, 20% `"holdout"`, decided by a hash of the brand so that no brand appears in
   both. Check that the holdout ended up with enough recycles to measure anything (at least 40); if one large
   brand's hash tipped the balance, change the salt and say so.
+  A third value, `"validation"`, is also understood: pairs that are never trained on and are used to choose
+  between models, so that the holdout chooses nothing. It can be assigned here (for example 70/10/20, by the same
+  brand hash) or carved out of `"calibrate"` afterwards with `record-similarity pairs carve`.
 
 ## Handling
 

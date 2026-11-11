@@ -11,6 +11,7 @@
 // Tests compare exact floats where exactness is the point (what a rounded number is rounded to).
 #![cfg_attr(test, allow(clippy::float_cmp))]
 
+use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -52,6 +53,7 @@ enum DeviceChoice {
 /// Fine-tune the record-similarity embedding model on labeled listing data.
 #[derive(Debug, Parser)]
 #[command(name = "record-similarity-train", version, about)]
+#[expect(clippy::struct_excessive_bools, reason = "each one is a switch on the command line")]
 struct Cli {
   /// The model directory to start from
   #[arg(long, required_unless_present = "resume", conflicts_with = "resume")]
@@ -86,6 +88,20 @@ struct Cli {
   /// Report, but never train on, pairs whose `split` is this
   #[arg(long, default_value = "holdout")]
   holdout_split: String,
+
+  /// Choose among the run's checkpoints with pairs whose `split` is this. Never trained on. When the file has
+  /// such pairs, every checkpoint is scored on them and the best is named, and the holdout is measured only for
+  /// that one
+  #[arg(long, default_value = "validation")]
+  validation_split: String,
+
+  /// Do not score checkpoints on the validation pairs, even if the file has some
+  #[arg(long)]
+  no_validation: bool,
+
+  /// The embedding width checkpoints are compared at: one of the trained widths. The narrowest, if not given
+  #[arg(long)]
+  select_width: Option<usize>,
 
   /// Embedding widths to keep usable. Must include the server's `output_dim`; a width the model cannot produce is
   /// replaced by its native width
@@ -361,9 +377,16 @@ impl Checkpoints {
           .is_some_and(|every| progress.step.is_multiple_of(every.get())))
   }
 
-  fn after(&mut self, step: &Step<'_>, lineage: &Provenance) -> similarity_train::Result<()> {
+  /// Writes a checkpoint if one is due, and returns where. `best` is the checkpoint validation has chosen so
+  /// far, which tidying up must not delete.
+  fn after(
+    &mut self,
+    step: &Step<'_>,
+    lineage: &Provenance,
+    best: Option<&Path>,
+  ) -> similarity_train::Result<Option<PathBuf>> {
     if !self.due(&step.progress) {
-      return Ok(());
+      return Ok(None);
     }
     let path = self.path(step.progress.step);
     step.checkpoint(&path, Some(lineage))?;
@@ -373,29 +396,230 @@ impl Checkpoints {
       path = %path.display(),
       "checkpoint"
     );
-    self.own.push(path);
-    self.prune();
-    Ok(())
+    self.own.push(path.clone());
+    self.prune(best);
+    Ok(Some(path))
   }
 
-  /// Deletes the oldest of this run's checkpoints beyond the number to keep.
+  /// Deletes the oldest of this run's checkpoints beyond the number to keep, except `best`: the newest few are
+  /// kept for resuming, and the best one is kept because it may be the model that is wanted.
   ///
   /// Never an error. The new checkpoint is already safely written, and failing to tidy up behind it is no reason
   /// to throw the run away; a checkpoint someone has moved elsewhere to keep is simply no longer here to delete.
-  fn prune(&mut self) {
-    while self.keep > 0 && self.own.len() > self.keep {
-      let oldest = self.own.remove(0);
-      match std::fs::remove_dir_all(&oldest) {
+  fn prune(&mut self, best: Option<&Path>) {
+    if self.keep == 0 {
+      return;
+    }
+    let surplus = self.own.len().saturating_sub(self.keep);
+    let mut kept = Vec::with_capacity(self.own.len());
+    for (index, path) in std::mem::take(&mut self.own).into_iter().enumerate() {
+      if index >= surplus || best == Some(path.as_path()) {
+        kept.push(path);
+        continue;
+      }
+      match std::fs::remove_dir_all(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => tracing::warn!(
-          path = %oldest.display(),
+          path = %path.display(),
           %error,
           "could not delete an old checkpoint; training continues"
         ),
       }
     }
+    self.own = kept;
   }
+}
+
+/// What `--pairs` holds, by what each part is for.
+#[derive(Default)]
+struct LabeledPairs {
+  /// Trained on.
+  training: PairExamples,
+  /// Never trained on, and measured once.
+  held_out: Vec<PairExample>,
+  /// Never trained on, and used to choose among checkpoints.
+  validation: Vec<PairExample>,
+  /// The owners of the last two: the brands the model is measured on.
+  measured_on: BTreeSet<String>,
+}
+
+/// What it takes to score a model on pairs: the same tokenizer, device, widths, and batch size every time.
+struct Scorer<'a> {
+  tokenizer: &'a TextTokenizer,
+  device: &'a Device,
+  widths: &'a [usize],
+  batch_size: usize,
+}
+
+impl Scorer<'_> {
+  fn score(&self, encoder: &SentenceEncoder, pairs: &[PairExample]) -> similarity_train::Result<Vec<Separation>> {
+    separation(
+      encoder,
+      self.tokenizer,
+      self.device,
+      pairs,
+      self.widths,
+      self.batch_size,
+    )
+  }
+
+  /// Scores a model directory or a checkpoint, loaded as it would be served.
+  fn score_saved(&self, dir: &Path, pairs: &[PairExample]) -> anyhow::Result<Vec<Separation>> {
+    Ok(self.score(&SentenceEncoder::load(dir, self.device)?, pairs)?)
+  }
+
+  /// The chosen model on the held-out pairs, when it is not the final model: the one time the holdout is
+  /// consulted about a choice. A failure is a warning, since the run's models are all safely on disk.
+  fn chosen_on_holdout(
+    &self,
+    best: Option<&Candidate>,
+    is_final: bool,
+    held_out: &[PairExample],
+  ) -> Option<Vec<Separation>> {
+    let best = best.filter(|_| !is_final && !held_out.is_empty())?;
+    match self.score_saved(&best.dir, held_out) {
+      Ok(rows) => Some(rows),
+      Err(error) => {
+        tracing::warn!(
+          path = %best.dir.display(),
+          error = format!("{error:#}"),
+          "the chosen model could not be scored on the held-out pairs"
+        );
+        None
+      }
+    }
+  }
+}
+
+/// A model that could be chosen: the one the run started from, one of its checkpoints, or the final model.
+#[derive(Debug, Clone, PartialEq)]
+struct Candidate {
+  step: usize,
+  dir: PathBuf,
+  auc: f64,
+}
+
+/// The pairs checkpoints are compared on, and the best model seen so far.
+///
+/// The comparison is the area under the curve at one width: how often an edit scores above a recycle. It needs
+/// no threshold, and a threshold would be the wrong tool, since the configured one belongs to the base model
+/// (D3). The holdout is not used for this. Choosing with it would use it up.
+struct Validation {
+  examples: Vec<PairExample>,
+  width: usize,
+  best: Option<Candidate>,
+}
+
+impl Validation {
+  /// Reports one model's scores on the validation pairs and keeps the model if it is the best so far. On a tie
+  /// the earlier model stays: the same result for less training.
+  fn consider(
+    &mut self,
+    stage: &'static str,
+    baseline: Option<&'static str>,
+    step: usize,
+    dir: &Path,
+    rows: &[Separation],
+  ) {
+    for row in rows {
+      emit_separation("validation", stage, baseline, step, Some(dir), row);
+    }
+    let Some(auc) = rows.iter().find(|row| row.width == self.width).and_then(|row| row.auc) else {
+      return;
+    };
+    let auc = rounded(auc, 4);
+    if self.best.as_ref().is_none_or(|best| auc > best.auc) {
+      self.best = Some(Candidate {
+        step,
+        dir: dir.to_owned(),
+        auc,
+      });
+    }
+  }
+
+  fn best_dir(&self) -> Option<&Path> {
+    self.best.as_ref().map(|best| best.dir.as_path())
+  }
+
+  /// Scores the model the run starts from: the base, or the checkpoint a resumed run goes on from. It is a
+  /// candidate like any other, since training can make a model worse.
+  fn start(
+    &mut self,
+    scorer: &Scorer<'_>,
+    encoder: &SentenceEncoder,
+    resumed_at: Option<usize>,
+    source: &Path,
+  ) -> anyhow::Result<()> {
+    let rows = scorer.score(encoder, &self.examples)?;
+    let baseline = if resumed_at.is_some() {
+      "checkpoint"
+    } else {
+      "base model"
+    };
+    self.consider("before", Some(baseline), resumed_at.unwrap_or(0), source, &rows);
+    Ok(())
+  }
+
+  /// Scores a checkpoint that was just written, loaded back as it would be served. One that cannot be scored is
+  /// a warning and not a candidate: the checkpoint itself is safely on disk, and training goes on.
+  fn checkpoint(&mut self, scorer: &Scorer<'_>, step: usize, path: &Path) {
+    match scorer.score_saved(path, &self.examples) {
+      Ok(rows) => self.consider("checkpoint", None, step, path, &rows),
+      Err(error) => tracing::warn!(
+        path = %path.display(),
+        error = format!("{error:#}"),
+        "a checkpoint could not be scored on the validation pairs; training continues"
+      ),
+    }
+  }
+}
+
+/// What validation chose, for the run's closing lines.
+struct Selection<'a> {
+  /// How many validation examples the choice rests on.
+  examples: usize,
+  /// The width the models were compared at.
+  width: usize,
+  /// The chosen model. `None` if no model could be scored, for want of both labels.
+  best: Option<&'a Candidate>,
+  /// Whether that is the final model, the one in `--out`.
+  is_final: bool,
+  /// The chosen model on the held-out pairs, when it is not the final model.
+  held: Option<&'a [Separation]>,
+}
+
+/// One `separation` result line: how one model separates edits from recycles on one split at one width.
+fn emit_separation(
+  split: &'static str,
+  stage: &'static str,
+  compared_with: Option<&'static str>,
+  step: usize,
+  path: Option<&Path>,
+  row: &Separation,
+) {
+  let [edits_min, edits_mean, edits_max] = spread(row.edits);
+  let [recycles_min, recycles_mean, recycles_max] = spread(row.recycles);
+  tracing::info!(
+    target: RESULT,
+    split,
+    stage,
+    compared_with,
+    step,
+    path = path.map(|path| path.display().to_string()),
+    width = row.width,
+    edits = row.edits.map_or(0, |spread| spread.count),
+    edits_min,
+    edits_mean,
+    edits_max,
+    recycles = row.recycles.map_or(0, |spread| spread.count),
+    recycles_min,
+    recycles_mean,
+    recycles_max,
+    gap_of_means = row.mean_gap().map(|gap| rounded(f64::from(gap), 4)),
+    auc = row.auc.map(|auc| rounded(auc, 4)),
+    "separation"
+  );
 }
 
 /// What a run measured and produced, reported once at the end.
@@ -409,6 +633,8 @@ struct Outcome<'a> {
   /// Before and after, on the training pairs and on the held-out pairs.
   training: (&'a [Separation], &'a [Separation]),
   held: (&'a [Separation], &'a [Separation]),
+  /// What validation chose, if checkpoints were compared.
+  selection: Option<Selection<'a>>,
 }
 
 /// The lowest, mean, and highest similarity of one label's examples, rounded for reporting.
@@ -435,6 +661,7 @@ impl Outcome<'_> {
     } else {
       "base model"
     };
+    let start = self.resumed_at.unwrap_or(0);
     let splits = [
       ("training", self.examples.pairs.len(), self.training),
       ("held_out", self.held_out, self.held),
@@ -444,30 +671,28 @@ impl Outcome<'_> {
       if examples == 0 {
         continue;
       }
-      for (stage, rows) in [("before", before), ("after", after)] {
-        for row in rows {
-          let [edits_min, edits_mean, edits_max] = spread(row.edits);
-          let [recycles_min, recycles_mean, recycles_max] = spread(row.recycles);
-          tracing::info!(
-            target: RESULT,
-            split,
-            stage,
-            compared_with = (stage == "before").then_some(baseline),
-            width = row.width,
-            edits = row.edits.map_or(0, |spread| spread.count),
-            edits_min,
-            edits_mean,
-            edits_max,
-            recycles = row.recycles.map_or(0, |spread| spread.count),
-            recycles_min,
-            recycles_mean,
-            recycles_max,
-            gap_of_means = row.mean_gap().map(|gap| rounded(f64::from(gap), 4)),
-            "separation"
-          );
-        }
+      for row in before {
+        emit_separation(split, "before", Some(baseline), start, None, row);
+      }
+      // With a validation fold, the holdout is asked one question: how good is the model that was chosen. The
+      // final model's held-out numbers are that answer only if the final model is the one chosen.
+      let chosen_elsewhere = self.selection.as_ref().is_some_and(|selection| !selection.is_final);
+      if split == "held_out" && chosen_elsewhere {
+        continue;
+      }
+      for row in after {
+        emit_separation(split, "after", None, self.steps, None, row);
       }
     }
+    if let Some(selection) = &self.selection
+      && let (Some(best), Some(rows)) = (selection.best, selection.held)
+    {
+      for row in rows {
+        emit_separation("held_out", "selected", None, best.step, Some(&best.dir), row);
+      }
+    }
+    let selection = self.selection.as_ref();
+    let best = selection.and_then(|selection| selection.best);
     tracing::info!(
       target: RESULT,
       out = %self.out.display(),
@@ -477,6 +702,12 @@ impl Outcome<'_> {
       steps = self.steps,
       resumed_at = self.resumed_at,
       elapsed_s = rounded(self.elapsed_s, 1),
+      validation_examples = selection.map(|selection| selection.examples),
+      select_width = selection.map(|selection| selection.width),
+      best_step = best.map(|best| best.step),
+      best_model = best.map(|best| best.dir.display().to_string()),
+      best_auc = best.map(|best| best.auc),
+      best_is_final = selection.filter(|selection| selection.best.is_some()).map(|selection| selection.is_final),
       "finished"
     );
   }
@@ -506,34 +737,58 @@ impl Cli {
     }
   }
 
-  /// The training pairs and the held-out pairs of `--pairs`.
-  fn pairs(&self) -> anyhow::Result<(PairExamples, Vec<PairExample>)> {
+  /// The training pairs, the held-out pairs, and the validation pairs of `--pairs`, and the owners of the last
+  /// two: the brands the model is measured on.
+  fn pairs(&self) -> anyhow::Result<LabeledPairs> {
     let Some(path) = &self.pairs else {
-      return Ok((PairExamples::default(), Vec::new()));
+      return Ok(LabeledPairs::default());
     };
     let jsonl = data::read(path)?;
     let training = data::pair_examples(&jsonl, path, &self.fields, Split::Training(&self.split))?;
     let held_out = data::pair_examples(&jsonl, path, &self.fields, Split::HeldOut(&self.holdout_split))?;
+    let validation = if self.no_validation {
+      PairExamples::default()
+    } else {
+      data::pair_examples(&jsonl, path, &self.fields, Split::HeldOut(&self.validation_split))?
+    };
+    let measured_on = data::owners_in(&jsonl, path, &[&self.holdout_split, &self.validation_split])?;
     tracing::info!(
       file = %path.display(),
       examples = training.examples.len(),
       from_edits = training.edits(),
       from_recycles = training.recycles(),
       held_out = held_out.examples.len(),
+      validation = validation.examples.len(),
       skipped_other_labels = training.skipped_label,
       "labeled pairs"
     );
-    Ok((training, held_out.examples))
+    Ok(LabeledPairs {
+      training,
+      held_out: held_out.examples,
+      validation: validation.examples,
+      measured_on,
+    })
   }
 
-  /// Everything to train on, and the held-out pairs to report on.
-  fn examples(&self) -> anyhow::Result<(Examples, Vec<PairExample>)> {
-    let (training, held_out) = self.pairs()?;
+  /// Everything to train on, the held-out pairs to report on, and the validation pairs to choose with.
+  fn examples(&self) -> anyhow::Result<(Examples, Vec<PairExample>, Vec<PairExample>)> {
+    let LabeledPairs {
+      training,
+      held_out,
+      validation,
+      measured_on,
+    } = self.pairs()?;
     let groups = match &self.catalog_groups {
       Some(path) => {
-        let groups = data::group_examples(&data::read(path)?, path, &self.fields)?;
-        tracing::info!(file = %path.display(), examples = groups.len(), "catalog groups");
-        groups
+        let groups = data::group_examples(&data::read(path)?, path, &self.fields, &measured_on)?;
+        tracing::info!(
+          file = %path.display(),
+          examples = groups.examples.len(),
+          excluded_groups = groups.excluded_groups,
+          groups_without_owner = groups.groups_without_owner,
+          "catalog groups"
+        );
+        groups.examples
       }
       None => Vec::new(),
     };
@@ -541,7 +796,7 @@ impl Cli {
       pairs: training.examples,
       groups,
     };
-    Ok((examples, held_out))
+    Ok((examples, held_out, validation))
   }
 
   /// Where and when this run checkpoints, if it does.
@@ -691,6 +946,74 @@ impl Cli {
     }
   }
 
+  fn log_loaded(
+    &self,
+    source: &Path,
+    resumed_at: Option<usize>,
+    encoder: &SentenceEncoder,
+    options: &TrainOptions,
+    checkpoints: Option<&Path>,
+  ) {
+    tracing::info!(
+      model = %source.display(),
+      resumed_at,
+      device = ?self.device,
+      native_width = encoder.dimension(),
+      widths = ?options.widths,
+      dropout = options.dropout,
+      checkpoints = checkpoints.map(|dir| dir.display().to_string()),
+      "model loaded"
+    );
+  }
+
+  /// Saves the trained model and proves it loads.
+  fn save(
+    &self,
+    trained: &SentenceEncoder,
+    lineage: &Provenance,
+    steps: usize,
+    run: Option<&Run>,
+  ) -> anyhow::Result<()> {
+    // Saved before anything else is done with it. Until this returns, the last pass exists only in memory, and
+    // the scoring below is minutes of forward passes on a large dataset.
+    checkpoint::save_model(trained, &self.out, Some((lineage, steps)))?;
+    // Loaded back through the path the server uses, including its warm-up forward pass, so that a directory this
+    // command reports as saved is one the server is known to start with.
+    let embedder_options = EmbedderOptions {
+      max_tokens: self.max_tokens,
+      ..EmbedderOptions::default()
+    };
+    let saved = Embedder::load(&self.out, Device::flex(), &embedder_options)
+      .with_context(|| format!("the model saved to {} does not load back", self.out.display()))?;
+    tracing::info!(out = %self.out.display(), "model saved and verified to load");
+    if let Some(run) = run {
+      run.note_output(Output {
+        role: "model".to_owned(),
+        path: self.out.display().to_string(),
+        digest: Some(saved.content_digest().to_owned()),
+      });
+    }
+    Ok(())
+  }
+
+  /// The validation pairs and the width to compare models at, if there are any validation pairs.
+  fn validation(&self, examples: Vec<PairExample>, widths: &[usize]) -> anyhow::Result<Option<Validation>> {
+    if examples.is_empty() {
+      return Ok(None);
+    }
+    let narrowest = widths.iter().copied().min().unwrap_or_default();
+    let width = self.select_width.unwrap_or(narrowest);
+    anyhow::ensure!(
+      widths.contains(&width),
+      "--select-width {width} is not one of the widths being trained ({widths:?})"
+    );
+    Ok(Some(Validation {
+      examples,
+      width,
+      best: None,
+    }))
+  }
+
   /// Trains. `run` is the record being kept of it, if one is: tests pass `None`, and so write nothing outside
   /// the directories they were given.
   fn run(&self, run: Option<&Run>) -> anyhow::Result<()> {
@@ -704,7 +1027,7 @@ impl Cli {
       None => None,
     };
 
-    let (examples, held_out) = self.examples()?;
+    let (examples, held_out, validation) = self.examples()?;
     let device = device(self.device)?;
     let (encoder, tokenizer, source) = self.load(&device)?;
     let options = self.options(&encoder);
@@ -713,38 +1036,29 @@ impl Cli {
       let run = RunIdentity::of(&options, &examples, self.max_tokens);
       checkpoints.prepare(&self.out, self.resume.as_deref(), resumed_at.unwrap_or(0), &run)?;
     }
-    tracing::info!(
-      model = %source.display(),
-      resumed_at,
-      device = ?self.device,
-      native_width = encoder.dimension(),
-      widths = ?options.widths,
-      dropout = options.dropout,
-      checkpoints = checkpoints.as_ref().map(|checkpoints| checkpoints.dir.display().to_string()),
-      "model loaded"
-    );
+    let checkpoint_dir = checkpoints.as_ref().map(|checkpoints| checkpoints.dir.as_path());
+    self.log_loaded(source, resumed_at, &encoder, &options, checkpoint_dir);
 
     let mut lineage = self.lineage(&encoder, source, &examples, &options)?;
-    if let (Some(run), Some(trained)) = (run, &lineage.trained) {
-      run.note_options(trained.options.clone());
-      run.note_model(ModelRef {
-        role: "base".to_owned(),
-        dir: trained.base.dir.clone(),
-        digest: trained.base.digest.clone(),
-        fingerprint: None,
-      });
-      for file in &trained.data {
-        run.note_input(file.into());
-      }
-    }
+    note_setup(run, &lineage);
     // Every checkpoint and the final model name the run that wrote them. A run id changes nothing a step does,
     // so it is no part of `RunIdentity`: a resume is always another run, and must be accepted.
     lineage.run = run.map(|run| run.id().to_owned());
 
-    let score = |encoder: &SentenceEncoder, pairs: &[PairExample]| {
-      separation(encoder, &tokenizer, &device, pairs, &options.widths, self.batch_size)
+    let scorer = Scorer {
+      tokenizer: &tokenizer,
+      device: &device,
+      widths: &options.widths,
+      batch_size: self.batch_size,
     };
-    let before = (score(&encoder, &examples.pairs)?, score(&encoder, &held_out)?);
+    let before = (
+      scorer.score(&encoder, &examples.pairs)?,
+      scorer.score(&encoder, &held_out)?,
+    );
+    let mut validation = self.validation(validation, &options.widths)?;
+    if let Some(validation) = &mut validation {
+      validation.start(&scorer, &encoder, resumed_at, source)?;
+    }
 
     let started = Instant::now();
     let mut window = Window::default();
@@ -763,35 +1077,32 @@ impl Cli {
         if progress.step.is_multiple_of(self.log_every.max(1)) || progress.step == progress.total_steps {
           window.log(progress, started);
         }
-        match &mut checkpoints {
-          Some(checkpoints) => checkpoints.after(step, &lineage),
-          None => Ok(()),
+        let best = validation.as_ref().and_then(Validation::best_dir).map(Path::to_owned);
+        let written = match &mut checkpoints {
+          Some(checkpoints) => checkpoints.after(step, &lineage, best.as_deref())?,
+          None => None,
+        };
+        if let (Some(path), Some(validation)) = (written, &mut validation) {
+          validation.checkpoint(&scorer, progress.step, &path);
         }
+        Ok(())
       },
     )?;
     let elapsed_s = started.elapsed().as_secs_f64();
 
-    // Saved before anything else is done with it. Until this returns, the last pass exists only in memory, and
-    // the scoring below is minutes of forward passes on a large dataset.
-    checkpoint::save_model(&trained, &self.out, Some((&lineage, steps)))?;
-    // Loaded back through the path the server uses, including its warm-up forward pass, so that a directory this
-    // command reports as saved is one the server is known to start with.
-    let embedder_options = EmbedderOptions {
-      max_tokens: self.max_tokens,
-      ..EmbedderOptions::default()
-    };
-    let saved = Embedder::load(&self.out, Device::flex(), &embedder_options)
-      .with_context(|| format!("the model saved to {} does not load back", self.out.display()))?;
-    tracing::info!(out = %self.out.display(), "model saved and verified to load");
-    if let Some(run) = run {
-      run.note_output(Output {
-        role: "model".to_owned(),
-        path: self.out.display().to_string(),
-        digest: Some(saved.content_digest().to_owned()),
-      });
-    }
+    self.save(&trained, &lineage, steps, run)?;
 
-    let after = (score(&trained, &examples.pairs)?, score(&trained, &held_out)?);
+    if let Some(validation) = &mut validation {
+      let rows = scorer.score(&trained, &validation.examples)?;
+      validation.consider("after", None, steps, &self.out, &rows);
+    }
+    let best = validation.as_ref().and_then(|validation| validation.best.as_ref());
+    let is_final = best.is_some_and(|best| best.dir == self.out);
+    let chosen_held = scorer.chosen_on_holdout(best, is_final, &held_out);
+    let after = (
+      scorer.score(&trained, &examples.pairs)?,
+      scorer.score(&trained, &held_out)?,
+    );
     Outcome {
       out: &self.out,
       examples: &examples,
@@ -801,9 +1112,33 @@ impl Cli {
       elapsed_s,
       training: (&before.0, &after.0),
       held: (&before.1, &after.1),
+      selection: validation.as_ref().map(|validation| Selection {
+        examples: validation.examples.len(),
+        width: validation.width,
+        best,
+        is_final,
+        held: chosen_held.as_deref(),
+      }),
     }
     .report();
     Ok(())
+  }
+}
+
+/// Writes down, in the run's manifest, how the run was set up: its options, the model it starts from, its data.
+fn note_setup(run: Option<&Run>, lineage: &Provenance) {
+  let (Some(run), Some(trained)) = (run, &lineage.trained) else {
+    return;
+  };
+  run.note_options(trained.options.clone());
+  run.note_model(ModelRef {
+    role: "base".to_owned(),
+    dir: trained.base.dir.clone(),
+    digest: trained.base.digest.clone(),
+    fingerprint: None,
+  });
+  for file in &trained.data {
+    run.note_input(file.into());
   }
 }
 
@@ -1041,7 +1376,7 @@ mod tests {
 
     let third = fake_checkpoint(dir.path(), 6, &run);
     resumed.own.push(third.clone());
-    resumed.prune();
+    resumed.prune(None);
     assert!(!first.exists(), "the oldest of this run's three was deleted");
     assert!(second.exists() && third.exists());
     assert!(
@@ -1052,7 +1387,7 @@ mod tests {
     // A checkpoint someone moved away to keep is not an error, and neither is anything else about tidying up.
     std::fs::remove_dir_all(&second).unwrap();
     resumed.own.push(fake_checkpoint(dir.path(), 8, &run));
-    resumed.prune();
+    resumed.prune(None);
     assert_eq!(resumed.own.len(), 2);
     assert!(third.exists());
   }
@@ -1093,6 +1428,7 @@ mod tests {
       width,
       edits: spread(edits),
       recycles: spread(recycles),
+      auc: None,
     }
   }
 
@@ -1120,6 +1456,7 @@ mod tests {
       elapsed_s: 19.84,
       training: (&before, &after),
       held: (&before, &after),
+      selection: None,
     };
 
     for level in ["info", "warn", "off"] {
@@ -1178,6 +1515,7 @@ mod tests {
       elapsed_s: 1.0,
       training: (&empty, &empty),
       held: (&empty, &empty),
+      selection: None,
     };
     let (results, _) = reported(&outcome, "info");
     assert_eq!(
@@ -1201,6 +1539,165 @@ mod tests {
     // No recycles among them: their statistics are left out, not written as zeros or nulls.
     assert_eq!(results[0]["recycles"], 0);
     assert!(results[0].get("recycles_mean").is_none() && results[0].get("gap_of_means").is_none());
+  }
+
+  fn scored_at(width: usize, auc: Option<f64>) -> Separation {
+    Separation {
+      auc,
+      ..row(width, Some((5, 0.9)), Some((5, 0.5)))
+    }
+  }
+
+  fn validation(width: usize) -> Validation {
+    Validation {
+      examples: Vec::new(),
+      width,
+      best: None,
+    }
+  }
+
+  #[test]
+  fn the_best_model_is_the_one_edits_most_often_outscore_recycles_in_at_the_chosen_width() {
+    let mut validation = validation(256);
+    let offer = |validation: &mut Validation, step: usize, wide: f64, narrow: Option<f64>| {
+      let rows = [scored_at(1024, Some(wide)), scored_at(256, narrow)];
+      capture("off", || {
+        validation.consider("checkpoint", None, step, Path::new(&format!("step-{step}")), &rows);
+      });
+    };
+    offer(&mut validation, 0, 0.99, Some(0.80));
+    assert_eq!(validation.best.as_ref().unwrap().step, 0);
+    // Better at the width that is served is better; better at another width is not.
+    offer(&mut validation, 2, 0.50, Some(0.90));
+    offer(&mut validation, 4, 1.00, Some(0.85));
+    assert_eq!(
+      (
+        validation.best.as_ref().unwrap().step,
+        validation.best.as_ref().unwrap().auc
+      ),
+      (2, 0.9)
+    );
+    // The same to four places is a tie, and the earlier model keeps it: the same result for less training.
+    offer(&mut validation, 6, 0.50, Some(0.900_04));
+    assert_eq!(validation.best_dir(), Some(Path::new("step-2")));
+    // A model that could not be scored on both labels is not a candidate.
+    offer(&mut validation, 8, 0.50, None);
+    assert_eq!(validation.best.as_ref().unwrap().step, 2);
+    offer(&mut validation, 10, 0.50, Some(0.95));
+    assert_eq!(validation.best.as_ref().unwrap().step, 10);
+  }
+
+  #[test]
+  fn a_validation_score_is_reported_with_the_step_and_the_model_it_is_of() {
+    let mut validation = validation(256);
+    let rows = [scored_at(256, Some(0.912_345))];
+    let captured = capture("off", || {
+      validation.consider("checkpoint", None, 120, Path::new("m.checkpoints/step-000120"), &rows);
+    });
+    let line: serde_json::Value = serde_json::from_str(&captured.results[0]).unwrap();
+    assert_eq!(
+      (&line["split"], &line["stage"], &line["step"]),
+      (&"validation".into(), &"checkpoint".into(), &120.into())
+    );
+    assert_eq!(line["path"], "m.checkpoints/step-000120");
+    assert_eq!(line["auc"], 0.9123, "four places");
+    assert!(line.get("compared_with").is_none());
+  }
+
+  #[test]
+  fn tidying_up_never_deletes_the_best_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = identity(0);
+    let paths: Vec<PathBuf> = [2, 4, 6, 8]
+      .iter()
+      .map(|step| fake_checkpoint(dir.path(), *step, &run))
+      .collect();
+    let mut checkpoints = checkpoints(dir.path(), None, 1);
+    checkpoints.own.clone_from(&paths);
+
+    // Keeping one, with the first as the best: the newest and the best stay.
+    checkpoints.prune(Some(&paths[0]));
+    assert_eq!(checkpoints.own, [paths[0].clone(), paths[3].clone()]);
+    assert!(paths[0].exists() && paths[3].exists() && !paths[1].exists() && !paths[2].exists());
+
+    // Once another is the best, the old best is an old checkpoint like any other.
+    checkpoints.prune(Some(&paths[3]));
+    assert_eq!(checkpoints.own, [paths[3].clone()]);
+    assert!(!paths[0].exists());
+  }
+
+  /// With a validation fold, the holdout answers one question: how good is the model that was chosen.
+  #[test]
+  fn the_holdout_is_reported_for_the_chosen_model_and_not_for_a_final_model_that_was_not_chosen() {
+    let examples = Examples {
+      pairs: vec![],
+      groups: vec![],
+    };
+    let rows = [scored_at(256, Some(0.9))];
+    let best = Candidate {
+      step: 4,
+      dir: PathBuf::from("m.checkpoints/step-000004"),
+      auc: 0.93,
+    };
+    let outcome = |is_final: bool, held: Option<&'static [Separation]>, best: Option<&'static Candidate>| Outcome {
+      out: Path::new("m"),
+      examples: Box::leak(Box::new(Examples {
+        pairs: vec![],
+        groups: vec![],
+      })),
+      held_out: 7,
+      resumed_at: None,
+      steps: 6,
+      elapsed_s: 1.0,
+      training: (&[], &[]),
+      held: (Box::leak(Box::new(rows)), Box::leak(Box::new(rows))),
+      selection: Some(Selection {
+        examples: 9,
+        width: 256,
+        best,
+        is_final,
+        held,
+      }),
+    };
+    drop(examples);
+    let stages = |results: &[serde_json::Value]| -> Vec<String> {
+      results
+        .iter()
+        .filter(|line| line["message"] == "separation")
+        .map(|line| line["stage"].as_str().unwrap().to_owned())
+        .collect()
+    };
+    let best: &'static Candidate = Box::leak(Box::new(best));
+    let held: &'static [Separation] = Box::leak(Box::new(rows));
+
+    let (results, _) = reported(&outcome(false, Some(held), Some(best)), "off");
+    assert_eq!(stages(&results), ["before", "selected"]);
+    let selected = &results[1];
+    assert_eq!((&selected["split"], &selected["step"]), (&"held_out".into(), &4.into()));
+    assert_eq!(selected["path"], "m.checkpoints/step-000004");
+    let finished = results.last().unwrap();
+    assert_eq!(finished["message"], "finished");
+    assert_eq!(
+      (&finished["best_step"], &finished["best_is_final"]),
+      (&4.into(), &false.into())
+    );
+    assert_eq!(
+      (&finished["best_auc"], &finished["select_width"]),
+      (&0.93.into(), &256.into())
+    );
+    assert_eq!(finished["best_model"], "m.checkpoints/step-000004");
+    assert_eq!(finished["validation_examples"], 9);
+
+    // When the final model is the one chosen, its held-out line is the answer, as it always was.
+    let (results, _) = reported(&outcome(true, None, Some(best)), "off");
+    assert_eq!(stages(&results), ["before", "after"]);
+    assert_eq!(results.last().unwrap()["best_is_final"], true);
+
+    // No model could be scored on both labels: nothing was chosen, and nothing claims otherwise.
+    let (results, _) = reported(&outcome(false, None, None), "off");
+    let finished = results.last().unwrap();
+    assert!(finished.get("best_step").is_none() && finished.get("best_is_final").is_none());
+    assert_eq!(finished["validation_examples"], 9);
   }
 
   #[test]
@@ -1392,6 +1889,105 @@ mod tests {
     assert_eq!(model.run.as_deref(), Some(resumed.manifest.id.as_str()));
     assert_eq!(trained.resumed[0].run.as_deref(), Some(original.manifest.id.as_str()));
     assert_eq!(similarity_runs::list(&runs).unwrap().0.len(), 2);
+  }
+
+  /// The whole path on the tiny model: pairs of three splits, every checkpoint scored, the best one named.
+  #[test]
+  fn a_run_with_validation_pairs_scores_every_checkpoint_and_names_the_best_model() {
+    let (dir, base, _) = workspace();
+    let pairs = dir.path().join("pairs.splits.jsonl");
+    let line = |split: &str, label: &str, before: &str, after: &str| {
+      format!(
+        r#"{{"label": "{label}", "split": "{split}", "owner": "brand-{split}", "before": {{"name": "{before}"}}, "after": {{"name": "{after}"}}}}"#
+      )
+    };
+    let text = [
+      line("calibrate", "edit", "blueberry gummies", "blueberry gummies mg"),
+      line("calibrate", "edit", "indica flower", "indica flower resin"),
+      line("calibrate", "recycle", "blueberry gummies", "vape cartridge"),
+      line("calibrate", "recycle", "sativa flower", "wyld edibles"),
+      line("validation", "edit", "sativa flower", "sativa flower resin"),
+      line("validation", "recycle", "indica flower", "wyld gummies"),
+      line("holdout", "edit", "vape cartridge", "vape cartridge mg"),
+      line("holdout", "recycle", "wyld edibles", "blueberry flower"),
+    ]
+    .join("\n");
+    std::fs::write(&pairs, text).unwrap();
+    let out = dir.path().join("out");
+    let path = |path: &Path| path.to_str().unwrap().to_owned();
+
+    let captured = capture("off", || {
+      train(&["--base", &path(&base), "--out", &path(&out), "--pairs", &path(&pairs)]);
+    });
+    let results: Vec<serde_json::Value> = captured
+      .results
+      .iter()
+      .map(|line| serde_json::from_str(line).unwrap())
+      .collect();
+    let of = |split: &str, stage: &str| -> Vec<&serde_json::Value> {
+      results
+        .iter()
+        .filter(|line| line["message"] == "separation" && line["split"] == split && line["stage"] == stage)
+        .collect()
+    };
+
+    // The base, each checkpoint, and the final model are all scored on the validation pairs.
+    assert_eq!(of("validation", "before").len(), 1);
+    assert_eq!(of("validation", "before")[0]["path"], path(&base));
+    let checkpoints = of("validation", "checkpoint");
+    assert!(!checkpoints.is_empty(), "{results:#?}");
+    assert!(
+      checkpoints
+        .iter()
+        .all(|line| line["auc"].is_number() && line["path"].is_string())
+    );
+    assert_eq!(of("validation", "after").len(), 1);
+    assert_eq!(
+      of("training", "before")[0]["edits"],
+      2,
+      "the validation and held-out pairs are not trained on"
+    );
+
+    let finished = results.last().unwrap();
+    assert_eq!(
+      (&finished["message"], &finished["validation_examples"]),
+      (&"finished".into(), &2.into())
+    );
+    assert_eq!(finished["select_width"], 24);
+    let best = finished["best_model"].as_str().unwrap();
+    assert!(Path::new(best).is_dir(), "the best model is on disk: {best}");
+    let is_final = finished["best_is_final"].as_bool().unwrap();
+    assert_eq!(is_final, best == path(&out));
+
+    // The holdout is reported once after training, for the model that was chosen.
+    let (after, selected) = (of("held_out", "after").len(), of("held_out", "selected").len());
+    assert_eq!((after, selected), if is_final { (1, 0) } else { (0, 1) });
+    assert_eq!(
+      of("held_out", "before").len(),
+      1,
+      "the base model's holdout is not a choice"
+    );
+
+    // Switched off, the run is as it was before validation existed.
+    let plain = dir.path().join("plain");
+    let captured = capture("off", || {
+      train(&[
+        "--base",
+        &path(&base),
+        "--out",
+        &path(&plain),
+        "--pairs",
+        &path(&pairs),
+        "--no-validation",
+      ]);
+    });
+    assert!(
+      !captured.results.iter().any(|line| line.contains("validation\"")),
+      "{:?}",
+      captured.results
+    );
+    assert!(captured.results.last().unwrap().contains("\"finished\""));
+    assert!(!captured.results.last().unwrap().contains("best_"));
   }
 
   fn provenance(dir: &Path) -> (Provenance, Trained) {

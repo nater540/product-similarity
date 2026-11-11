@@ -163,9 +163,10 @@ The binary is `record-similarity` (`target/release/record-similarity` after `jus
 | `record-similarity model fetch [--repo R] [--revision REV] [--dir DIR]` | Downloads and verifies a model directory. `--dir` defaults to `models/<repository name>`, so two models never share a directory. |
 | `record-similarity import [--config config.toml] EXPORT.jsonl [--check]` | Loads a whole catalog into the store. See [Importing a catalog](#importing-a-catalog). |
 | `record-similarity compare [--config config.toml] BEFORE.json AFTER.json` | Scores one before/after pair offline. |
-| `record-similarity calibrate [--config config.toml] PAIRS.jsonl [--full] [--split S] [--ndjson]` | Scores labeled pairs and suggests a threshold. See [Choosing thresholds](#choosing-thresholds). |
+| `record-similarity calibrate [--config config.toml] PAIRS.jsonl [--full] [--split S] [--model DIR] [--ndjson]` | Scores labeled pairs and suggests a threshold. See [Choosing thresholds](#choosing-thresholds). |
 | `record-similarity calibrate-diff OLD.ndjson (NEW.ndjson \| --config-b CONFIG) [--fail-on WHAT]` | Compares two calibrations, or one under a second configuration. See [Comparing two calibrations](#comparing-two-calibrations). |
 | `record-similarity runs list [--runs DIR] [--kind KIND] [--limit N]` | Lists what was recorded: every calibration and every training run. See [Recorded runs](#recorded-runs). |
+| `record-similarity pairs carve PAIRS.jsonl --fraction F [--from S] [--into S] [--salt TEXT]` | Gives a share of one split's owners a split of their own. See [Choose a model, then measure it once](#3-choose-a-model-then-measure-it-once). |
 
 Environment variables:
 
@@ -706,6 +707,7 @@ Vape Pens                     2         2                 0                 0
 
 configured policy (threshold 0.900 plus field floors and any quantity limits): 0 edit(s) wrongly rejected, 0 recycle(s) wrongly accepted, of 46 pairs
 best overall threshold for this data: 0.895 (margin 0.046; 0 edit(s) rejected, 0 recycle(s) accepted)
+an edit scores above a recycle in 100.0% of pairings (AUC 1.0000): the number to compare two models by, since it needs no threshold
 to accept at most 1.0% of recycles on the overall score alone: threshold 0.895, rejecting 0.0% of edits
 to accept at most 5.0% of recycles on the overall score alone: threshold 0.846, rejecting 0.0% of edits
 ```
@@ -788,6 +790,7 @@ brand-2                       4         4                 0                 0
 configured policy (threshold 0.900 plus field floors and any quantity limits): 0 edit(s) wrongly rejected, 0 recycle(s) wrongly accepted, of 45 pairs
 false-reject rate 0.0% (0.0% to 0.0%), false-accept rate 0.0% (0.0% to 0.0%) (95% intervals from resampling 7 owners)
 best overall threshold for this data: 0.895 (margin 0.046; 0 edit(s) rejected, 0 recycle(s) accepted)
+an edit scores above a recycle in 100.0% of pairings (AUC 1.0000): the number to compare two models by, since it needs no threshold
 to accept at most 1.0% of recycles on the overall score alone: threshold 0.895, rejecting 0.0% (0.0% to 0.0%) of edits
 to accept at most 5.0% of recycles on the overall score alone: threshold 0.846, rejecting 0.0% (0.0% to 0.0%) of edits
 
@@ -983,8 +986,9 @@ Two kinds of signal, either or both. The formats are the ones `docs/data-request
 
 - **Labeled pairs** (`--pairs`): the same before/after pairs used for calibration. Extra keys are ignored, so
   `pairs.full.jsonl` works directly. Pairs labeled anything other than `edit` or `recycle` are skipped. If pairs
-  carry a `split` key, `calibrate` is trained on (`--split` changes that) and `holdout` is only ever measured
-  (`--holdout-split`). Pairs with no `split` are all trained on.
+  carry a `split` key, `calibrate` is trained on (`--split` changes that), `holdout` is only ever measured
+  (`--holdout-split`), and `validation` is what checkpoints are compared on (`--validation-split`; see
+  [step 3](#3-choose-a-model-then-measure-it-once)). Pairs with no `split` are all trained on.
 - **Catalog groups** (`--catalog-groups`): listings from different merchants linked to the same catalog product.
   These are naturally occurring paraphrases and usually the larger, cleaner source.
 
@@ -1021,6 +1025,9 @@ just release-train metal        # or: just release-train cuda
 | `--fields` | `name,description` | Fields to learn from. |
 | `--split` | `calibrate` | Which `split` of the pairs to train on. |
 | `--holdout-split` | `holdout` | Which `split` to report on without training on it. |
+| `--validation-split` | `validation` | Which `split` to compare checkpoints on. Never trained on. Used when the file has such pairs. |
+| `--no-validation` | off | Do not compare checkpoints, even if the file has validation pairs. |
+| `--select-width` | the narrowest of `--dims` | The embedding width checkpoints are compared at. Use the server's `output_dim`. |
 | `--dims` | `1024,512,256` | Embedding widths to keep usable. Must include the server's `output_dim`. A width the model cannot produce is replaced by its native width, so a 384-wide model is trained at `384,256`. |
 | `--epochs` | `2` | Passes over the data. |
 | `--batch-size` | `32` | Larger batches give the catalog-group loss more negatives per step, and cost memory. |
@@ -1065,7 +1072,9 @@ you whether training moved things the right way; step 3 tells you whether the mo
 **Output.** Everything the trainer writes is one JSON object per line (NDJSON), in two streams:
 
 - **stdout: results.** One `separation` line per split (`training`, `held_out`), stage (`before`, `after`), and
-  width, then one `finished` line. This is the run's output, so no log level hides it:
+  width, then one `finished` line. With validation pairs there is also one for the model the run started from,
+  for every checkpoint, and for the final model, as each is scored. This is the run's output, so no log level
+  hides it:
   `just finetune ... > results.ndjson`.
 - **stderr: logs.** Progress, filtered by `RUST_LOG` (default `info`). A failure is always written here,
   whatever `RUST_LOG` says, as a `failed` line at level `ERROR` (or `panicked`, for a crash).
@@ -1081,8 +1090,8 @@ you whether training moved things the right way; step 3 tells you whether the mo
 | `model loaded` | stderr | Once. | The model, device, widths, and checkpoint directory; `resumed_at` when resuming. |
 | `training` | stderr | Every `--log-every` steps. | `step`, `of`, `epoch`, `pair_loss` and `group_loss` (means since the last line; left out if no batch of that kind fell in it), `grad_norm`, `rate`, `elapsed_s`. |
 | `checkpoint` | stderr | Each checkpoint. | `step`, `epoch`, `path`. |
-| `separation` | stdout | At the end. Only for a split that has pairs. | `split`, `stage`, `width`; `edits` and `recycles` (counts) with `_min`, `_mean`, `_max` for each; `gap_of_means`. A `before` line also says what it describes: `compared_with` is `base model`, or `checkpoint` on a resumed run. |
-| `finished` | stdout | At the end. | `out`, example counts, `steps`, `elapsed_s`, `resumed_at` if resumed. |
+| `separation` | stdout | At the end. Only for a split that has pairs. | `split` (`training`, `held_out`, `validation`), `stage` (`before`, `after`; `checkpoint` on validation lines; `selected` on the held-out line of a chosen model that is not the final one), `step`, `width`; `edits` and `recycles` (counts) with `_min`, `_mean`, `_max` for each; `gap_of_means`; `auc` (how often an edit scores above a recycle); `path` where the line is about a model on disk. A `before` line also says what it describes: `compared_with` is `base model`, or `checkpoint` on a resumed run. |
+| `finished` | stdout | At the end. | `out`, example counts, `steps`, `elapsed_s`, `resumed_at` if resumed. With validation pairs: `validation_examples`, `select_width`, and the chosen model as `best_step`, `best_model`, `best_auc`, `best_is_final`. |
 | `failed` | stderr | In place of the results. | `error`. |
 
 Losses, rates, and similarities are numbers, rounded, so they chart without parsing. For example, the loss curve:
@@ -1137,38 +1146,72 @@ A run has `examples / batch-size x epochs` steps, so 10,000 description examples
 around an hour and a half on that CPU, or a quarter of an hour on its GPU. Use a GPU, or a smaller `--batch-size`,
 when the CPU's memory use is a problem.
 
-### 3. Measure whether it helped
+### 3. Choose a model, then measure it once
 
-Evaluate on pairs the model did not train on, with the full policy: calibrate on the holdout split, with the base
-model and with the fine-tuned one, using two configs that differ only in `model.dir`.
-
-```sh
-just calibrate pairs.full.jsonl config.toml --full --split holdout             # base model
-just calibrate pairs.full.jsonl config-finetuned.toml --full --split holdout   # dir = "models/mdbr-leaf-mt-ft"
-```
-
-Keep the fine-tuned model only if the gap between the two overall ranges is clearly wider, or the number of
-misclassified pairs clearly lower, on the holdout. A model that improves only on the pairs it trained on has
-memorized them.
-
-**The holdout answers that one question, once.** Anything chosen by looking at it (a threshold, a learning rate,
-which of several runs to keep) has been fitted to it, and the error rates it reports afterwards are better than
-production will be. To choose things and still have a fair test, keep a third `split` value in the pairs file,
-say `validation`, made of whole `owner`s that appear in no other split. The trainer trains on `calibrate` and
-leaves every other split alone, and `--split` reads any value:
+Two different questions, and they need different pairs. *Which* model (which checkpoint, which learning rate,
+which threshold) is a choice, and whatever pairs make it have been fitted to. *How good is it* is a measurement,
+and only pairs that chose nothing can make it. An export has one split nobody trains on, the holdout, so it can
+answer only one of the two. Give the choosing a split of its own:
 
 ```sh
-just calibrate pairs.full.jsonl config-finetuned.toml --full --split validation   # choose with this
+record-similarity pairs carve pairs.full.jsonl --fraction 0.15 > pairs.carved.jsonl
 ```
+
+That moves a share of the `calibrate` owners to a new `validation` split. Whole owners move, never single pairs,
+and which ones is decided by a hash of the owner's name and `--salt`, so the same command always moves the same
+owners. Pick the share so that the new split has enough of both labels to tell models apart; the command logs
+how many edits and recycles it moved, and warns if either is none. Catalog groups whose `owner` is in the
+validation or holdout split are left out of training too, so that a brand held back for measuring is not learned
+from by another route.
+
+Train on the carved file and the trainer does the choosing. It scores the model it started from, every
+checkpoint, and the final model on the validation pairs, and names the best in its `finished` line
+(`best_model`, `best_step`). The score is the **AUC**: how often an edit scores above a recycle, which needs no
+threshold. That matters, because the configured thresholds belong to the base model and would judge every other
+model on the wrong scale. `--out` still holds the final model; if a checkpoint or the base did better, the line
+says which, and `--keep-checkpoints` never deletes the best one. On the bundled sample the base model already
+separates every validation pair, so three passes of training cannot beat it and the run says so:
+
+```text
+validation before     step   0  auc 1.0  models/mdbr-leaf-mt
+validation checkpoint step   5  auc 1.0  ft.checkpoints/step-000005
+validation checkpoint step  10  auc 1.0  ft.checkpoints/step-000010
+validation after      step  15  auc 1.0  ft
+held_out   selected   step   0  auc 1.0  models/mdbr-leaf-mt
+```
+
+(The `separation` lines of that run at width 256, reduced to five of their fields. A tie goes to the earlier
+model: the same result for less training.)
+
+For the full policy on a candidate, with field weights, floors, and quantities, calibrate it on the validation
+split. `--model` points at any model directory or checkpoint without a second config file:
+
+```sh
+just calibrate pairs.carved.jsonl config.toml --full --split validation --model models/ft.checkpoints/step-000120
+```
+
+Its report has the same AUC over the overall similarity, the suggested threshold with its margin, and the
+operating points. Set the new model's thresholds from this.
+
+Then the holdout, once, for the model that was chosen, against the base model:
+
+```sh
+just calibrate pairs.carved.jsonl config.toml --full --split holdout                               # base model
+just calibrate pairs.carved.jsonl config.toml --full --split holdout --model models/mdbr-leaf-mt-ft
+```
+
+Keep the fine-tuned model only if it is clearly better there. A model that improves only on the pairs it trained
+on has memorized them. The trainer follows the same rule: with validation pairs, the only held-out line it
+prints after training is for the model that was chosen.
 
 ### 4. Deploy it
 
 A fine-tuned model is a different model. Its fingerprint differs, so:
 
 1. Set `model.dir` to the new directory and `qdrant.collection` to a **new** collection name.
-2. Set the thresholds from a calibration of the new model on pairs it did not train on: the `validation` split
-   above if there is one. The old thresholds do not carry over. If the holdout is all there is, use it, and
-   expect production to be somewhat worse than the error rates it then reports.
+2. Set the thresholds from the calibration of the new model on the `validation` split (step 3). The old
+   thresholds do not carry over. If the holdout is all there is, use it, and expect production to be somewhat
+   worse than the error rates it then reports.
 3. Re-index: see [Re-indexing](#re-indexing).
 4. To ship it in the container image, `COPY` the directory into the image in place of the `model fetch` step in
    the `Dockerfile`, and remove `/models` from `.dockerignore` so the build can see it.
@@ -1520,7 +1563,7 @@ data/
   regression.snapshot.ndjson      what the pinned model and the example config make of them
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D23)
+  decisions.md               why things are the way they are (D1 to D24)
   data-request-prompt.md     a brief for collecting labeled production data
   feature-suggestions.md     twenty features that could be added, none built yet
   plan-features.md           a plan for the first five of them

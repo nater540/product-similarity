@@ -22,6 +22,7 @@ use crate::quantity::{self, Quantities, Quantity, QuantityChange, first_values};
 use crate::record::{RecordVectors, normalize_text, text_hash};
 use crate::schema::{FieldSpec, QuantitySpec, Schema};
 use crate::score::{self, FieldChange, Policy, Reason};
+use crate::separation::area_under_curve;
 use crate::testing::{WORDS, tiny_embedder, tiny_tokenizer};
 use crate::tokenize::TextTokenizer;
 use crate::vector::{cosine, norm, normalize};
@@ -542,5 +543,41 @@ proptest! {
     let tokenizer = TextTokenizer::new(tokenizer, max_tokens).unwrap();
     let text = stretches.concat();
     prop_assert_eq!(tokenizer.encode(&text).unwrap(), tokenizer.encode_whole(&text).unwrap());
+  }
+}
+
+/// A handful of scores on a coarse grid, so that ties are common.
+fn scores() -> impl Strategy<Value = Vec<f32>> {
+  proptest::collection::vec((-4_i8..=20).prop_map(|step| f32::from(step) / 20.0), 1..12)
+}
+
+proptest! {
+  #![proptest_config(cases())]
+
+  /// The area under the curve is the share of (edit, recycle) pairings the edit wins, a tie counting half:
+  /// counted here one pairing at a time, which is slow and obviously right.
+  #[test]
+  fn the_area_under_the_curve_is_the_share_of_pairings_an_edit_wins(edits in scores(), recycles in scores()) {
+    let mut wins = 0.0_f64;
+    for edit in &edits {
+      for recycle in &recycles {
+        wins += if edit > recycle { 1.0 } else if edit == recycle { 0.5 } else { 0.0 };
+      }
+    }
+    #[expect(clippy::cast_precision_loss, reason = "a few dozen pairings")]
+    let expected = wins / (edits.len() * recycles.len()) as f64;
+    let area = area_under_curve(&edits, &recycles).unwrap();
+    prop_assert!((area - expected).abs() < 1e-12, "{} against {}", area, expected);
+    prop_assert!((0.0..=1.0).contains(&area));
+
+    // Asked the other way round, it is the complement.
+    let reversed = area_under_curve(&recycles, &edits).unwrap();
+    prop_assert!((area + reversed - 1.0).abs() < 1e-12);
+
+    // It depends on the order of the scores and nothing else, which is why it needs no threshold: any rescaling
+    // that keeps the order keeps the area.
+    let rescale = |values: &[f32]| values.iter().map(|value| value * 3.0 - 0.25).collect::<Vec<f32>>();
+    let rescaled = area_under_curve(&rescale(&edits), &rescale(&recycles)).unwrap();
+    prop_assert!((area - rescaled).abs() < 1e-12);
   }
 }

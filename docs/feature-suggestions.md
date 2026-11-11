@@ -1,7 +1,7 @@
 # Feature suggestions
 
 Twenty features that could be added to this project, with what each is, why it matters here, how it would fit the
-code, and what it would cost. **Features 1, 2, 7, 8, 9, 13, 16, and 19 are built** (D17 to D23, and the README); the rest are not. They were proposed in November 2026 from a read of the
+code, and what it would cost. **Features 1, 2, 3, 7, 8, 9, 13, 16, and 19 are built** (D17 to D24, and the README); the rest are not. They were proposed in November 2026 from a read of the
 repository as it stood then (`README.md`, `docs/decisions.md`, and the crates); check a suggestion against the
 code before starting on it, since the code will have moved. It has moved once already: records now carry
 quantities, compared as numbers (D16), and the features that touch a verdict or a report say below what that
@@ -128,6 +128,11 @@ dependency, used by both binaries. `runs/` joins `.gitignore`.
 **Effort.** M: logging plumbing plus manifests for three commands. **Needs real data:** no.
 
 ### 3. Evaluation at every checkpoint
+
+**Built** (D24). What came out differently: results are not written into a checkpoint (D18) but emitted as
+events; checkpoints are compared by AUC and not at the configured thresholds, which belong to the base model;
+the validation split is carved by whole owners with `pairs carve`; and catalog groups of measured owners are
+left out of training. A resumed run does not re-score its predecessor's checkpoints.
 
 **What.** The trainer measures separation on an evaluation split at each checkpoint, not only at the start and
 end. It emits `separation` events with `stage: "checkpoint"` and the step, writes `separation.json` into the
