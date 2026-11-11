@@ -142,7 +142,7 @@ just client similar sku-1
 Then run the test suites that use the real model and the real Qdrant:
 
 ```sh
-just test-real            # parity with PyTorch, then the whole stack through gRPC
+just test-real            # parity with PyTorch, the pinned verdicts, then the whole stack through gRPC
 ```
 
 Without `just`, the same setup is:
@@ -646,8 +646,8 @@ The input is one JSON object per line, labeled `edit` (should be accepted) or `r
 Blank lines and lines starting with `#` are ignored. `before` and `after` are records in the shape the bundled
 client reads: a string is a text field, an object is a quantity. There are two formats:
 
-- **Strict**, the default, for pairs written by hand. Exactly four keys per line, and every name in a record must
-  be one the schema defines, so a typo is an error.
+- **Strict**, the default, for pairs written by hand. Four keys per line (and optionally `anchor`, below), and
+  every name in a record must be one the schema defines, so a typo is an error.
 
   ```json
   {"label": "recycle", "note": "an eighth becomes an ounce", "before": {"name": "...", "weight_per_item": {"value": 3.5, "unit": "g"}}, "after": {"name": "...", "weight_per_item": {"value": 28, "unit": "g"}}}
@@ -671,6 +671,7 @@ client reads: a string is a text field, an object is a quantity. There are two f
 The report starts with the model and the width it ran at, lists every pair with its score and verdict, flags the
 ones the current config gets wrong, and ends with a summary. On the bundled sample:
 
+<!-- measured: calibrate data/calibration.sample.jsonl -->
 ```text
 model     f46e48ee0ea2dd02-d256-t256 (256 dimensions per field, up to 256 tokens)
 ...
@@ -741,12 +742,29 @@ Reading it:
 synthetic pairs carry quantities, written by hand. That is why `config.example.toml` sets no quantity limit at
 all, and why none should be set until this section has been produced from labeled production edits.
 
+### A pair that is one step of a history
+
+A before/after pair cannot show the two-step swap that the anchor exists to stop: blank a field in one edit, fill
+it with another product's text in the next. Scored as a pair, the second step is only a field being filled in,
+which is left out of the score. So a pair, in either format, may carry a third record, `anchor`: the record as it
+was first created.
+
+```json
+{"label": "recycle", "note": "brand blanked earlier, now another brand", "anchor": {"name": "Blueberry Gummies", "brand": "Sunny Orchard"}, "before": {"name": "Blueberry Gummies"}, "after": {"name": "Blueberry Gummies", "brand": "Volt Labs"}}
+```
+
+It is then judged as the server judges a record imported with that original version and revised once: a field or
+quantity `before` lacks is compared with the anchor (`restored`), and the similarity to the anchor is reported
+and held to `anchor_threshold`. The report marks such a pair `(anchored)`. A pair without an `anchor` is scored
+exactly as before.
+
 ### A data export, with intervals
 
 `data/calibration.sample.full.jsonl` is the same sample in the full format, with invented owners, splits, and
 label sources, three `unsure` variant changes, and a `strain` key the schema does not define. Its report has more
 in it (shortened here):
 
+<!-- measured: calibrate data/calibration.sample.full.jsonl --full -->
 ```text
 $ just calibrate data/calibration.sample.full.jsonl config.example.toml --full
 ...
@@ -816,7 +834,7 @@ its `pair_id`. One recycle from the sample, with the envelope fields removed:
 | `message` | One per | Fields |
 |---|---|---|
 | `calibration` | run, first | `fingerprint`, `dimension`, `max_tokens`, `threshold`, `anchor_threshold`, `reject_on_measure_change`, `pairs_sha256`, `pairs`, `split`, `min_confidence`, `seed` |
-| `pair` | pair | `pair_id`, `label`, `split`, `owner`, `variant_change`, `label_source`, `label_confidence`, `category`, `note`, `similarity`, `accepted`, `wrong`, `measure_changed` |
+| `pair` | pair | `pair_id`, `label`, `split`, `owner`, `variant_change`, `label_source`, `label_confidence`, `category`, `note`, `similarity`, `accepted`, `wrong`, `measure_changed`, `anchored`, `anchor_similarity` |
 | `pair_field` | pair and field | `pair_id`, `field`, `change`, `similarity`, `weight`, `below_floor` |
 | `pair_quantity` | pair and quantity | `pair_id`, `quantity`, `change`, `factor`, `zero_crossing`, `incomparable`, `previous_unit`, `unit`, `beyond_limit` |
 | `pair_reason` | pair and reason for rejecting it | `pair_id`, `code`, `field`, `value`, `limit` |
@@ -890,6 +908,18 @@ second configuration prints the same three lines, which is the check that judgin
   line saying why) when the comparison shows that, for use in a script. `--ndjson` writes one `flip` line per
   changed verdict and a closing `diff` line in place of the report.
 - Pairs with any other label are listed when their verdict changes and never count as an error either way.
+- A verdict can stay the same while what is behind it moves. The report ends with every pair whose overall, anchor,
+  or field similarity moved by more than `--tolerance` (0.001 unless given), whose field or quantity changed in
+  kind (`added` to `restored`), whose factor changed, or which is now rejected for another reason.
+  `--fail-on moved` fails on any of those, and `--fail-on` may be given more than once. With `--ndjson` each is a
+  `moved` line (`pair_id`, `what`, `subject`, `old`, `new`, `old_change`, `new_change`) between the `flip` lines
+  and the `diff` line, which counts the pairs in `moved`.
+
+To hold a calibration of real pairs to an earlier one, keep the `--ndjson` output and gate on it:
+
+```sh
+just verdict-gate kept.ndjson pairs.full.jsonl config.toml    # fails on a flipped verdict or a score that moved
+```
 
 If the two overall ranges overlap on real data, there are three things to try, in order of cost: weights and
 floors, [a different model](#using-a-different-model), and [fine-tuning](#fine-tuning-the-model).
@@ -1395,12 +1425,30 @@ just fmt             # format
 just ci              # fmt-check, clippy, test, cargo-deny: what CI runs
 just test-qdrant     # the storage contract against a live Qdrant
 just test-parity     # Burn against PyTorch on the real model: the embeddings, then the training steps
-just test-real       # test-parity, then the full stack through gRPC against Qdrant
+just test-snapshot   # the curated hard cases against the pinned verdicts, and the README's quoted reports
+just test-real       # both of those, then the full stack through gRPC against Qdrant
+just snapshot        # rewrite the pinned verdicts after an intended change, printing what moved
 just throughput      # forward-pass latency on this machine
 ```
 
 Run `just test-real` after touching the encoder, the loader, the tokenizer settings, the trainer, or
 `config.example.toml`.
+
+**Pinned verdicts.** `data/regression.jsonl` holds two dozen synthetic pairs chosen to be hard: the same amount
+in another unit, a same-brand variant, a field blanked and refilled with another product's text, look-alike
+characters, an edit past the token limit. `data/regression.snapshot.ndjson` is what the pinned model and
+`config.example.toml` make of each, as a `calibrate --ndjson` run. Two tests hold it:
+
+- `just test` judges the snapshot again under the current `config.example.toml` and scoring code, with no model.
+  A changed weight, floor, threshold, limit, or judging rule that moves any case fails there, in a fraction of a
+  second.
+- `just test-snapshot` scores the cases afresh with the real model, which is what catches a change to the encoder,
+  the loader, or the tokenizer. It also checks that the calibration reports quoted under
+  [Choosing thresholds](#choosing-thresholds) are what `calibrate` prints. CI runs it.
+
+When a change is meant to move a case, `just snapshot` prints what moved and rewrites the file; that printout
+belongs in the commit message. The cases pin behavior, not correctness (several are `unsure` on purpose), and no
+threshold may be read from them: they were picked, not sampled.
 
 **Property tests.** `just test` includes tests that state a rule and let the machine look for an input that
 breaks it (the `properties` modules of `similarity-core` and `similarity-server`, on
@@ -1424,9 +1472,11 @@ crates/
 data/
   calibration.sample.jsonl        synthetic labeled pairs, in the strict format
   calibration.sample.full.jsonl   the same pairs in the full format a data export uses
+  regression.jsonl                curated hard cases, synthetic, whose verdicts are pinned
+  regression.snapshot.ndjson      what the pinned model and the example config make of them
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D21)
+  decisions.md               why things are the way they are (D1 to D22)
   data-request-prompt.md     a brief for collecting labeled production data
   feature-suggestions.md     twenty features that could be added, none built yet
   plan-features.md           a plan for the first five of them

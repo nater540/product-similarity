@@ -32,7 +32,7 @@ record has an anchor (plans 11 and 18). `calibrate-diff --config-b` is not affec
 | 4 | [Model registry and gate](04-model-registry.md) | medium | | A model has a digest, not a fingerprint; the server cannot read a local registry |
 | 5 | [Run report and compare](05-run-report.md) | medium | 2, 3 for curves | Comparing calibrations is already `calibrate-diff`; resumes need a chain |
 | 6 | [Sweeps](06-hyperparameter-sweeps.md) | large | 3 | Calibration code is not in core; epochs cannot be swept by picking checkpoints |
-| 9 | [Verdict snapshot](09-verdict-snapshot.md) | medium | | Refill cases need an anchor on a pair; output has timestamps, so not byte-stable |
+| 9 | [Verdict snapshot](09-verdict-snapshot.md) | medium, **built** | | Refill cases need an anchor on a pair; output has timestamps, so not byte-stable |
 | 10 | [Score telemetry](10-score-telemetry.md) | medium | shares a step with 19 | Per-field values need flat lines joined on a request id; nothing is timed today |
 | 11 | [Drift calibration](11-drift-calibration.md) | medium | `sequences.jsonl` | Replaying in `ENFORCE` makes up everything after the first rejection |
 | 12 | [Latency and load test](12-latency-load-test.md) | medium | | Batch sizes are invisible to a client; the worker needs counters |
@@ -55,7 +55,8 @@ record has an anchor (plans 11 and 18). `calibrate-diff --config-b` is not affec
   17's exported feedback replay a restored field the way the server judged it, which 17 lists as a limit.
 - **Two things called drift.** 10 names its command `drift` (production scores moving away from calibration); 11
   names its command `calibrate-drift` (a record moving away from its anchor). Rename 10's before building either.
-- **Every plan but 19 calls its decision record D22.** Number them when they are written.
+- **Every plan but 19 calls its decision record D22.** Feature 9 took that number; the rest are numbered as they
+  are written.
 - **CI.** `.github/workflows/ci.yml` exists and the repository has no remote. 9 and 14 plan CI jobs; 15 defers its
   job until there is somewhere to run it. All three are right about half of that.
 
@@ -73,7 +74,7 @@ Each plan ends with its full list of decisions and a recommended default for eac
 
 1. Fix the D21 cut, and correct the README's holdout advice. Both done.
 2. Run `calibrate --full` on the real pairs (nothing to build).
-3. **19** (built), then **9**. Both small to medium, and 9 turns "run `just test-real`" from a rule into a check.
+3. **19** and **9**: both built. Both small to medium, and 9 turns "run `just test-real`" from a rule into a check.
 4. **15** and **14**, at any point. 14's first targets confirm the two predicted findings above.
 5. **11**, once `sequences.jsonl` exists.
 6. Before real fine-tuning: **2**, then **3**, then **4** and **5**. **6** last; it is large and builds on 3.

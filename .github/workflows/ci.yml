@@ -54,8 +54,32 @@ jobs:
       - run: cargo test --workspace --all-targets
       - run: cargo test --workspace --doc
 
-  # The storage contract against a real Qdrant. The model-dependent tests stay local (`just test-real`): they need a
-  # 90 MB download, and the parity fixture they check against is already pinned in the repository.
+  # The real model: parity with PyTorch, then the curated hard cases against the committed verdict snapshot and the
+  # README's quoted calibration reports against what `calibrate` prints (D22). The model is cached under the hash
+  # of fetch.rs, which pins its revision and checksums; `model fetch` verifies a restored cache and downloads only
+  # what is missing. It runs in the dev profile on purpose: the release profile's LTO would add a long second
+  # compile for a command that downloads and hashes.
+  real-model:
+    name: real model (parity and verdict snapshot)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: actions/cache@v4
+        with:
+          path: models/mdbr-leaf-mt
+          key: model-${{ hashFiles('crates/similarity-server/src/fetch.rs') }}
+      - run: cargo run -p similarity-server -- model fetch
+      - run: cargo test -p similarity-core --test real_parity -- --ignored
+      - run: cargo test -p similarity-train --test real_parity -- --ignored
+      - run: cargo test -p similarity-server --test real_snapshot -- --ignored
+
+  # The storage contract against a real Qdrant. The full stack against Qdrant with the real model
+  # (`tests/real_e2e.rs`) stays local, in `just test-real`.
   qdrant:
     name: qdrant contract
     runs-on: ubuntu-latest

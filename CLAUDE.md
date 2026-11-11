@@ -6,7 +6,7 @@ marketplace listings. Each revision is embedded field by field with a small BERT
 thresholds. A record's quantities (weight, volume, potency) are compared as numbers beside that, never embedded.
 Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D21) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D22) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -44,6 +44,12 @@ changing a design. Infer conventions from the existing code first.
   proptest, D19), beside the example tests and not in place of them. After changing the engine's write path, the
   anchor, or the scoring, run `PROPTEST_CASES=5000 just test` once. When a property fails, fix the code or the
   rule, keep the shrunk case as an ordinary named test, and commit the `proptest-regressions/` file it wrote.
+- **Verdicts on curated hard cases are pinned** (D22). `data/regression.jsonl` is synthetic and stays that way;
+  `data/regression.snapshot.ndjson` is what the pinned model and `config.example.toml` make of it. A change to the
+  config or the scoring code that moves any case fails `cargo test` (the snapshot is judged again, with no model);
+  a change to the encoder or tokenizer that moves one fails `just test-snapshot`. If the move is intended, run
+  `just snapshot` (it needs the model) and put what it prints in the commit message. Never read a threshold from
+  these cases, and never edit the snapshot by hand.
 - After touching the encoder, the loader, the tokenizer settings, the trainer, or `config.example.toml`, run
   `just test-real`. It is the only thing that proves numerical parity with PyTorch (embeddings and training steps)
   and that the shipped thresholds still behave.
@@ -132,10 +138,11 @@ changing a design. Infer conventions from the existing code first.
 - Test (fast): `just test`, or one crate: `just test similarity-core`
 - Lint: `just clippy`; format: `just fmt`; everything CI runs: `just ci`
 - Model: `just fetch-model`; Qdrant: `just qdrant-up` / `just qdrant-down`
-- Slow tests: `just test-parity`, `just test-qdrant`, `just test-real`
+- Slow tests: `just test-parity`, `just test-snapshot`, `just test-qdrant`, `just test-real`; `just snapshot` rewrites
+  the pinned verdicts
 - Run: `just serve` (needs Qdrant) or `just serve-in-memory`; then `just client describe`
 - Load a catalog: `just import export.jsonl config.toml` (`--check` validates only)
-- Measure: `just throughput`, `just calibrate`, `just calibrate-diff`
+- Measure: `just throughput`, `just calibrate`, `just calibrate-diff`, `just verdict-gate old.ndjson pairs.full.jsonl`
 - Fine-tune: `just finetune --base ... --out ... --pairs ...` (CPU); GPU: `just release-train metal`, then
   `./target/release/record-similarity-train --device metal ...`. Continue an interrupted run with `--resume
   <out>.checkpoints/step-NNNNNN` in place of `--base`. Results are NDJSON on stdout, logs NDJSON on stderr.

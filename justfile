@@ -37,14 +37,29 @@ image tag="record-similarity:dev":
 test crate="":
     {{ if crate == "" { "cargo test --workspace" } else { "cargo test -p " + crate } }}
 
-# Tests that need the downloaded model: parity with PyTorch, and the full stack against Qdrant
-test-real: test-parity
+# Tests that need the downloaded model: parity with PyTorch, the pinned verdicts, and the full stack against Qdrant
+test-real: test-parity test-snapshot
     QDRANT_URL={{ qdrant_url }} cargo test -p similarity-server --test real_e2e -- --ignored
 
 # The Burn port against PyTorch on the real model: the embeddings, then the training steps (needs `just fetch-model`)
 test-parity:
     cargo test -p similarity-core --test real_parity -- --ignored
     cargo test -p similarity-train --test real_parity -- --ignored
+
+# The curated hard cases against the committed verdict snapshot, and the README's quoted calibration reports
+# against what `calibrate` prints (needs `just fetch-model`)
+test-snapshot:
+    cargo test -p similarity-server --test real_snapshot -- --ignored
+
+# Rewrite the verdict snapshot after an intended change, printing what moved (needs `just fetch-model`)
+snapshot:
+    UPDATE_SNAPSHOT=1 cargo test -p similarity-server --test real_snapshot the_pinned_model -- --ignored --nocapture
+
+# Gate a calibration of labeled pairs against an earlier `--ndjson` run of the same pairs: fails on a flipped
+# verdict or a score that moved. For real pairs, where the data is: `just verdict-gate kept.ndjson pairs.full.jsonl`
+verdict-gate old pairs config="config.toml" *flags:
+    RUST_LOG=warn cargo run --release -q -p similarity-server -- calibrate --config {{ config }} {{ pairs }} --full --ndjson {{ flags }} > target/verdict-gate.ndjson
+    cargo run --release -q -p similarity-server -- calibrate-diff {{ old }} target/verdict-gate.ndjson --fail-on any-flip --fail-on moved
 
 # The storage contract against a live Qdrant (needs `just qdrant-up`)
 test-qdrant:

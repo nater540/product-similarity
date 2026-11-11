@@ -722,3 +722,56 @@ cheap.
 
 The logic is in the tokenizer wrapper that serving and training share, so a model is still fine-tuned on exactly
 the token sequences it is served with.
+
+## D22. Verdicts on hard cases are pinned, and checked without the model where they can be
+
+"Run `just test-real` after touching the encoder" was a rule, and a rule is only as good as the memory of whoever
+is making the change. The cases a change is most likely to break are also the ones nobody thinks to try by hand:
+a weight rewritten in ounces, a field blanked in one edit and refilled in the next, a Cyrillic letter in a name.
+
+`data/regression.jsonl` holds 25 such pairs, synthetic, in the full pair format.
+`data/regression.snapshot.ndjson` is what the pinned model and `config.example.toml` make of each one.
+
+**The snapshot is a calibration run, not a new format.** It is the output of `calibrate --ndjson` (D17) with the
+`timestamp` taken off each line, so `events::read` reads it and `calibrate-diff` compares it. The timestamps go
+because they would make every regeneration a whole-file change, and the point of committing the file is that its
+diff shows what moved.
+
+**Two checks, because two kinds of change move a verdict.** A weight, a floor, a threshold, a quantity limit, or
+the judging code changes what is made of the similarities, not the similarities. `tests/regression_snapshot.rs`
+therefore judges the committed snapshot again under the current `config.example.toml` and scoring code
+(`diff::rejudge`) and requires that nothing comes out different. It needs no model and runs in `cargo test` on
+every machine. Only a change to the similarities themselves (the model files, the encoder, the loader, the
+tokenizer, pooling, truncation) needs the model: `tests/real_snapshot.rs` scores the cases afresh, and CI runs it
+with the model cached under the hash of `fetch.rs`.
+
+**The check is by tolerance, never by bytes.** `calibrate-diff` learned to report what moved without a verdict
+flipping: a similarity by more than a tolerance, a kind of change, a factor, a reason. The tolerance is 0.001.
+The parity tests hold an embedding to a cosine of 0.99999 with PyTorch's, so the same model on another machine
+should agree to about five decimals, and 0.001 is well clear of that and well short of a real change. That
+reasoning has not yet met a Linux runner: the snapshot was made on macOS, and the repository has no remote for CI
+to run on. The first CI run is where the figure is confirmed or raised.
+
+**A case on a border is refused.** `just snapshot` will not write while any case sits within the tolerance of the
+threshold, floor, or limit it is judged against (`diff::borderline`). Such a case would flip on the noise between
+two machines, and a gate that fails for no reason gets switched off. The case is changed instead.
+
+**A pair may carry an anchor.** The blank-and-refill swap is two revisions and an anchor (D8), and a before/after
+pair scored its second step as a field being added, which is left out of the score: the opposite of what the
+server does. A pair may now say what the record was first created as. It is built as an import with an original
+version is built (D20), and a property scores generated anchored pairs through the offline scorer and through an
+engine import followed by an evaluate, on the same weights, and requires the same measurements, reasons, and
+verdict.
+
+**It pins behavior, not correctness, and it is not a calibration.** Four cases are same-brand variant changes
+labeled `unsure`: three are accepted and one rejected, and the snapshot holds that without claiming it is right.
+One case, a weight that was dropped and comes back eight times as large, is a recycle the shipped configuration
+accepts, because it sets no quantity limit (D16). The cases were picked to be hard, not sampled, so no threshold
+or limit may be read from them (D3).
+
+**The README's quoted reports are checked too.** Each calibration report quoted under "Choosing thresholds" is
+preceded by a `<!-- measured: calibrate ... -->` comment, and a test in the same file runs that calibration and
+requires every quoted line to be one it prints.
+
+Regenerating is local (`just snapshot`) and CI only checks: a job that rewrote a pinned file would be an
+unreviewed change to it.

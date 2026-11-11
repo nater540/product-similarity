@@ -95,7 +95,7 @@ Not planned in detail. What the review would add to each when its turn comes:
 | 4 | Model registry and promotion gate | Now mostly assembly: `provenance.json` identifies a model, `calibrate --ndjson` records a calibration with its fingerprint, and `calibrate-diff --fail-on` is the gate. |
 | 5 | Run report and compare | Depends on 2. The calibration half can be drawn from the events that exist now. |
 | 6 | Hyperparameter sweeps | The scoring it needs is in `similarity-core` already (step 0). Needs real data. |
-| 9 | Pinned verdict snapshot in CI | A committed `calibrate --ndjson` run of curated hard cases, and `calibrate-diff --fail-on any-flip` against a fresh one, is most of it. The hard cases should include a unit rewrite, a size change, `%` to `mg`, and a quantity removed and refilled. |
+| 9 | Pinned verdict snapshot in CI | **Built** (D22): curated cases, a snapshot checked with and without the model, `calibrate-diff --fail-on moved`, pairs with an `anchor`. |
 | 10 | Production score telemetry | `measure_changed` is already on the `evaluate` log line. Round the similarities there. Add per-quantity factors and reason codes (`Reason::code`). |
 | 11 | Drift-threshold calibration | Replays `sequences.jsonl` through the engine; `Engine::import` with `anchor` is the way to seed each history. Also report, per history, the largest factor each quantity reaches against its first value. |
 | 12 | Latency tracking and a load test | Would replace the last unmeasured throughput figure. |
@@ -114,8 +114,7 @@ With real labeled pairs about to exist, in this order:
    pairs, and the quantity lines, and set thresholds and limits from that. Keep the `--ndjson` output of every
    run: it is what the next one is compared against.
 2. **Feature 19** (reason codes on the wire). Built.
-3. **Feature 9** (a pinned snapshot in CI). Also small now, and it turns "run `just test-real` after touching
-   the encoder" from a rule into a check.
+3. **Feature 9** (a pinned snapshot in CI). Built.
 4. **Feature 11** (drift calibration from histories), once `sequences.jsonl` exists. It answers the two open
    questions about drift: where `anchor_threshold` belongs, and whether quantities need a drift check.
 5. **Feature 2** (the run registry), before the first real fine-tuning runs, so that their results are kept.

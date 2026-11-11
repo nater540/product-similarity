@@ -1,7 +1,7 @@
 # Feature suggestions
 
 Twenty features that could be added to this project, with what each is, why it matters here, how it would fit the
-code, and what it would cost. **Features 1, 7, 8, 13, 16, and 19 are built** (D17 to D20, and the README); the rest are not. They were proposed in November 2026 from a read of the
+code, and what it would cost. **Features 1, 7, 8, 9, 13, 16, and 19 are built** (D17 to D22, and the README); the rest are not. They were proposed in November 2026 from a read of the
 repository as it stood then (`README.md`, `docs/decisions.md`, and the crates); check a suggestion against the
 code before starting on it, since the code will have moved. It has moved once already: records now carry
 quantities, compared as numbers (D16), and the features that touch a verdict or a report say below what that
@@ -261,6 +261,11 @@ hash exists already). It should refuse to diff runs over different pair sets unl
 **Effort.** M. **Needs real data:** no to build; the value arrives with the real holdout.
 
 ### 9. Pinned verdict snapshot gated in CI
+
+**Built** (D22). What came out differently: the snapshot is a `calibrate --ndjson` run and not a format of its
+own; it is checked by tolerance (0.001), not at three decimals; most of the check needs no model, because the
+snapshot is judged again under the current config in `cargo test`; and pairs may carry an `anchor`, without which
+the blank-and-refill swap could not be a case.
 
 **What.** A committed `data/regression.jsonl` of curated synthetic hard cases:
 

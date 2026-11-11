@@ -1,0 +1,214 @@
+{"anchor_threshold":0.85,"dimension":256,"fingerprint":"f46e48ee0ea2dd02-d256-t256","level":"INFO","max_tokens":256,"message":"calibration","pairs":25,"pairs_sha256":"ddab876bb31ffa09def034ae040cc1ed815b764cefff3c8b0dd519afcc320202","reject_on_measure_change":false,"seed":0,"target":"result","threshold":0.9}
+{"field":"brand","level":"INFO","message":"schema_field","required":false,"target":"result","weight":1.0}
+{"field":"category","level":"INFO","message":"schema_field","required":false,"target":"result","weight":3.0}
+{"field":"description","level":"INFO","message":"schema_field","required":false,"target":"result","weight":2.0}
+{"field":"name","level":"INFO","message":"schema_field","reject_below":0.8,"required":true,"target":"result","weight":4.0}
+{"level":"INFO","message":"schema_quantity","quantity":"cbd_per_item","reject_incomparable":false,"target":"result"}
+{"level":"INFO","message":"schema_quantity","quantity":"thc_per_item","reject_incomparable":false,"target":"result"}
+{"level":"INFO","message":"schema_quantity","quantity":"volume_per_item","reject_incomparable":false,"target":"result"}
+{"level":"INFO","message":"schema_quantity","quantity":"weight_per_item","reject_incomparable":false,"target":"result"}
+{"accepted":true,"anchored":false,"category":"Edibles","label":"unsure","level":"INFO","measure_changed":false,"message":"pair","note":"gummies in another flavor, same brand and size","pair_id":"r-variant-flavor","similarity":0.945543,"target":"result","variant_change":"flavor","wrong":false}
+{"below_floor":false,"change":"unchanged","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-variant-flavor","similarity":1.0,"target":"result","weight":1.0}
+{"below_floor":false,"change":"unchanged","field":"category","level":"INFO","message":"pair_field","pair_id":"r-variant-flavor","similarity":1.0,"target":"result","weight":3.0}
+{"below_floor":false,"change":"unchanged","field":"description","level":"INFO","message":"pair_field","pair_id":"r-variant-flavor","similarity":1.0,"target":"result","weight":2.0}
+{"below_floor":false,"change":"modified","field":"name","level":"INFO","message":"pair_field","pair_id":"r-variant-flavor","similarity":0.863858,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-variant-flavor","previous_unit":"mg","quantity":"thc_per_item","target":"result","unit":"mg","zero_crossing":false}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-variant-flavor","previous_unit":"g","quantity":"weight_per_item","target":"result","unit":"g","zero_crossing":false}
+{"accepted":false,"anchored":false,"category":"Flower","label":"unsure","level":"INFO","measure_changed":false,"message":"pair","note":"flower of another strain, same brand and size","pair_id":"r-variant-strain","similarity":0.880143,"target":"result","variant_change":"strain","wrong":false}
+{"below_floor":false,"change":"unchanged","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-variant-strain","similarity":1.0,"target":"result","weight":1.0}
+{"below_floor":false,"change":"unchanged","field":"category","level":"INFO","message":"pair_field","pair_id":"r-variant-strain","similarity":1.0,"target":"result","weight":3.0}
+{"below_floor":false,"change":"modified","field":"description","level":"INFO","message":"pair_field","pair_id":"r-variant-strain","similarity":0.779057,"target":"result","weight":2.0}
+{"below_floor":false,"change":"modified","field":"name","level":"INFO","message":"pair_field","pair_id":"r-variant-strain","similarity":0.810829,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"modified","factor":1.1111111111111112,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-variant-strain","previous_unit":"%","quantity":"thc_per_item","target":"result","unit":"%","zero_crossing":false}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-variant-strain","previous_unit":"g","quantity":"weight_per_item","target":"result","unit":"g","zero_crossing":false}
+{"code":"below_threshold","level":"INFO","limit":0.9,"message":"pair_reason","pair_id":"r-variant-strain","target":"result","value":0.880143}
+{"accepted":true,"anchored":false,"category":"Flower","label":"unsure","level":"INFO","measure_changed":false,"message":"pair","note":"an eighth becomes a quarter","pair_id":"r-variant-size","similarity":0.973499,"target":"result","variant_change":"size","wrong":false}
+{"below_floor":false,"change":"unchanged","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-variant-size","similarity":1.0,"target":"result","weight":1.0}
+{"below_floor":false,"change":"unchanged","field":"category","level":"INFO","message":"pair_field","pair_id":"r-variant-size","similarity":1.0,"target":"result","weight":3.0}
+{"below_floor":false,"change":"unchanged","field":"description","level":"INFO","message":"pair_field","pair_id":"r-variant-size","similarity":1.0,"target":"result","weight":2.0}
+{"below_floor":false,"change":"modified","field":"name","level":"INFO","message":"pair_field","pair_id":"r-variant-size","similarity":0.933748,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-variant-size","previous_unit":"%","quantity":"thc_per_item","target":"result","unit":"%","zero_crossing":false}
+{"beyond_limit":false,"change":"modified","factor":2.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-variant-size","previous_unit":"g","quantity":"weight_per_item","target":"result","unit":"g","zero_crossing":false}
+{"accepted":true,"anchored":false,"category":"Edibles","label":"unsure","level":"INFO","measure_changed":false,"message":"pair","note":"gummies doubled in potency","pair_id":"r-variant-potency","similarity":0.97168,"target":"result","variant_change":"potency","wrong":false}
+{"below_floor":false,"change":"unchanged","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-variant-potency","similarity":1.0,"target":"result","weight":1.0}
+{"below_floor":false,"change":"unchanged","field":"category","level":"INFO","message":"pair_field","pair_id":"r-variant-potency","similarity":1.0,"target":"result","weight":3.0}
+{"below_floor":false,"change":"modified","field":"description","level":"INFO","message":"pair_field","pair_id":"r-variant-potency","similarity":0.979075,"target":"result","weight":2.0}
+{"below_floor":false,"change":"modified","field":"name","level":"INFO","message":"pair_field","pair_id":"r-variant-potency","similarity":0.939663,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"modified","factor":2.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-variant-potency","previous_unit":"mg","quantity":"thc_per_item","target":"result","unit":"mg","zero_crossing":false}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-variant-potency","previous_unit":"g","quantity":"weight_per_item","target":"result","unit":"g","zero_crossing":false}
+{"accepted":true,"anchored":false,"category":"Flower","label":"edit","level":"INFO","measure_changed":false,"message":"pair","note":"an eighth written in ounces","pair_id":"r-unit-oz","similarity":1.0,"target":"result","wrong":false}
+{"below_floor":false,"change":"unchanged","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-unit-oz","similarity":1.0,"target":"result","weight":1.0}
+{"below_floor":false,"change":"unchanged","field":"category","level":"INFO","message":"pair_field","pair_id":"r-unit-oz","similarity":1.0,"target":"result","weight":3.0}
+{"below_floor":false,"change":"unchanged","field":"description","level":"INFO","message":"pair_field","pair_id":"r-unit-oz","similarity":1.0,"target":"result","weight":2.0}
+{"below_floor":false,"change":"unchanged","field":"name","level":"INFO","message":"pair_field","pair_id":"r-unit-oz","similarity":1.0,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-unit-oz","previous_unit":"%","quantity":"thc_per_item","target":"result","unit":"%","zero_crossing":false}
+{"beyond_limit":false,"change":"modified","factor":1.0124829687499999,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-unit-oz","previous_unit":"g","quantity":"weight_per_item","target":"result","unit":"oz","zero_crossing":false}
+{"accepted":true,"anchored":false,"category":"Tinctures","label":"edit","level":"INFO","measure_changed":false,"message":"pair","note":"1000 mg written as 1 g","pair_id":"r-unit-mg-g","similarity":1.0,"target":"result","wrong":false}
+{"below_floor":false,"change":"unchanged","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-unit-mg-g","similarity":1.0,"target":"result","weight":1.0}
+{"below_floor":false,"change":"unchanged","field":"category","level":"INFO","message":"pair_field","pair_id":"r-unit-mg-g","similarity":1.0,"target":"result","weight":3.0}
+{"below_floor":false,"change":"unchanged","field":"description","level":"INFO","message":"pair_field","pair_id":"r-unit-mg-g","similarity":1.0,"target":"result","weight":2.0}
+{"below_floor":false,"change":"unchanged","field":"name","level":"INFO","message":"pair_field","pair_id":"r-unit-mg-g","similarity":1.0,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-unit-mg-g","previous_unit":"mg","quantity":"cbd_per_item","target":"result","unit":"g","zero_crossing":false}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-unit-mg-g","previous_unit":"ml","quantity":"volume_per_item","target":"result","unit":"ml","zero_crossing":false}
+{"accepted":true,"anchored":false,"category":"Tinctures","label":"edit","level":"INFO","measure_changed":false,"message":"pair","note":"one fluid ounce written in milliliters","pair_id":"r-unit-floz","similarity":1.0,"target":"result","wrong":false}
+{"below_floor":false,"change":"unchanged","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-unit-floz","similarity":1.0,"target":"result","weight":1.0}
+{"below_floor":false,"change":"unchanged","field":"category","level":"INFO","message":"pair_field","pair_id":"r-unit-floz","similarity":1.0,"target":"result","weight":3.0}
+{"below_floor":false,"change":"unchanged","field":"description","level":"INFO","message":"pair_field","pair_id":"r-unit-floz","similarity":1.0,"target":"result","weight":2.0}
+{"below_floor":false,"change":"unchanged","field":"name","level":"INFO","message":"pair_field","pair_id":"r-unit-floz","similarity":1.0,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"modified","factor":1.01442068105529,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-unit-floz","previous_unit":"fl oz","quantity":"volume_per_item","target":"result","unit":"ml","zero_crossing":false}
+{"accepted":true,"anchored":false,"category":"Flower","label":"edit","level":"INFO","measure_changed":true,"message":"pair","note":"potency moved from a percentage to milligrams","pair_id":"r-unit-percent-mg","similarity":1.0,"target":"result","wrong":false}
+{"below_floor":false,"change":"unchanged","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-unit-percent-mg","similarity":1.0,"target":"result","weight":1.0}
+{"below_floor":false,"change":"unchanged","field":"category","level":"INFO","message":"pair_field","pair_id":"r-unit-percent-mg","similarity":1.0,"target":"result","weight":3.0}
+{"below_floor":false,"change":"unchanged","field":"description","level":"INFO","message":"pair_field","pair_id":"r-unit-percent-mg","similarity":1.0,"target":"result","weight":2.0}
+{"below_floor":false,"change":"unchanged","field":"name","level":"INFO","message":"pair_field","pair_id":"r-unit-percent-mg","similarity":1.0,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"incomparable","incomparable":true,"level":"INFO","message":"pair_quantity","pair_id":"r-unit-percent-mg","previous_unit":"%","quantity":"thc_per_item","target":"result","unit":"mg","zero_crossing":false}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-unit-percent-mg","previous_unit":"g","quantity":"weight_per_item","target":"result","unit":"g","zero_crossing":false}
+{"accepted":true,"anchored":false,"category":"Flower","label":"edit","level":"INFO","measure_changed":false,"message":"pair","note":"the weight was dropped, the text is the same","pair_id":"r-quantity-removed","similarity":1.0,"target":"result","wrong":false}
+{"below_floor":false,"change":"unchanged","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-quantity-removed","similarity":1.0,"target":"result","weight":1.0}
+{"below_floor":false,"change":"unchanged","field":"category","level":"INFO","message":"pair_field","pair_id":"r-quantity-removed","similarity":1.0,"target":"result","weight":3.0}
+{"below_floor":false,"change":"unchanged","field":"description","level":"INFO","message":"pair_field","pair_id":"r-quantity-removed","similarity":1.0,"target":"result","weight":2.0}
+{"below_floor":false,"change":"unchanged","field":"name","level":"INFO","message":"pair_field","pair_id":"r-quantity-removed","similarity":1.0,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-quantity-removed","previous_unit":"%","quantity":"thc_per_item","target":"result","unit":"%","zero_crossing":false}
+{"beyond_limit":false,"change":"removed","incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-quantity-removed","previous_unit":"g","quantity":"weight_per_item","target":"result","zero_crossing":false}
+{"accepted":true,"anchor_similarity":1.0,"anchored":true,"category":"Flower","label":"recycle","level":"INFO","measure_changed":false,"message":"pair","note":"the weight was dropped earlier and comes back eight times as large","pair_id":"r-quantity-refilled","similarity":1.0,"target":"result","wrong":true}
+{"below_floor":false,"change":"unchanged","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-quantity-refilled","similarity":1.0,"target":"result","weight":1.0}
+{"below_floor":false,"change":"unchanged","field":"category","level":"INFO","message":"pair_field","pair_id":"r-quantity-refilled","similarity":1.0,"target":"result","weight":3.0}
+{"below_floor":false,"change":"unchanged","field":"description","level":"INFO","message":"pair_field","pair_id":"r-quantity-refilled","similarity":1.0,"target":"result","weight":2.0}
+{"below_floor":false,"change":"unchanged","field":"name","level":"INFO","message":"pair_field","pair_id":"r-quantity-refilled","similarity":1.0,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-quantity-refilled","previous_unit":"%","quantity":"thc_per_item","target":"result","unit":"%","zero_crossing":false}
+{"beyond_limit":false,"change":"restored","factor":8.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-quantity-refilled","previous_unit":"g","quantity":"weight_per_item","target":"result","unit":"g","zero_crossing":false}
+{"accepted":true,"anchored":false,"category":"Edibles","label":"edit","level":"INFO","measure_changed":false,"message":"pair","note":"brand and description blanked, the first step of a swap","pair_id":"r-swap-blanking","similarity":1.0,"target":"result","wrong":false}
+{"below_floor":false,"change":"removed","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-swap-blanking","target":"result","weight":1.0}
+{"below_floor":false,"change":"unchanged","field":"category","level":"INFO","message":"pair_field","pair_id":"r-swap-blanking","similarity":1.0,"target":"result","weight":3.0}
+{"below_floor":false,"change":"removed","field":"description","level":"INFO","message":"pair_field","pair_id":"r-swap-blanking","target":"result","weight":2.0}
+{"below_floor":false,"change":"unchanged","field":"name","level":"INFO","message":"pair_field","pair_id":"r-swap-blanking","similarity":1.0,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-swap-blanking","previous_unit":"mg","quantity":"thc_per_item","target":"result","unit":"mg","zero_crossing":false}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-swap-blanking","previous_unit":"g","quantity":"weight_per_item","target":"result","unit":"g","zero_crossing":false}
+{"accepted":false,"anchor_similarity":0.85555,"anchored":true,"category":"Edibles","label":"recycle","level":"INFO","measure_changed":false,"message":"pair","note":"brand and description were blanked earlier and come back as a vape cartridge's","pair_id":"r-swap-refill","similarity":0.85555,"target":"result","wrong":false}
+{"below_floor":false,"change":"restored","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-swap-refill","similarity":0.452791,"target":"result","weight":1.0}
+{"below_floor":false,"change":"unchanged","field":"category","level":"INFO","message":"pair_field","pair_id":"r-swap-refill","similarity":1.0,"target":"result","weight":3.0}
+{"below_floor":false,"change":"restored","field":"description","level":"INFO","message":"pair_field","pair_id":"r-swap-refill","similarity":0.551356,"target":"result","weight":2.0}
+{"below_floor":false,"change":"unchanged","field":"name","level":"INFO","message":"pair_field","pair_id":"r-swap-refill","similarity":1.0,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-swap-refill","previous_unit":"mg","quantity":"thc_per_item","target":"result","unit":"mg","zero_crossing":false}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-swap-refill","previous_unit":"g","quantity":"weight_per_item","target":"result","unit":"g","zero_crossing":false}
+{"code":"below_threshold","level":"INFO","limit":0.9,"message":"pair_reason","pair_id":"r-swap-refill","target":"result","value":0.85555}
+{"accepted":true,"anchor_similarity":1.0,"anchored":true,"category":"Edibles","label":"edit","level":"INFO","measure_changed":false,"message":"pair","note":"brand and description were blanked earlier and come back as they were","pair_id":"r-swap-restore","similarity":1.0,"target":"result","wrong":false}
+{"below_floor":false,"change":"restored","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-swap-restore","similarity":1.0,"target":"result","weight":1.0}
+{"below_floor":false,"change":"unchanged","field":"category","level":"INFO","message":"pair_field","pair_id":"r-swap-restore","similarity":1.0,"target":"result","weight":3.0}
+{"below_floor":false,"change":"restored","field":"description","level":"INFO","message":"pair_field","pair_id":"r-swap-restore","similarity":1.0,"target":"result","weight":2.0}
+{"below_floor":false,"change":"unchanged","field":"name","level":"INFO","message":"pair_field","pair_id":"r-swap-restore","similarity":1.0,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-swap-restore","previous_unit":"mg","quantity":"thc_per_item","target":"result","unit":"mg","zero_crossing":false}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-swap-restore","previous_unit":"g","quantity":"weight_per_item","target":"result","unit":"g","zero_crossing":false}
+{"accepted":true,"anchored":false,"category":"Edibles","label":"edit","level":"INFO","measure_changed":false,"message":"pair","note":"doubled spaces, a tab, and a trailing line break","pair_id":"r-whitespace","similarity":1.0,"target":"result","wrong":false}
+{"below_floor":false,"change":"unchanged","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-whitespace","similarity":1.0,"target":"result","weight":1.0}
+{"below_floor":false,"change":"unchanged","field":"category","level":"INFO","message":"pair_field","pair_id":"r-whitespace","similarity":1.0,"target":"result","weight":3.0}
+{"below_floor":false,"change":"unchanged","field":"description","level":"INFO","message":"pair_field","pair_id":"r-whitespace","similarity":1.0,"target":"result","weight":2.0}
+{"below_floor":false,"change":"unchanged","field":"name","level":"INFO","message":"pair_field","pair_id":"r-whitespace","similarity":1.0,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-whitespace","previous_unit":"mg","quantity":"thc_per_item","target":"result","unit":"mg","zero_crossing":false}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-whitespace","previous_unit":"g","quantity":"weight_per_item","target":"result","unit":"g","zero_crossing":false}
+{"accepted":true,"anchored":false,"category":"Edibles","label":"edit","level":"INFO","measure_changed":false,"message":"pair","note":"the name rewritten in capitals","pair_id":"r-caps","similarity":1.0,"target":"result","wrong":false}
+{"below_floor":false,"change":"unchanged","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-caps","similarity":1.0,"target":"result","weight":1.0}
+{"below_floor":false,"change":"unchanged","field":"category","level":"INFO","message":"pair_field","pair_id":"r-caps","similarity":1.0,"target":"result","weight":3.0}
+{"below_floor":false,"change":"unchanged","field":"description","level":"INFO","message":"pair_field","pair_id":"r-caps","similarity":1.0,"target":"result","weight":2.0}
+{"below_floor":false,"change":"modified","field":"name","level":"INFO","message":"pair_field","pair_id":"r-caps","similarity":1.0,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-caps","previous_unit":"mg","quantity":"thc_per_item","target":"result","unit":"mg","zero_crossing":false}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-caps","previous_unit":"g","quantity":"weight_per_item","target":"result","unit":"g","zero_crossing":false}
+{"accepted":true,"anchored":false,"category":"Edibles","label":"edit","level":"INFO","measure_changed":false,"message":"pair","note":"a Cyrillic letter in place of its Latin look-alike in the name","pair_id":"r-unicode-cyrillic","similarity":0.955017,"target":"result","wrong":false}
+{"below_floor":false,"change":"unchanged","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-unicode-cyrillic","similarity":1.0,"target":"result","weight":1.0}
+{"below_floor":false,"change":"unchanged","field":"category","level":"INFO","message":"pair_field","pair_id":"r-unicode-cyrillic","similarity":1.0,"target":"result","weight":3.0}
+{"below_floor":false,"change":"unchanged","field":"description","level":"INFO","message":"pair_field","pair_id":"r-unicode-cyrillic","similarity":1.0,"target":"result","weight":2.0}
+{"below_floor":false,"change":"modified","field":"name","level":"INFO","message":"pair_field","pair_id":"r-unicode-cyrillic","similarity":0.887542,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-unicode-cyrillic","previous_unit":"mg","quantity":"thc_per_item","target":"result","unit":"mg","zero_crossing":false}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-unicode-cyrillic","previous_unit":"g","quantity":"weight_per_item","target":"result","unit":"g","zero_crossing":false}
+{"accepted":true,"anchored":false,"category":"Edibles","label":"edit","level":"INFO","measure_changed":false,"message":"pair","note":"the potency written in full-width digits","pair_id":"r-unicode-fullwidth","similarity":0.947554,"target":"result","wrong":false}
+{"below_floor":false,"change":"unchanged","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-unicode-fullwidth","similarity":1.0,"target":"result","weight":1.0}
+{"below_floor":false,"change":"unchanged","field":"category","level":"INFO","message":"pair_field","pair_id":"r-unicode-fullwidth","similarity":1.0,"target":"result","weight":3.0}
+{"below_floor":false,"change":"unchanged","field":"description","level":"INFO","message":"pair_field","pair_id":"r-unicode-fullwidth","similarity":1.0,"target":"result","weight":2.0}
+{"below_floor":false,"change":"modified","field":"name","level":"INFO","message":"pair_field","pair_id":"r-unicode-fullwidth","similarity":0.868884,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-unicode-fullwidth","previous_unit":"mg","quantity":"thc_per_item","target":"result","unit":"mg","zero_crossing":false}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-unicode-fullwidth","previous_unit":"g","quantity":"weight_per_item","target":"result","unit":"g","zero_crossing":false}
+{"accepted":true,"anchored":false,"category":"Edibles","label":"edit","level":"INFO","measure_changed":false,"message":"pair","note":"a no-break space between two words of the name","pair_id":"r-unicode-nbsp","similarity":1.0,"target":"result","wrong":false}
+{"below_floor":false,"change":"unchanged","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-unicode-nbsp","similarity":1.0,"target":"result","weight":1.0}
+{"below_floor":false,"change":"unchanged","field":"category","level":"INFO","message":"pair_field","pair_id":"r-unicode-nbsp","similarity":1.0,"target":"result","weight":3.0}
+{"below_floor":false,"change":"unchanged","field":"description","level":"INFO","message":"pair_field","pair_id":"r-unicode-nbsp","similarity":1.0,"target":"result","weight":2.0}
+{"below_floor":false,"change":"unchanged","field":"name","level":"INFO","message":"pair_field","pair_id":"r-unicode-nbsp","similarity":1.0,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-unicode-nbsp","previous_unit":"mg","quantity":"thc_per_item","target":"result","unit":"mg","zero_crossing":false}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-unicode-nbsp","previous_unit":"g","quantity":"weight_per_item","target":"result","unit":"g","zero_crossing":false}
+{"accepted":true,"anchored":false,"category":"Beverages","label":"edit","level":"INFO","measure_changed":false,"message":"pair","note":"an accent dropped from the brand","pair_id":"r-unicode-accent","similarity":1.0,"target":"result","wrong":false}
+{"below_floor":false,"change":"modified","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-unicode-accent","similarity":1.0,"target":"result","weight":1.0}
+{"below_floor":false,"change":"unchanged","field":"category","level":"INFO","message":"pair_field","pair_id":"r-unicode-accent","similarity":1.0,"target":"result","weight":3.0}
+{"below_floor":false,"change":"unchanged","field":"description","level":"INFO","message":"pair_field","pair_id":"r-unicode-accent","similarity":1.0,"target":"result","weight":2.0}
+{"below_floor":false,"change":"unchanged","field":"name","level":"INFO","message":"pair_field","pair_id":"r-unicode-accent","similarity":1.0,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-unicode-accent","previous_unit":"ml","quantity":"volume_per_item","target":"result","unit":"ml","zero_crossing":false}
+{"accepted":true,"anchored":false,"category":"Edibles","label":"edit","level":"INFO","measure_changed":false,"message":"pair","note":"a description changed only after its first 256 tokens","pair_id":"r-past-the-limit","similarity":1.0,"target":"result","wrong":false}
+{"below_floor":false,"change":"unchanged","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-past-the-limit","similarity":1.0,"target":"result","weight":1.0}
+{"below_floor":false,"change":"unchanged","field":"category","level":"INFO","message":"pair_field","pair_id":"r-past-the-limit","similarity":1.0,"target":"result","weight":3.0}
+{"below_floor":false,"change":"modified","field":"description","level":"INFO","message":"pair_field","pair_id":"r-past-the-limit","similarity":1.0,"target":"result","weight":2.0}
+{"below_floor":false,"change":"unchanged","field":"name","level":"INFO","message":"pair_field","pair_id":"r-past-the-limit","similarity":1.0,"target":"result","weight":4.0}
+{"accepted":true,"anchored":false,"category":"Edibles","label":"edit","level":"INFO","measure_changed":false,"message":"pair","note":"the description reworded and extended","pair_id":"r-edit-description","similarity":0.981316,"target":"result","wrong":false}
+{"below_floor":false,"change":"unchanged","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-edit-description","similarity":1.0,"target":"result","weight":1.0}
+{"below_floor":false,"change":"unchanged","field":"category","level":"INFO","message":"pair_field","pair_id":"r-edit-description","similarity":1.0,"target":"result","weight":3.0}
+{"below_floor":false,"change":"modified","field":"description","level":"INFO","message":"pair_field","pair_id":"r-edit-description","similarity":0.906581,"target":"result","weight":2.0}
+{"below_floor":false,"change":"unchanged","field":"name","level":"INFO","message":"pair_field","pair_id":"r-edit-description","similarity":1.0,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-edit-description","previous_unit":"mg","quantity":"thc_per_item","target":"result","unit":"mg","zero_crossing":false}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-edit-description","previous_unit":"g","quantity":"weight_per_item","target":"result","unit":"g","zero_crossing":false}
+{"accepted":true,"anchored":false,"category":"Edibles","label":"edit","level":"INFO","measure_changed":false,"message":"pair","note":"the strain type appended to the name","pair_id":"r-edit-name-suffix","similarity":0.985361,"target":"result","wrong":false}
+{"below_floor":false,"change":"unchanged","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-edit-name-suffix","similarity":1.0,"target":"result","weight":1.0}
+{"below_floor":false,"change":"unchanged","field":"category","level":"INFO","message":"pair_field","pair_id":"r-edit-name-suffix","similarity":1.0,"target":"result","weight":3.0}
+{"below_floor":false,"change":"unchanged","field":"description","level":"INFO","message":"pair_field","pair_id":"r-edit-name-suffix","similarity":1.0,"target":"result","weight":2.0}
+{"below_floor":false,"change":"modified","field":"name","level":"INFO","message":"pair_field","pair_id":"r-edit-name-suffix","similarity":0.963403,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-edit-name-suffix","previous_unit":"mg","quantity":"thc_per_item","target":"result","unit":"mg","zero_crossing":false}
+{"beyond_limit":false,"change":"unchanged","factor":1.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-edit-name-suffix","previous_unit":"g","quantity":"weight_per_item","target":"result","unit":"g","zero_crossing":false}
+{"accepted":false,"anchored":false,"category":"Edibles","label":"recycle","level":"INFO","measure_changed":false,"message":"pair","note":"another product of the same brand and category, a different thing entirely","pair_id":"r-recycle-same-shelf","similarity":0.771596,"target":"result","wrong":false}
+{"below_floor":false,"change":"unchanged","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-recycle-same-shelf","similarity":1.0,"target":"result","weight":1.0}
+{"below_floor":false,"change":"unchanged","field":"category","level":"INFO","message":"pair_field","pair_id":"r-recycle-same-shelf","similarity":1.0,"target":"result","weight":3.0}
+{"below_floor":false,"change":"modified","field":"description","level":"INFO","message":"pair_field","pair_id":"r-recycle-same-shelf","similarity":0.698261,"target":"result","weight":2.0}
+{"below_floor":true,"change":"modified","field":"name","level":"INFO","message":"pair_field","pair_id":"r-recycle-same-shelf","similarity":0.57986,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"modified","factor":2.5,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-recycle-same-shelf","previous_unit":"mg","quantity":"thc_per_item","target":"result","unit":"mg","zero_crossing":false}
+{"beyond_limit":false,"change":"modified","factor":2.5,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-recycle-same-shelf","previous_unit":"g","quantity":"weight_per_item","target":"result","unit":"g","zero_crossing":false}
+{"code":"below_threshold","level":"INFO","limit":0.9,"message":"pair_reason","pair_id":"r-recycle-same-shelf","target":"result","value":0.771596}
+{"code":"field_below_floor","field":"name","level":"INFO","limit":0.8,"message":"pair_reason","pair_id":"r-recycle-same-shelf","target":"result","value":0.57986}
+{"accepted":false,"anchored":false,"category":"Edibles","label":"recycle","level":"INFO","measure_changed":true,"message":"pair","note":"gummies became a vape cartridge","pair_id":"r-recycle-category","similarity":0.513344,"target":"result","wrong":false}
+{"below_floor":false,"change":"modified","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-recycle-category","similarity":0.452791,"target":"result","weight":1.0}
+{"below_floor":false,"change":"modified","field":"category","level":"INFO","message":"pair_field","pair_id":"r-recycle-category","similarity":0.558786,"target":"result","weight":3.0}
+{"below_floor":false,"change":"modified","field":"description","level":"INFO","message":"pair_field","pair_id":"r-recycle-category","similarity":0.551356,"target":"result","weight":2.0}
+{"below_floor":true,"change":"modified","field":"name","level":"INFO","message":"pair_field","pair_id":"r-recycle-category","similarity":0.475393,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"incomparable","incomparable":true,"level":"INFO","message":"pair_quantity","pair_id":"r-recycle-category","previous_unit":"mg","quantity":"thc_per_item","target":"result","unit":"%","zero_crossing":false}
+{"beyond_limit":false,"change":"modified","factor":40.0,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-recycle-category","previous_unit":"g","quantity":"weight_per_item","target":"result","unit":"g","zero_crossing":false}
+{"code":"below_threshold","level":"INFO","limit":0.9,"message":"pair_reason","pair_id":"r-recycle-category","target":"result","value":0.513344}
+{"code":"field_below_floor","field":"name","level":"INFO","limit":0.8,"message":"pair_reason","pair_id":"r-recycle-category","target":"result","value":0.475393}
+{"accepted":false,"anchored":false,"category":"Flower","label":"recycle","level":"INFO","measure_changed":false,"message":"pair","note":"an eighth of flower became a pack of pre-rolls from another brand","pair_id":"r-recycle-flower-to-preroll","similarity":0.388788,"target":"result","wrong":false}
+{"below_floor":false,"change":"modified","field":"brand","level":"INFO","message":"pair_field","pair_id":"r-recycle-flower-to-preroll","similarity":0.390753,"target":"result","weight":1.0}
+{"below_floor":false,"change":"modified","field":"category","level":"INFO","message":"pair_field","pair_id":"r-recycle-flower-to-preroll","similarity":0.393668,"target":"result","weight":3.0}
+{"below_floor":false,"change":"modified","field":"description","level":"INFO","message":"pair_field","pair_id":"r-recycle-flower-to-preroll","similarity":0.480944,"target":"result","weight":2.0}
+{"below_floor":true,"change":"modified","field":"name","level":"INFO","message":"pair_field","pair_id":"r-recycle-flower-to-preroll","similarity":0.338559,"target":"result","weight":4.0}
+{"beyond_limit":false,"change":"modified","factor":1.3333333333333333,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-recycle-flower-to-preroll","previous_unit":"%","quantity":"thc_per_item","target":"result","unit":"%","zero_crossing":false}
+{"beyond_limit":false,"change":"modified","factor":1.4,"incomparable":false,"level":"INFO","message":"pair_quantity","pair_id":"r-recycle-flower-to-preroll","previous_unit":"g","quantity":"weight_per_item","target":"result","unit":"g","zero_crossing":false}
+{"code":"below_threshold","level":"INFO","limit":0.9,"message":"pair_reason","pair_id":"r-recycle-flower-to-preroll","target":"result","value":0.388788}
+{"code":"field_below_floor","field":"name","level":"INFO","limit":0.8,"message":"pair_reason","pair_id":"r-recycle-flower-to-preroll","target":"result","value":0.338559}
+{"count":1,"field":"brand","high":1.0,"label":"edit","level":"INFO","low":1.0,"message":"field_range","target":"result"}
+{"count":2,"field":"description","high":1.0,"label":"edit","level":"INFO","low":0.906581,"message":"field_range","target":"result"}
+{"count":4,"field":"name","high":1.0,"label":"edit","level":"INFO","low":0.868884,"message":"field_range","target":"result"}
+{"count":0,"incomparable":0,"label":"edit","level":"INFO","message":"quantity_range","quantity":"cbd_per_item","target":"result","zero_crossings":0}
+{"count":0,"incomparable":1,"label":"edit","level":"INFO","message":"quantity_range","quantity":"thc_per_item","target":"result","zero_crossings":0}
+{"count":1,"high":1.01442068105529,"incomparable":0,"label":"edit","level":"INFO","low":1.01442068105529,"message":"quantity_range","quantity":"volume_per_item","target":"result","zero_crossings":0}
+{"count":1,"high":1.0124829687499999,"incomparable":0,"label":"edit","level":"INFO","low":1.0124829687499999,"message":"quantity_range","quantity":"weight_per_item","target":"result","zero_crossings":0}
+{"count":2,"field":"brand","high":0.452791,"label":"recycle","level":"INFO","low":0.390753,"message":"field_range","target":"result"}
+{"count":2,"field":"category","high":0.558786,"label":"recycle","level":"INFO","low":0.393668,"message":"field_range","target":"result"}
+{"count":3,"field":"description","high":0.698261,"label":"recycle","level":"INFO","low":0.480944,"message":"field_range","target":"result"}
+{"count":3,"field":"name","high":0.57986,"label":"recycle","level":"INFO","low":0.338559,"message":"field_range","target":"result"}
+{"count":0,"incomparable":0,"label":"recycle","level":"INFO","message":"quantity_range","quantity":"cbd_per_item","target":"result","zero_crossings":0}
+{"count":2,"high":2.5,"incomparable":1,"label":"recycle","level":"INFO","low":1.3333333333333333,"message":"quantity_range","quantity":"thc_per_item","target":"result","zero_crossings":0}
+{"count":0,"incomparable":0,"label":"recycle","level":"INFO","message":"quantity_range","quantity":"volume_per_item","target":"result","zero_crossings":0}
+{"count":4,"high":40.0,"incomparable":0,"label":"recycle","level":"INFO","low":1.4,"message":"quantity_range","quantity":"weight_per_item","target":"result","zero_crossings":0}
+{"false_accepts":1,"false_rejects":0,"level":"INFO","margin":0.046002,"message":"suggestion","target":"result","threshold":0.901552}
+{"edit_zero_crossings":0,"level":"INFO","message":"quantity_suggestion","quantity":"cbd_per_item","recycles_caught":0,"recycles_changed":0,"target":"result"}
+{"edit_zero_crossings":0,"level":"INFO","message":"quantity_suggestion","quantity":"thc_per_item","recycles_caught":0,"recycles_changed":2,"target":"result"}
+{"edit_zero_crossings":0,"edits_high":1.01442068105529,"level":"INFO","message":"quantity_suggestion","quantity":"volume_per_item","recycles_caught":0,"recycles_changed":0,"target":"result"}
+{"edit_zero_crossings":0,"edits_high":1.0124829687499999,"level":"INFO","message":"quantity_suggestion","quantity":"weight_per_item","recycles_caught":4,"recycles_changed":4,"recycles_next":1.4,"reject_above_factor":1.1905780765031748,"target":"result"}
+{"by":"category","edits":1,"edits_high":1.0,"edits_low":1.0,"false_accepts":0,"false_rejects":0,"level":"INFO","message":"slice","recycles":0,"target":"result","value":"Beverages"}
+{"by":"category","edits":10,"edits_high":1.0,"edits_low":0.947554,"false_accepts":0,"false_rejects":0,"level":"INFO","message":"slice","recycles":3,"recycles_high":0.85555,"recycles_low":0.513344,"target":"result","value":"Edibles"}
+{"by":"category","edits":3,"edits_high":1.0,"edits_low":1.0,"false_accepts":1,"false_rejects":0,"level":"INFO","message":"slice","recycles":2,"recycles_high":1.0,"recycles_low":0.388788,"target":"result","value":"Flower"}
+{"by":"category","edits":2,"edits_high":1.0,"edits_low":1.0,"false_accepts":0,"false_rejects":0,"level":"INFO","message":"slice","recycles":0,"target":"result","value":"Tinctures"}
+{"false_accept_target":0.01,"level":"INFO","message":"operating_point","target":"result"}
+{"edits":16,"false_accept_rate":0.2,"false_accepts":1,"false_reject_rate":0.0,"false_rejects":0,"level":"INFO","message":"summary","pairs":25,"recycles":5,"skipped_confidence":0,"skipped_split":0,"target":"result","unlabeled":4}
