@@ -685,6 +685,21 @@ mod tests {
     assert_eq!((edits.below, edits.above), (1, 1));
     let recycles = histogram(&calibration, Some(Label::Recycle), 0.5, 1.0, 5);
     assert_eq!(recycles.counts, [0, 0, 1, 0, 0]);
+
+    // Everything out of range is counted on its own side, however many there are, and nothing in range is.
+    let wide = summarized(vec![
+      scored(Label::Edit, 0.2, true),
+      scored(Label::Edit, 0.3, true),
+      scored(Label::Edit, 0.75, true),
+      scored(Label::Edit, 1.1, true),
+      scored(Label::Edit, 1.2, true),
+      scored(Label::Edit, 1.3, true),
+    ]);
+    let wide = histogram(&wide, Some(Label::Edit), 0.5, 1.0, 5);
+    assert_eq!(
+      (wide.below, wide.counts.as_slice(), wide.above),
+      (2, [0, 0, 1, 0, 0].as_slice(), 3)
+    );
     assert_eq!(
       histogram(&calibration, None, 0.5, 1.0, 5).counts.iter().sum::<usize>(),
       0

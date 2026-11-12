@@ -957,6 +957,21 @@ mod tests {
     );
     let both = recycles(&run_of(vec![walk, jump]), &policy);
     assert_eq!((both.later, both.at_recycle, both.by_drift_alone), (1, 1, 1));
+
+    // "Caught by drift alone" needs a rejection: a recycle every version of which is accepted was caught by
+    // nothing, and one whose every version drifts too far was caught by drift, with no accepted version at all.
+    let missed = made(
+      "missed",
+      None,
+      "recycle",
+      Some(1),
+      &[(0.75, true), (0.75, true)],
+      Some(0.5),
+    );
+    let unaccepted = made("unaccepted", None, "recycle", Some(1), &[(0.25, true)], Some(0.5));
+    let missed = recycles(&run_of(vec![missed]), &policy);
+    assert_eq!((missed.never, missed.by_drift_alone), (1, 0));
+    assert_eq!(recycles(&run_of(vec![unaccepted]), &policy).by_drift_alone, 1);
   }
 
   #[test]
