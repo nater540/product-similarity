@@ -8,6 +8,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # Enough debug information for a backtrace to name files and lines, and no more. With all of it, the test
+  # binaries of this workspace come to 12 GB (17 of them, up to 640 MB each, every one with Burn and ONNX Runtime
+  # linked in), which a hosted runner's disk does not have: the linker died of a bus error writing one. This way
+  # they come to 5 GB.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   fmt:
