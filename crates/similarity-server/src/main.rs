@@ -68,6 +68,9 @@ enum Command {
   CalibrateDiff(CalibrateDiffArgs),
   /// Replay whole edit histories and report how far products drift, to choose `anchor_threshold`.
   CalibrateDrift(CalibrateDriftArgs),
+  /// Say what a shadowed server wrote: how often its candidate policy disagreed with the live one, in which
+  /// direction, for which tenants, and why. Reads the server's stdout; no model, no store.
+  ShadowReport(ShadowReportArgs),
   /// Score catalog groups (a product and the listings known to describe it) as `Match` would, to see how often
   /// the right product comes first and where `matching.threshold` belongs.
   CalibrateMatch(CalibrateMatchArgs),
@@ -987,6 +990,49 @@ impl CalibrateSweepArgs {
 }
 
 #[derive(Debug, Args)]
+struct ShadowReportArgs {
+  /// The stdout of a server with a `[shadow]` table. Lines that are not a shadow's are passed over.
+  events: PathBuf,
+  /// Which candidate, when the file has lines of more than one.
+  #[arg(long)]
+  shadow: Option<String>,
+  /// Write the revisions the two policies disagree on to this file, one JSON object per line, to be looked up
+  /// and labeled.
+  #[arg(long)]
+  ids: Option<PathBuf>,
+  /// How many tenants to list.
+  #[arg(long, default_value_t = 10)]
+  top: usize,
+  /// Write the report as NDJSON events on stdout, for tools, in place of the text.
+  #[arg(long)]
+  ndjson: bool,
+  /// Fixes the resampling behind the intervals, so that a report can be reproduced.
+  #[arg(long, default_value_t = 0)]
+  seed: u64,
+}
+
+impl ShadowReportArgs {
+  fn run(self) -> anyhow::Result<()> {
+    let text =
+      std::fs::read_to_string(&self.events).with_context(|| format!("cannot read {}", self.events.display()))?;
+    let logs = offline::shadow_report::read(&text).with_context(|| format!("in {}", self.events.display()))?;
+    let log = offline::shadow_report::select(logs, self.shadow.as_deref())
+      .with_context(|| format!("in {}", self.events.display()))?;
+    let report = offline::stats::shadow::report(&log, self.top, self.seed);
+    if let Some(path) = &self.ids {
+      std::fs::write(path, offline::shadow_report::ids(&log)?)
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    }
+    if self.ndjson {
+      offline::shadow_report::emit(&report);
+    } else {
+      write!(std::io::stdout().lock(), "{}", offline::shadow_report::render(&report))?;
+    }
+    Ok(())
+  }
+}
+
+#[derive(Debug, Args)]
 struct CalibrateMatchArgs {
   /// The configuration file (for the model, the schema, and `[matching]`).
   #[arg(long, short, default_value = "config.toml")]
@@ -1458,6 +1504,7 @@ fn main() -> ExitCode {
     Command::CalibrateDiff(args) => args.run(),
     Command::CalibrateDrift(args) => args.run(),
     Command::CalibrateMatch(args) => args.run(),
+    Command::ShadowReport(args) => args.run(),
     Command::CalibrateSweep(args) => args.run(),
     Command::Import(args) => args.run(),
     Command::Runs(RunsCommand::List(args)) => args.run(),

@@ -156,6 +156,8 @@ changing a design. Infer conventions from the existing code first.
   event names are an interface like the calibration ones, and a line carries an id, a tenant, scores, and codes:
   never a record's text. `config.example.toml` ships no shadow and no number for one. A shadow measures
   agreement, not quality: do not add anything that ranks or adopts a candidate by its disagreements.
+  `shadow-report` takes totals from the `shadow_summary` lines and everything else from the `shadow` lines, and
+  never mixes the two.
 - **A sweep is a search, and what it finds is fitted** (D29). `calibrate-sweep` ranks on one calibration and may
   evaluate the best points on another at the threshold already chosen. Never report a swept point's errors on
   the run it was ranked on as if they were a measurement, and never let it choose a threshold on the evaluation
@@ -203,6 +205,7 @@ changing a design. Infer conventions from the existing code first.
 - Run: `just serve` (needs Qdrant) or `just serve-in-memory`; then `just client describe`
 - Load a catalog: `just import export.jsonl config.toml` (`--check` validates only)
 - Measure: `just throughput`, `just load`, `just calibrate`, `just calibrate-drift`, `just calibrate-match`, `just calibrate-sweep`, `just calibrate-diff`, `just verdict-gate old.ndjson pairs.full.jsonl`
+- Read a shadowed server's stdout: `just shadow-report shadow.ndjson --ids to-label.jsonl`
 - Put a model into service: `just promote --config candidate.toml --calibration holdout.ndjson`; then
   `record-similarity model list`, `model register <dir>`, `model retire <digest> --reason "..."`
 - See what was run: `just runs` (`calibrate` and the trainer each leave a directory under `runs/`; `--no-run`

@@ -1968,22 +1968,52 @@ reason    below_threshold              0.879 < 0.900
 The caller got the live verdict. `shadow.ndjson` got what the candidate made of it:
 
 ```json
-{"timestamp":"2026-11-12T01:13:48.687887Z","level":"INFO","message":"shadow","key":"1794445945-2","id":"sku-1","shadow":"name-6-no-floor","kind":"policy","mode":"enforce","live_verdict":"rejected","shadow_verdict":"accepted","agree":false,"live_similarity":0.878707,"shadow_similarity":0.942242,"live_anchor_similarity":0.860299,"shadow_anchor_similarity":0.917739,"live_threshold":0.9,"shadow_threshold":0.857,"measure_changed":false,"live_stored":false,"revision":2,"target":"result"}
-{"timestamp":"2026-11-12T01:13:48.687941Z","level":"INFO","message":"shadow_reason","key":"1794445945-2","shadow":"name-6-no-floor","side":"live","code":"below_threshold","value":0.878707,"limit":0.9,"target":"result"}
-{"timestamp":"2026-11-12T01:13:48.707425Z","level":"INFO","message":"shadow_summary","shadow":"name-6-no-floor","kind":"policy","observed":3,"created":1,"judged":2,"agreed":1,"only_shadow_rejected":0,"only_live_rejected":1,"failed":0,"target":"result"}
+{"timestamp":"2026-11-12T03:33:25.254273Z","level":"INFO","message":"shadow","key":"1794454404-2","id":"sku-1","shadow":"name-6-no-floor","kind":"policy","run":1794454404,"mode":"enforce","live_verdict":"rejected","shadow_verdict":"accepted","agree":false,"live_similarity":0.878707,"shadow_similarity":0.942242,"live_anchor_similarity":0.860299,"shadow_anchor_similarity":0.917739,"live_threshold":0.9,"shadow_threshold":0.857,"measure_changed":false,"live_stored":false,"revision":2,"target":"result"}
+{"timestamp":"2026-11-12T03:33:25.254314Z","level":"INFO","message":"shadow_reason","key":"1794454404-2","shadow":"name-6-no-floor","side":"live","code":"below_threshold","value":0.878707,"limit":0.9,"target":"result"}
+{"timestamp":"2026-11-12T03:33:25.257014Z","level":"INFO","message":"shadow_summary","shadow":"name-6-no-floor","kind":"policy","run":1794454404,"observed":3,"created":1,"judged":2,"agreed":1,"only_shadow_rejected":0,"only_live_rejected":1,"failed":0,"target":"result"}
 ```
 
 A category that counts half as much lets a product move between categories: the candidate would have accepted
 what the live policy refused. Whether that is a fault of the candidate or of the live policy, the shadow cannot
 say.
 
+`shadow-report` reads the file and says what is in it. Here after a few more requests, from two tenants:
+
 ```sh
-jq -r 'select(.message == "shadow") | [.id, .live_verdict, .shadow_verdict, .live_similarity, .shadow_similarity] | @tsv' shadow.ndjson
+just shadow-report shadow.ndjson --ids to-label.jsonl
 ```
 
 ```text
-sku-1	rejected	accepted	0.878707	0.942242
+shadow    name-6-no-floor
+seen      7 requests over 1 run(s) of the server: 3 new records, 4 revisions judged, 0 the candidate could not judge
+agreed    2 of 4
+disagreed 0 of 4  0.00%  live accepted, the candidate would have rejected
+disagreed 2 of 4  50.00%  live rejected, the candidate would have accepted
+          no intervals: the file has a line for 2 of the judged revisions (`events = "all"` writes one for each)
+
+live rejected, the candidate would have accepted
+  scored 0.860 to 0.879 by the live weights and 0.918 to 0.942 by the candidate's
+       2  below_threshold
+
+tenant                          lines only candidate rejects    only live rejects
+merchant-1                          1                      0                    1
+merchant-2                          1                      0                    1
+
+A disagreement says the two policies differ on a revision, not which is right. Label the revisions (`--ids`), and judge the candidate with `calibrate`.
 ```
+
+`to-label.jsonl` is the list to take to your own database, one line for each revision disagreed on:
+
+```json
+{"key":"1794454332-2","id":"sku-1","tenant":"merchant-1","live_verdict":"rejected","shadow_verdict":"accepted","live_similarity":0.878707,"shadow_similarity":0.942242}
+{"key":"1794454332-4","id":"sku-3","tenant":"merchant-2","live_verdict":"rejected","shadow_verdict":"accepted","live_similarity":0.860299,"shadow_similarity":0.917739}
+```
+
+The totals come from the server's `shadow_summary` lines, the last of each run added up, so a file that several
+restarts wrote into is counted whole. Which tenants and which reasons come from the `shadow` lines. An interval
+(resampled by tenant, since one brand's edits are not independent of each other) needs a line for every judged
+revision, which is what `events = "all"` writes. `--shadow NAME` picks one candidate out of a file that holds
+several, and `--ndjson` writes the report as `shadow_report*` lines.
 
 - **A disagreement is a question, not an answer.** It says the two policies differ on a request, not which is
   right. The ids are a list to label: look the revisions up in your own database, label them, and put the pairs
@@ -2004,7 +2034,7 @@ sku-1	rejected	accepted	0.878707	0.942242
   disagreement, and one `shadow_reason` line per reason either side gave, joined on `key`. `events = "all"`
   writes a `shadow` line for every judged revision instead, which is what it costs to see how the candidate
   scores what it agrees on. `shadow_summary` every `summary_every_s` seconds and once more as the server stops:
-  the counts since it started. `created` records had nothing to be judged against; `judged` is `agreed` plus
+  the counts since it started. `run`, on these lines, is the second that run of the server began. `created` records had nothing to be judged against; `judged` is `agreed` plus
   the two kinds of disagreement; `failed` should stay zero.
 - **No record text is written.** A line names a record by its id and by the tenant the request named, which is
   what lets disagreements be counted by brand. The requests above named none, so their lines have no `tenant`.

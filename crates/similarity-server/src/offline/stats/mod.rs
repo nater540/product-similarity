@@ -15,6 +15,7 @@ use similarity_core::rng::Rng;
 
 pub mod drift;
 pub mod matching;
+pub mod shadow;
 
 use super::calibrate::{Calibration, ScoredPair};
 use super::pairs::Label;

@@ -1186,9 +1186,16 @@ is answered on labeled pairs by `calibrate --model` and AUC (D24), with no servi
 only the cases nobody labeled. And no candidate model exists yet. The observer seam is what the model shadow
 would plug into, so building the policy half first cost it nothing.
 
-**Not built with it:** a `shadow-report` command (the summary line has the counts and `jq` lists the ids; a
-report with intervals resampled by tenant can now be written, since the tenant is on the line), the shadow in
-`Describe`, and more than one shadow.
+**`shadow-report` reads the file back.** Totals come from the summaries (each counts from its server's start,
+so the last of each run is taken and the runs are added up; `run` on the lines is what tells them apart), and
+everything about which revisions comes from the `shadow` lines. The two are never mixed: a rate is over what
+the summaries counted, and an interval, resampled by tenant, is given only when the file has a line for every
+judged revision (`events = "all"`), because only then is each tenant's share of the judged revisions known. The
+reasons listed for a disagreement are the ones the rejecting side gave. It writes the disagreements as a list
+to label and prints, last, that a disagreement is not a verdict on the candidate. Its numbers are in
+`offline::stats::shadow`, like every other report's (D17).
+
+**Not built with it:** the shadow in `Describe`, and more than one shadow.
 
 ## D31. A config names the model its thresholds were measured with, and a gate records what was put into service
 

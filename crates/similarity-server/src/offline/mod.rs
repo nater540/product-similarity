@@ -31,6 +31,7 @@ pub mod match_report;
 pub mod matching;
 pub mod pairs;
 pub mod report;
+pub mod shadow_report;
 pub mod stats;
 pub mod sweep;
 #[cfg(test)]

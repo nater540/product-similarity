@@ -16,7 +16,8 @@ in these ways, and the model half has to start from what exists:
   sides measured the same values. `in_sync`, `missing`, `queued_ms`, and `embed_ms` belong to the model shadow and are not written.
 - `events = "disagreements"` is the default; `"all"` writes every judged revision.
 - `[shadow.model]` and `[shadow.qdrant]` are parsed only to be refused with the reason. There is no `queue` key.
-- Not built: `shadow-report`, the shadow in `Describe`, `import --shadow`.
+- `shadow-report` is built, for policy shadows. The events carry `tenant` and `run`.
+- Not built: the shadow in `Describe`, `import --shadow`.
 
 ## Contents
 

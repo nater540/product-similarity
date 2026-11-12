@@ -153,6 +153,10 @@ calibrate-drift histories="data/drift.sample.jsonl" config="config.example.toml"
 calibrate-match groups="data/catalog-groups.sample.jsonl" config="config.example.toml" *flags:
     RUST_LOG=warn cargo run --release -q -p similarity-server -- calibrate-match --config {{ config }} {{ groups }} {{ flags }}
 
+# Say what a server with a `[shadow]` table wrote to its stdout: `just shadow-report shadow.ndjson --ids to-label.jsonl`
+shadow-report *args:
+    cargo run --release -q -p similarity-server -- shadow-report {{ args }}
+
 # Judge one recorded calibration under a grid of weights, floors, and limits, with no model:
 # `just calibrate-sweep select.ndjson --grid grid.toml --config config.toml [--evaluate other.ndjson]`
 calibrate-sweep *args:

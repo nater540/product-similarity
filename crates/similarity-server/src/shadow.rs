@@ -29,6 +29,10 @@
 //!   reason either side gave, joined on `key`;
 //! - `shadow_summary`, the counts since the server started, on a timer and once more as the server stops.
 //!
+//! Every one of those but the schema and reason lines carries `run`, the second this shadow was made, which is
+//! also the front of every `key`: a file that several runs of a server wrote into can be told apart by it, and
+//! `shadow-report` adds up the last summary of each.
+//!
 //! A line names a record by its id and the tenant the request named, and carries scores and codes: never a
 //! record's text.
 
@@ -203,6 +207,7 @@ impl PolicyShadow {
       target: RESULT,
       shadow,
       kind = KIND,
+      run = self.started,
       events = events_name(self.events),
       dimension = self.dimension,
       threshold = six(self.policy.threshold),
@@ -248,6 +253,7 @@ impl PolicyShadow {
       target: RESULT,
       shadow = self.name.as_str(),
       kind = KIND,
+      run = self.started,
       observed = summary.observed,
       created = summary.created,
       judged = summary.judged,
@@ -271,6 +277,7 @@ impl PolicyShadow {
       tenant = observation.tenant,
       shadow = name,
       kind = KIND,
+      run = self.started,
       mode = mode_name(observation.mode),
       live_verdict = verdict(live.accepted()),
       shadow_verdict = verdict(shadow.accepted()),
