@@ -99,7 +99,7 @@ Not planned in detail. What the review would add to each when its turn comes:
 | 11 | Drift-threshold calibration | **Built** (D27): `calibrate-drift` replays histories, measured first and judged afterwards; reports legitimate drift, the suggestion, and quantities walked. |
 | 12 | Latency tracking and a load test | **Built** (D26): `record-similarity load`, worker counters, `elapsed_ms` on request lines. The figure is in README "Performance". |
 | 14 | Fuzzing | The state machine in `similarity-server`'s `properties` module is the structure-aware target, ready to be driven by a fuzzer. Add a target for `RecordFields` and `Quantity` parsing. |
-| 15 | Mutation testing | **Built** (D25): `just mutants` over the files that decide a verdict; 517 mutants at the last run, none surviving, after a test for each survivor earlier runs found. |
+| 15 | Mutation testing | **Built** (D25): `just mutants` over the files that decide a verdict; 676 mutants at the last run, none surviving, after a test for each survivor earlier runs found. |
 | 17 | Reviewer feedback capture | "`before` matches the stored baseline" has to include the quantities. The event it emits should be a line `calibrate --full` reads. |
 | 18 | Shadow evaluation | **Half built** (D30): a candidate policy judges every live revision and decides none. A candidate model in the shadow is not built; it would fill its collection with `import`. |
 | 19 | Structured reason codes | **Built** (D17, "The API carries the same codes"): `EvaluateResponse.reason_details`. The word diff and the neighbor lookup were left out, for the reasons given there. |

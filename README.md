@@ -2179,20 +2179,21 @@ crate's `proptest-regressions/`, which is checked in, so the case is replayed fi
 
 **Mutation testing.** `just mutants` changes the code a little at a time (a `<` to a `<=`, a function's body to
 a constant) and runs the tests against each change. A change the tests do not notice is a boundary nothing
-holds. It covers the eight files whose boundaries are verdicts: scoring, quantities, the schema, the engine, and
-the calibration statistics. It needs `cargo install --locked cargo-mutants@27.1.0`, which is a tool on the
+holds. It covers the files whose boundaries are decisions: scoring, quantities, the schema, the engine, the
+calibration statistics, the match ranking, and the promotion gate. It needs `cargo install --locked cargo-mutants@27.1.0`, which is a tool on the
 machine and not a dependency of the project.
 
 ```sh
-just mutants -j 3          # every mutant; about a quarter of an hour
+just mutants -j 3          # every mutant; about 25 minutes
 just mutants-diff          # only the mutants in what changed since the last commit
 just mutants --list        # what would be tested, without building anything
 just mutants-train -j 3    # the trainer's checkpoint rules, a set of its own; four minutes
 ```
 
-The last full run tested 517 mutants in 18 minutes at three jobs: 434 were caught, 83 did not compile, and none
-survived; the trainer's set is 58 more, 39 caught and 19 that did not compile. It is not part of `just ci`. Run
-it after changing the scoring, the quantity comparison, the engine's write path, or the calibration statistics.
+The last full run tested 676 mutants in 25 minutes at three jobs: 563 were caught, 109 did not compile, and 4
+survived, each of which then got a test; the trainer's set is 58 more, 39 caught and 19 that did not compile.
+It is not part of `just ci`. Run it after changing the scoring, the quantity comparison, the engine's write
+path, the calibration statistics, the match ranking, or the promotion gate.
 
 - **A survivor is answered with a test,** an example that states the boundary as a sentence, or a property if
   the rule holds for every input. It is excluded in `.cargo/mutants.toml` only when the change cannot alter any

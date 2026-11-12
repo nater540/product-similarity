@@ -383,6 +383,16 @@ mod tests {
       "own below 0.8, and best other at or above it"
     );
 
+    // It says which groups file and which split it was made from, as any calibration says of its pairs.
+    let mut from = mixed();
+    from.input.sha256 = "abc".to_owned();
+    from.input.split = Some("holdout".to_owned());
+    let two = populations(&from, None);
+    assert_eq!(
+      (two.input.sha256.as_str(), two.input.split.as_deref()),
+      ("abc", Some("holdout"))
+    );
+
     // A listing with no other product to be confused with adds no second score.
     let alone = calibration(vec![scored("a", Some("brand-1"), 0.9, Some(1), None)], 5);
     let two = populations(&alone, None);
@@ -425,6 +435,22 @@ mod tests {
       "the two overlap, and no cut gets fewer than four of the ten scores wrong: {suggestion:?}"
     );
     assert!(!summary.operating_points.is_empty());
+
+    // A score exactly at the threshold reaches it, on both sides: an own product at 0.75 is not below 0.75, and
+    // a best other at 0.88 reaches 0.88.
+    let at = |threshold: f32| summarize_match(&mixed(), Some(threshold), 0).at_threshold.unwrap();
+    assert_eq!(
+      (at(0.75).own_below.errors, at(0.75_f32.next_up()).own_below.errors),
+      (1, 2)
+    );
+    assert_eq!(
+      (
+        at(0.88).other_reaches.errors,
+        at(0.88_f32.next_up()).other_reaches.errors
+      ),
+      (2, 1)
+    );
+    assert_eq!((at(0.88).wrong.errors, at(0.88_f32.next_up()).wrong.errors), (2, 1));
 
     let unjudged = summarize_match(&mixed(), None, 0);
     assert!(unjudged.at_threshold.is_none());

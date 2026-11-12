@@ -1231,6 +1231,14 @@ mod tests {
     assert!(registry.current().is_none());
     assert!(!registry.knows("anything"));
     assert_eq!(render_list(&registry), "the registry is empty\n");
+
+    // Only a file that is not there is an empty registry. One that is there and cannot be read is an error: a
+    // promotion that took it for empty would compare with nothing and record a first promotion.
+    let unreadable = Registry::read(directory.path()).unwrap_err();
+    assert!(
+      format!("{unreadable:#}").contains("cannot read the registry"),
+      "{unreadable:#}"
+    );
   }
 
   #[test]

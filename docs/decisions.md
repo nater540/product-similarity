@@ -910,16 +910,23 @@ at `7b14697` tested 517 mutants in 18 minutes: 434 caught, 83 that do not compil
 before it had left three alive, in the histogram's range checks and in what counts as a recycle caught by drift
 alone, and each got a test.
 
+The match ranking, the match statistics, and the promotion gate joined the set when they were built: a match and
+a promotion are decisions too. A run at `0210b39` tested 676 mutants in 25 minutes: 563 caught, 109 that do not
+compile, 4 surviving. One was in the registry (a file that exists and cannot be read was not told apart from one
+that does not exist, which would have recorded a first promotion over a damaged registry); three were in the
+match statistics (what a score exactly at the threshold counts as, and that the two populations say which file
+and split they came from). Each got a test, and each mutation was then applied by hand to see the test fail.
+
 **Why an allowlist of files.** The alternative, excluding what should not be mutated, grows a list of everything
 whose only tests need the model or Qdrant, and a new file is mutated by default whether or not its tests can run.
-The eight files are where a mutant that survives means a wrong verdict.
+The files listed are where a mutant that survives means a wrong decision.
 
 **Why one fixed proptest seed.** The property tests draw a new seed each run. A mutant that one seed catches and
 another misses would make the survivors differ from run to run, and a gate that changes its mind is ignored. The
 recipe fixes the seed and turns off the regression files, which would otherwise be written into a copy that is
 thrown away.
 
-**Why it is not in `just ci`.** A quarter of an hour of twelve cores. It is run by hand after a change to what
+**Why it is not in `just ci`.** Twenty-five minutes of twelve cores. It is run by hand after a change to what
 it covers, as the thorough property pass is. The repository has no remote, so there is no scheduled job to give
 it to.
 
