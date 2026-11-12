@@ -37,6 +37,10 @@ pub struct Config {
   /// empty table.
   #[serde(default)]
   pub quantities: BTreeMap<String, QuantityConfig>,
+  /// A candidate policy to judge every request under as well, without deciding any. Optional; with no table
+  /// nothing is shadowed.
+  #[serde(default)]
+  pub shadow: Option<ShadowConfig>,
 }
 
 /// `[server]`
@@ -193,6 +197,119 @@ pub struct QuantityConfig {
   pub reject_incomparable: bool,
 }
 
+/// A setting that may also be switched off where the table it overrides switches it on: a floor, or a factor
+/// limit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Setting {
+  /// No floor, or no limit. Written `"off"`: TOML has no null.
+  Off,
+  /// The value.
+  Value(f64),
+}
+
+impl Setting {
+  /// The value, or `None` when the setting is off.
+  pub fn value(self) -> Option<f64> {
+    match self {
+      Self::Off => None,
+      Self::Value(value) => Some(value),
+    }
+  }
+}
+
+impl<'de> Deserialize<'de> for Setting {
+  fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    use serde::de::Error as _;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+      Number(f64),
+      Text(String),
+    }
+    match Raw::deserialize(deserializer)? {
+      Raw::Number(value) => Ok(Self::Value(value)),
+      Raw::Text(text) if text == "off" => Ok(Self::Off),
+      Raw::Text(text) => Err(D::Error::custom(format!(
+        "`{text}` is not a number; the only word allowed here is \"off\""
+      ))),
+    }
+  }
+}
+
+/// Which judgments a shadow writes a line for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShadowEvents {
+  /// Only the requests the candidate would have decided the other way. The summary still counts the rest.
+  #[default]
+  Disagreements,
+  /// Every judged request. One more line on stdout per request, which is what it costs to see how the
+  /// candidate scores the requests it agrees on.
+  All,
+}
+
+/// `[shadow]`: a candidate policy, written as what it changes.
+///
+/// `[shadow.policy]` is a whole policy and inherits nothing: a candidate's threshold belongs to its own weights
+/// and floors, so it has to be stated. `[shadow.fields.<name>]` and `[shadow.quantities.<name>]` are overrides
+/// of the live tables, and can only name what those define, since a candidate with other fields would be judging
+/// other requests.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowConfig {
+  /// What the candidate is called on every line it writes.
+  pub name: String,
+  /// Which judgments get a line of their own.
+  #[serde(default)]
+  pub events: ShadowEvents,
+  /// How often the running counts are written, in seconds.
+  #[serde(default = "default_summary_every_s")]
+  pub summary_every_s: u64,
+  /// The candidate's thresholds.
+  pub policy: PolicyConfig,
+  /// What the candidate changes about a field.
+  #[serde(default)]
+  pub fields: BTreeMap<String, ShadowFieldConfig>,
+  /// What the candidate changes about a quantity.
+  #[serde(default)]
+  pub quantities: BTreeMap<String, ShadowQuantityConfig>,
+  // A candidate model is not something this server can shadow. Named so that asking for one gets the reason and
+  // not "unknown field".
+  #[serde(default)]
+  model: Option<toml::Value>,
+  #[serde(default)]
+  qdrant: Option<toml::Value>,
+}
+
+fn default_summary_every_s() -> u64 {
+  60
+}
+
+/// `[shadow.fields.<name>]`
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowFieldConfig {
+  /// The candidate's weight for the field. Omit to keep the live one.
+  #[serde(default)]
+  pub weight: Option<f32>,
+  /// The candidate's floor for the field, or `"off"` for none. Omit to keep the live one.
+  #[serde(default)]
+  pub reject_below: Option<Setting>,
+}
+
+/// `[shadow.quantities.<name>]`
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowQuantityConfig {
+  /// The candidate's factor limit for the quantity, or `"off"` for none. Omit to keep the live one.
+  #[serde(default)]
+  pub reject_above_factor: Option<Setting>,
+  /// Whether the candidate rejects a unit of another dimension. Omit to keep the live setting.
+  #[serde(default)]
+  pub reject_incomparable: Option<bool>,
+}
+
 impl Config {
   /// Parses a configuration from TOML text.
   ///
@@ -211,7 +328,69 @@ impl Config {
     if config.qdrant.collection.trim().is_empty() {
       bail!("`qdrant.collection` must not be blank");
     }
+    if let Some(shadow) = &config.shadow {
+      if shadow.name.trim().is_empty() {
+        bail!("`shadow.name` must not be blank");
+      }
+      if shadow.summary_every_s == 0 {
+        bail!("`shadow.summary_every_s` must be positive");
+      }
+      if shadow.model.is_some() || shadow.qdrant.is_some() {
+        bail!(
+          "`[shadow.model]` and `[shadow.qdrant]`: this server shadows a policy, not a model. A candidate model \
+           is compared with `calibrate --model` (docs/decisions.md, D30)"
+        );
+      }
+      let candidate = config
+        .shadowed()
+        .context("`[shadow]` does not describe a valid policy")?;
+      candidate
+        .schema()
+        .context("`[shadow]` does not describe a valid schema")?;
+      candidate.policy().context("`[shadow.policy]` is not a valid policy")?;
+    }
     Ok(config)
+  }
+
+  /// The configuration the shadow judges by: this one with `[shadow]`'s policy in place of `[policy]` and its
+  /// overrides applied to `[fields]` and `[quantities]`. The names, and which fields are required, are the live
+  /// ones by construction, so the candidate reads the same vectors under the same layout.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error if there is no `[shadow]` table, or if it overrides a field or a quantity that the live
+  /// tables do not define.
+  #[expect(clippy::cast_possible_truncation, reason = "floors are configured as 32-bit numbers")]
+  pub fn shadowed(&self) -> anyhow::Result<Self> {
+    let Some(shadow) = &self.shadow else {
+      bail!("the configuration has no `[shadow]` table");
+    };
+    let mut candidate = self.clone();
+    candidate.shadow = None;
+    candidate.policy = shadow.policy;
+    for (name, change) in &shadow.fields {
+      let Some(field) = candidate.fields.get_mut(name) else {
+        bail!("`[shadow.fields.{name}]`: `[fields]` has no `{name}`");
+      };
+      if let Some(weight) = change.weight {
+        field.weight = weight;
+      }
+      if let Some(floor) = change.reject_below {
+        field.reject_below = floor.value().map(|floor| floor as f32);
+      }
+    }
+    for (name, change) in &shadow.quantities {
+      let Some(quantity) = candidate.quantities.get_mut(name) else {
+        bail!("`[shadow.quantities.{name}]`: `[quantities]` has no `{name}`");
+      };
+      if let Some(limit) = change.reject_above_factor {
+        quantity.reject_above_factor = limit.value();
+      }
+      if let Some(reject) = change.reject_incomparable {
+        quantity.reject_incomparable = reject;
+      }
+    }
+    Ok(candidate)
   }
 
   /// Reads and parses a configuration file.
@@ -398,6 +577,176 @@ mod tests {
     );
     assert_eq!(config.policy().unwrap().anchor_threshold, Some(0.5));
     assert_eq!(config.schema().unwrap().field("name").unwrap().reject_below, Some(0.4));
+  }
+
+  const SHADOWED: &str = r#"
+    [policy]
+    threshold = 0.8
+    anchor_threshold = 0.6
+    reject_on_measure_change = true
+
+    [fields.name]
+    weight = 4.0
+    required = true
+    reject_below = 0.4
+
+    [fields.description]
+    weight = 1.0
+
+    [quantities.weight]
+    reject_above_factor = 4.0
+    reject_incomparable = true
+
+    [quantities.thc]
+
+    [shadow]
+    name = "candidate"
+  "#;
+
+  fn shadowed(tables: &str) -> anyhow::Result<Config> {
+    Config::parse(&format!("{SHADOWED}\n{tables}"))
+  }
+
+  #[test]
+  fn a_config_without_a_shadow_has_none() {
+    assert_eq!(Config::parse(MINIMAL).unwrap().shadow, None);
+    assert!(Config::parse(MINIMAL).unwrap().shadowed().is_err());
+    let shipped = Config::parse(include_str!("../../../config.example.toml")).unwrap();
+    assert_eq!(shipped.shadow, None, "a shadow is something an operator turns on");
+  }
+
+  /// The candidate's policy is its own, whole: nothing of `[policy]` leaks into it, least of all a threshold,
+  /// which belongs to the weights and floors it was measured with.
+  #[test]
+  fn a_shadow_policy_is_stated_whole_and_inherits_nothing() {
+    let missing = shadowed("").unwrap_err();
+    assert!(format!("{missing:#}").contains("policy"), "{missing:#}");
+
+    let config = shadowed("[shadow.policy]\nthreshold = 0.7").unwrap();
+    let shadow = config.shadow.as_ref().unwrap();
+    assert_eq!(
+      (shadow.name.as_str(), shadow.events, shadow.summary_every_s),
+      ("candidate", ShadowEvents::Disagreements, 60)
+    );
+    let policy = config.shadowed().unwrap().policy().unwrap();
+    assert_eq!(policy.threshold, 0.7);
+    assert_eq!(
+      policy.anchor_threshold, None,
+      "the live drift threshold is not inherited"
+    );
+    assert!(!policy.reject_on_measure_change);
+    // The live policy is what it was.
+    assert_eq!(config.policy().unwrap().threshold, 0.8);
+    assert_eq!(config.policy().unwrap().anchor_threshold, Some(0.6));
+  }
+
+  #[test]
+  fn a_shadow_overrides_only_what_it_names_and_can_switch_a_limit_off() {
+    let base = SHADOWED
+      .replace(
+        "name = \"candidate\"",
+        "name = \"candidate\"\nevents = \"all\"\nsummary_every_s = 5",
+      )
+      .replace("[quantities.thc]", "[quantities.thc]\nreject_incomparable = true");
+    let config = Config::parse(&format!(
+      r#"{base}
+      [shadow.policy]
+      threshold = 0.7
+
+      [shadow.fields.name]
+      weight = 2.5
+      reject_below = "off"
+
+      [shadow.fields.description]
+      reject_below = 0.25
+
+      [shadow.quantities.weight]
+      reject_above_factor = "off"
+      reject_incomparable = false
+
+      [shadow.quantities.thc]
+      reject_above_factor = 3.0
+      "#
+    ))
+    .unwrap();
+    let shadow = config.shadow.as_ref().unwrap();
+    assert_eq!((shadow.events, shadow.summary_every_s), (ShadowEvents::All, 5));
+
+    let candidate = config.shadowed().unwrap();
+    assert_eq!(candidate.shadow, None);
+    let schema = candidate.schema().unwrap();
+    let name = schema.field("name").unwrap();
+    assert_eq!((name.weight, name.required, name.reject_below), (2.5, true, None));
+    let description = schema.field("description").unwrap();
+    assert_eq!((description.weight, description.reject_below), (1.0, Some(0.25)));
+    let weight = schema.quantity("weight").unwrap();
+    assert_eq!((weight.reject_above_factor, weight.reject_incomparable), (None, false));
+    let thc = schema.quantity("thc").unwrap();
+    assert_eq!(
+      (thc.reject_above_factor, thc.reject_incomparable),
+      (Some(3.0), true),
+      "what the shadow does not name stays as the live table has it"
+    );
+
+    // The live schema is untouched, and both describe the same vectors.
+    let live = config.schema().unwrap();
+    assert_eq!(live.field("name").unwrap().reject_below, Some(0.4));
+    assert_eq!(live.quantity("weight").unwrap().reject_above_factor, Some(4.0));
+    assert_eq!(live.layout_id("m"), schema.layout_id("m"));
+  }
+
+  #[test]
+  fn a_shadow_that_names_what_the_live_tables_lack_is_refused() {
+    let policy = "[shadow.policy]\nthreshold = 0.7";
+    let field = shadowed(&format!("{policy}\n[shadow.fields.brand]\nweight = 1.0")).unwrap_err();
+    assert!(format!("{field:#}").contains("`[fields]` has no `brand`"), "{field:#}");
+    let quantity = shadowed(&format!(
+      "{policy}\n[shadow.quantities.volume]\nreject_incomparable = true"
+    ))
+    .unwrap_err();
+    assert!(
+      format!("{quantity:#}").contains("`[quantities]` has no `volume`"),
+      "{quantity:#}"
+    );
+  }
+
+  #[test]
+  fn an_invalid_shadow_is_refused_at_parse_time() {
+    let policy = "[shadow.policy]\nthreshold = 0.7";
+    assert!(
+      shadowed("[shadow.policy]\nthreshold = 7").is_err(),
+      "outside the cosine range"
+    );
+    assert!(shadowed(&format!("{policy}\n[shadow.fields.name]\nweight = 0")).is_err());
+    assert!(shadowed(&format!("{policy}\n[shadow.fields.name]\nreject_below = \"none\"")).is_err());
+    assert!(shadowed(&format!("{policy}\n[shadow.fields.name]\nrequired = false")).is_err());
+    assert!(
+      shadowed(&format!(
+        "{policy}\n[shadow.quantities.weight]\nreject_above_factor = 0.5"
+      ))
+      .is_err()
+    );
+    assert!(Config::parse(&format!("{}\n{policy}", SHADOWED.replace("\"candidate\"", "\" \""))).is_err());
+    let never = SHADOWED.replace("name = \"candidate\"", "name = \"candidate\"\nsummary_every_s = 0");
+    assert!(Config::parse(&format!("{never}\n{policy}")).is_err());
+    let events = SHADOWED.replace("name = \"candidate\"", "name = \"candidate\"\nevents = \"some\"");
+    assert!(Config::parse(&format!("{events}\n{policy}")).is_err());
+  }
+
+  /// Asking for a shadow model gets the reason it is not there, not "unknown field".
+  #[test]
+  fn a_shadow_model_is_refused_with_the_reason() {
+    let policy = "[shadow.policy]\nthreshold = 0.7";
+    for table in [
+      "[shadow.model]\ndir = \"models/candidate\"",
+      "[shadow.qdrant]\ncollection = \"c\"",
+    ] {
+      let error = shadowed(&format!("{policy}\n{table}")).unwrap_err();
+      assert!(
+        format!("{error:#}").contains("shadows a policy, not a model"),
+        "{error:#}"
+      );
+    }
   }
 
   #[test]

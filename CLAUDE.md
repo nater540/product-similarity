@@ -6,7 +6,7 @@ marketplace listings. Each revision is embedded field by field with a small BERT
 thresholds. A record's quantities (weight, volume, potency) are compared as numbers beside that, never embedded.
 Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D29) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D30) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -72,8 +72,8 @@ changing a design. Infer conventions from the existing code first.
   back. It records and lists; it decides nothing.
 - `crates/similarity-server`: config, the embedding worker thread, `Engine` (all behavior), the thin gRPC layer,
   `model fetch`, `import`, `compare`/`calibrate`/`calibrate-drift`/`calibrate-sweep` (the `offline` module), `load` (the load
-  test), `runs` (reading recorded runs back, comparing and reporting them), and the `record-similarity` binary.
-  Keep `grpc.rs` free of decisions.
+  test), `runs` (reading recorded runs back, comparing and reporting them), `shadow` (a candidate policy judging
+  live requests), and the `record-similarity` binary. Keep `grpc.rs` free of decisions.
 - `crates/similarity-train`: fine-tuning (data, losses, schedule, training loop) and the `record-similarity-train`
   binary. The only crate that enables Burn's `autodiff` and `optim`; the server must never depend on it (D13).
 
@@ -130,6 +130,13 @@ changing a design. Infer conventions from the existing code first.
   policy: after the first rejection the baseline stops moving and the rest of the history is fiction.
   `anchor_threshold = 0.85` in `config.example.toml` is a starting point, not a measurement; do not replace it
   with a number from `data/drift.sample.jsonl`, which is synthetic.
+- **A shadow decides nothing** (D30). `[shadow]` is a candidate policy that the engine tells about each judged
+  request through `Observer`, after the outcome is final and anything it writes is written. Never give `observe`
+  a return value, a way to fail the request, or anything to wait on, and never let a shadow judge with
+  `Evaluation::rejudge` (the similarity to the anchor has to be computed under its own weights). The `shadow*`
+  event names are an interface like the calibration ones, and a line carries an id, scores, and codes: never a
+  record's text, and not its tenant. `config.example.toml` ships no shadow and no number for one. A shadow
+  measures agreement, not quality: do not add anything that ranks or adopts a candidate by its disagreements.
 - **A sweep is a search, and what it finds is fitted** (D29). `calibrate-sweep` ranks on one calibration and may
   evaluate the best points on another at the threshold already chosen. Never report a swept point's errors on
   the run it was ranked on as if they were a measurement, and never let it choose a threshold on the evaluation

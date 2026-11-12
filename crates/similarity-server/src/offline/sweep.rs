@@ -25,36 +25,7 @@ use super::diff;
 use super::events::{Run, six, six_wide};
 use super::pairs::Label;
 use super::stats::{self, ErrorRates};
-use crate::config::Config;
-
-/// One value on an axis that may also be switched off: a floor, or a factor limit.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Setting {
-  /// No floor, or no limit. Written `"off"`: TOML has no null.
-  Off,
-  /// The value.
-  Value(f64),
-}
-
-impl<'de> Deserialize<'de> for Setting {
-  fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-    use serde::de::Error as _;
-
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Raw {
-      Number(f64),
-      Text(String),
-    }
-    match Raw::deserialize(deserializer)? {
-      Raw::Number(value) => Ok(Self::Value(value)),
-      Raw::Text(text) if text == "off" => Ok(Self::Off),
-      Raw::Text(text) => Err(D::Error::custom(format!(
-        "`{text}` is not a number; the only word allowed here is \"off\""
-      ))),
-    }
-  }
-}
+use crate::config::{Config, Setting};
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -240,13 +211,6 @@ fn axes(grid: &Grid) -> Vec<Vec<Change>> {
   axes
 }
 
-fn off_or(setting: Setting) -> Option<f64> {
-  match setting {
-    Setting::Off => None,
-    Setting::Value(value) => Some(value),
-  }
-}
-
 /// `base` with a point's settings in place of its own.
 #[expect(
   clippy::cast_possible_truncation,
@@ -263,12 +227,12 @@ pub fn apply(base: &Config, changes: &[Change]) -> Config {
       }
       Change::Floor(field, floor) => {
         if let Some(field) = config.fields.get_mut(field) {
-          field.reject_below = off_or(*floor).map(|floor| floor as f32);
+          field.reject_below = floor.value().map(|floor| floor as f32);
         }
       }
       Change::FactorLimit(quantity, limit) => {
         if let Some(quantity) = config.quantities.get_mut(quantity) {
-          quantity.reject_above_factor = off_or(*limit);
+          quantity.reject_above_factor = limit.value();
         }
       }
       Change::Incomparable(quantity, reject) => {

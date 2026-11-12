@@ -11,11 +11,13 @@
 //! process. Several replicas writing the same id at the same instant can still interleave, which is acceptable for
 //! a system whose callers already serialize edits to a single record, and is called out in the README.
 
+use std::fmt;
 use std::hash::{BuildHasher, RandomState};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use similarity_core::quantity::first_values;
-use similarity_core::score::{self, FieldScore};
+use similarity_core::score::{self, Evaluation, FieldScore};
 use similarity_core::{
   FieldChange, Policy, PreparedRecord, Quantities, Quantity, QuantityChange, QuantityScore, Reason, RecordVectors,
   Schema,
@@ -272,6 +274,49 @@ struct PreparedImport {
   anchor: Option<PreparedRecord>,
 }
 
+/// Something that is told about every request for an id once its outcome is final (see [`Engine::with_observer`]).
+///
+/// An observer is told; it is never asked. `observe` returns nothing, so nothing an observer concludes can reach
+/// the response or the store, and it is called with the record's lock still held, so what it is told about one id
+/// arrives in the order the engine judged it. For the same reason it must not wait on anything: a request for
+/// that id is waiting on it.
+pub trait Observer: fmt::Debug + Send + Sync + 'static {
+  /// Called once per successful `evaluate` of a record that has an id, after anything it writes is written.
+  fn observe(&self, observation: &Observation<'_>);
+}
+
+/// What an [`Observer`] is told about one request.
+#[derive(Debug, Clone, Copy)]
+pub struct Observation<'a> {
+  /// The record's id.
+  pub id: &'a str,
+  /// What the request asked to be done with the verdict.
+  pub mode: WriteMode,
+  /// The threshold the request asked to be judged at in place of the configured one, if it did.
+  pub threshold: Option<f32>,
+  /// The policy the request was judged by: the configured one, at the request's threshold if it asked for one.
+  pub policy: &'a Policy,
+  /// Whether the record was written.
+  pub stored: bool,
+  /// The record's revision counter after the request.
+  pub revision: u64,
+  /// What was judged. `None` when nothing was stored under the id, so there was nothing to judge against.
+  pub judged: Option<Judged<'a>>,
+}
+
+/// A revision and the verdict on it, as an [`Observer`] is shown them.
+#[derive(Debug, Clone, Copy)]
+pub struct Judged<'a> {
+  /// The record as it was stored when the revision arrived.
+  pub baseline: &'a StoredRecord,
+  /// The revision's vectors.
+  pub candidate: &'a RecordVectors,
+  /// The revision's quantities.
+  pub quantities: &'a Quantities,
+  /// What the engine made of it, under the policy the request was judged by.
+  pub evaluation: &'a Evaluation,
+}
+
 /// The service's behavior.
 #[derive(Debug)]
 pub struct Engine<S, E> {
@@ -279,6 +324,7 @@ pub struct Engine<S, E> {
   embedder: E,
   schema: Schema,
   policy: Policy,
+  observer: Option<Arc<dyn Observer>>,
   locks: Vec<Mutex<()>>,
   lock_hasher: RandomState,
 }
@@ -328,9 +374,20 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       embedder,
       schema,
       policy,
+      observer: None,
       locks: (0..LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
       lock_hasher: RandomState::new(),
     }
+  }
+
+  /// The same engine, telling `observer` about every judged request from now on.
+  ///
+  /// This is how a candidate policy is tried on live requests without deciding any of them (see
+  /// [`crate::shadow`]). There is one observer; a second call replaces the first.
+  #[must_use]
+  pub fn with_observer(mut self, observer: Arc<dyn Observer>) -> Self {
+    self.observer = Some(observer);
+    self
   }
 
   /// The store, for the drift replay, which reads a record's anchor before each step, and for tests that check
@@ -423,12 +480,14 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
         vectors: candidate,
         quantities,
       };
-      return self.revise(revision, input.mode, &policy, baseline).await;
+      return self
+        .revise(revision, (input.mode, input.threshold), &policy, baseline)
+        .await;
     }
     let stored = input.mode != WriteMode::DryRun;
     if stored {
       let record = StoredRecord {
-        id,
+        id: id.clone(),
         tenant,
         anchor: candidate.composite.clone(),
         vectors: candidate.clone(),
@@ -440,6 +499,17 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       };
       self.store.put(&record).await?;
     }
+    if let Some(observer) = &self.observer {
+      observer.observe(&Observation {
+        id: &id,
+        mode: input.mode,
+        threshold: input.threshold,
+        policy: &policy,
+        stored,
+        revision: u64::from(stored),
+        judged: None,
+      });
+    }
     Ok(EvaluateOutput::without_baseline(
       Verdict::Created,
       &policy,
@@ -448,14 +518,16 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     ))
   }
 
-  /// Judges `candidate` against `baseline` and writes it back if the policy and the mode allow.
+  /// Judges `candidate` against `baseline` and writes it back if the policy and the mode allow. `asked` is the
+  /// request's mode and the threshold it asked for, if it asked for one; `policy` already has that threshold.
   async fn revise(
     &self,
     candidate: Revision,
-    mode: WriteMode,
+    asked: (WriteMode, Option<f32>),
     policy: &Policy,
     baseline: StoredRecord,
   ) -> Result<EvaluateOutput, EngineError> {
+    let (mode, threshold) = asked;
     let Revision {
       id,
       tenant,
@@ -512,16 +584,34 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
         (anchor, first_values(&baseline.anchor_quantities, &quantities))
       };
       let record = StoredRecord {
-        id,
+        id: id.clone(),
         tenant,
         anchor,
         vectors: candidate.clone(),
-        quantities,
+        quantities: quantities.clone(),
         anchor_quantities,
         revision,
         updated_at: now(),
       };
       self.store.put(&record).await?;
+    }
+
+    // Only now is the outcome final: a write that failed has already returned its error, and is never observed.
+    if let Some(observer) = &self.observer {
+      observer.observe(&Observation {
+        id: &id,
+        mode,
+        threshold,
+        policy,
+        stored: write,
+        revision,
+        judged: Some(Judged {
+          baseline: &baseline,
+          candidate: &candidate,
+          quantities: &quantities,
+          evaluation: &evaluation,
+        }),
+      });
     }
 
     Ok(EvaluateOutput {
@@ -902,6 +992,240 @@ mod tests {
     async fn search(&self, query: SearchQuery<'_>) -> Result<Vec<Neighbor>, StoreError> {
       self.0.search(query).await
     }
+  }
+
+  /// What an observer was told, kept: an [`Observation`] only borrows.
+  #[derive(Debug, Clone, PartialEq)]
+  struct Told {
+    id: String,
+    mode: WriteMode,
+    threshold: Option<f32>,
+    judged_at: f32,
+    stored: bool,
+    revision: u64,
+    /// The baseline's revision, the candidate's composite, its quantities, and whether it was accepted.
+    judged: Option<(u64, Vec<f32>, Quantities, bool)>,
+  }
+
+  #[derive(Debug, Default)]
+  struct Recorder(std::sync::Mutex<Vec<Told>>);
+
+  impl Recorder {
+    fn told(&self) -> Vec<Told> {
+      self.0.lock().unwrap().clone()
+    }
+  }
+
+  impl Observer for Recorder {
+    fn observe(&self, observation: &Observation<'_>) {
+      self.0.lock().unwrap().push(Told {
+        id: observation.id.to_owned(),
+        mode: observation.mode,
+        threshold: observation.threshold,
+        judged_at: observation.policy.threshold,
+        stored: observation.stored,
+        revision: observation.revision,
+        judged: observation.judged.map(|judged| {
+          (
+            judged.baseline.revision,
+            judged.candidate.composite.clone(),
+            judged.quantities.clone(),
+            judged.evaluation.accepted(),
+          )
+        }),
+      });
+    }
+  }
+
+  fn observed() -> (TestEngine, Arc<Recorder>) {
+    let recorder = Arc::new(Recorder::default());
+    let engine = engine_over(measured_schema((None, false)), Policy::new(0.75, None).unwrap());
+    (engine.with_observer(recorder.clone()), recorder)
+  }
+
+  /// An observer is how a candidate policy watches live requests (`shadow.rs`). It is told about each request
+  /// for an id exactly once, with what was judged and what came of it.
+  #[tokio::test]
+  async fn an_observer_is_told_what_was_judged_and_what_came_of_it() {
+    let (engine, recorder) = observed();
+    let weighed = |fields: &[(&str, &str)], mode: WriteMode, threshold: Option<f32>| EvaluateInput {
+      record: RecordInput {
+        quantities: vec![("weight".to_owned(), grams(3.5))],
+        ..record(Some("p1"), fields)
+      },
+      mode,
+      threshold,
+    };
+
+    let created = engine
+      .evaluate(weighed(&GUMMIES, WriteMode::Enforce, None))
+      .await
+      .unwrap();
+    let edited = engine
+      .evaluate(weighed(&GUMMIES_EDITED, WriteMode::Enforce, Some(0.5)))
+      .await
+      .unwrap();
+    let recycled = engine.evaluate(weighed(&VAPE, WriteMode::Enforce, None)).await.unwrap();
+    let tried = engine.evaluate(weighed(&VAPE, WriteMode::DryRun, None)).await.unwrap();
+    let forced = engine.evaluate(weighed(&VAPE, WriteMode::Force, None)).await.unwrap();
+    assert_eq!(
+      [edited.verdict, recycled.verdict, tried.verdict, forced.verdict],
+      [
+        Verdict::Accepted,
+        Verdict::Rejected,
+        Verdict::Rejected,
+        Verdict::Rejected
+      ]
+    );
+
+    let weight: Quantities = [("weight".to_owned(), grams(3.5))].into_iter().collect();
+    let told = |mode, threshold: Option<f32>, stored, revision, judged| Told {
+      id: "p1".to_owned(),
+      mode,
+      threshold,
+      judged_at: threshold.unwrap_or(0.75),
+      stored,
+      revision,
+      judged,
+    };
+    let judged = |baseline: u64, output: &EvaluateOutput, accepted: bool| {
+      Some((baseline, output.vector.clone(), weight.clone(), accepted))
+    };
+    assert_eq!(
+      recorder.told(),
+      [
+        told(WriteMode::Enforce, None, true, 1, None),
+        told(WriteMode::Enforce, Some(0.5), true, 2, judged(1, &edited, true)),
+        told(WriteMode::Enforce, None, false, 2, judged(2, &recycled, false)),
+        told(WriteMode::DryRun, None, false, 2, judged(2, &tried, false)),
+        told(WriteMode::Force, None, true, 3, judged(2, &forced, false)),
+      ]
+    );
+    assert_eq!(created.revision, 1);
+
+    // A new record that a dry run does not store is observed as not stored, at revision zero.
+    engine
+      .evaluate(EvaluateInput {
+        mode: WriteMode::DryRun,
+        ..evaluate_input(Some("p2"), &GUMMIES)
+      })
+      .await
+      .unwrap();
+    let last = recorder.told().pop().unwrap();
+    assert_eq!(
+      (last.id.as_str(), last.stored, last.revision, last.judged),
+      ("p2", false, 0, None)
+    );
+  }
+
+  /// A store that can be told to refuse every write.
+  struct Refusing {
+    inner: MemoryStore,
+    refuse: std::sync::atomic::AtomicBool,
+  }
+
+  impl VectorStore for Refusing {
+    async fn get(&self, id: &str) -> Result<Option<StoredRecord>, StoreError> {
+      self.inner.get(id).await
+    }
+
+    async fn put(&self, record: &StoredRecord) -> Result<(), StoreError> {
+      if self.refuse.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(StoreError::Unavailable("refusing writes".to_owned()));
+      }
+      self.inner.put(record).await
+    }
+
+    async fn delete(&self, id: &str) -> Result<bool, StoreError> {
+      self.inner.delete(id).await
+    }
+
+    async fn search(&self, query: SearchQuery<'_>) -> Result<Vec<Neighbor>, StoreError> {
+      self.inner.search(query).await
+    }
+  }
+
+  /// Only an outcome is observed. A request without an id has no verdict, a request that is refused has none,
+  /// and a write that failed is an error the caller got: none of them is something a candidate could have
+  /// decided differently.
+  #[tokio::test]
+  async fn a_request_without_an_id_and_a_request_that_failed_are_never_observed() {
+    let (engine, recorder) = observed();
+    engine.evaluate(evaluate_input(None, &GUMMIES)).await.unwrap();
+    assert!(engine.evaluate(evaluate_input(Some("p1"), &[])).await.is_err());
+    let invalid = EvaluateInput {
+      threshold: Some(7.0),
+      ..evaluate_input(Some("p1"), &GUMMIES)
+    };
+    assert!(engine.evaluate(invalid).await.is_err());
+    assert_eq!(recorder.told(), []);
+
+    // A write that fails, for a new record and for a revision of a stored one.
+    let embedder = WordBagEmbedder::new("word-bag-v1");
+    let (layout, dimension) = store_layout(&schema(), &embedder);
+    let store = Refusing {
+      inner: MemoryStore::new(layout, dimension),
+      refuse: std::sync::atomic::AtomicBool::new(false),
+    };
+    let recorder = Arc::new(Recorder::default());
+    let engine =
+      Engine::new(store, embedder, schema(), Policy::new(0.75, None).unwrap()).with_observer(recorder.clone());
+    engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
+    assert_eq!(recorder.told().len(), 1);
+
+    engine.store.refuse.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(engine.evaluate(evaluate_input(Some("p2"), &GUMMIES)).await.is_err());
+    assert!(
+      engine
+        .evaluate(evaluate_input(Some("p1"), &GUMMIES_EDITED))
+        .await
+        .is_err()
+    );
+    assert_eq!(
+      recorder.told().len(),
+      1,
+      "a write that failed has no outcome to observe"
+    );
+    // A request that writes nothing succeeds on the same store, and is observed.
+    engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
+    assert_eq!(recorder.told().len(), 2);
+  }
+
+  /// The observer is called under the record's lock, so what it is told about one id is in the order the engine
+  /// judged it: the revision counter it sees never goes back.
+  #[tokio::test]
+  async fn an_observer_is_told_about_one_record_in_the_order_it_was_judged() {
+    let embedder = WordBagEmbedder::new("word-bag-v1");
+    let (layout, dimension) = store_layout(&schema(), &embedder);
+    let recorder = Arc::new(Recorder::default());
+    let engine = Engine::new(
+      Slow(MemoryStore::new(layout, dimension)),
+      embedder,
+      schema(),
+      Policy::new(0.0, None).unwrap(),
+    )
+    .with_observer(recorder.clone());
+    let request = |fields: &[(&str, &str)]| engine.evaluate(evaluate_input(Some("p1"), fields));
+    let (a, b, c, d) = tokio::join!(
+      request(&GUMMIES),
+      request(&GUMMIES_EDITED),
+      request(&VAPE),
+      request(&GUMMIES)
+    );
+    for outcome in [a, b, c, d] {
+      outcome.unwrap();
+    }
+    // Which request got the lock first is not fixed. Whichever it was, each one after it was judged against
+    // exactly what the one before it left.
+    let told = recorder.told();
+    assert_eq!(told.len(), 4);
+    assert_eq!((told[0].revision, &told[0].judged), (1, &None));
+    for pair in told.windows(2) {
+      let baseline = pair[1].judged.as_ref().map(|judged| judged.0);
+      assert_eq!(baseline, Some(pair[0].revision), "{told:?}");
+      assert!(pair[1].revision >= pair[0].revision, "{told:?}");
+    }
+    assert!(told.iter().filter(|told| told.stored).count() >= 2, "{told:?}");
   }
 
   /// A verdict is a read, a judgment, and a write. Two requests for one id that interleave would both read "no

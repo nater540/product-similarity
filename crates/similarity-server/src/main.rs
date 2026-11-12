@@ -13,6 +13,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -31,7 +32,8 @@ use similarity_server::load;
 use similarity_server::offline::events::{self, Run};
 use similarity_server::offline::{self, Confidence, Offline, RecordFields, Selection, diff};
 use similarity_server::runs;
-use similarity_server::worker::{DirectEmbedder, EmbedWorker};
+use similarity_server::shadow::{self, PolicyShadow};
+use similarity_server::worker::{DirectEmbedder, EmbedWorker, TextEmbedder};
 use similarity_store::{MemoryStore, QdrantStore, VectorStore};
 
 /// What this binary knows about itself, for the provenance of a model directory it fetches.
@@ -479,12 +481,35 @@ async fn serve_with<S: VectorStore>(
   config: &Config,
   listen: std::net::SocketAddr,
 ) -> anyhow::Result<()> {
-  let engine = Arc::new(Engine::new(store, worker, config.schema()?, config.policy()?));
+  let (schema, policy) = (config.schema()?, config.policy()?);
+  // A candidate policy, if the configuration names one. It is told about every judged request and decides none
+  // (docs/decisions.md, D30).
+  let shadow = PolicyShadow::from_config(config, worker.dimension())?.map(Arc::new);
+  let mut engine = Engine::new(store, worker, schema.clone(), policy);
+  let mut summaries = None;
+  if let (Some(shadow), Some(settings)) = (&shadow, &config.shadow) {
+    shadow.announce(&schema, &policy);
+    engine = engine.with_observer(shadow.clone());
+    let every = Duration::from_secs(settings.summary_every_s);
+    summaries = Some(tokio::spawn(shadow::summarize_every(shadow.clone(), every)));
+    tracing::info!(
+      shadow = settings.name.as_str(),
+      "judging every revision under a shadow policy as well"
+    );
+  }
   let listener = tokio::net::TcpListener::bind(listen)
     .await
     .with_context(|| format!("cannot listen on {listen}"))?;
   tracing::info!(address = %listener.local_addr()?, "serving gRPC");
-  similarity_server::serve(engine, listener, shutdown_signal()).await
+  let served = similarity_server::serve(Arc::new(engine), listener, shutdown_signal()).await;
+  if let Some(summaries) = summaries {
+    summaries.abort();
+  }
+  // The counts as the server stops: the timer's last line is up to an interval old.
+  if let Some(shadow) = shadow {
+    shadow.emit_summary();
+  }
+  served
 }
 
 impl ServeArgs {

@@ -40,7 +40,7 @@ record has an anchor (plans 11 and 18). `calibrate-diff --config-b` is not affec
 | 14 | [Fuzzing](14-fuzzing.md) | medium | | Does not need nightly; the state machine is private and index-driven |
 | 15 | [Mutation testing](15-mutation-testing.md) | small, **built** | | The tool never mutates method calls or constants; proptest seeds must be fixed |
 | 17 | [Reviewer feedback](17-reviewer-feedback.md) | medium | | A feedback event cannot nest a pair; a restored field replays differently |
-| 18 | [Shadow evaluation](18-shadow-evaluation.md) | large | 12 helps | A low-priority thread does nothing: Burn runs on the global rayon pool |
+| 18 | [Shadow evaluation](18-shadow-evaluation.md) | large, **policy half built** | 12 helps | A low-priority thread does nothing: Burn runs on the global rayon pool |
 | 19 | [Reason codes](19-reason-codes.md) | small, **built** | | Mostly exists; a server-side word diff is impossible (only hashes are stored) |
 | 20 | [Menu-item matching](20-menu-item-matching.md) | large | | A brand-name filter is impossible; search returns no vectors |
 
@@ -79,5 +79,5 @@ Each plan ends with its full list of decisions and a recommended default for eac
 4. **15** (built) and **14**, at any point. 14's first targets confirm the two predicted findings above.
 5. **11** is built, on synthetic histories; it is run for real once `sequences.jsonl` exists.
 6. Before real fine-tuning: **2**, **3**, and **5** (all built), then **4**. **6** last; it is large and builds on 3.
-7. Before production: **10** and **12** (12 is built). In production: **17**, then **18** (its policy-only half is a day or two).
+7. Before production: **10** and **12** (12 is built). In production: **17**, then **18** (its policy-only half is built, D30; the model half waits for a candidate model).
 8. **20** when the matching question is taken up; it is a separate product question.

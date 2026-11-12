@@ -501,6 +501,12 @@ operator's own log stream. No new dependencies.
 
 ### 18. Shadow evaluation of a candidate model
 
+**Half built** (D30). A `[shadow]` table names a candidate policy (thresholds, weights, floors, quantity limits),
+which judges every live revision on the live vectors and writes a `shadow` event for each disagreement, without
+deciding anything. The half described below, a second model with its own collection, is not built: it competes
+with the live model for the same cores, and whether a model is better is first answered offline by
+`calibrate --model`. `docs/plans/18-shadow-evaluation.md` has its design.
+
 **What.** A `[shadow]` config section naming a second model directory, collection, and policy. After each
 primary `Evaluate`, a second low-priority embedding worker evaluates the same revision against the shadow
 collection and logs a `shadow` event with both verdicts.

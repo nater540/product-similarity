@@ -1104,3 +1104,71 @@ sweeping, and how many runs a sweep can afford: each point is a whole training r
 would have been wrong in any case: sweeping the number of passes by picking checkpoints (the learning-rate
 schedule depends on the total number of steps, so the checkpoint after pass two of four is not the model two
 passes would give), and judging trained models at the configured thresholds, which belong to the base model.
+
+## D30. A candidate policy runs in the shadow of the live one; a candidate model does not
+
+A changed policy could be tried on labeled pairs (`calibrate-diff --config-b`, `calibrate-sweep`) and then only
+by deploying it. Pairs say whether it separates the labels. They do not say how many of the requests the service
+really gets it would decide differently, or which. A `[shadow]` table answers that: every judged revision is
+judged again under the candidate, and the disagreements are written down.
+
+**The engine tells an observer; it never asks one.** `Engine::with_observer` takes one `Observer`, whose
+`observe` returns nothing. It is called once for each successful `evaluate` of a record with an id, after
+anything the request writes is written (a write that failed returned its error and is not observed), with the
+record's lock still held, so what is observed about one id is in the order it was judged. The observation
+borrows what the engine already has in hand (the baseline, the candidate's vectors and quantities, the live
+evaluation), so nothing is copied for it. That shape is what makes "a shadow cannot change a verdict" true by
+construction instead of by care: there is no value for it to return and nothing mutable for it to reach. A
+property holds it anyway (`a_shadow_never_changes_an_answer_or_a_write`): any sequence of requests gets the same
+answers and leaves the same store with a candidate watching, including one that fails on every revision.
+
+**The candidate judges as the engine does.** `score::evaluate` and `judge_quantities`, under the candidate's
+schema and policy, on the live vectors, against the live baseline and anchor. Not `Evaluation::rejudge`, which
+keeps the similarity to the anchor it was given: with other weights that number is another number (D17), and
+here the vectors are in hand, so it is computed.
+
+**Its baseline is the live history.** A shadow that kept its own history would need its own store and its own
+write rules, and would answer "where would the catalog be". This one answers "what would the candidate have said
+to this request, here", which is the question a change of policy raises on the day it is made, and needs no
+state at all. The price is stated in the README: a revision the candidate would have refused still becomes the
+baseline when the live policy stores it.
+
+**A request's own threshold replaces the candidate's.** Were the candidate live, the request would have been
+judged at the threshold it asked for. Judging it at the candidate's configured one would report disagreements
+that the change of policy would never cause.
+
+**`[shadow.policy]` is whole; `[shadow.fields]` and `[shadow.quantities]` are overrides.** A threshold belongs
+to the weights and floors it was measured with (D3), so it is never inherited. Fields and quantities can only be
+the live ones, since the candidate reads the live vectors under the live layout (D12), so they are written as
+what changes, with `"off"` for no floor or limit as in a sweep grid (D29). `Config::shadowed` builds the
+candidate's configuration from the live one, which is how the names and `required` are the same by construction.
+`[shadow.model]` and `[shadow.qdrant]` are refused by name, with the reason.
+
+**What it writes are results, flat, and their names are an interface** (D15, D17): `shadow_started` with a
+`shadow_schema_field` and `shadow_schema_quantity` line per item, `shadow` and `shadow_reason` joined on `key`,
+`shadow_summary`. They go to stdout, which a serving process did not write to before; that is why nothing is
+written without a `[shadow]` table, and why the default is a line per disagreement and not per request. A
+`shadow` line carries scores, verdicts, and codes. It names the record by id, as the request log line does, and
+carries no text and no tenant: whether a tenant may be written to a log is the owner's decision, pending with
+the telemetry plan. Fields can be added later; none may be repurposed.
+
+**Agreement is not quality.** A disagreement says the policies differ, not which is right. The summary counts
+both directions and nothing in the tool ranks a candidate by them. The ids are for labeling; the labeled pairs
+go through `calibrate`, where a gate exists (`calibrate-diff --fail-on`).
+
+**What it costs was measured, not argued.** One weighted comparison of vectors in memory per judged revision,
+and three small clones per stored write so that the engine can still show the observer what it stored. Under
+`load --server` on the development machine the medians with and without a shadow were within noise of each
+other (README).
+
+**A candidate model is not shadowed.** `docs/plans/18-shadow-evaluation.md` designs it: a second model, a second
+collection, writes mirrored from the live decision, a lossy ordered queue, an import into the shadow collection,
+a report. It is not built, for three reasons. The second model competes with the live one for the same cores
+(Burn's CPU backend runs on the global rayon pool, so a low-priority thread bounds nothing), and what latency
+that costs can only be measured on the production hardware and accepted by its owner. Whether a model is better
+is answered on labeled pairs by `calibrate --model` and AUC (D24), with no service running; live traffic adds
+only the cases nobody labeled. And no candidate model exists yet. The observer seam is what the model shadow
+would plug into, so building the policy half first cost it nothing.
+
+**Not built with it:** a `shadow-report` command (the summary line has the counts, `jq` lists the ids, and
+intervals resampled by tenant need the tenant on the line), the shadow in `Describe`, and more than one shadow.

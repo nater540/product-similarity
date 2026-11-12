@@ -91,3 +91,28 @@ weight = 2.0
 [quantities.thc_per_item]
 
 [quantities.cbd_per_item]
+
+# A candidate policy, judged in the shadow of the one above. Optional, and off unless the table is there.
+#
+# With it, the server judges every revision a second time under the candidate (the same vectors, against the same
+# stored record) and writes a line on stdout for each one the candidate would have decided the other way. The
+# candidate decides nothing: no verdict, response, or stored record depends on it.
+#
+# NO NUMBERS ARE GIVEN HERE, ON PURPOSE. A candidate's threshold is a measurement like any other: take it from
+# `record-similarity calibrate` or `calibrate-sweep` run with the candidate's weights and floors.
+#
+#   [shadow]
+#   name = "..."                  # written on every line
+#   events = "disagreements"      # or "all": a line for every judged revision
+#   summary_every_s = 60          # how often the running counts are written
+#
+#   [shadow.policy]               # a whole policy: nothing is inherited from [policy]
+#   threshold = ...
+#   anchor_threshold = ...        # omit, and the candidate does not enforce drift
+#
+#   [shadow.fields.name]          # overrides of [fields] and [quantities]; what is not named stays as it is
+#   weight = ...
+#   reject_below = ...            # or "off" for no floor
+#
+#   [shadow.quantities.weight_per_item]
+#   reject_above_factor = ...     # or "off" for no limit

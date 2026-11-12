@@ -913,7 +913,8 @@ The first point gets as many wrong with more room around its threshold (a margin
   the `validation` split and evaluate once on the holdout, for the same reason a model is chosen that way
   ([Choose a model, then measure it once](#3-choose-a-model-then-measure-it-once)).
 - The best point is something to try, not to paste: put it in a copy of the config, run `calibrate` under it, and
-  compare with `calibrate-diff`. `--ndjson` writes the sweep as `policy_sweep`, `policy_point`, and
+  compare with `calibrate-diff`. To see what it would do to live requests before it decides any, run it as
+  [a candidate policy in the shadow](#a-candidate-policy-in-the-shadow). `--ndjson` writes the sweep as `policy_sweep`, `policy_point`, and
   `policy_point_setting` lines.
 
 Training options are swept by hand, for now: run the trainer once per setting (every option that changes a
@@ -1569,6 +1570,13 @@ commented starting point.
 | `[quantities.<name>]` | none defined | Naming the table defines the quantity, even with nothing in it. It is then accepted in requests, compared, and reported. |
 | `quantities.<name>.reject_above_factor` | none | Reject a revision that changes this quantity by more than this factor, in either direction, or moves it between zero and a value above zero. At least 1. |
 | `quantities.<name>.reject_incomparable` | `false` | Reject a revision that puts this quantity in a unit that cannot be compared with the one it had. |
+| `[shadow]` | none | A candidate policy that judges every revision as well and decides none. See [A candidate policy in the shadow](#a-candidate-policy-in-the-shadow). |
+| `shadow.name` | (required) | What the candidate is called on every line it writes. |
+| `shadow.events` | `disagreements` | `disagreements` writes a line for each revision the candidate would have decided the other way; `all` writes one for every judged revision. |
+| `shadow.summary_every_s` | `60` | How often the running counts are written. |
+| `shadow.policy.*` | `threshold` required | The candidate's policy, with the keys of `[policy]`. Nothing is inherited from `[policy]`. |
+| `shadow.fields.<name>.weight`, `.reject_below` | the live value | The candidate's weight and floor for a field of `[fields]`. `reject_below = "off"` removes the floor. |
+| `shadow.quantities.<name>.reject_above_factor`, `.reject_incomparable` | the live value | The candidate's limits for a quantity of `[quantities]`. `reject_above_factor = "off"` removes the limit. |
 
 At least one field is required. Field and quantity names may contain letters, digits, and underscores, and a name
 cannot be both. The example configuration defines four quantities and sets no limit on any of them.
@@ -1578,6 +1586,7 @@ What a change costs:
 | Change | Consequence |
 |---|---|
 | A threshold, a floor, `required` | None. Takes effect on restart. |
+| `[shadow]` added, changed, or removed | None for any verdict or stored record. Takes effect on restart. With a shadow the server writes result lines on stdout, which is otherwise empty. |
 | A quantity added, removed, or given a limit | None. Quantities are stored beside the vectors, not in them. A record stored before a quantity existed reports it as `ADDED` the first time it arrives. |
 | A field weight | Verdicts use the new weight at once. Search rankings use the weights records were written with until they are rewritten. |
 | `model.dir`, `output_dim`, `max_tokens`, or the set of fields | Stored vectors are no longer comparable. Use a new collection and re-index. The server refuses to mix them. |
@@ -1639,6 +1648,108 @@ verdict   Accepted (stored: false, revision 1)
 overall   1.000 against a threshold of 0.900
 drift     0.963 similarity to the original record
 ```
+
+### A candidate policy in the shadow
+
+`calibrate`, `calibrate-diff`, and `calibrate-sweep` say what another threshold, weight, floor, or limit makes of
+labeled pairs. They cannot say what it would make of the requests the service actually gets. A `[shadow]` table
+does: the server judges every revision a second time under the candidate, on the same vectors against the same
+stored record, and writes down where the candidate would have decided the other way.
+
+**The candidate decides nothing.** It is told about a request after the answer is final, and it cannot change a
+verdict, a response, or a write, whatever it concludes.
+
+```toml
+# Appended to a copy of config.example.toml, as shadow.toml. This candidate is the first point of the sweep
+# above: a heavier name with no floor, a lighter category, at the threshold the sweep chose for it.
+[shadow]
+name = "name-6-no-floor"
+
+[shadow.policy]
+threshold = 0.857
+
+[shadow.fields.name]
+weight = 6.0
+reject_below = "off"
+
+[shadow.fields.category]
+weight = 1.5
+```
+
+```sh
+just serve-in-memory shadow.toml > shadow.ndjson     # logs stay on stderr; what the shadow writes is on stdout
+```
+
+```text
+$ just client evaluate sku-1 data/examples/gummies.json
+verdict   Created (stored: true, revision 1)
+
+$ just client evaluate sku-1 data/examples/gummies-edited.json
+verdict   Accepted (stored: true, revision 2)
+
+$ just client evaluate sku-1 data/examples/gummies-moved.json      # the same gummies, filed under vaporizers
+verdict   Rejected (stored: false, revision 2)
+overall   0.879 against a threshold of 0.900
+drift     0.860 similarity to the original record
+field     brand           1.000  Unchanged
+field     category        0.596  Modified
+field     description     1.000  Unchanged
+field     name            1.000  Unchanged
+quantity  thc_per_item        x1.00  Unchanged (g to g)
+quantity  weight_per_item     x1.00  Unchanged (g to g)
+reason    below_threshold              0.879 < 0.900
+```
+
+The caller got the live verdict. `shadow.ndjson` got what the candidate made of it:
+
+```json
+{"timestamp":"2026-11-12T01:13:48.687887Z","level":"INFO","message":"shadow","key":"1794445945-2","id":"sku-1","shadow":"name-6-no-floor","kind":"policy","mode":"enforce","live_verdict":"rejected","shadow_verdict":"accepted","agree":false,"live_similarity":0.878707,"shadow_similarity":0.942242,"live_anchor_similarity":0.860299,"shadow_anchor_similarity":0.917739,"live_threshold":0.9,"shadow_threshold":0.857,"measure_changed":false,"live_stored":false,"revision":2,"target":"result"}
+{"timestamp":"2026-11-12T01:13:48.687941Z","level":"INFO","message":"shadow_reason","key":"1794445945-2","shadow":"name-6-no-floor","side":"live","code":"below_threshold","value":0.878707,"limit":0.9,"target":"result"}
+{"timestamp":"2026-11-12T01:13:48.707425Z","level":"INFO","message":"shadow_summary","shadow":"name-6-no-floor","kind":"policy","observed":3,"created":1,"judged":2,"agreed":1,"only_shadow_rejected":0,"only_live_rejected":1,"failed":0,"target":"result"}
+```
+
+A category that counts half as much lets a product move between categories: the candidate would have accepted
+what the live policy refused. Whether that is a fault of the candidate or of the live policy, the shadow cannot
+say.
+
+```sh
+jq -r 'select(.message == "shadow") | [.id, .live_verdict, .shadow_verdict, .live_similarity, .shadow_similarity] | @tsv' shadow.ndjson
+```
+
+```text
+sku-1	rejected	accepted	0.878707	0.942242
+```
+
+- **A disagreement is a question, not an answer.** It says the two policies differ on a request, not which is
+  right. The ids are a list to label: look the revisions up in your own database, label them, and put the pairs
+  through `calibrate`. A candidate is adopted on what `calibrate` says, never on a count of disagreements.
+- **`[shadow.policy]` is a whole policy and inherits nothing.** A threshold belongs to the weights and floors it
+  was measured with, so the candidate states its own, and it enforces drift only if it sets `anchor_threshold`.
+  `[shadow.fields.<name>]` and `[shadow.quantities.<name>]` are overrides of the live tables: what they do not
+  name stays as it is, `"off"` removes a floor or a limit, and a name the live tables lack is an error. The
+  candidate reads the vectors the live policy just scored, so it cannot have other fields.
+- **The candidate is judged on the history the live policy made.** Its baseline and its anchor are the stored
+  record's. A revision it would have refused still becomes the baseline if the live policy stored it. Each line
+  answers "what would the candidate have said to this request, here", not "where would the catalog be had the
+  candidate been in charge".
+- **A request that names its own threshold is judged at it by both**, as it would be were the candidate live.
+  `live_threshold` and `shadow_threshold` are what each side was held to.
+- **Lines.** `shadow_started` once, with the candidate's policy beside the live one, then a `shadow_schema_field`
+  and `shadow_schema_quantity` line per item, so that the file says what produced it. One `shadow` line per
+  disagreement, and one `shadow_reason` line per reason either side gave, joined on `key`. `events = "all"`
+  writes a `shadow` line for every judged revision instead, which is what it costs to see how the candidate
+  scores what it agrees on. `shadow_summary` every `summary_every_s` seconds and once more as the server stops:
+  the counts since it started. `created` records had nothing to be judged against; `judged` is `agreed` plus
+  the two kinds of disagreement; `failed` should stay zero.
+- **No record text is written, and no tenant.** A line names a record by its id, as the request log does.
+- **It costs one more comparison of vectors already in memory**: no model, no store, nothing waited for. Against
+  this server with `just load ... --server`, one caller, 300 records: edits took a median of 5.63 ms with no
+  shadow, 5.63 ms with this one, and 5.69 ms with `events = "all"`; resaves, which never reach the model,
+  0.10 ms, 0.11 ms, and 0.11 ms. One run each, so differences of that size are noise.
+- **Only a policy can be shadowed, and one at a time.** A candidate model is compared with `calibrate --model`
+  on labeled pairs ([Choose a model, then measure it once](#3-choose-a-model-then-measure-it-once)); running one
+  beside the live model is not built, and `[shadow.model]` is refused with that reason. Changing or removing
+  the shadow is a restart.
 
 ### Re-indexing
 
@@ -1845,9 +1956,9 @@ data/
   regression.snapshot.ndjson      what the pinned model and the example config make of them
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D29)
+  decisions.md               why things are the way they are (D1 to D30)
   data-request-prompt.md     a brief for collecting labeled production data
-  feature-suggestions.md     twenty features that could be added, none built yet
+  feature-suggestions.md     twenty features that could be added, and which of them are built
   plan-features.md           a plan for the first five of them
 models/                 fetched and fine-tuned model directories (ignored by git)
 tools/                  referees, not part of any pipeline: they write the fixtures the parity tests compare with

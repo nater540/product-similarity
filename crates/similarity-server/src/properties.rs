@@ -25,6 +25,7 @@ use similarity_core::vector::cosine;
 use similarity_core::{EmbedderOptions, FieldSpec, Policy, Quantity, QuantitySpec, Reason, Schema};
 use similarity_store::{MemoryStore, StoredRecord, VectorStore};
 
+use crate::config::ShadowEvents;
 use crate::engine::{
   Engine, EngineError, EvaluateInput, FindSimilarInput, ImportInput, Imported, Original, RecordInput, SimilarTo,
   Verdict, WriteMode, store_layout,
@@ -32,6 +33,7 @@ use crate::engine::{
 use crate::offline::calibrate::suggest_threshold;
 use crate::offline::pairs::Label;
 use crate::offline::{Offline, RecordFields, Suggestion};
+use crate::shadow::PolicyShadow;
 use crate::worker::testing::{WORD_BAG_DIMENSION, WordBagEmbedder, word_bag};
 use crate::worker::{EmbedError, TextEmbedder};
 
@@ -264,6 +266,40 @@ fn check_anchor_kept(before: &StoredRecord, after: &StoredRecord) -> Result<(), 
 }
 
 /// Runs one request against the engine and checks every rule that applies to it.
+/// The `Evaluate` call a request stands for, if it is one.
+fn evaluate_input(request: &Request) -> Option<EvaluateInput> {
+  let Request::Evaluate {
+    id,
+    tenant,
+    name,
+    category,
+    description,
+    weight,
+    thc,
+    mode,
+    threshold,
+  } = request.clone()
+  else {
+    return None;
+  };
+  let mut fields = vec![("name".to_owned(), NAMES[name].to_owned())];
+  fields.extend(category.map(|index| ("category".to_owned(), CATEGORIES[index].to_owned())));
+  fields.extend(description.map(|index| ("description".to_owned(), DESCRIPTIONS[index].to_owned())));
+  let mut quantities = Vec::new();
+  quantities.extend(weight.map(|(value, unit)| ("weight".to_owned(), Quantity::single(value, unit))));
+  quantities.extend(thc.map(|(value, unit)| ("thc".to_owned(), Quantity::single(value, unit))));
+  Some(EvaluateInput {
+    record: RecordInput {
+      id: id.map(|index| IDS[index].to_owned()),
+      tenant: tenant.map(|index| TENANTS[index].to_owned()),
+      fields,
+      quantities,
+    },
+    mode,
+    threshold,
+  })
+}
+
 #[expect(
   clippy::too_many_lines,
   reason = "one request, and every rule it must obey, read in one place"
@@ -275,30 +311,14 @@ async fn step(engine: &TestEngine, request: &Request) -> Result<(), TestCaseErro
       id,
       tenant,
       name,
-      category,
-      description,
       weight,
       thc,
       mode,
       threshold,
+      ..
     } => {
-      let mut fields = vec![("name".to_owned(), NAMES[name].to_owned())];
-      fields.extend(category.map(|index| ("category".to_owned(), CATEGORIES[index].to_owned())));
-      fields.extend(description.map(|index| ("description".to_owned(), DESCRIPTIONS[index].to_owned())));
-      let mut quantities = Vec::new();
-      quantities.extend(weight.map(|(value, unit)| ("weight".to_owned(), Quantity::single(value, unit))));
-      quantities.extend(thc.map(|(value, unit)| ("thc".to_owned(), Quantity::single(value, unit))));
       let tenant = tenant.map(|index| TENANTS[index].to_owned());
-      let input = EvaluateInput {
-        record: RecordInput {
-          id: id.map(|index| IDS[index].to_owned()),
-          tenant: tenant.clone(),
-          fields,
-          quantities,
-        },
-        mode,
-        threshold,
-      };
+      let input = evaluate_input(request).unwrap();
       let outcome = engine.evaluate(input).await;
       let after = stored(engine).await;
 
@@ -822,5 +842,102 @@ proptest! {
     };
     prop_assert_eq!(kinds(&output.reasons), kinds(&expected.reasons));
     prop_assert_eq!(output.verdict == Verdict::Rejected, !expected.accepted());
+  }
+}
+
+/// The candidates a shadow is tried with: one that disagrees with the live policy as often as it can in each
+/// direction, one with other weights and limits, and one that cannot judge anything at all.
+fn candidate(kind: usize) -> PolicyShadow {
+  let field = |name: &str, weight: f32, reject_below: Option<f32>| FieldSpec {
+    name: name.to_owned(),
+    weight,
+    required: name == "name",
+    reject_below,
+  };
+  let quantity = |name: &str, reject_above_factor: Option<f64>| QuantitySpec {
+    name: name.to_owned(),
+    reject_above_factor,
+    reject_incomparable: true,
+  };
+  let reweighted = Schema::new(vec![
+    field("name", 1.0, None),
+    field("category", 1.0, Some(0.9)),
+    field("description", 5.0, None),
+  ])
+  .unwrap()
+  .with_quantities(vec![quantity("weight", None), quantity("thc", Some(1.5))])
+  .unwrap();
+  let mut strict = Policy::new(0.999, Some(0.999)).unwrap();
+  strict.reject_on_measure_change = true;
+  let (schema, policy, wrong_by) = match kind {
+    0 => (schema(), strict, 0),
+    1 => (schema(), Policy::new(-1.0, None).unwrap(), 0),
+    2 => (reweighted, Policy::new(0.75, Some(0.5)).unwrap(), 0),
+    _ => (schema(), strict, 1),
+  };
+  PolicyShadow::new(
+    "candidate",
+    schema,
+    policy,
+    WORD_BAG_DIMENSION + wrong_by,
+    ShadowEvents::All,
+  )
+}
+
+proptest! {
+  #![proptest_config(cases())]
+
+  /// A shadow decides nothing: with any candidate watching, every request in any sequence gets the answer it
+  /// gets with nobody watching, and leaves the store as it leaves it then. The write rules hold beside it too.
+  #[test]
+  fn a_shadow_never_changes_an_answer_or_a_write(
+    requests in proptest::collection::vec(request(), 1..40),
+    anchor_threshold in proptest::option::of(Just(0.5_f32)),
+    kind in 0_usize..4,
+  ) {
+    let unwatched = engine(anchor_threshold, false);
+    let shadow = std::sync::Arc::new(candidate(kind));
+    let watched = engine(anchor_threshold, false).with_observer(shadow.clone());
+    let timeless = |records: Vec<Option<StoredRecord>>| -> Vec<Option<StoredRecord>> {
+      records
+        .into_iter()
+        .map(|record| record.map(|record| StoredRecord { updated_at: 0, ..record }))
+        .collect()
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    runtime.block_on(async {
+      let mut judged = 0_u64;
+      for (index, request) in requests.iter().enumerate() {
+        if let Some(input) = evaluate_input(request) {
+          let alone = unwatched.evaluate(input.clone()).await;
+          let beside = watched.evaluate(input).await;
+          prop_assert_eq!(&alone, &beside, "request {}, {:?}", index, request);
+          let revised = alone.is_ok_and(|output| matches!(output.verdict, Verdict::Accepted | Verdict::Rejected));
+          judged += u64::from(revised);
+        } else {
+          for engine in [&unwatched, &watched] {
+            step(engine, request)
+              .await
+              .map_err(|error| TestCaseError::fail(format!("request {index}, {request:?}: {error}")))?;
+          }
+        }
+        prop_assert_eq!(
+          timeless(stored(&unwatched).await),
+          timeless(stored(&watched).await),
+          "request {}, {:?}",
+          index,
+          request
+        );
+      }
+      // And it was watching: every revision was put to the candidate, which judged it or failed to.
+      let summary = shadow.summary();
+      prop_assert_eq!(summary.judged + summary.failed, judged);
+      prop_assert_eq!(summary.failed > 0, kind == 3 && judged > 0);
+      prop_assert_eq!(
+        summary.agreed + summary.only_shadow_rejected + summary.only_live_rejected,
+        summary.judged
+      );
+      Ok::<(), TestCaseError>(())
+    })?;
   }
 }

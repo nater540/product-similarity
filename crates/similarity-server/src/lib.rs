@@ -10,6 +10,7 @@
 //! - [`fetch`]: downloading and verifying a model directory.
 //! - [`import`]: loading a whole catalog into the store, a batch at a time.
 //! - [`offline`]: comparing and calibrating from the command line, without a store.
+//! - [`shadow`]: a candidate policy judging live requests without deciding any.
 
 // Tests compute expected values with ordinary arithmetic and compare exact floats where exactness is the point.
 #![cfg_attr(test, allow(clippy::arithmetic_side_effects, clippy::float_cmp))]
@@ -25,6 +26,7 @@ pub mod offline;
 #[cfg(test)]
 mod properties;
 pub mod runs;
+pub mod shadow;
 pub mod worker;
 
 use std::future::Future;

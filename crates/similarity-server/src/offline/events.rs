@@ -29,11 +29,11 @@ use super::{Offline, RecordFields, change_name, quantity_change_name};
 
 /// A similarity, widened and rounded to six places. Without the rounding a 32-bit value prints its conversion
 /// noise (`0.5670740008354187`).
-pub(super) fn six(value: f32) -> f64 {
+pub(crate) fn six(value: f32) -> f64 {
   (f64::from(value) * 1e6).round() / 1e6
 }
 
-pub(super) fn six_wide(value: f64) -> f64 {
+pub(crate) fn six_wide(value: f64) -> f64 {
   (value * 1e6).round() / 1e6
 }
 

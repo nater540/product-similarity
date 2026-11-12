@@ -101,7 +101,7 @@ Not planned in detail. What the review would add to each when its turn comes:
 | 14 | Fuzzing | The state machine in `similarity-server`'s `properties` module is the structure-aware target, ready to be driven by a fuzzer. Add a target for `RecordFields` and `Quantity` parsing. |
 | 15 | Mutation testing | **Built** (D25): `just mutants` over eight files; 400 mutants, none surviving, after a test for each of the 18 the first runs found. |
 | 17 | Reviewer feedback capture | "`before` matches the stored baseline" has to include the quantities. The event it emits should be a line `calibrate --full` reads. |
-| 18 | Shadow evaluation | The shadow collection is filled with `import`; disagreements are a `calibrate-diff`. |
+| 18 | Shadow evaluation | **Half built** (D30): a candidate policy judges every live revision and decides none. A candidate model in the shadow is not built; it would fill its collection with `import`. |
 | 19 | Structured reason codes | **Built** (D17, "The API carries the same codes"): `EvaluateResponse.reason_details`. The word diff and the neighbor lookup were left out, for the reasons given there. |
 | 20 | Menu-item to brand-product matching | Quantities are a natural re-ranking signal for a match and are deliberately not used by `FindSimilar` today (D16). Decide when this is designed. |
 
