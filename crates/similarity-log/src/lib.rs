@@ -169,7 +169,7 @@ pub mod testing {
   )]
 
   use std::io::Write;
-  use std::sync::{Arc, Mutex};
+  use std::sync::{Arc, Mutex, OnceLock};
 
   use tracing_subscriber::filter::EnvFilter;
   use tracing_subscriber::fmt::MakeWriter;
@@ -219,8 +219,25 @@ pub mod testing {
     pub record: Vec<String>,
   }
 
+  /// Keeps a capture from losing events to a test running beside it on another thread.
+  ///
+  /// `tracing` remembers, for each place an event is written, whether anybody wants it. While exactly one
+  /// subscriber exists it takes a shortcut and asks whichever subscriber the *current* thread has, on the
+  /// assumption that the one subscriber is the process's. A capture's subscriber belongs to one thread. So when a
+  /// capture was the only one alive, and a test on another thread was the first to reach some event, the answer
+  /// remembered was that other thread's (nobody), and the capturing thread's later event was dropped: a
+  /// `finished` line missing from a run that wrote one. It happened whenever the tests ran on three threads, which
+  /// is what a three-core CI runner gives them. A second subscriber that lives as long as the process ends the
+  /// shortcut, and every subscriber that exists is asked. A process that installs one global subscriber, which is
+  /// every real one (D15), is what the shortcut was made for and is not affected.
+  fn never_the_only_subscriber() {
+    static SECOND: OnceLock<tracing::Dispatch> = OnceLock::new();
+    SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+  }
+
   /// Runs `emit` with logging set up as [`super::init`] sets it up, at the `RUST_LOG` value `level`.
   pub fn capture(level: &str, emit: impl FnOnce()) -> Captured {
+    never_the_only_subscriber();
     let (logs, results) = (Capture::default(), Capture::default());
     let subscriber = super::subscriber(logs.clone(), results.clone(), EnvFilter::new(level));
     tracing::subscriber::with_default(subscriber, emit);
@@ -233,6 +250,7 @@ pub mod testing {
 
   /// Runs `emit` with logging set up as [`super::init_with`] sets it up for a process that is recording a run.
   pub fn capture_recorded(level: &str, results_on_stdout: bool, emit: impl FnOnce()) -> Captured {
+    never_the_only_subscriber();
     let (logs, results, record) = (Capture::default(), Capture::default(), Capture::default());
     let subscriber = super::subscriber_with(
       logs.clone(),
