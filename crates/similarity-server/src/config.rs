@@ -89,6 +89,25 @@ pub struct ModelConfig {
   pub output_dim: Option<usize>,
   /// How many embedding requests may wait for the encoder before new ones are refused with `RESOURCE_EXHAUSTED`.
   pub queue_depth: usize,
+  /// The fingerprint of the model the thresholds in this file were measured with. `serve` and `import` refuse
+  /// to run with any other model: thresholds do not transfer between models. Omit, and nothing is checked.
+  ///
+  /// An assertion, not an input: it is no part of the fingerprint or of the layout, and changes no vector.
+  pub expected_fingerprint: Option<String>,
+}
+
+/// The model that was loaded is not the one the configuration's thresholds were measured with.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+  "the configuration's thresholds were measured with the model `{expected}` (`model.expected_fingerprint`), and \
+   the model that was loaded is `{actual}`. Thresholds do not transfer between models: run `calibrate` with this \
+   model, set the thresholds from its report, and then name it in `model.expected_fingerprint`"
+)]
+pub struct FingerprintMismatch {
+  /// The fingerprint the configuration names.
+  pub expected: String,
+  /// The fingerprint of the model that was loaded, at the configured width and token limit.
+  pub actual: String,
 }
 
 impl Default for ModelConfig {
@@ -103,11 +122,29 @@ impl Default for ModelConfig {
       // default that truncates would silently damage any model that was not trained for it (docs/decisions.md, D4).
       output_dim: None,
       queue_depth: 256,
+      expected_fingerprint: None,
     }
   }
 }
 
 impl ModelConfig {
+  /// Whether the configuration is tied to the model whose fingerprint is `actual`: `true` if it names that
+  /// model, `false` if it names none.
+  ///
+  /// # Errors
+  ///
+  /// Returns the mismatch if the configuration names another model.
+  pub fn check_fingerprint(&self, actual: &str) -> Result<bool, FingerprintMismatch> {
+    match &self.expected_fingerprint {
+      None => Ok(false),
+      Some(expected) if expected == actual => Ok(true),
+      Some(expected) => Err(FingerprintMismatch {
+        expected: expected.clone(),
+        actual: actual.to_owned(),
+      }),
+    }
+  }
+
   /// The options the embedder is loaded with.
   pub fn embedder_options(&self) -> EmbedderOptions {
     EmbedderOptions {
@@ -324,6 +361,16 @@ impl Config {
     config.policy()?;
     if config.model.queue_depth == 0 {
       bail!("`model.queue_depth` must be positive");
+    }
+    if let Some(expected) = &config.model.expected_fingerprint
+      && expected.trim() != expected
+    {
+      bail!(
+        "`model.expected_fingerprint` must be a fingerprint exactly as `calibrate` prints it, with no spaces around it"
+      );
+    }
+    if config.model.expected_fingerprint.as_deref() == Some("") {
+      bail!("`model.expected_fingerprint` must not be empty; leave the key out to check nothing");
     }
     if config.qdrant.collection.trim().is_empty() {
       bail!("`qdrant.collection` must not be blank");
@@ -577,6 +624,39 @@ mod tests {
     );
     assert_eq!(config.policy().unwrap().anchor_threshold, Some(0.5));
     assert_eq!(config.schema().unwrap().field("name").unwrap().reject_below, Some(0.4));
+  }
+
+  /// The key that ties thresholds to the model they were measured with (D31). It is opt-in: the shipped example
+  /// does not set it, and a file without it checks nothing.
+  #[test]
+  fn a_config_names_the_model_its_thresholds_were_measured_with_only_if_it_wants_to() {
+    let untied = Config::parse(MINIMAL).unwrap();
+    assert_eq!(untied.model.expected_fingerprint, None);
+    assert_eq!(untied.model.check_fingerprint("abc-d256-t256"), Ok(false));
+    let shipped = Config::parse(include_str!("../../../config.example.toml")).unwrap();
+    assert_eq!(shipped.model.expected_fingerprint, None);
+
+    let tied = Config::parse(&format!("[model]\nexpected_fingerprint = \"abc-d256-t256\"\n{MINIMAL}")).unwrap();
+    assert_eq!(tied.model.check_fingerprint("abc-d256-t256"), Ok(true));
+    let mismatch = tied.model.check_fingerprint("abc-d384-t256").unwrap_err();
+    assert_eq!(
+      (mismatch.expected.as_str(), mismatch.actual.as_str()),
+      ("abc-d256-t256", "abc-d384-t256"),
+      "the same files at another width are another model"
+    );
+    let message = mismatch.to_string();
+    assert!(
+      message.contains("abc-d256-t256") && message.contains("abc-d384-t256"),
+      "{message}"
+    );
+    assert!(message.contains("do not transfer"), "{message}");
+
+    for bad in ["\"\"", "\" abc \"", "7"] {
+      assert!(
+        Config::parse(&format!("[model]\nexpected_fingerprint = {bad}\n{MINIMAL}")).is_err(),
+        "{bad}"
+      );
+    }
   }
 
   const SHADOWED: &str = r#"

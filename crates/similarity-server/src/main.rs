@@ -401,7 +401,36 @@ fn metal_device() -> anyhow::Result<Device> {
   anyhow::bail!("`device = \"metal\"` needs a binary built with `--features metal`; this one runs on the CPU only")
 }
 
-fn load_embedder(config: &Config) -> anyhow::Result<Embedder> {
+/// What a command does when the configuration names another model than the one it loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tie {
+  /// Refuse to go on: the command judges or writes for production (`serve`, `import`).
+  Enforced,
+  /// Say so and go on: measuring a new model under a copy of the old configuration is how one is evaluated.
+  Reported,
+}
+
+/// Holds the loaded model to `model.expected_fingerprint` (docs/decisions.md, D31).
+fn check_tie(config: &Config, fingerprint: &str, tie: Tie) -> anyhow::Result<()> {
+  match (config.model.check_fingerprint(fingerprint), tie) {
+    (Ok(true), _) | (Ok(false), Tie::Reported) => {}
+    (Ok(false), Tie::Enforced) => tracing::warn!(
+      fingerprint,
+      "the configuration does not name the model its thresholds were measured with \
+       (`model.expected_fingerprint`), so nothing stops them being used with another"
+    ),
+    (Err(mismatch), Tie::Enforced) => return Err(mismatch.into()),
+    (Err(mismatch), Tie::Reported) => tracing::warn!(
+      expected = mismatch.expected.as_str(),
+      actual = mismatch.actual.as_str(),
+      "this is not the model the configuration's thresholds were measured with; what it reports at those \
+       thresholds says nothing about this model"
+    ),
+  }
+  Ok(())
+}
+
+fn load_embedder(config: &Config, tie: Tie) -> anyhow::Result<Embedder> {
   let started = std::time::Instant::now();
   let embedder = Embedder::load(
     &config.model.dir,
@@ -447,6 +476,7 @@ fn load_embedder(config: &Config) -> anyhow::Result<Embedder> {
       "the model's provenance file describes other files than the ones in the directory"
     );
   }
+  check_tie(config, embedder.fingerprint(), tie)?;
   Ok(embedder)
 }
 
@@ -516,7 +546,7 @@ impl ServeArgs {
   fn run(self) -> anyhow::Result<()> {
     let config = Config::load(&self.config)?;
     let listen = self.listen.unwrap_or(config.server.listen);
-    let embedder = load_embedder(&config)?;
+    let embedder = load_embedder(&config, Tie::Enforced)?;
     let worker = EmbedWorker::spawn(embedder, config.model.queue_depth, config.model.batch_size)
       .context("cannot start the embedding thread")?;
     let (layout, dimension) = store_layout(&config.schema()?, &worker);
@@ -626,7 +656,10 @@ fn read_fields(path: &Path) -> anyhow::Result<RecordFields> {
 
 fn offline(config: &Config) -> anyhow::Result<(Offline, similarity_core::Policy)> {
   let policy = config.policy()?;
-  Ok((Offline::new(load_embedder(config)?, config.schema()?, policy), policy))
+  Ok((
+    Offline::new(load_embedder(config, Tie::Reported)?, config.schema()?, policy),
+    policy,
+  ))
 }
 
 /// The SHA-256 of a file a run read, for its manifest. A file that cannot be read again here is one the command
@@ -803,7 +836,7 @@ impl CalibrateDriftArgs {
       std::fs::read_to_string(&self.histories).with_context(|| format!("cannot read {}", self.histories.display()))?;
     let histories = offline::histories::parse_histories(&text, &schema, Some(self.min_confidence))
       .with_context(|| format!("in {}", self.histories.display()))?;
-    let embedder = load_embedder(&config)?;
+    let embedder = load_embedder(&config, Tie::Reported)?;
     let (fingerprint, dimension, max_tokens) = (
       embedder.fingerprint().to_owned(),
       embedder.dimension(),
@@ -895,7 +928,7 @@ impl LoadArgs {
     // A server of its own, on a store in memory: nothing here can touch a real collection.
     let config = Config::load(&self.config)?;
     let worker = EmbedWorker::spawn(
-      load_embedder(&config)?,
+      load_embedder(&config, Tie::Reported)?,
       config.model.queue_depth,
       config.model.batch_size,
     )
@@ -1025,7 +1058,7 @@ impl ImportArgs {
     let summary = if self.check {
       import::check(&schema, open()?, report_failure)
     } else {
-      let embedder = DirectEmbedder(load_embedder(&config)?);
+      let embedder = DirectEmbedder(load_embedder(&config, Tie::Enforced)?);
       let (layout, dimension) = store_layout(&schema, &embedder);
       let options = import::Options {
         batch_records: self.batch_records,
@@ -1258,6 +1291,28 @@ mod tests {
   #[test]
   fn the_command_line_definition_is_internally_consistent() {
     Cli::command().debug_assert();
+  }
+
+  /// `serve` and `import` refuse a model the configuration does not name; the tools that measure say so and go
+  /// on, because measuring another model under a copy of the configuration is how one is evaluated.
+  #[test]
+  fn a_configuration_tied_to_another_model_stops_serving_and_only_warns_a_measurement() {
+    let config = |model: &str| {
+      Config::parse(&format!(
+        "{model}[policy]\nthreshold = 0.8\n[fields.name]\nweight = 1.0"
+      ))
+      .unwrap()
+    };
+    let tied = config("[model]\nexpected_fingerprint = \"abc-d256-t256\"\n");
+    let untied = config("");
+
+    for tie in [Tie::Enforced, Tie::Reported] {
+      assert!(check_tie(&tied, "abc-d256-t256", tie).is_ok());
+      assert!(check_tie(&untied, "anything", tie).is_ok(), "the key is opt-in");
+    }
+    let refused = check_tie(&tied, "def-d256-t256", Tie::Enforced).unwrap_err();
+    assert!(refused.to_string().contains("def-d256-t256"), "{refused}");
+    assert!(check_tie(&tied, "def-d256-t256", Tie::Reported).is_ok());
   }
 
   #[test]

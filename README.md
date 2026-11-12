@@ -1558,6 +1558,7 @@ commented starting point.
 | `model.output_dim` | none (native width) | Keep only the first N components of each field vector. Only for models trained for it. The example config sets 256 for the default model. |
 | `model.batch_size` | `32` | The most texts in one forward pass. |
 | `model.queue_depth` | `256` | Requests that may wait for the encoder before new ones get `RESOURCE_EXHAUSTED`. |
+| `model.expected_fingerprint` | none | The fingerprint of the model the thresholds were measured with, as on the `model` line of `calibrate`. With it, `serve` and `import` refuse to run with any other model, and `compare` and the `calibrate` commands warn. Without it nothing is checked, and `serve` and `import` say so once. |
 | `qdrant.url` | `http://localhost:6334` | Qdrant's gRPC endpoint (6334, not the REST port 6333). |
 | `qdrant.collection` | `records` | The collection. Created if missing. |
 | `qdrant.timeout_ms` | `5000` | Deadline for one Qdrant request. |

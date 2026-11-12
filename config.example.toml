@@ -23,6 +23,10 @@ output_dim = 256
 batch_size = 32
 # Requests that may wait for the encoder before new ones get RESOURCE_EXHAUSTED.
 queue_depth = 256
+# The model the thresholds below were measured with. Not set here. Set it in a production config, to the
+# fingerprint on the `model` line of `calibrate` (or the one `model promote` prints): `serve` and `import` then
+# refuse to run with any other model, because thresholds do not transfer between models.
+# expected_fingerprint = "..."
 
 [qdrant]
 url = "http://localhost:6334"
