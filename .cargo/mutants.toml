@@ -13,7 +13,11 @@ examine_globs = [
   "crates/similarity-server/src/engine.rs",
   "crates/similarity-server/src/offline/stats/mod.rs",
   "crates/similarity-server/src/offline/stats/drift.rs",
+  "crates/similarity-server/src/offline/stats/matching.rs",
   "crates/similarity-server/src/offline/calibrate.rs",
+  # A match and a promotion are decisions too.
+  "crates/similarity-core/src/matching.rs",
+  "crates/similarity-server/src/registry.rs",
 ]
 
 # Every test that can kill a mutant in these files is in a crate's library target. The integration targets either
