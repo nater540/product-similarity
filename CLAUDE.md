@@ -134,9 +134,9 @@ changing a design. Infer conventions from the existing code first.
   request through `Observer`, after the outcome is final and anything it writes is written. Never give `observe`
   a return value, a way to fail the request, or anything to wait on, and never let a shadow judge with
   `Evaluation::rejudge` (the similarity to the anchor has to be computed under its own weights). The `shadow*`
-  event names are an interface like the calibration ones, and a line carries an id, scores, and codes: never a
-  record's text, and not its tenant. `config.example.toml` ships no shadow and no number for one. A shadow
-  measures agreement, not quality: do not add anything that ranks or adopts a candidate by its disagreements.
+  event names are an interface like the calibration ones, and a line carries an id, a tenant, scores, and codes:
+  never a record's text. `config.example.toml` ships no shadow and no number for one. A shadow measures
+  agreement, not quality: do not add anything that ranks or adopts a candidate by its disagreements.
 - **A sweep is a search, and what it finds is fitted** (D29). `calibrate-sweep` ranks on one calibration and may
   evaluate the best points on another at the threshold already chosen. Never report a swept point's errors on
   the run it was ranked on as if they were a measurement, and never let it choose a threshold on the evaluation

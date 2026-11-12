@@ -29,8 +29,8 @@
 //!   reason either side gave, joined on `key`;
 //! - `shadow_summary`, the counts since the server started, on a timer and once more as the server stops.
 //!
-//! A line names a record by its id, as the request log does, and carries scores and codes: never a record's
-//! text, and not its tenant.
+//! A line names a record by its id and the tenant the request named, and carries scores and codes: never a
+//! record's text.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -268,6 +268,7 @@ impl PolicyShadow {
       target: RESULT,
       key = key.as_str(),
       id = observation.id,
+      tenant = observation.tenant,
       shadow = name,
       kind = KIND,
       mode = mode_name(observation.mode),
@@ -369,6 +370,7 @@ mod tests {
   type TestEngine = Engine<MemoryStore, WordBagEmbedder>;
 
   const ID: &str = "p1";
+  const TENANT: &str = "brand-1";
   const NAME: &str = "blueberry gummies vegan fruit chews";
   /// One word of five is different.
   const RENAMED: &str = "blueberry gummies vegan fruit cartridge";
@@ -415,7 +417,7 @@ mod tests {
     EvaluateInput {
       record: RecordInput {
         id: Some(ID.to_owned()),
-        tenant: None,
+        tenant: Some(TENANT.to_owned()),
         fields: vec![
           ("name".to_owned(), name.to_owned()),
           ("description".to_owned(), description.to_owned()),
@@ -558,6 +560,7 @@ mod tests {
     assert_eq!(events.len(), 1, "{:?}", watched.results);
     let event = events[0];
     assert_eq!(event["id"], ID);
+    assert_eq!(event["tenant"], TENANT);
     assert_eq!(event["shadow"], "candidate");
     assert_eq!(event["kind"], "policy");
     assert_eq!(event["mode"], "enforce");
@@ -628,6 +631,24 @@ mod tests {
       (&reasons[0]["side"], &reasons[0]["code"]),
       (&Value::from("live"), &Value::from("below_threshold"))
     );
+  }
+
+  /// The tenant on a line is the one the request named. A request that named none gets a line without the key.
+  #[test]
+  fn a_line_names_the_tenant_only_when_the_request_did() {
+    let untenanted = |name: &str| {
+      let mut request = request(name, DESCRIPTION, None);
+      request.record.tenant = None;
+      request
+    };
+    let watched = run(
+      (plain(), policy(0.5, None)),
+      (plain(), policy(0.99, None), ShadowEvents::Disagreements),
+      &[untenanted(NAME), untenanted(RENAMED)],
+    );
+    let event = watched.events("shadow")[0];
+    assert_eq!(event["id"], ID);
+    assert!(event.get("tenant").is_none(), "{event}");
   }
 
   /// A candidate with other weights scores the same vectors differently, against the baseline and against the

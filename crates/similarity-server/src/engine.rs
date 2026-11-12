@@ -290,6 +290,8 @@ pub trait Observer: fmt::Debug + Send + Sync + 'static {
 pub struct Observation<'a> {
   /// The record's id.
   pub id: &'a str,
+  /// The tenant the request named, if it named one.
+  pub tenant: Option<&'a str>,
   /// What the request asked to be done with the verdict.
   pub mode: WriteMode,
   /// The threshold the request asked to be judged at in place of the configured one, if it did.
@@ -488,7 +490,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     if stored {
       let record = StoredRecord {
         id: id.clone(),
-        tenant,
+        tenant: tenant.clone(),
         anchor: candidate.composite.clone(),
         vectors: candidate.clone(),
         // A new record is its own point of reference, for quantities as for text.
@@ -502,6 +504,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     if let Some(observer) = &self.observer {
       observer.observe(&Observation {
         id: &id,
+        tenant: tenant.as_deref(),
         mode: input.mode,
         threshold: input.threshold,
         policy: &policy,
@@ -585,7 +588,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       };
       let record = StoredRecord {
         id: id.clone(),
-        tenant,
+        tenant: tenant.clone(),
         anchor,
         vectors: candidate.clone(),
         quantities: quantities.clone(),
@@ -600,6 +603,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     if let Some(observer) = &self.observer {
       observer.observe(&Observation {
         id: &id,
+        tenant: tenant.as_deref(),
         mode,
         threshold,
         policy,
@@ -998,6 +1002,7 @@ mod tests {
   #[derive(Debug, Clone, PartialEq)]
   struct Told {
     id: String,
+    tenant: Option<String>,
     mode: WriteMode,
     threshold: Option<f32>,
     judged_at: f32,
@@ -1020,6 +1025,7 @@ mod tests {
     fn observe(&self, observation: &Observation<'_>) {
       self.0.lock().unwrap().push(Told {
         id: observation.id.to_owned(),
+        tenant: observation.tenant.map(str::to_owned),
         mode: observation.mode,
         threshold: observation.threshold,
         judged_at: observation.policy.threshold,
@@ -1050,6 +1056,7 @@ mod tests {
     let (engine, recorder) = observed();
     let weighed = |fields: &[(&str, &str)], mode: WriteMode, threshold: Option<f32>| EvaluateInput {
       record: RecordInput {
+        tenant: Some("brand-1".to_owned()),
         quantities: vec![("weight".to_owned(), grams(3.5))],
         ..record(Some("p1"), fields)
       },
@@ -1081,6 +1088,7 @@ mod tests {
     let weight: Quantities = [("weight".to_owned(), grams(3.5))].into_iter().collect();
     let told = |mode, threshold: Option<f32>, stored, revision, judged| Told {
       id: "p1".to_owned(),
+      tenant: Some("brand-1".to_owned()),
       mode,
       threshold,
       judged_at: threshold.unwrap_or(0.75),
@@ -1113,8 +1121,9 @@ mod tests {
       .unwrap();
     let last = recorder.told().pop().unwrap();
     assert_eq!(
-      (last.id.as_str(), last.stored, last.revision, last.judged),
-      ("p2", false, 0, None)
+      (last.id.as_str(), last.tenant, last.stored, last.revision, last.judged),
+      ("p2", None, false, 0, None),
+      "and a request that names no tenant is observed with none"
     );
   }
 

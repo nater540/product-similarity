@@ -12,9 +12,8 @@ in these ways, and the model half has to start from what exists:
   quantities, the live evaluation). A model shadow that queues work has to copy what it keeps, and needs the
   prepared texts added to the observation. There is no `deleted` callback yet.
 - `next_anchor` was not extracted; the mirror write will want it.
-- The events have no `tenant` (the owner has not decided whether one may be logged), `shadow_reason` says
-  `subject`, and a policy shadow writes no `shadow_field` or `shadow_quantity` lines: both sides measured the
-  same values. `in_sync`, `missing`, `queued_ms`, and `embed_ms` belong to the model shadow and are not written.
+- `shadow_reason` says `subject`, and a policy shadow writes no `shadow_field` or `shadow_quantity` lines: both
+  sides measured the same values. `in_sync`, `missing`, `queued_ms`, and `embed_ms` belong to the model shadow and are not written.
 - `events = "disagreements"` is the default; `"all"` writes every judged revision.
 - `[shadow.model]` and `[shadow.qdrant]` are parsed only to be refused with the reason. There is no `queue` key.
 - Not built: `shadow-report`, the shadow in `Describe`, `import --shadow`.

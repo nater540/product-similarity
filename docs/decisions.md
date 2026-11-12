@@ -1153,9 +1153,10 @@ candidate's configuration from the live one, which is how the names and `require
 `shadow_schema_field` and `shadow_schema_quantity` line per item, `shadow` and `shadow_reason` joined on `key`,
 `shadow_summary`. They go to stdout, which a serving process did not write to before; that is why nothing is
 written without a `[shadow]` table, and why the default is a line per disagreement and not per request. A
-`shadow` line carries scores, verdicts, and codes. It names the record by id, as the request log line does, and
-carries no text and no tenant: whether a tenant may be written to a log is the owner's decision, pending with
-the telemetry plan. Fields can be added later; none may be repurposed.
+`shadow` line carries scores, verdicts, and codes, and no text. It names the record by id and by the tenant the
+request named, as given: the owner decided on 2026-11-11 that a tenant is an identifier the server may write,
+which is also the answer the telemetry plan was waiting for. A request that names no tenant gets a line without
+the key. Fields can be added later; none may be repurposed.
 
 **Agreement is not quality.** A disagreement says the policies differ, not which is right. The summary counts
 both directions and nothing in the tool ranks a candidate by them. The ids are for labeling; the labeled pairs
@@ -1178,5 +1179,6 @@ is answered on labeled pairs by `calibrate --model` and AUC (D24), with no servi
 only the cases nobody labeled. And no candidate model exists yet. The observer seam is what the model shadow
 would plug into, so building the policy half first cost it nothing.
 
-**Not built with it:** a `shadow-report` command (the summary line has the counts, `jq` lists the ids, and
-intervals resampled by tenant need the tenant on the line), the shadow in `Describe`, and more than one shadow.
+**Not built with it:** a `shadow-report` command (the summary line has the counts and `jq` lists the ids; a
+report with intervals resampled by tenant can now be written, since the tenant is on the line), the shadow in
+`Describe`, and more than one shadow.

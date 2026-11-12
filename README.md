@@ -1741,7 +1741,8 @@ sku-1	rejected	accepted	0.878707	0.942242
   scores what it agrees on. `shadow_summary` every `summary_every_s` seconds and once more as the server stops:
   the counts since it started. `created` records had nothing to be judged against; `judged` is `agreed` plus
   the two kinds of disagreement; `failed` should stay zero.
-- **No record text is written, and no tenant.** A line names a record by its id, as the request log does.
+- **No record text is written.** A line names a record by its id and by the tenant the request named, which is
+  what lets disagreements be counted by brand. The requests above named none, so their lines have no `tenant`.
 - **It costs one more comparison of vectors already in memory**: no model and no store. Its lines are written
   the way log lines are, so stdout has to be read by something, as stderr already has to be. Against
   this server with `just load ... --server`, one caller, 300 records: edits took a median of 5.63 ms with no
