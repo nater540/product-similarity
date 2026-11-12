@@ -167,6 +167,7 @@ The binary is `record-similarity` (`target/release/record-similarity` after `jus
 | `record-similarity calibrate-diff OLD.ndjson (NEW.ndjson \| --config-b CONFIG) [--fail-on WHAT]` | Compares two calibrations, or one under a second configuration. See [Comparing two calibrations](#comparing-two-calibrations). |
 | `record-similarity calibrate-drift [--config config.toml] HISTORIES.jsonl [--ndjson]` | Replays whole edit histories and reports how far products drift. See [The drift threshold](#the-drift-threshold). |
 | `record-similarity runs list [--runs DIR] [--kind KIND] [--limit N]` | Lists what was recorded: every calibration and every training run. See [Recorded runs](#recorded-runs). |
+| `record-similarity runs compare A B`, `runs report A [B ...] [--out report.html]` | Compares two recorded runs as text, or writes an HTML page for up to six. See [Recorded runs](#recorded-runs). |
 | `record-similarity pairs carve PAIRS.jsonl --fraction F [--from S] [--into S] [--salt TEXT]` | Gives a share of one split's owners a split of their own. See [Choose a model, then measure it once](#3-choose-a-model-then-measure-it-once). |
 | `record-similarity load [--config config.toml] [--server URL] [--concurrency 1,4,16] [--records N]` | Measures latency and throughput through the API with synthetic records. See [Under concurrent callers](#under-concurrent-callers). |
 
@@ -1402,6 +1403,55 @@ fingerprint it scored with), and its first input.
 
 Only `calibrate` and the trainer are recorded. `serve`, `import`, `compare`, and `calibrate-diff` are not.
 
+**Comparing two runs.** `record-similarity runs compare` takes two run directories of one kind. Two calibrations
+are compared pair by pair, exactly as [`calibrate-diff`](#comparing-two-calibrations) compares them. Two training
+runs are laid side by side: what went in, then what came out, with every row that differs marked. These two
+differ in one option (four passes over the bundled sample; shortened):
+
+```text
+$ record-similarity runs compare runs/20261112T002811Z-train-ft-2e-5 runs/20261112T002853Z-train-ft-6e-5
+a      20261112T002811Z-train-ft-2e-5   finished   commit 1ea2c08f1226 (uncommitted changes)
+b      20261112T002853Z-train-ft-6e-5   finished   commit 1ea2c08f1226 (uncommitted changes)
+
+                             a                            b
+  base model                 f46e48ee0ea2                 f46e48ee0ea2
+  pairs                      bedd362ac75d, 34 examples    bedd362ac75d, 34 examples
+  batch_size                 8                            8
+  epochs                     4                            4
+* learning_rate              0.00002                      0.00006
+...
+  steps                      20                           20
+* last pair loss             0.0171                       0.0168
+* lowest pair loss           0.0136 at 8                  0.0115 at 12
+  best model (validation)    step 0, AUC 1.0000           step 0, AUC 1.0000
+
+* differs between the two (3 row(s))
+
+validation, width 256         a before   a after  b before   b after
+edits mean                      0.9238    0.9262    0.9238    0.9245
+recycles mean                   0.6175    0.6147    0.6175    0.5790
+gap of means                    0.3064    0.3115    0.3064    0.3455
+AUC                             1.0000    1.0000    1.0000    1.0000
+...
+```
+
+The separation tables are at the narrowest width both runs were measured at. A held-out column reads `chosen`
+where only the chosen model was measured after training. If the two `before` columns differ, the runs did not
+start from the same model and data, and the comparison says that their `after` columns are not like for like.
+
+**A page for several.** `record-similarity runs report` writes one HTML file for up to six runs, training runs
+and calibrations in any mix:
+
+```sh
+record-similarity runs report runs/<a> runs/<b> runs/<a calibration> --out report.html
+```
+
+It has the same side-by-side table, the training curves (loss, gradient norm, learning rate) with one line per
+run, the validation AUC of each model a run scored, and for each calibration a histogram of the overall
+similarity of edits and recycles with the configured and the suggested threshold marked. Every chart has a table
+of the numbers it draws beneath it. The file needs no network and runs no script, so it can be attached or
+printed. A resumed run is named by its last directory, and is drawn as one curve.
+
 ## Using a different model
 
 Any sentence-transformers model with a BERT encoder, mean or CLS pooling, and optionally a linear projection can be
@@ -1735,7 +1785,7 @@ data/
   regression.snapshot.ndjson      what the pinned model and the example config make of them
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D27)
+  decisions.md               why things are the way they are (D1 to D28)
   data-request-prompt.md     a brief for collecting labeled production data
   feature-suggestions.md     twenty features that could be added, none built yet
   plan-features.md           a plan for the first five of them

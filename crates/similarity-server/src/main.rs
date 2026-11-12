@@ -30,6 +30,7 @@ use similarity_server::import::{self, Failure, Summary};
 use similarity_server::load;
 use similarity_server::offline::events::{self, Run};
 use similarity_server::offline::{self, Confidence, Offline, RecordFields, Selection, diff};
+use similarity_server::runs;
 use similarity_server::worker::{DirectEmbedder, EmbedWorker};
 use similarity_store::{MemoryStore, QdrantStore, VectorStore};
 
@@ -130,6 +131,35 @@ struct CarveArgs {
 enum RunsCommand {
   /// List the recorded runs, newest first.
   List(RunsListArgs),
+  /// Compare two recorded runs of one kind: two training runs side by side, or two calibrations pair by pair.
+  Compare(RunsCompareArgs),
+  /// Write one HTML page for up to six recorded runs: what went in, the training curves, each calibration.
+  Report(RunsReportArgs),
+}
+
+#[derive(Debug, Args)]
+struct RunsCompareArgs {
+  /// The first run's directory.
+  a: PathBuf,
+  /// The second run's directory.
+  b: PathBuf,
+  /// For two calibrations: compare the pairs both have, where they were not made from the same selection of the
+  /// same file.
+  #[arg(long)]
+  intersect: bool,
+  /// For two calibrations: how far a similarity may differ before it is listed as moved.
+  #[arg(long, default_value_t = diff::TOLERANCE)]
+  tolerance: f32,
+}
+
+#[derive(Debug, Args)]
+struct RunsReportArgs {
+  /// The run directories, at most six. A resumed training run is named by its last directory.
+  #[arg(required = true, num_args = 1..=similarity_server::runs::html::MAX_RUNS)]
+  runs: Vec<PathBuf>,
+  /// Where to write the page.
+  #[arg(long, default_value = "report.html")]
+  out: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -813,6 +843,32 @@ impl LoadArgs {
   }
 }
 
+impl RunsCompareArgs {
+  fn run(self) -> anyhow::Result<()> {
+    let (a, b) = (runs::load(&self.a)?, runs::load(&self.b)?);
+    write!(
+      std::io::stdout().lock(),
+      "{}",
+      runs::compare::compare(&a, &b, self.intersect, self.tolerance)?
+    )?;
+    Ok(())
+  }
+}
+
+impl RunsReportArgs {
+  fn run(self) -> anyhow::Result<()> {
+    let loaded = self
+      .runs
+      .iter()
+      .map(|dir| runs::load(dir))
+      .collect::<anyhow::Result<Vec<_>>>()?;
+    std::fs::write(&self.out, runs::html::report(&loaded))
+      .with_context(|| format!("cannot write {}", self.out.display()))?;
+    tracing::info!(out = %self.out.display(), runs = loaded.len(), "report written");
+    Ok(())
+  }
+}
+
 impl RunsListArgs {
   fn run(self) -> anyhow::Result<()> {
     let (runs, unreadable) = similarity_runs::list(&self.runs)?;
@@ -1054,6 +1110,8 @@ fn main() -> ExitCode {
     Command::CalibrateDrift(args) => args.run(),
     Command::Import(args) => args.run(),
     Command::Runs(RunsCommand::List(args)) => args.run(),
+    Command::Runs(RunsCommand::Compare(args)) => args.run(),
+    Command::Runs(RunsCommand::Report(args)) => args.run(),
     Command::Pairs(PairsCommand::Carve(args)) => args.run(),
     Command::Load(args) => args.run(),
   }

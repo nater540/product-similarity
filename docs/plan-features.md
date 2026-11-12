@@ -92,7 +92,7 @@ Not planned in detail. What the review would add to each when its turn comes:
 | 2 | Local run registry | **Built** (D23): `calibrate` and the trainer each leave a directory under `runs/`; `runs list`. |
 | 3 | Evaluation at every checkpoint | **Built** (D24): `pairs carve`, the trainer scores every checkpoint on the validation split by AUC and names the best, `calibrate --model`. |
 | 4 | Model registry and promotion gate | Now mostly assembly: `provenance.json` identifies a model, `calibrate --ndjson` records a calibration with its fingerprint, and `calibrate-diff --fail-on` is the gate. |
-| 5 | Run report and compare | Depends on 2. The calibration half can be drawn from the events that exist now. |
+| 5 | Run report and compare | **Built** (D28): `runs compare` as text, `runs report` as one HTML file with curves and calibration histograms. |
 | 6 | Hyperparameter sweeps | The scoring it needs is in `similarity-core` already (step 0). Needs real data. |
 | 9 | Pinned verdict snapshot in CI | **Built** (D22): curated cases, a snapshot checked with and without the model, `calibrate-diff --fail-on moved`, pairs with an `anchor`. |
 | 10 | Production score telemetry | `measure_changed` is already on the `evaluate` log line. Round the similarities there. Add per-quantity factors and reason codes (`Reason::code`). |

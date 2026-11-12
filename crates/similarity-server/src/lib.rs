@@ -24,6 +24,7 @@ pub mod load;
 pub mod offline;
 #[cfg(test)]
 mod properties;
+pub mod runs;
 pub mod worker;
 
 use std::future::Future;

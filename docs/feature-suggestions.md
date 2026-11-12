@@ -1,7 +1,7 @@
 # Feature suggestions
 
 Twenty features that could be added to this project, with what each is, why it matters here, how it would fit the
-code, and what it would cost. **Features 1, 2, 3, 7, 8, 9, 11, 12, 13, 15, 16, and 19 are built** (D17 to D27, and the README); the rest are not. They were proposed in November 2026 from a read of the
+code, and what it would cost. **Features 1, 2, 3, 5, 7, 8, 9, 11, 12, 13, 15, 16, and 19 are built** (D17 to D28, and the README); the rest are not. They were proposed in November 2026 from a read of the
 repository as it stood then (`README.md`, `docs/decisions.md`, and the crates); check a suggestion against the
 code before starting on it, since the code will have moved. It has moved once already: records now carry
 quantities, compared as numbers (D16), and the features that touch a verdict or a report say below what that
@@ -174,6 +174,11 @@ group exists). No conflicts.
 **Effort.** M. **Needs real data:** no, though it is most useful once real holdouts exist.
 
 ### 5. Run report and compare
+
+**Built** (D28). What came out differently: the commands are `record-similarity runs compare` and `runs report`,
+not a binary of their own, since comparing calibrations needs code the trainer must not link; two calibrations
+are compared by `calibrate-diff`'s own code; a resumed run is stitched into one curve; and the page has no
+script. Grouping calibrations under their training run and per-field range bars were left out.
 
 **What.** `record-similarity-runs report runs/A runs/B --out report.html` writes one self-contained HTML file
 with inline SVG drawn in Rust (no JavaScript, no CDN, opens offline):

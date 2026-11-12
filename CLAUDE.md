@@ -6,7 +6,7 @@ marketplace listings. Each revision is embedded field by field with a small BERT
 thresholds. A record's quantities (weight, volume, potency) are compared as numbers beside that, never embedded.
 Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D27) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D28) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -71,9 +71,9 @@ changing a design. Infer conventions from the existing code first.
 - `crates/similarity-runs`: the local record of runs (D23): the manifest, starting and ending a run, reading runs
   back. It records and lists; it decides nothing.
 - `crates/similarity-server`: config, the embedding worker thread, `Engine` (all behavior), the thin gRPC layer,
-  `model fetch`, `import`, `compare`/`calibrate` (the `offline` module), `load` (the load test), and the
-  `record-similarity` binary. Keep
-  `grpc.rs` free of decisions.
+  `model fetch`, `import`, `compare`/`calibrate`/`calibrate-drift` (the `offline` module), `load` (the load
+  test), `runs` (reading recorded runs back, comparing and reporting them), and the `record-similarity` binary.
+  Keep `grpc.rs` free of decisions.
 - `crates/similarity-train`: fine-tuning (data, losses, schedule, training loop) and the `record-similarity-train`
   binary. The only crate that enables Burn's `autodiff` and `optim`; the server must never depend on it (D13).
 
@@ -136,6 +136,10 @@ changing a design. Infer conventions from the existing code first.
   are compared by AUC (`similarity_core::separation`), never by errors at a configured threshold, which belongs
   to the model it was measured on. Catalog groups of an owner in the validation or holdout split are not trained
   on.
+- **A report computes nothing** (D28). `runs compare` and `runs report` lay out numbers from `runs::training`
+  (a training run's events) and `offline::stats` (a calibration). Put a new number in one of those, never in
+  `runs/html.rs` or `runs/compare.rs`. The page is one file with no script and nothing fetched; a chart shows one
+  measure, never two axes, and is followed by a table of what it draws.
 - **A run is recorded by `main`, never by the code it calls** (D23). `calibrate` and the trainer start a
   `similarity_runs::Run` before any work and pass it down as an `Option`; tests pass `None`, so no test writes
   into `runs/`. The record is a third layer in `similarity-log`, built by the same function as the two streams:
@@ -170,7 +174,7 @@ changing a design. Infer conventions from the existing code first.
 - Load a catalog: `just import export.jsonl config.toml` (`--check` validates only)
 - Measure: `just throughput`, `just load`, `just calibrate`, `just calibrate-drift`, `just calibrate-diff`, `just verdict-gate old.ndjson pairs.full.jsonl`
 - See what was run: `just runs` (`calibrate` and the trainer each leave a directory under `runs/`; `--no-run`
-  turns that off)
+  turns that off); `record-similarity runs compare A B`; `record-similarity runs report A B --out report.html`
 - Make a validation split: `record-similarity pairs carve pairs.full.jsonl --fraction F > pairs.carved.jsonl`
 - Fine-tune: `just finetune --base ... --out ... --pairs ...` (CPU); GPU: `just release-train metal`, then
   `./target/release/record-similarity-train --device metal ...`. Continue an interrupted run with `--resume

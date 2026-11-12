@@ -1024,3 +1024,41 @@ The drift events are new names (`drift_run`, `history`, `step`, ...), so nothing
 affected. They carry each field's similarity to the anchor, which is what would let a drift run be judged again
 under other weights. That re-judging is not built: the overall anchor similarity is weight-dependent, and
 `rejudge` reuses it as measured.
+
+## D28. Runs are compared as text and reported as one file
+
+A recorded run (D23) is only worth keeping if two of them can be put next to each other. Two questions come up
+after every pair of training runs: what was different about them, and what did it change.
+
+**`runs compare` answers both in a terminal.** Two training runs are laid out as what went in (the base model's
+digest, each data file's hash, every option) and what came out (the losses, the chosen model, the separation
+before and after), with every row that differs marked. The one option that was changed is then the first thing
+seen. Two calibrations are handed to the comparison that already exists (`calibrate-diff`, D17): a second
+comparison of calibrations would be a second thing to keep right. It has no `--fail-on`; the gate is
+`calibrate-diff`.
+
+**`runs report` is one HTML file with no script and nothing fetched.** It opens from disk, attaches to a
+message, and prints. Charts are inline SVG. A value is read from a native tooltip, and every chart is followed by
+a table of exactly what it draws, so nothing depends on color or on a pointer. Lines are told apart by dash
+pattern as well as by color, and the six colors were checked for color-vision deficiency in both the light and
+the dark theme.
+
+**It lives in the server crate, not in one of its own.** Comparing two calibrations needs the calibration reader
+and the comparison, which are there, and which the trainer must never link (D13). The commands are under
+`record-similarity runs`, beside `runs list`.
+
+**The page computes nothing.** Training numbers come from `runs::training`, which reads a run's events back by
+message name; calibration numbers come from `offline::stats`, which gained the histogram for this. A renderer
+that worked something out for itself would be a second place for a number to be wrong.
+
+**A resumed run is one curve.** Its directories are followed back through `continues`, and the processes are
+stitched: a process that went on from step 20 replaces whatever its predecessor logged past step 20, since those
+steps were taken again. A link to a directory that is gone is an error naming it, not a shorter curve.
+
+**What a chart may show.** One measure per chart (loss, gradient norm, and learning rate are three charts, never
+one with two axes), at most six runs, and histogram bins that are for looking at: the page says no threshold is
+to be read from where a bin ends, and the only thresholds drawn are the configured one and the one `stats`
+suggested.
+
+**Left out:** grouping calibrations under the training run that produced their model, per-field range bars, and
+a shared x range across calibrations. Each is a layout refinement over data the page already has.

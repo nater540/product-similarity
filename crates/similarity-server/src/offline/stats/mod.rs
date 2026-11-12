@@ -86,6 +86,56 @@ pub fn area_under_curve(calibration: &Calibration) -> Option<f64> {
   similarity_core::separation::area_under_curve(&scores(Label::Edit), &scores(Label::Recycle))
 }
 
+/// How many pairs fall in each of a row of equal bins.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Histogram {
+  /// Where the first bin starts.
+  pub low: f64,
+  /// Where the last bin ends.
+  pub high: f64,
+  /// The count in each bin. A score exactly at `high` is in the last one.
+  pub counts: Vec<usize>,
+  /// Scores below `low`.
+  pub below: usize,
+  /// Scores above `high`.
+  pub above: usize,
+}
+
+/// The overall similarities of the pairs of `label` (`None`: the pairs with any other label), counted into `bins`
+/// equal bins from `low` to `high`.
+///
+/// The bins are for looking at, not a measurement: nothing is to be read from where one ends.
+pub fn histogram(calibration: &Calibration, label: Option<Label>, low: f64, high: f64, bins: usize) -> Histogram {
+  let mut histogram = Histogram {
+    low,
+    high,
+    counts: vec![0; bins],
+    below: 0,
+    above: 0,
+  };
+  let width = (high - low) / number(bins.max(1));
+  for scored in calibration.pairs.iter().filter(|scored| scored.pair.label == label) {
+    let score = f64::from(scored.similarity());
+    if score < low {
+      histogram.below = histogram.below.saturating_add(1);
+    } else if score > high {
+      histogram.above = histogram.above.saturating_add(1);
+    } else {
+      // How many whole bins lie below the score, which is a small non-negative number.
+      #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a bin index, floored"
+      )]
+      let index = (((score - low) / width).floor() as usize).min(bins.saturating_sub(1));
+      if let Some(count) = histogram.counts.get_mut(index) {
+        *count = count.saturating_add(1);
+      }
+    }
+  }
+  histogram
+}
+
 /// Every text field that some pair compared, in name order.
 pub fn field_names(calibration: &Calibration) -> BTreeSet<&str> {
   calibration
@@ -613,6 +663,31 @@ mod tests {
       point.false_reject.unwrap().errors,
       0,
       "an edit at the threshold is accepted"
+    );
+  }
+
+  #[test]
+  fn a_histogram_counts_each_pair_once_in_the_bin_its_score_is_in() {
+    let calibration = summarized(vec![
+      scored(Label::Edit, 0.95, true),
+      scored(Label::Edit, 1.0, true),
+      scored(Label::Edit, 0.5, true),
+      scored(Label::Edit, 0.49, true),
+      scored(Label::Edit, 1.2, true),
+      scored(Label::Recycle, 0.74, false),
+    ]);
+    let edits = histogram(&calibration, Some(Label::Edit), 0.5, 1.0, 5);
+    assert_eq!(
+      edits.counts,
+      [1, 0, 0, 0, 2],
+      "0.5 opens the first bin and 1.0 closes the last"
+    );
+    assert_eq!((edits.below, edits.above), (1, 1));
+    let recycles = histogram(&calibration, Some(Label::Recycle), 0.5, 1.0, 5);
+    assert_eq!(recycles.counts, [0, 0, 1, 0, 0]);
+    assert_eq!(
+      histogram(&calibration, None, 0.5, 1.0, 5).counts.iter().sum::<usize>(),
+      0
     );
   }
 
