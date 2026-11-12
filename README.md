@@ -495,9 +495,9 @@ In JSON, enum values are written by name (`"WRITE_MODE_DRY_RUN"`), 64-bit intege
 `.proto`, which the collection names by a relative path: they stay in step with it, and the folder has to stay
 where it is in the checkout.
 
-They are numbered in an order that works on an empty server (`just serve-in-memory config.toml`): `Describe`,
-an `Import` stream that creates two records and has a third refused, the five kinds of `Evaluate`, two searches,
-two matches, and a `Delete`. Each has a note saying what to expect. Every one was sent through Bruno's own gRPC
+Bruno lists them in an order that works on an empty server (`just serve-in-memory config.toml`): `Describe`,
+an `Import` stream that creates two records and has a third refused, six kinds of `Evaluate`, two searches,
+three matches, and a `Delete`. Each has a note saying what to expect. Every body was sent through Bruno's own gRPC
 client (4.3.0) against a local server, and they answer as the notes say.
 
 Bodies use the names in the `.proto` as they are written there (`brand_id`, `menu_item`, `return_vector`), and
