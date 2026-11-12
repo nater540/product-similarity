@@ -390,25 +390,23 @@ pub fn anchor_suggestion(run: &DriftRun, policy: &Policy) -> AnchorSuggestion {
     })
     .filter_map(|replayed| low(recycled(replayed)))
     .collect();
-  let next_below = legit_low.and_then(|floor| {
-    uncaught
-      .iter()
-      .copied()
-      .filter(|lowest| *lowest < floor)
-      .max_by(f64::total_cmp)
+  // The uncaught recycles that sink below every legitimate history: the ones a threshold can separate. One that
+  // only reaches as low as a legitimate history does cannot be told from it by any threshold.
+  let below: Vec<f64> = legit_low.map_or_else(Vec::new, |floor| {
+    uncaught.iter().copied().filter(|lowest| *lowest < floor).collect()
   });
+  let next_below = below.iter().copied().max_by(f64::total_cmp);
   let anchor_threshold = legit_low
     .zip(next_below)
-    .map(|(floor, below)| f64::midpoint(floor, below));
+    .map(|(floor, next)| f64::midpoint(floor, next));
   AnchorSuggestion {
     legit_low,
     uncaught: uncaught.len(),
     next_below,
     anchor_threshold,
-    margin: legit_low.zip(next_below).map(|(floor, below)| (floor - below) / 2.0),
-    recycles_caught: anchor_threshold.map_or(0, |threshold| {
-      uncaught.iter().filter(|lowest| **lowest < threshold).count()
-    }),
+    margin: legit_low.zip(next_below).map(|(floor, next)| (floor - next) / 2.0),
+    // The threshold lies above the nearest of them, so it rejects them all.
+    recycles_caught: anchor_threshold.map_or(0, |_| below.len()),
     above_threshold: anchor_threshold.is_some_and(|threshold| threshold > f64::from(policy.threshold)),
   }
 }
@@ -758,5 +756,227 @@ mod tests {
     assert!(step.step > 2);
     assert!(matches!(reasons, [Reason::AnchorDrift { .. }]), "{reasons:?}");
     assert!(first_rejection(&run.histories[0]).is_none());
+  }
+
+  /// A history made by hand: each step's similarity to the anchor, and whether the pair rules pass it. The
+  /// configured policy rejects a step the pair rules reject, and nothing else, unless `drift_below` is given.
+  fn made(
+    id: &str,
+    owner: Option<&str>,
+    label: &str,
+    recycled_at: Option<usize>,
+    steps: &[(f32, bool)],
+    drift_below: Option<f32>,
+  ) -> Replayed {
+    use similarity_core::score::{Comparison, Evaluation};
+
+    use crate::offline::drift::Step;
+    use crate::offline::histories::{History, Version};
+
+    let version = || Version {
+      at: None,
+      fields: crate::offline::RecordFields::default(),
+    };
+    Replayed {
+      history: History {
+        id: id.to_owned(),
+        owner: owner.map(str::to_owned),
+        label: match label {
+          "edit" => Some(Label::Edit),
+          "recycle" => Some(Label::Recycle),
+          _ => None,
+        },
+        label_text: label.to_owned(),
+        label_source: None,
+        label_confidence: None,
+        recycled_at,
+        truncated: false,
+        original: None,
+        versions: (0..=steps.len()).map(|_| version()).collect(),
+      },
+      steps: steps
+        .iter()
+        .enumerate()
+        .map(|(index, (to_anchor, by_pair_rules))| {
+          let mut reasons = Vec::new();
+          if !by_pair_rules {
+            reasons.push(Reason::BelowThreshold {
+              similarity: 0.1,
+              threshold: 0.5,
+            });
+          }
+          if let Some(threshold) = drift_below.filter(|threshold| to_anchor < threshold) {
+            reasons.push(Reason::AnchorDrift {
+              similarity: *to_anchor,
+              threshold,
+            });
+          }
+          Step {
+            step: index + 1,
+            at: None,
+            evaluation: Evaluation {
+              comparison: Comparison {
+                similarity: 0.9,
+                fields: Vec::new(),
+              },
+              anchor_similarity: Some(*to_anchor),
+              reasons,
+              quantities: Vec::new(),
+              measure_changed: false,
+            },
+            accepted_by_pair_rules: *by_pair_rules,
+            anchor_fields: Vec::new(),
+            anchor_quantities: Vec::new(),
+            written: true,
+          }
+        })
+        .collect(),
+    }
+  }
+
+  fn run_of(histories: Vec<Replayed>) -> DriftRun {
+    DriftRun {
+      histories,
+      input: crate::offline::pairs::Input::default(),
+    }
+  }
+
+  /// Where a history was recycled may not be known. All of it is then its recycled part, and none of it can be
+  /// called legitimate.
+  #[test]
+  fn a_recycle_that_does_not_say_where_is_recycled_throughout() {
+    let run = run_of(vec![
+      made("edit", None, "edit", None, &[(0.75, true)], None),
+      made("somewhere", None, "recycle", None, &[(0.5, true), (0.25, true)], None),
+    ]);
+    let recycled = drift_range(&run, Label::Recycle).unwrap();
+    assert_eq!((recycled.count, recycled.lowest), (1, 0.25));
+    assert_eq!(
+      drift_range(&run, Label::Edit).unwrap().count,
+      1,
+      "none of the recycle is legitimate"
+    );
+    let suggestion = anchor_suggestion(&run, &policy());
+    assert_eq!((suggestion.uncaught, suggestion.next_below), (1, Some(0.25)));
+  }
+
+  #[test]
+  fn the_suggestion_is_exactly_halfway_and_counts_only_what_it_separates() {
+    // Exact in binary, so that "halfway" and "equal" can be asserted and not approximated.
+    let policy = Policy::new(0.5, None).unwrap();
+    let run = run_of(vec![
+      made("edit", None, "edit", None, &[(0.75, true)], None),
+      made("below", None, "recycle", None, &[(0.25, true)], None),
+      made("lower", None, "recycle", None, &[(0.125, true)], None),
+      // As low as the legitimate history and no lower: no threshold tells the two apart.
+      made("level", None, "recycle", None, &[(0.75, true)], None),
+      // Caught by the pair rules at its one step: it says nothing about drift.
+      made("jump", None, "recycle", None, &[(0.0, false)], None),
+    ]);
+    let suggestion = anchor_suggestion(&run, &policy);
+    assert_eq!(suggestion.legit_low, Some(0.75));
+    assert_eq!(suggestion.uncaught, 3);
+    assert_eq!(
+      suggestion.next_below,
+      Some(0.25),
+      "the highest that is below, not the one that is level"
+    );
+    assert_eq!(
+      (suggestion.anchor_threshold, suggestion.margin),
+      (Some(0.5), Some(0.25))
+    );
+    assert_eq!(
+      suggestion.recycles_caught, 2,
+      "the two below; not the level one, and not the jump"
+    );
+    assert!(
+      !suggestion.above_threshold,
+      "equal to the overall threshold is not above it"
+    );
+
+    let stricter = Policy::new(0.25, None).unwrap();
+    assert!(anchor_suggestion(&run, &stricter).above_threshold);
+  }
+
+  #[test]
+  fn a_share_is_errors_over_histories_and_its_interval_needs_every_history_to_name_one_of_several_owners() {
+    let blocked_run = |owners: [Option<&str>; 3]| {
+      run_of(vec![
+        made("a", owners[0], "edit", None, &[(0.75, false)], None),
+        made("b", owners[1], "edit", None, &[(0.75, false)], None),
+        made("c", owners[2], "edit", None, &[(0.75, true)], None),
+      ])
+    };
+    let owned = blocked(&blocked_run([Some("b1"), Some("b2"), Some("b3")]), 0);
+    assert_eq!((owned.by_policy.errors, owned.by_policy.of), (2, 3));
+    assert!((owned.by_policy.rate.unwrap() - 2.0 / 3.0).abs() < 1e-12);
+    let interval = owned.by_policy.interval.unwrap();
+    assert!(
+      interval.low >= 0.0 && interval.high <= 1.0 && interval.low < interval.high,
+      "{interval:?}"
+    );
+
+    // One history without an owner, and there is nothing sound to resample.
+    assert_eq!(
+      blocked(&blocked_run([Some("b1"), Some("b2"), None]), 0)
+        .by_policy
+        .interval,
+      None
+    );
+    // One owner for all of them, likewise.
+    assert_eq!(
+      blocked(&blocked_run([Some("b1"), Some("b1"), Some("b1")]), 0)
+        .by_policy
+        .interval,
+      None
+    );
+    assert_eq!(
+      blocked(&run_of(Vec::new()), 0).by_policy.rate,
+      None,
+      "no histories, no share"
+    );
+  }
+
+  #[test]
+  fn a_recycle_is_caught_by_drift_alone_only_if_the_pair_rules_never_reject_it() {
+    let policy = Policy::new(0.5, Some(0.5)).unwrap();
+    let walk = made(
+      "walk",
+      None,
+      "recycle",
+      Some(1),
+      &[(0.75, true), (0.25, true)],
+      Some(0.5),
+    );
+    let jump = made("jump", None, "recycle", Some(1), &[(0.25, false)], Some(0.5));
+    assert_eq!(recycles(&run_of(vec![walk.clone()]), &policy).by_drift_alone, 1);
+    assert_eq!(
+      recycles(&run_of(vec![jump.clone()]), &policy).by_drift_alone,
+      0,
+      "the pair rules caught it too"
+    );
+    let both = recycles(&run_of(vec![walk, jump]), &policy);
+    assert_eq!((both.later, both.at_recycle, both.by_drift_alone), (1, 1, 1));
+  }
+
+  #[test]
+  fn a_walk_is_further_than_any_edit_goes_in_steps_no_larger_than_an_edit_s() {
+    let name = "indica flower";
+    let weights = |product: &str, label: &str, grams: &[f64]| {
+      let versions: Vec<_> = grams.iter().map(|grams| (name, None, Some(*grams))).collect();
+      line(product, &format!(r#""label": "{label}", "#), &versions)
+    };
+    // The edits double a weight once, and reach four times the first value over two steps.
+    let edit = weights("edit", "edit", &[1.0, 2.0, 4.0]);
+    let walked =
+      |recycle: &[f64]| quantity_drift(&replayed(&[edit.clone(), weights("r", "recycle", recycle)]))[0].walked;
+    assert_eq!(walked(&[1.0, 2.0, 4.0, 8.0]), 1, "eight times, in steps of two");
+    assert_eq!(
+      walked(&[1.0, 8.0]),
+      0,
+      "eight times in one step is a step limit's to catch"
+    );
+    assert_eq!(walked(&[1.0, 2.0, 4.0]), 0, "as far as an edit goes, and no further");
+    assert_eq!(walked(&[1.0, 2.0]), 0);
   }
 }
