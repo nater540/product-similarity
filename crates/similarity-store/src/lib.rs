@@ -1,7 +1,8 @@
 //! Where record vectors live.
 //!
-//! [`VectorStore`] is the whole contract the server needs: fetch a record's stored vectors by id, replace them,
-//! delete them, and search for similar records. Two implementations:
+//! [`VectorStore`] is the whole contract the server needs: fetch a record's stored vectors by id, replace them
+//! (always, or only if they are still what was read), delete them, and search for similar records. Two
+//! implementations:
 //!
 //! - [`MemoryStore`]: a map behind a lock with brute-force search. Used by every test that is not about Qdrant, and
 //!   a faithful reference for what the Qdrant implementation must do.
@@ -12,6 +13,7 @@
 //! wrong offsets or have come from a different model, and the numbers would be wrong without looking wrong.
 
 use std::future::Future;
+use std::sync::Arc;
 
 use similarity_core::{Quantities, RecordVectors};
 
@@ -89,6 +91,39 @@ pub struct StoredRecord {
   pub updated_at: u64,
 }
 
+impl StoredRecord {
+  /// Which write of the record this is: what a conditional write or delete names to say "still this one".
+  #[must_use]
+  pub const fn version(&self) -> Version {
+    Version {
+      revision: self.revision,
+      updated_at: self.updated_at,
+    }
+  }
+}
+
+/// One write of a record, as a later writer names it.
+///
+/// A record's revision goes up by one with every write, so within the life of one record a version names one
+/// write. A record that is deleted and stored again starts over at revision 1, which is why the time is part of
+/// it: the two lives are told apart unless both were written in the same second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Version {
+  /// [`StoredRecord::revision`] of that write.
+  pub revision: u64,
+  /// [`StoredRecord::updated_at`] of that write.
+  pub updated_at: u64,
+}
+
+/// What a conditional write expects to find under the record's id. The write happens only if it is so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expected {
+  /// Nothing: the write creates the record. A record with that id, under any layout, is left as it is.
+  Absent,
+  /// The record that was read, unchanged since: this store's layout, and this version.
+  Version(Version),
+}
+
 /// A similarity search.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SearchQuery<'a> {
@@ -148,12 +183,32 @@ pub trait VectorStore: Send + Sync + 'static {
   /// [`StoreError::Invalid`] if a vector has the wrong length, [`StoreError::Unavailable`] if the write fails.
   fn put(&self, record: &StoredRecord) -> impl Future<Output = Result<()>> + Send;
 
+  /// Writes a record only if what is stored under its id is still what `expected` says: read, decide, and write
+  /// as one step, for writers that cannot share a lock. Returns whether the record was written. `Ok(false)` means
+  /// another writer got there first and nothing was changed: read again and decide again.
+  ///
+  /// A record that has been deleted is never brought back by a write that expected a version of it.
+  ///
+  /// # Errors
+  ///
+  /// As [`Self::put`]. An error says nothing about whether the write happened.
+  fn put_if(&self, record: &StoredRecord, expected: Expected) -> impl Future<Output = Result<bool>> + Send;
+
   /// Deletes a record. Returns whether there was one, under any layout.
   ///
   /// # Errors
   ///
   /// [`StoreError::Unavailable`] if the delete fails.
   fn delete(&self, id: &str) -> impl Future<Output = Result<bool>> + Send;
+
+  /// Deletes a record only if it is still at `version`, under this store's layout. Returns whether the record is
+  /// gone: `Ok(false)` means a record is stored under that id that is not that version (another writer changed
+  /// it, or it is another layout's), and it was left as it is. A record that was not there is gone.
+  ///
+  /// # Errors
+  ///
+  /// [`StoreError::Unavailable`] if the delete fails.
+  fn delete_if(&self, id: &str, version: Version) -> impl Future<Output = Result<bool>> + Send;
 
   /// Finds the records most similar to a vector, most similar first. Only records of this store's layout match.
   ///
@@ -171,4 +226,35 @@ pub trait VectorStore: Send + Sync + 'static {
   ///
   /// As [`Self::search`], and [`StoreError::Corrupt`] if a result's vectors cannot be read.
   fn search_vectors(&self, query: SearchQuery<'_>) -> impl Future<Output = Result<Vec<Found>>> + Send;
+}
+
+/// A shared store is a store: two engines in one process, or a test standing in for two replicas, hold one each.
+impl<S: VectorStore> VectorStore for Arc<S> {
+  fn get(&self, id: &str) -> impl Future<Output = Result<Option<StoredRecord>>> + Send {
+    self.as_ref().get(id)
+  }
+
+  fn put(&self, record: &StoredRecord) -> impl Future<Output = Result<()>> + Send {
+    self.as_ref().put(record)
+  }
+
+  fn put_if(&self, record: &StoredRecord, expected: Expected) -> impl Future<Output = Result<bool>> + Send {
+    self.as_ref().put_if(record, expected)
+  }
+
+  fn delete(&self, id: &str) -> impl Future<Output = Result<bool>> + Send {
+    self.as_ref().delete(id)
+  }
+
+  fn delete_if(&self, id: &str, version: Version) -> impl Future<Output = Result<bool>> + Send {
+    self.as_ref().delete_if(id, version)
+  }
+
+  fn search(&self, query: SearchQuery<'_>) -> impl Future<Output = Result<Vec<Neighbor>>> + Send {
+    self.as_ref().search(query)
+  }
+
+  fn search_vectors(&self, query: SearchQuery<'_>) -> impl Future<Output = Result<Vec<Found>>> + Send {
+    self.as_ref().search_vectors(query)
+  }
 }

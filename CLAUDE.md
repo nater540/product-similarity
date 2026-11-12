@@ -3,10 +3,10 @@
 A gRPC server (tonic) that decides whether an edit to a record is still the same record, to catch "recycled"
 marketplace listings. Each revision is embedded field by field with a small BERT-class sentence encoder (defined
 and trained in [Burn](https://burn.dev), run by ONNX Runtime), compared with the stored baseline, and accepted or
-rejected against calibrated thresholds. A record's quantities (weight, volume, potency) are compared as numbers beside that, never embedded.
-Vectors live in Qdrant, which also provides neighbor search.
+rejected against calibrated thresholds. A record's quantities (weight, volume, potency) are compared as numbers
+beside that, never embedded. Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D34) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D35) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -94,6 +94,14 @@ changing a design. Infer conventions from the existing code first.
   holds; it may only give the anchor the first value of a field it has never had (D8). Fields present on one side
   only stay out of the score, except a `Restored` field, which is scored against the anchor. Do not "simplify"
   that away: it is what stops a field being swapped by blanking it and filling it in again.
+- **Every write the engine makes is conditional on what it read** (D35). `Engine` never calls `VectorStore::put`
+  or `delete`: it calls `put_if` with the version it judged against (or `Expected::Absent` for a record it found
+  missing) and `delete_if`, and when one comes back `false` it has written nothing and reads and judges again,
+  at most `WRITE_ATTEMPTS` times, before answering `Conflict` (`ABORTED`). That is what lets replicas share a
+  store and no lock, and what makes "an import only creates" true beside another writer. Do not write
+  unconditionally "because the lock is held": the lock is one process's. Do not observe, log an outcome for, or
+  count an attempt that lost. A store implementation must pass the conditional half of the contract test, and
+  `just test-qdrant` is what proves it against the real thing.
 - **Quantities never enter the weighted score or the layout id** (D16). They are compared as numbers
   (`similarity_core::quantity`), stored in the payload beside the vectors, and judged by
   `Evaluation::judge_quantities` after the text is scored. Do not embed one, do not fold one into `similarity`, and

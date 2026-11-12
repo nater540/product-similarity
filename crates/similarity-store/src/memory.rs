@@ -10,7 +10,7 @@ use std::sync::RwLock;
 
 use similarity_core::vector::cosine;
 
-use crate::{Found, Neighbor, Result, SearchQuery, StoreError, StoredRecord, VectorStore};
+use crate::{Expected, Found, Neighbor, Result, SearchQuery, StoreError, StoredRecord, VectorStore, Version};
 
 /// A [`VectorStore`] that keeps everything in memory.
 #[derive(Debug)]
@@ -119,9 +119,37 @@ impl VectorStore for MemoryStore {
     Ok(())
   }
 
+  async fn put_if(&self, record: &StoredRecord, expected: Expected) -> Result<bool> {
+    self.check_length("the composite", &record.vectors.composite)?;
+    self.check_length("the anchor", &record.anchor)?;
+    // Looked at and written under one lock: that is all a compare-and-swap is.
+    let mut records = self.records.write().map_err(|_| Self::poisoned())?;
+    let as_expected = match (expected, records.get(&record.id)) {
+      (Expected::Absent, stored) => stored.is_none(),
+      (Expected::Version(version), Some((layout, stored))) => *layout == self.layout && stored.version() == version,
+      (Expected::Version(_), None) => false,
+    };
+    if as_expected {
+      records.insert(record.id.clone(), (self.layout.clone(), record.clone()));
+    }
+    Ok(as_expected)
+  }
+
   async fn delete(&self, id: &str) -> Result<bool> {
     let mut records = self.records.write().map_err(|_| Self::poisoned())?;
     Ok(records.remove(id).is_some())
+  }
+
+  async fn delete_if(&self, id: &str, version: Version) -> Result<bool> {
+    let mut records = self.records.write().map_err(|_| Self::poisoned())?;
+    let Some((layout, stored)) = records.get(id) else {
+      return Ok(true);
+    };
+    if *layout != self.layout || stored.version() != version {
+      return Ok(false);
+    }
+    records.remove(id);
+    Ok(true)
   }
 
   async fn search(&self, query: SearchQuery<'_>) -> Result<Vec<Neighbor>> {

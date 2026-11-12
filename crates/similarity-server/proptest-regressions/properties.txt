@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 97424e7bdb5a8f24712a7f4b824d67879e8fe1123ab54f513c1ec899b45e6b10 # shrinks to history = [Import { id: 1, tenant: None, name: 0, category: None, weight: None, original: None }], here_asked = Delete { id: 1, tenant: None }, there_asked = Delete { id: 1, tenant: None }, late = false, anchor_threshold = None
+cc 8c5119077de1c3ed364288de56413ef6327be06d4b45b7926ede4a864d719e25 # shrinks to requests = [Import { id: 1, tenant: None, name: 0, category: None, weight: None, original: None }, Evaluate { id: Some(1), tenant: None, name: 0, category: None, description: None, weight: None, thc: None, mode: Enforce, threshold: None }], late = true, anchor_threshold = None

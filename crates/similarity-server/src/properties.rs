@@ -12,7 +12,9 @@
 //! - a record with a tenant is touched only by a request that names it (D14);
 //! - an import creates a record or leaves it exactly alone, and what it creates has the original version, where
 //!   one was given, as its anchor;
-//! - nothing ever happens to a record other than the one a request is about.
+//! - nothing ever happens to a record other than the one a request is about;
+//! - two replicas asked about a record at the same moment end as they would have had the two requests arrived
+//!   one after the other (D10).
 //!
 //! It runs on the in-memory store and the bag-of-words embedder, so it needs no model and no Qdrant. See
 //! `similarity-core`'s `properties` module for the scoring properties and for how failures are saved.
@@ -26,10 +28,12 @@ use similarity_core::vector::cosine;
 use similarity_core::{EmbedderOptions, FieldSpec, Policy, Quantity, QuantitySpec, Reason, Schema};
 use similarity_store::{MemoryStore, StoredRecord, VectorStore};
 
+use crate::engine::racing::Raced;
+
 use crate::config::ShadowEvents;
 use crate::engine::{
-  Engine, EngineError, EvaluateInput, FindSimilarInput, ImportInput, Imported, MatchInput, Original, RecordInput,
-  SimilarTo, Verdict, WriteMode, store_layout,
+  Engine, EngineError, EvaluateInput, EvaluateOutput, FindSimilarInput, ImportInput, Imported, MatchInput, Original,
+  RecordInput, SimilarTo, Verdict, WriteMode, store_layout,
 };
 use crate::offline::calibrate::suggest_threshold;
 use crate::offline::pairs::Label;
@@ -320,6 +324,41 @@ fn evaluate_input(request: &Request) -> Option<EvaluateInput> {
   })
 }
 
+/// The `Import` call a request stands for, if it is one.
+fn import_input(request: &Request) -> Option<ImportInput> {
+  let Request::Import {
+    id,
+    tenant,
+    name,
+    category,
+    weight,
+    original,
+  } = request.clone()
+  else {
+    return None;
+  };
+  let mut fields = vec![("name".to_owned(), NAMES[name].to_owned())];
+  fields.extend(category.map(|index| ("category".to_owned(), CATEGORIES[index].to_owned())));
+  let weigh = |weight: Option<(f64, &str)>| -> Vec<(String, Quantity)> {
+    weight
+      .map(|(value, unit)| ("weight".to_owned(), Quantity::single(value, unit)))
+      .into_iter()
+      .collect()
+  };
+  Some(ImportInput {
+    record: RecordInput {
+      id: Some(IDS[id].to_owned()),
+      tenant: tenant.map(|index| TENANTS[index].to_owned()),
+      fields,
+      quantities: weigh(weight),
+    },
+    anchor: original.map(|(name, weight)| Original {
+      fields: vec![("name".to_owned(), NAMES[name].to_owned())],
+      quantities: weigh(weight),
+    }),
+  })
+}
+
 #[expect(
   clippy::too_many_lines,
   reason = "one request, and every rule it must obey, read in one place"
@@ -486,31 +525,12 @@ async fn step(engine: &TestEngine, request: &Request) -> Result<(), TestCaseErro
       id,
       tenant,
       name,
-      category,
       weight,
       original,
+      ..
     } => {
       let tenant = tenant.map(|index| TENANTS[index].to_owned());
-      let mut fields = vec![("name".to_owned(), NAMES[name].to_owned())];
-      fields.extend(category.map(|index| ("category".to_owned(), CATEGORIES[index].to_owned())));
-      let weigh = |weight: Option<(f64, &str)>| -> Vec<(String, Quantity)> {
-        weight
-          .map(|(value, unit)| ("weight".to_owned(), Quantity::single(value, unit)))
-          .into_iter()
-          .collect()
-      };
-      let input = ImportInput {
-        record: RecordInput {
-          id: Some(IDS[id].to_owned()),
-          tenant: tenant.clone(),
-          fields,
-          quantities: weigh(weight),
-        },
-        anchor: original.map(|(name, weight)| Original {
-          fields: vec![("name".to_owned(), NAMES[name].to_owned())],
-          quantities: weigh(weight),
-        }),
-      };
+      let input = import_input(request).unwrap();
       let mut outcomes = sound_engine(engine.import(vec![input]).await)?;
       let outcome = outcomes
         .pop()
@@ -1080,5 +1100,148 @@ proptest! {
       prop_assert_eq!(registry.retirement(digest).is_some(), retired, "{}", digest);
       prop_assert_eq!(registry.knows(digest), last(digest, true).is_some() || last(digest, false).is_some());
     }
+  }
+}
+
+/// What a request that can write was answered. A search and a match write nothing and are not asked here.
+#[derive(Debug, Clone, PartialEq)]
+enum Answer {
+  Evaluated(Box<Result<EvaluateOutput, EngineError>>),
+  Imported(Result<Vec<Result<Imported, EngineError>>, EngineError>),
+  Deleted(Result<bool, EngineError>),
+  NotAsked,
+}
+
+async fn ask<S: VectorStore>(engine: &Engine<S, WordBagEmbedder>, request: &Request) -> Answer {
+  if let Some(input) = evaluate_input(request) {
+    return Answer::Evaluated(Box::new(engine.evaluate(input).await));
+  }
+  if let Some(input) = import_input(request) {
+    return Answer::Imported(engine.import(vec![input]).await);
+  }
+  match request {
+    Request::Delete { id, tenant } => {
+      let tenant = tenant.map(|index| TENANTS[index].to_owned());
+      Answer::Deleted(engine.delete(IDS[*id].to_owned(), tenant).await)
+    }
+    _ => Answer::NotAsked,
+  }
+}
+
+fn engine_on<S: VectorStore>(store: S, anchor_threshold: Option<f32>) -> Engine<S, WordBagEmbedder> {
+  Engine::new(
+    store,
+    WordBagEmbedder::new("word-bag-v1"),
+    schema(),
+    Policy::new(0.75, anchor_threshold).unwrap(),
+  )
+}
+
+fn empty_store() -> MemoryStore {
+  let (layout, dimension) = store_layout(&schema(), &WordBagEmbedder::new("word-bag-v1"));
+  MemoryStore::new(layout, dimension)
+}
+
+/// Every record the requests can be about, without the time it was written: two runs of one history differ in
+/// nothing else.
+async fn timeless(store: &MemoryStore) -> Vec<Option<StoredRecord>> {
+  let mut records = Vec::new();
+  for id in IDS {
+    let record = store.get(id).await.unwrap();
+    records.push(record.map(|record| StoredRecord {
+      updated_at: 0,
+      ..record
+    }));
+  }
+  records
+}
+
+/// `history`, then `first`, then `second`, each finished before the next begins: both answers, and what is stored.
+async fn one_after_the_other(
+  history: &[Request],
+  first: &Request,
+  second: &Request,
+  anchor_threshold: Option<f32>,
+) -> (Answer, Answer, Vec<Option<StoredRecord>>) {
+  let engine = engine_on(empty_store(), anchor_threshold);
+  // Boxed, here and below: a request's future is large, and a test thread's stack is not.
+  for request in history {
+    Box::pin(ask(&engine, request)).await;
+  }
+  let first = Box::pin(ask(&engine, first)).await;
+  let second = Box::pin(ask(&engine, second)).await;
+  (first, second, timeless(engine.store()).await)
+}
+
+proptest! {
+  #![proptest_config(cases())]
+
+  /// Two replicas share a store and no lock (D10). Whatever each is asked at the same moment, with one of them
+  /// reading a record before the other writes and going to write after it, what comes of it is what comes of
+  /// the two requests arriving one after the other, in one order or the other: both answers, and what is stored.
+  /// No request is judged against a record that was replaced under it and then written anyway.
+  ///
+  /// One answer is allowed to differ, and only that one: two deletes of one record at once are both told that
+  /// there was a record, where one after the other the second is told there was none. The store says whether a
+  /// record is gone, not who removed it.
+  #[test]
+  fn two_replicas_asked_at_once_end_as_if_asked_one_after_the_other(
+    // What came before, and then the two requests that arrive together: the last two of the list. (One list,
+    // because a generated request is a large thing to hold three of at once on a test thread's stack.)
+    requests in proptest::collection::vec(request(), 2..14),
+    // An import reads once before it embeds and once when it goes to write: the other replica gets in after
+    // either.
+    late in any::<bool>(),
+    anchor_threshold in proptest::option::of(Just(0.5_f32)),
+  ) {
+    let Some((there_asked, history)) = requests.split_last() else {
+      return Err(TestCaseError::reject("two requests are needed to arrive together"));
+    };
+    let Some((here_asked, history)) = history.split_last() else {
+      return Err(TestCaseError::reject("two requests are needed to arrive together"));
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    runtime.block_on(async {
+      let store = std::sync::Arc::new(empty_store());
+      let there = std::sync::Arc::new(engine_on(std::sync::Arc::clone(&store), anchor_threshold));
+      let here = engine_on(Raced::over(std::sync::Arc::clone(&store)), anchor_threshold);
+      for request in history {
+        Box::pin(ask(&*there, request)).await;
+      }
+
+      let answered = std::sync::Arc::new(std::sync::Mutex::new(None));
+      let skipped = usize::from(late && matches!(here_asked, Request::Import { .. }));
+      here.store().after_read(skipped, {
+        let (there, asked, answered) = (std::sync::Arc::clone(&there), there_asked.clone(), std::sync::Arc::clone(&answered));
+        async move {
+          let answer = Box::pin(ask(&*there, &asked)).await;
+          *answered.lock().unwrap() = Some(answer);
+        }
+      });
+      let here_answered = Box::pin(ask(&here, here_asked)).await;
+      // A request that was refused before it read anything let nobody in: the other replica is simply next.
+      if let Some(still_waiting) = here.store().waiting() {
+        still_waiting.await;
+      }
+      let there_answered = answered.lock().unwrap().take().unwrap();
+      let at_once = (here_answered, there_answered, timeless(&store).await);
+
+      let here_first = Box::pin(one_after_the_other(history, here_asked, there_asked, anchor_threshold)).await;
+      let there_first = Box::pin(one_after_the_other(history, there_asked, here_asked, anchor_threshold)).await;
+      let there_first = (there_first.1, there_first.0, there_first.2);
+      let both_deleted = (Answer::Deleted(Ok(true)), Answer::Deleted(Ok(true)));
+      let two_deletes_of_one_record = (&at_once.0, &at_once.1) == (&both_deleted.0, &both_deleted.1)
+        && at_once.2 == here_first.2
+        && here_first.0 == both_deleted.0
+        && there_first.1 == both_deleted.1;
+      prop_assert!(
+        at_once == here_first || at_once == there_first || two_deletes_of_one_record,
+        "at once: {:#?}\nhere first: {:#?}\nthere first: {:#?}",
+        at_once,
+        here_first,
+        there_first
+      );
+      Ok::<(), TestCaseError>(())
+    })?;
   }
 }

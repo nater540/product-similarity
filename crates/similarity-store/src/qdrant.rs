@@ -9,11 +9,19 @@
 //!   timestamp, and the record's quantities (current and original). Quantities are compared as numbers and are in
 //!   no vector, which is why a point written before they existed needs no migration: it reads back with none.
 //!
+//! A conditional write is an upsert with a filter on the point being replaced: Qdrant applies it only if the
+//! stored payload still has the revision and time the writer read. Qdrant does not say whether it did (the
+//! answer is `completed` either way), so each conditional write carries a mark of its own in the payload and the
+//! point is read back to see whose mark it holds.
+//!
 //! Qdrant point ids must be integers or UUIDs, and record ids are arbitrary strings, so the point id is the UUIDv5
 //! of the record id under a fixed namespace. The mapping is deterministic, so a record is always one point no
 //! matter which server instance writes it.
 
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{BuildHasher, RandomState};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use qdrant_client::qdrant::vector_output::Vector as StoredVector;
@@ -21,7 +29,7 @@ use qdrant_client::qdrant::vectors_config::Config as VectorsLayout;
 use qdrant_client::qdrant::{
   Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, DeletePointsBuilder, Distance, FieldType,
   Filter, GetPointsBuilder, HnswConfigDiffBuilder, KeywordIndexParamsBuilder, NamedVectors, PointId, PointStruct,
-  PointsIdsList, QueryPointsBuilder, UpsertPointsBuilder, Value, VectorParamsBuilder, VectorsConfigBuilder,
+  PointsIdsList, QueryPointsBuilder, UpdateMode, UpsertPointsBuilder, Value, VectorParamsBuilder, VectorsConfigBuilder,
   VectorsOutput, VectorsSelector,
 };
 use qdrant_client::{Payload, Qdrant, QdrantError};
@@ -29,12 +37,15 @@ use serde::{Deserialize, Serialize};
 use similarity_core::{Quantities, RecordVectors};
 use uuid::Uuid;
 
-use crate::{Found, Neighbor, Result, SearchQuery, StoreError, StoredRecord, VectorStore};
+use crate::{Expected, Found, Neighbor, Result, SearchQuery, StoreError, StoredRecord, VectorStore, Version};
 
 const CURRENT: &str = "current";
 const ANCHOR: &str = "anchor";
 const TENANT_KEY: &str = "tenant";
 const LAYOUT_KEY: &str = "layout";
+// The two payload keys a conditional write filters on. They are the names `PointPayload` serializes under.
+const REVISION_KEY: &str = "revision";
+const UPDATED_AT_KEY: &str = "updated_at";
 
 /// The UUIDv5 namespace record ids are hashed under. Changing it orphans every stored point.
 const POINT_NAMESPACE: Uuid = Uuid::from_u128(0x7d0c_3f5e_9a41_4b6e_8c1d_52a7_e3b9_604f);
@@ -69,6 +80,31 @@ struct PointPayload {
   quantities: Quantities,
   #[serde(default, skip_serializing_if = "Quantities::is_empty")]
   anchor_quantities: Quantities,
+  // The mark of the conditional write that stored the point, by which that writer recognizes it when it reads
+  // the point back. Absent on a point stored by a plain write, and never read for anything else.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  write: Option<String>,
+}
+
+/// Makes the marks conditional writes are recognized by: no two alike from one store, and none alike between
+/// two processes short of a 64-bit accident. The keys are random for each store, and the counter never repeats.
+#[derive(Debug)]
+struct Marks {
+  keys: RandomState,
+  next: AtomicU64,
+}
+
+impl Marks {
+  fn new() -> Self {
+    Self {
+      keys: RandomState::new(),
+      next: AtomicU64::new(0),
+    }
+  }
+
+  fn next(&self) -> String {
+    format!("{:016x}", self.keys.hash_one(self.next.fetch_add(1, Ordering::Relaxed)))
+  }
 }
 
 /// A [`VectorStore`] backed by a Qdrant collection.
@@ -78,6 +114,7 @@ pub struct QdrantStore {
   collection: String,
   layout: String,
   dimension: usize,
+  marks: Arc<Marks>,
 }
 
 impl std::fmt::Debug for QdrantStore {
@@ -126,6 +163,7 @@ impl QdrantStore {
       collection: settings.collection.clone(),
       layout: layout.into(),
       dimension,
+      marks: Arc::new(Marks::new()),
     };
     store.ensure_collection().await?;
     Ok(store)
@@ -289,6 +327,64 @@ impl QdrantStore {
     }
   }
 
+  /// The point a record is stored as. `write` is the mark of a conditional write, and `None` for a plain one.
+  fn point(&self, record: &StoredRecord, write: Option<String>) -> Result<PointStruct> {
+    self.check_length("the composite", &record.vectors.composite)?;
+    self.check_length("the anchor", &record.anchor)?;
+
+    let payload = serde_json::to_value(PointPayload {
+      record_id: record.id.clone(),
+      tenant: record.tenant.clone(),
+      layout: self.layout.clone(),
+      hashes: record.vectors.hashes.clone(),
+      revision: record.revision,
+      updated_at: record.updated_at,
+      quantities: record.quantities.clone(),
+      anchor_quantities: record.anchor_quantities.clone(),
+      write,
+    })
+    .map_err(|source| StoreError::Invalid(format!("payload does not serialize: {source}")))
+    .and_then(|value| {
+      Payload::try_from(value).map_err(|source| StoreError::Invalid(format!("payload is not an object: {source}")))
+    })?;
+    let vectors = NamedVectors::default()
+      .add_vector(CURRENT, record.vectors.composite.clone())
+      .add_vector(ANCHOR, record.anchor.clone());
+    Ok(PointStruct::new(point_id(&record.id), vectors, payload))
+  }
+
+  /// What a point's payload must say for it to be `version` of a record of this layout.
+  fn at(&self, version: Version) -> Result<Vec<Condition>> {
+    let stored = |what: &str, value: u64| {
+      i64::try_from(value)
+        .map_err(|_| StoreError::Invalid(format!("{what} {value} is beyond what a stored record can hold")))
+    };
+    Ok(vec![
+      Condition::matches(LAYOUT_KEY, self.layout.clone()),
+      Condition::matches(REVISION_KEY, stored("the revision", version.revision)?),
+      Condition::matches(UPDATED_AT_KEY, stored("the time", version.updated_at)?),
+    ])
+  }
+
+  /// A point's payload without its vectors, or `None` if there is no such point.
+  async fn payload_of(&self, id: &str) -> Result<Option<PointPayload>> {
+    let response = self
+      .client
+      .get_points(
+        GetPointsBuilder::new(self.collection.as_str(), vec![point_id(id)])
+          .with_payload(true)
+          .with_vectors(false),
+      )
+      .await
+      .map_err(|source| unavailable(&source))?;
+    response
+      .result
+      .into_iter()
+      .next()
+      .map(|point| decode_payload(id, point.payload))
+      .transpose()
+  }
+
   /// The request both kinds of search send, or `None` for a search that asks for nothing. One place, so that
   /// they cannot differ in what they match.
   fn query_request(&self, query: SearchQuery<'_>) -> Result<Option<QueryPointsBuilder>> {
@@ -378,40 +474,39 @@ impl VectorStore for QdrantStore {
   }
 
   async fn put(&self, record: &StoredRecord) -> Result<()> {
-    self.check_length("the composite", &record.vectors.composite)?;
-    self.check_length("the anchor", &record.anchor)?;
-
-    let payload = serde_json::to_value(PointPayload {
-      record_id: record.id.clone(),
-      tenant: record.tenant.clone(),
-      layout: self.layout.clone(),
-      hashes: record.vectors.hashes.clone(),
-      revision: record.revision,
-      updated_at: record.updated_at,
-      quantities: record.quantities.clone(),
-      anchor_quantities: record.anchor_quantities.clone(),
-    })
-    .map_err(|source| StoreError::Invalid(format!("payload does not serialize: {source}")))
-    .and_then(|value| {
-      Payload::try_from(value).map_err(|source| StoreError::Invalid(format!("payload is not an object: {source}")))
-    })?;
-    let vectors = NamedVectors::default()
-      .add_vector(CURRENT, record.vectors.composite.clone())
-      .add_vector(ANCHOR, record.anchor.clone());
-
+    let point = self.point(record, None)?;
     self
       .client
       .upsert_points(
         // `wait` makes the write visible to the very next read, which the compare-then-write cycle depends on.
-        UpsertPointsBuilder::new(
-          self.collection.as_str(),
-          vec![PointStruct::new(point_id(&record.id), vectors, payload)],
-        )
-        .wait(true),
+        UpsertPointsBuilder::new(self.collection.as_str(), vec![point]).wait(true),
       )
       .await
       .map(|_| ())
       .map_err(|source| unavailable(&source))
+  }
+
+  async fn put_if(&self, record: &StoredRecord, expected: Expected) -> Result<bool> {
+    let mark = self.marks.next();
+    let point = self.point(record, Some(mark.clone()))?;
+    let request = UpsertPointsBuilder::new(self.collection.as_str(), vec![point]).wait(true);
+    let request = match expected {
+      // Never over a point that is there, whatever it holds.
+      Expected::Absent => request.update_mode(UpdateMode::InsertOnly),
+      // Only over the point that was read, and never as a new point: a record deleted since stays deleted.
+      Expected::Version(version) => request
+        .update_mode(UpdateMode::UpdateOnly)
+        .update_filter(Filter::must(self.at(version)?)),
+    };
+    self
+      .client
+      .upsert_points(request)
+      .await
+      .map_err(|source| unavailable(&source))?;
+    // Qdrant answers `completed` whether the condition held or not. The point says which: it carries this
+    // write's mark only if this write is what stored it.
+    let stored = self.payload_of(&record.id).await?;
+    Ok(stored.and_then(|payload| payload.write).as_deref() == Some(mark.as_str()))
   }
 
   async fn delete(&self, id: &str) -> Result<bool> {
@@ -439,6 +534,31 @@ impl VectorStore for QdrantStore {
       .await
       .map_err(|source| unavailable(&source))?;
     Ok(true)
+  }
+
+  async fn delete_if(&self, id: &str, version: Version) -> Result<bool> {
+    let mut only = self.at(version)?;
+    only.push(Condition::has_id([point_id(id)]));
+    self
+      .client
+      .delete_points(
+        DeletePointsBuilder::new(self.collection.as_str())
+          .points(Filter::must(only))
+          .wait(true),
+      )
+      .await
+      .map_err(|source| unavailable(&source))?;
+    // As for a conditional write, the answer does not say whether anything matched: looking does.
+    let remaining = self
+      .client
+      .get_points(
+        GetPointsBuilder::new(self.collection.as_str(), vec![point_id(id)])
+          .with_payload(false)
+          .with_vectors(false),
+      )
+      .await
+      .map_err(|source| unavailable(&source))?;
+    Ok(remaining.result.is_empty())
   }
 
   async fn search(&self, query: SearchQuery<'_>) -> Result<Vec<Neighbor>> {
@@ -534,9 +654,16 @@ mod tests {
         ("thc_per_item".to_owned(), Quantity::range(18.0, 22.0, "%")),
       ]),
       anchor_quantities: Quantities::from([("weight_per_item".to_owned(), Quantity::single(1.0, "g"))]),
+      write: Some("00000000deadbeef".to_owned()),
     };
     let encoded = Payload::try_from(serde_json::to_value(&payload).unwrap()).unwrap();
+    // The filter of a conditional write names these two keys: they have to be the ones the payload is written
+    // under, as whole numbers.
+    let written: HashMap<String, Value> = encoded.clone().into();
+    assert_eq!(written[REVISION_KEY].as_integer(), Some(3));
+    assert_eq!(written[UPDATED_AT_KEY].as_integer(), Some(1_700_000_000));
     let decoded = decode_payload("product-42", encoded.into()).unwrap();
+    assert_eq!(decoded.write.as_deref(), Some("00000000deadbeef"));
     assert_eq!(decoded.record_id, "product-42");
     assert_eq!(decoded.tenant.as_deref(), Some("merchant-7"));
     assert_eq!(decoded.hashes["name"], "00ff");
@@ -585,5 +712,35 @@ mod tests {
       decode_payload("p", encoded.into()),
       Err(StoreError::Corrupt { .. })
     ));
+  }
+
+  #[test]
+  fn a_plain_write_carries_no_mark_and_a_point_without_one_decodes() {
+    let payload = PointPayload {
+      record_id: "p".to_owned(),
+      tenant: None,
+      layout: "l".to_owned(),
+      hashes: BTreeMap::new(),
+      revision: 1,
+      updated_at: 1,
+      quantities: Quantities::new(),
+      anchor_quantities: Quantities::new(),
+      write: None,
+    };
+    let value = serde_json::to_value(&payload).unwrap();
+    assert!(value.get("write").is_none(), "{value}");
+    let decoded = decode_payload("p", Payload::try_from(value).unwrap().into()).unwrap();
+    assert_eq!(decoded.write, None);
+  }
+
+  #[test]
+  fn no_two_marks_of_a_store_are_alike_and_two_stores_do_not_share_theirs() {
+    let (here, there) = (Marks::new(), Marks::new());
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..1000 {
+      assert!(seen.insert(here.next()));
+      assert!(seen.insert(there.next()), "another store's marks are other marks");
+    }
+    assert!(seen.iter().all(|mark| mark.len() == 16));
   }
 }

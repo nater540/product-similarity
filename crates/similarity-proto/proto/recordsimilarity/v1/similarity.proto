@@ -22,7 +22,13 @@ service RecordSimilarity {
   // Errors: `INVALID_ARGUMENT` for a record that does not fit the configured schema (an unknown field or quantity,
   // a quantity that is not a usable measurement) or a `mode` this server does not know, `FAILED_PRECONDITION` if the stored baseline belongs to a tenant the request does not name or was
   // written under a different model or schema layout, `RESOURCE_EXHAUSTED` if the embedding queue is full,
-  // `UNAVAILABLE` if the vector store cannot be reached.
+  // `UNAVAILABLE` if the vector store cannot be reached, `ABORTED` if another writer changed the record every
+  // time this request had judged it and gone to write.
+  //
+  // A record is judged against what is stored at the moment it is written. When two requests for one `id` reach
+  // two servers at once, one is written and the other is judged again, against the one that was written: each
+  // gets the answer it would have got had it simply arrived second. `ABORTED` is what is left when that keeps
+  // happening; nothing was written, and the request can be sent again as it is.
   rpc Evaluate(EvaluateRequest) returns (EvaluateResponse);
 
   // Finds stored records similar to a given one, most similar first.
@@ -35,7 +41,11 @@ service RecordSimilarity {
 
   // Forgets a record. The next `Evaluate` for its id starts a new baseline.
   //
-  // Errors: `FAILED_PRECONDITION` if the record is stored under a tenant the request does not name.
+  // The tenant the request has to name is the tenant of the record as it is when it is deleted. Two requests to
+  // delete one record that reach two servers at the same moment may both be answered `deleted: true`.
+  //
+  // Errors: `FAILED_PRECONDITION` if the record is stored under a tenant the request does not name, `ABORTED`
+  // as for `Evaluate`.
   rpc Delete(DeleteRequest) returns (DeleteResponse);
 
   // Creates records that are not stored yet, as many as the caller sends, over one call.
@@ -463,7 +473,7 @@ message ImportResponse {
 
   // For `IMPORT_OUTCOME_FAILED`: the gRPC status code the same record would have got from `Evaluate` (3
   // `INVALID_ARGUMENT`, 9 `FAILED_PRECONDITION` for a record stored under another tenant, 8 `RESOURCE_EXHAUSTED`,
-  // 14 `UNAVAILABLE`). Zero otherwise.
+  // 10 `ABORTED`, 14 `UNAVAILABLE`). Zero otherwise.
   uint32 status_code = 4;
 
   // For `IMPORT_OUTCOME_FAILED`: what was wrong, as a sentence. Empty otherwise.

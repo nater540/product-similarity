@@ -44,6 +44,7 @@ impl From<EngineError> for Status {
       EngineError::InvalidArgument(message) => Self::invalid_argument(message),
       EngineError::NotFound(message) => Self::not_found(message),
       EngineError::FailedPrecondition(message) => Self::failed_precondition(message),
+      EngineError::Conflict(message) => Self::aborted(message),
       EngineError::Overloaded(message) => Self::resource_exhausted(message),
       EngineError::Unavailable(message) => {
         tracing::warn!(%message, "dependency unavailable");
@@ -462,6 +463,7 @@ mod tests {
         EngineError::FailedPrecondition("m".to_owned()),
         Code::FailedPrecondition,
       ),
+      (EngineError::Conflict("m".to_owned()), Code::Aborted),
       (EngineError::Overloaded("m".to_owned()), Code::ResourceExhausted),
       (EngineError::Unavailable("m".to_owned()), Code::Unavailable),
       (EngineError::Internal("m".to_owned()), Code::Internal),

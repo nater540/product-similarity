@@ -5,11 +5,12 @@
 //! It is generic over the store and the embedder so that every rule below is tested in memory, in microseconds,
 //! without Qdrant or model weights.
 //!
-//! The one piece of state it owns is a set of locks. Evaluating a record is read-compare-write, and two concurrent
-//! revisions of the same id must not both be compared against the same baseline and then both be written. Requests
-//! for the same id are serialized here; requests for different ids run concurrently. This holds within one server
-//! process. Several replicas writing the same id at the same instant can still interleave, which is acceptable for
-//! a system whose callers already serialize edits to a single record, and is called out in the README.
+//! Evaluating a record is read-compare-write, and two concurrent revisions of the same id must not both be
+//! compared against the same baseline and then both be written. Two things see to that. Within one process,
+//! requests for the same id are serialized by a set of locks, the one piece of state the engine owns; requests
+//! for different ids run concurrently. Across processes, which share no lock, every write is conditional on the
+//! store still holding what was read ([`VectorStore::put_if`]): a writer that finds the record changed under it
+//! has written nothing, and reads and judges again (docs/decisions.md, D10).
 
 use std::fmt;
 use std::hash::{BuildHasher, RandomState};
@@ -23,7 +24,7 @@ use similarity_core::{
   FieldChange, Policy, PreparedRecord, Quantities, Quantity, QuantityChange, QuantityScore, Reason, RecordVectors,
   Schema,
 };
-use similarity_store::{Neighbor, SearchQuery, StoreError, StoredRecord, VectorStore};
+use similarity_store::{Expected, Neighbor, SearchQuery, StoreError, StoredRecord, VectorStore};
 use tokio::sync::Mutex;
 
 use crate::worker::{EmbedError, TextEmbedder};
@@ -44,6 +45,11 @@ pub const MAX_NEIGHBORS: usize = 100;
 /// How many independent locks guard record ids. A power of two well above the expected request concurrency, so that
 /// two different ids rarely share a lock.
 const LOCK_STRIPES: usize = 256;
+/// How many times a request reads a record, judges, and tries to write before it gives up with
+/// [`EngineError::Conflict`]. Each try after the first means another writer changed the record in the moment
+/// between this one's read and its write, which takes another replica working on the same record at the same
+/// instant: once is rare, and this many times in a row means something is rewriting the record in a loop.
+pub const WRITE_ATTEMPTS: usize = 4;
 
 /// A failed request, classified the way a caller needs it classified.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -57,6 +63,10 @@ pub enum EngineError {
   /// The request is fine but the stored state forbids it (another tenant's record, another model's vectors).
   #[error("{0}")]
   FailedPrecondition(String),
+  /// Another writer kept changing the record while this request was being judged, so nothing was written.
+  /// Sending the request again is safe.
+  #[error("{0}")]
+  Conflict(String),
   /// The server is saturated. Retry with backoff.
   #[error("{0}")]
   Overloaded(String),
@@ -421,6 +431,14 @@ fn same_tenant(stored: &StoredRecord, given: Option<&str>) -> Result<(), EngineE
   }
 }
 
+/// What a request is answered when every attempt it made found the record changed by another writer.
+fn contended(id: &str) -> EngineError {
+  EngineError::Conflict(format!(
+    "record `{id}` was changed by another writer each of the {WRITE_ATTEMPTS} times this request read it and went \
+     to write, so nothing was written; send the request again"
+  ))
+}
+
 fn now() -> u64 {
   SystemTime::now()
     .duration_since(UNIX_EPOCH)
@@ -553,27 +571,62 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     };
 
     let _serialized = self.lock_for(&id)?.lock().await;
-    let baseline = self.store.get(&id).await?;
-    if let Some(stored) = &baseline {
-      same_tenant(stored, tenant.as_deref())?;
+    let asked = (input.mode, input.threshold);
+    for _ in 0..WRITE_ATTEMPTS {
+      let attempt = self.attempt(&id, tenant.as_deref(), &prepared, asked, &policy);
+      if let Some(output) = attempt.await? {
+        return Ok(output);
+      }
     }
-    let candidate = self
-      .embed(&prepared, baseline.as_ref().map(|record| &record.vectors))
-      .await?;
+    Err(contended(&id))
+  }
 
-    let quantities = prepared.quantities().clone();
-    if let Some(baseline) = baseline {
-      let revision = Revision {
-        id,
-        tenant,
-        vectors: candidate,
-        quantities,
-      };
-      return self
-        .revise(revision, (input.mode, input.threshold), &policy, baseline)
-        .await;
+  /// Reads the record, judges the request against it, and writes what that allows, provided the record is still
+  /// what was read. `None` means it was not: another writer changed it in between, nothing was written, nobody
+  /// was told, and the whole of this has to be done again against what is stored now.
+  async fn attempt(
+    &self,
+    id: &str,
+    tenant: Option<&str>,
+    prepared: &PreparedRecord,
+    asked: (WriteMode, Option<f32>),
+    policy: &Policy,
+  ) -> Result<Option<EvaluateOutput>, EngineError> {
+    let baseline = self.store.get(id).await?;
+    if let Some(stored) = &baseline {
+      same_tenant(stored, tenant)?;
     }
-    let stored = input.mode != WriteMode::DryRun;
+    let vectors = self
+      .embed(prepared, baseline.as_ref().map(|record| &record.vectors))
+      .await?;
+    let revision = Revision {
+      id: id.to_owned(),
+      tenant: tenant.map(str::to_owned),
+      vectors,
+      quantities: prepared.quantities().clone(),
+    };
+    match baseline {
+      Some(baseline) => self.revise(revision, asked, policy, baseline).await,
+      None => self.create(revision, asked, policy).await,
+    }
+  }
+
+  /// Stores the first version of a record, unless the mode forbids writing. `None` if another writer created the
+  /// record first.
+  async fn create(
+    &self,
+    first: Revision,
+    asked: (WriteMode, Option<f32>),
+    policy: &Policy,
+  ) -> Result<Option<EvaluateOutput>, EngineError> {
+    let (mode, threshold) = asked;
+    let Revision {
+      id,
+      tenant,
+      vectors: candidate,
+      quantities,
+    } = first;
+    let stored = mode != WriteMode::DryRun;
     if stored {
       let record = StoredRecord {
         id: id.clone(),
@@ -586,37 +639,40 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
         revision: 1,
         updated_at: now(),
       };
-      self.store.put(&record).await?;
+      if !self.store.put_if(&record, Expected::Absent).await? {
+        return Ok(None);
+      }
     }
     if let Some(observer) = &self.observer {
       observer.observe(&Observation {
         id: &id,
         tenant: tenant.as_deref(),
-        mode: input.mode,
-        threshold: input.threshold,
-        policy: &policy,
+        mode,
+        threshold,
+        policy,
         stored,
         revision: u64::from(stored),
         judged: None,
       });
     }
-    Ok(EvaluateOutput::without_baseline(
+    Ok(Some(EvaluateOutput::without_baseline(
       Verdict::Created,
-      &policy,
+      policy,
       stored,
       candidate.composite,
-    ))
+    )))
   }
 
   /// Judges `candidate` against `baseline` and writes it back if the policy and the mode allow. `asked` is the
   /// request's mode and the threshold it asked for, if it asked for one; `policy` already has that threshold.
+  /// `None` if there was something to write and `baseline` was no longer what is stored.
   async fn revise(
     &self,
     candidate: Revision,
     asked: (WriteMode, Option<f32>),
     policy: &Policy,
     baseline: StoredRecord,
-  ) -> Result<EvaluateOutput, EngineError> {
+  ) -> Result<Option<EvaluateOutput>, EngineError> {
     let (mode, threshold) = asked;
     let Revision {
       id,
@@ -683,10 +739,20 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
         revision,
         updated_at: now(),
       };
-      self.store.put(&record).await?;
+      // The verdict above is about `baseline`. If that is no longer what is stored, the verdict is about
+      // nothing, and writing would replace a record this request never saw: a forced write included, whose
+      // revision number would be wrong.
+      if !self
+        .store
+        .put_if(&record, Expected::Version(baseline.version()))
+        .await?
+      {
+        return Ok(None);
+      }
     }
 
-    // Only now is the outcome final: a write that failed has already returned its error, and is never observed.
+    // Only now is the outcome final: a write that failed has already returned its error, a write that lost to
+    // another writer is judged again, and neither is observed.
     if let Some(observer) = &self.observer {
       observer.observe(&Observation {
         id: &id,
@@ -705,7 +771,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       });
     }
 
-    Ok(EvaluateOutput {
+    Ok(Some(EvaluateOutput {
       verdict: if accepted { Verdict::Accepted } else { Verdict::Rejected },
       similarity: Some(evaluation.comparison.similarity),
       threshold: policy.threshold,
@@ -717,7 +783,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       revision,
       quantities: evaluation.quantities,
       measure_changed: evaluation.measure_changed,
-    })
+    }))
   }
 
   /// Imports records that are not stored yet, embedding all of them in one call to the model.
@@ -865,13 +931,6 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     anchor: &[Vec<f32>],
   ) -> Result<Imported, EngineError> {
     let dimension = self.embedder.dimension();
-    let _serialized = self.lock_for(&prepared.id)?.lock().await;
-    if let Some(stored) = self.store.get(&prepared.id).await? {
-      // Naming another tenant is the mistake the tenant rule exists for, here as anywhere (D14).
-      same_tenant(&stored, prepared.tenant.as_deref())?;
-      return Ok(Imported::Skipped);
-    }
-
     let vectors = prepared
       .record
       .plan(&self.schema, dimension, None)?
@@ -890,20 +949,31 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       }
       None => (vectors.composite.clone(), quantities.clone()),
     };
-    self
-      .store
-      .put(&StoredRecord {
-        id: prepared.id,
-        tenant: prepared.tenant,
-        vectors,
-        anchor,
-        quantities,
-        anchor_quantities,
-        revision: 1,
-        updated_at: now(),
-      })
-      .await?;
-    Ok(Imported::Created)
+    let record = StoredRecord {
+      id: prepared.id,
+      tenant: prepared.tenant,
+      vectors,
+      anchor,
+      quantities,
+      anchor_quantities,
+      revision: 1,
+      updated_at: now(),
+    };
+
+    let _serialized = self.lock_for(&record.id)?.lock().await;
+    for _ in 0..WRITE_ATTEMPTS {
+      if let Some(stored) = self.store.get(&record.id).await? {
+        // Naming another tenant is the mistake the tenant rule exists for, here as anywhere (D14).
+        same_tenant(&stored, record.tenant.as_deref())?;
+        return Ok(Imported::Skipped);
+      }
+      // "Only creates" is the store's to keep, not this process's lock: a record another replica, or the import
+      // command beside it, stored a moment ago is left alone like any other (D20).
+      if self.store.put_if(&record, Expected::Absent).await? {
+        return Ok(Imported::Created);
+      }
+    }
+    Err(contended(&record.id))
   }
 
   /// Finds stored records similar to a stored or ad hoc record, most similar first.
@@ -1043,11 +1113,112 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     };
     let tenant = required_text("tenant", tenant)?;
     let _serialized = self.lock_for(&id)?.lock().await;
-    let Some(stored) = self.store.get(&id).await? else {
-      return Ok(false);
-    };
-    same_tenant(&stored, tenant.as_deref())?;
-    Ok(self.store.delete(&id).await?)
+    for _ in 0..WRITE_ATTEMPTS {
+      let Some(stored) = self.store.get(&id).await? else {
+        return Ok(false);
+      };
+      same_tenant(&stored, tenant.as_deref())?;
+      // The record that is deleted is the one whose tenant was just checked. One that another writer has since
+      // replaced, and may have given a tenant, is looked at again.
+      if self.store.delete_if(&id, stored.version()).await? {
+        return Ok(true);
+      }
+    }
+    Err(contended(&id))
+  }
+}
+
+/// A store that lets a test stand in for a second replica: shared with the engine tests and the properties.
+#[cfg(test)]
+pub(crate) mod racing {
+  use std::collections::VecDeque;
+  use std::pin::Pin;
+  use std::sync::atomic::{AtomicUsize, Ordering};
+  use std::sync::{Arc, Mutex};
+
+  use similarity_store::{
+    Expected, Found, MemoryStore, Neighbor, SearchQuery, StoreError, StoredRecord, VectorStore, Version,
+  };
+
+  /// What another replica does to the store while this engine is between a read and its write.
+  type Rival = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+  /// A store another replica gets a request into just after one of this engine's reads. The read returns what was
+  /// stored before the rival wrote, which is what a read from a store two processes share can be by the time it
+  /// is acted on. One entry is taken for each read; `None` is a read with nobody beside it.
+  pub(crate) struct Raced {
+    store: Arc<MemoryStore>,
+    rivals: Mutex<VecDeque<Option<Rival>>>,
+    reads: AtomicUsize,
+  }
+
+  impl Raced {
+    pub(crate) fn over(store: Arc<MemoryStore>) -> Self {
+      Self {
+        store,
+        rivals: Mutex::default(),
+        reads: AtomicUsize::new(0),
+      }
+    }
+
+    /// Lets `skipped` reads through, and gets `rival` in after the next one.
+    pub(crate) fn after_read(&self, skipped: usize, rival: impl Future<Output = ()> + Send + 'static) {
+      let mut rivals = self.rivals.lock().unwrap();
+      rivals.extend((0..skipped).map(|_| None));
+      rivals.push_back(Some(Box::pin(rival)));
+    }
+
+    /// A rival that no read has let in yet, if there is one: the engine did not read as often as was planned.
+    pub(crate) fn waiting(&self) -> Option<impl Future<Output = ()> + Send + use<>> {
+      self.rivals.lock().unwrap().drain(..).flatten().next()
+    }
+
+    pub(crate) fn reads(&self) -> usize {
+      self.reads.load(Ordering::Relaxed)
+    }
+
+    /// The store itself, as the other replica sees it.
+    pub(crate) fn shared(&self) -> &Arc<MemoryStore> {
+      &self.store
+    }
+  }
+
+  impl VectorStore for Raced {
+    async fn get(&self, id: &str) -> Result<Option<StoredRecord>, StoreError> {
+      self.reads.fetch_add(1, Ordering::Relaxed);
+      let found = self.store.get(id).await;
+      let rival = self.rivals.lock().unwrap().pop_front().flatten();
+      if let Some(rival) = rival {
+        // As a task of its own, which is what another replica is, and so that its work is not stacked on top of
+        // the request that is waiting here: the two together are deeper than a test thread's stack.
+        tokio::spawn(rival).await.unwrap();
+      }
+      found
+    }
+
+    async fn put(&self, record: &StoredRecord) -> Result<(), StoreError> {
+      self.store.put(record).await
+    }
+
+    async fn put_if(&self, record: &StoredRecord, expected: Expected) -> Result<bool, StoreError> {
+      self.store.put_if(record, expected).await
+    }
+
+    async fn delete(&self, id: &str) -> Result<bool, StoreError> {
+      self.store.delete(id).await
+    }
+
+    async fn delete_if(&self, id: &str, version: Version) -> Result<bool, StoreError> {
+      self.store.delete_if(id, version).await
+    }
+
+    async fn search(&self, query: SearchQuery<'_>) -> Result<Vec<Neighbor>, StoreError> {
+      self.store.search(query).await
+    }
+
+    async fn search_vectors(&self, query: SearchQuery<'_>) -> Result<Vec<Found>, StoreError> {
+      self.store.search_vectors(query).await
+    }
   }
 }
 
@@ -1056,8 +1227,9 @@ mod tests {
   use std::sync::Arc;
 
   use similarity_core::{FieldSpec, QuantitySpec};
-  use similarity_store::{Found, MemoryStore};
+  use similarity_store::{Found, MemoryStore, Version};
 
+  use super::racing::Raced;
   use super::*;
   use crate::worker::testing::WordBagEmbedder;
 
@@ -1188,8 +1360,16 @@ mod tests {
       self.0.put(record).await
     }
 
+    async fn put_if(&self, record: &StoredRecord, expected: Expected) -> Result<bool, StoreError> {
+      self.0.put_if(record, expected).await
+    }
+
     async fn delete(&self, id: &str) -> Result<bool, StoreError> {
       self.0.delete(id).await
+    }
+
+    async fn delete_if(&self, id: &str, version: Version) -> Result<bool, StoreError> {
+      self.0.delete_if(id, version).await
     }
 
     async fn search(&self, query: SearchQuery<'_>) -> Result<Vec<Neighbor>, StoreError> {
@@ -1656,14 +1836,22 @@ mod tests {
     }
 
     async fn put(&self, record: &StoredRecord) -> Result<(), StoreError> {
+      self.inner.put(record).await
+    }
+
+    async fn put_if(&self, record: &StoredRecord, expected: Expected) -> Result<bool, StoreError> {
       if self.refuse.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(StoreError::Unavailable("refusing writes".to_owned()));
       }
-      self.inner.put(record).await
+      self.inner.put_if(record, expected).await
     }
 
     async fn delete(&self, id: &str) -> Result<bool, StoreError> {
       self.inner.delete(id).await
+    }
+
+    async fn delete_if(&self, id: &str, version: Version) -> Result<bool, StoreError> {
+      self.inner.delete_if(id, version).await
     }
 
     async fn search(&self, query: SearchQuery<'_>) -> Result<Vec<Neighbor>, StoreError> {
@@ -2993,6 +3181,442 @@ mod tests {
     }
     assert_eq!(created, 1, "exactly one request found no baseline");
     assert_eq!(stored(&engine, "p1").await.unwrap().revision, 1);
+  }
+
+  type Replica = Engine<Arc<MemoryStore>, WordBagEmbedder>;
+
+  /// Two replicas on one store, which share nothing else: `here`, whose reads a test can get in behind, and
+  /// `there`.
+  fn replicas() -> (Engine<Raced, WordBagEmbedder>, Arc<Replica>) {
+    let policy = Policy::new(0.75, None).unwrap();
+    let embedder = WordBagEmbedder::new("word-bag-v1");
+    let (layout, dimension) = store_layout(&schema(), &embedder);
+    let store = Arc::new(MemoryStore::new(layout, dimension));
+    let there = Engine::new(
+      Arc::clone(&store),
+      WordBagEmbedder::new("word-bag-v1"),
+      schema(),
+      policy,
+    );
+    (
+      Engine::new(Raced::over(store), embedder, schema(), policy),
+      Arc::new(there),
+    )
+  }
+
+  /// `there` evaluating `input`, as something to get in behind a read.
+  fn rival(there: &Arc<Replica>, input: EvaluateInput) -> impl Future<Output = ()> + Send + 'static {
+    let there = Arc::clone(there);
+    async move {
+      there.evaluate(input).await.unwrap();
+    }
+  }
+
+  const CHEWS: [(&str, &str); 3] = [
+    ("name", "Blueberry Gummies Vegan Chews"),
+    ("category", "Edibles Gummies"),
+    ("description", "Ten vegan gummies with real fruit"),
+  ];
+  const RINGS: [(&str, &str); 3] = [
+    ("name", "Blueberry Gummies Sour Rings"),
+    ("category", "Edibles Gummies"),
+    ("description", "Ten vegan gummies with real fruit"),
+  ];
+
+  /// What D10 could not promise until the store could be written to conditionally. Each of two edits is a small
+  /// change to the record both replicas read, and neither is a small change to the other. Judged against that
+  /// one baseline, both would be accepted, and the second write would replace the first unseen.
+  #[tokio::test]
+  async fn two_replicas_cannot_both_accept_against_one_baseline() {
+    // One after the other, on one engine: the first is accepted and the second, held to the first, is not.
+    let serial = engine();
+    serial.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
+    let first = serial.evaluate(evaluate_input(Some("p1"), &CHEWS)).await.unwrap();
+    let second = serial.evaluate(evaluate_input(Some("p1"), &RINGS)).await.unwrap();
+    assert_eq!((first.verdict, second.verdict), (Verdict::Accepted, Verdict::Rejected));
+    // And the second alone would have been accepted: it is the order that decides.
+    let alone = engine();
+    alone.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
+    let unopposed = alone.evaluate(evaluate_input(Some("p1"), &RINGS)).await.unwrap();
+    assert_eq!(unopposed.verdict, Verdict::Accepted);
+
+    // At once, on two replicas: `there` writes the first while `here` is between reading and writing.
+    let (here, there) = replicas();
+    there.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
+    here
+      .store
+      .after_read(0, rival(&there, evaluate_input(Some("p1"), &CHEWS)));
+    let raced = here.evaluate(evaluate_input(Some("p1"), &RINGS)).await.unwrap();
+    assert_eq!(
+      raced, second,
+      "the answer the request gets when it simply arrives second"
+    );
+    assert_eq!(
+      (raced.verdict, raced.stored, raced.revision),
+      (Verdict::Rejected, false, 2)
+    );
+    let kept = here.store.shared().get("p1").await.unwrap().unwrap();
+    let expected = stored(&serial, "p1").await.unwrap();
+    assert_eq!(
+      (kept.revision, &kept.vectors, &kept.anchor),
+      (2, &expected.vectors, &expected.anchor)
+    );
+    assert_eq!(here.store.reads(), 2, "read, found it changed, read again");
+  }
+
+  /// The same race where both edits are fine in either order: neither is lost, and the revisions count both.
+  #[tokio::test]
+  async fn an_edit_that_lost_the_race_is_judged_against_the_edit_that_won() {
+    let serial = engine();
+    serial.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
+    serial
+      .evaluate(evaluate_input(Some("p1"), &GUMMIES_EDITED))
+      .await
+      .unwrap();
+    let second = serial.evaluate(evaluate_input(Some("p1"), &CHEWS)).await.unwrap();
+
+    let (here, there) = replicas();
+    there.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
+    here
+      .store
+      .after_read(0, rival(&there, evaluate_input(Some("p1"), &GUMMIES_EDITED)));
+    let raced = here.evaluate(evaluate_input(Some("p1"), &CHEWS)).await.unwrap();
+    assert_eq!(raced, second);
+    assert_eq!(
+      (raced.verdict, raced.stored, raced.revision),
+      (Verdict::Accepted, true, 3)
+    );
+    let kept = here.store.shared().get("p1").await.unwrap().unwrap();
+    let expected = stored(&serial, "p1").await.unwrap();
+    assert_eq!(
+      (kept.revision, &kept.vectors, &kept.anchor),
+      (3, &expected.vectors, &expected.anchor)
+    );
+
+    // A forced write is conditional too: it replaces what is stored now, and its revision follows that.
+    here
+      .store
+      .after_read(0, rival(&there, evaluate_input(Some("p1"), &GUMMIES)));
+    let forced = here
+      .evaluate(EvaluateInput {
+        mode: WriteMode::Force,
+        ..evaluate_input(Some("p1"), &VAPE)
+      })
+      .await
+      .unwrap();
+    assert_eq!(
+      (forced.verdict, forced.stored, forced.revision),
+      (Verdict::Rejected, true, 5)
+    );
+    let kept = here.store.shared().get("p1").await.unwrap().unwrap();
+    assert_eq!((kept.revision, &kept.anchor), (5, &kept.vectors.composite));
+
+    // A request that writes nothing has nothing to lose a race with, and is answered from what it read.
+    here
+      .store
+      .after_read(0, rival(&there, evaluate_input(Some("p1"), &GUMMIES)));
+    let dry = here
+      .evaluate(EvaluateInput {
+        mode: WriteMode::DryRun,
+        ..evaluate_input(Some("p1"), &VAPE)
+      })
+      .await
+      .unwrap();
+    assert_eq!((dry.similarity, dry.stored, dry.revision), (Some(1.0), false, 5));
+  }
+
+  #[tokio::test]
+  async fn two_replicas_that_both_find_no_record_do_not_both_create_it() {
+    let (here, there) = replicas();
+    here
+      .store
+      .after_read(0, rival(&there, evaluate_input(Some("p1"), &GUMMIES)));
+    let second = here
+      .evaluate(evaluate_input(Some("p1"), &GUMMIES_EDITED))
+      .await
+      .unwrap();
+    assert_eq!(
+      (second.verdict, second.stored, second.revision),
+      (Verdict::Accepted, true, 2),
+      "it found a record there after all, and was judged as an edit of it"
+    );
+    assert_eq!(here.store.shared().get("p1").await.unwrap().unwrap().revision, 2);
+    assert_eq!(here.store.reads(), 2);
+
+    // The same record from both is created once, and the one that came second wrote nothing.
+    here
+      .store
+      .after_read(0, rival(&there, evaluate_input(Some("p2"), &GUMMIES)));
+    let same = here.evaluate(evaluate_input(Some("p2"), &GUMMIES)).await.unwrap();
+    assert_eq!(
+      (same.verdict, same.stored, same.revision),
+      (Verdict::Accepted, false, 1)
+    );
+
+    // A record of another tenant that turned up in between is another tenant's record.
+    let branded = |tenant: &str| EvaluateInput {
+      record: RecordInput {
+        tenant: Some(tenant.to_owned()),
+        ..record(Some("p3"), &GUMMIES)
+      },
+      ..EvaluateInput::default()
+    };
+    here.store.after_read(0, rival(&there, branded("brand-1")));
+    let refused = here.evaluate(branded("brand-2")).await.unwrap_err();
+    assert!(
+      matches!(&refused, EngineError::FailedPrecondition(message) if message.contains("brand-1")),
+      "{refused}"
+    );
+  }
+
+  /// An import only creates (D20), and that holds against another replica as it holds against itself.
+  #[tokio::test]
+  async fn an_import_never_replaces_what_another_replica_stored_a_moment_before() {
+    let (here, there) = replicas();
+    // An import reads twice: once before it embeds, to save the work, and once when it goes to write.
+    here
+      .store
+      .after_read(1, rival(&there, evaluate_input(Some("p1"), &GUMMIES)));
+    let outcomes = here.import(vec![import_of("p1", &VAPE, None)]).await.unwrap();
+    assert_eq!(outcomes, [Ok(Imported::Skipped)]);
+    let reference = engine();
+    reference.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
+    let kept = here.store.shared().get("p1").await.unwrap().unwrap();
+    assert_eq!(
+      (kept.revision, &kept.vectors),
+      (1, &stored(&reference, "p1").await.unwrap().vectors),
+      "the gummies the other replica stored, not the vape this one was importing"
+    );
+    assert_eq!(here.store.reads(), 3);
+
+    // Created under a tenant the import does not name, it is refused like any import of that id.
+    here.store.after_read(
+      1,
+      rival(
+        &there,
+        EvaluateInput {
+          record: RecordInput {
+            tenant: Some("brand-1".to_owned()),
+            ..record(Some("p2"), &GUMMIES)
+          },
+          ..EvaluateInput::default()
+        },
+      ),
+    );
+    let outcomes = here.import(vec![import_of("p2", &VAPE, None)]).await.unwrap();
+    assert!(
+      matches!(outcomes.as_slice(), [Err(EngineError::FailedPrecondition(message))] if message.contains("brand-1")),
+      "{outcomes:?}"
+    );
+  }
+
+  /// The tenant a delete has to name is the tenant of the record that is deleted (D14), not of a version of it
+  /// that was read a moment earlier.
+  #[tokio::test]
+  async fn a_delete_is_held_to_the_record_as_it_is_when_it_is_deleted() {
+    let (here, there) = replicas();
+    there.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
+    // The record gains a tenant while a delete that names none is on its way.
+    here.store.after_read(
+      0,
+      rival(
+        &there,
+        EvaluateInput {
+          record: RecordInput {
+            tenant: Some("brand-1".to_owned()),
+            ..record(Some("p1"), &GUMMIES)
+          },
+          ..EvaluateInput::default()
+        },
+      ),
+    );
+    let refused = here.delete("p1".to_owned(), None).await.unwrap_err();
+    assert!(
+      matches!(&refused, EngineError::FailedPrecondition(message) if message.contains("brand-1")),
+      "{refused}"
+    );
+    let kept = here.store.shared().get("p1").await.unwrap().unwrap();
+    assert_eq!((kept.revision, kept.tenant.as_deref()), (2, Some("brand-1")));
+
+    // A record that was only edited in between is still the caller's to delete, and is deleted as it is now.
+    let edit = EvaluateInput {
+      record: RecordInput {
+        tenant: Some("brand-1".to_owned()),
+        ..record(Some("p1"), &GUMMIES_EDITED)
+      },
+      ..EvaluateInput::default()
+    };
+    here.store.after_read(0, rival(&there, edit));
+    let reads = here.store.reads();
+    assert!(here.delete("p1".to_owned(), Some("brand-1".to_owned())).await.unwrap());
+    assert_eq!(here.store.shared().get("p1").await.unwrap(), None);
+    assert_eq!(here.store.reads() - reads, 2);
+  }
+
+  /// The case the property `two_replicas_asked_at_once_end_as_if_asked_one_after_the_other` first shrank to, and
+  /// the one answer that is allowed to differ from any order of arrival. Two replicas delete one record at the
+  /// same moment: the record is gone, and both are told there was one. The store can say that a record is gone
+  /// and not which of two deletes removed it, and a caller that asked for a record to be gone has what it asked.
+  #[tokio::test]
+  async fn two_replicas_deleting_one_record_at_once_are_both_told_it_was_there() {
+    let (here, there) = replicas();
+    there.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
+    here.store.after_read(0, {
+      let there = Arc::clone(&there);
+      async move {
+        assert!(there.delete("p1".to_owned(), None).await.unwrap());
+      }
+    });
+    assert!(here.delete("p1".to_owned(), None).await.unwrap());
+    assert_eq!(here.store.shared().get("p1").await.unwrap(), None);
+    // One after the other, the second is told there was nothing to delete.
+    assert!(!here.delete("p1".to_owned(), None).await.unwrap());
+    assert!(!there.delete("p1".to_owned(), None).await.unwrap());
+  }
+
+  /// A lost attempt is not an outcome: the candidate policy hears about the request once, as it was finally
+  /// judged, against the baseline it was finally judged against (D30).
+  #[tokio::test]
+  async fn an_observer_hears_nothing_of_an_attempt_that_lost_the_race() {
+    let (here, there) = replicas();
+    let recorder = Arc::new(Recorder::default());
+    let here = here.with_observer(recorder.clone());
+    there.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
+    here
+      .store
+      .after_read(0, rival(&there, evaluate_input(Some("p1"), &GUMMIES_EDITED)));
+    here.evaluate(evaluate_input(Some("p1"), &CHEWS)).await.unwrap();
+    let told = recorder.told();
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert_eq!((told[0].stored, told[0].revision), (true, 3));
+    assert_eq!(
+      told[0].judged.as_ref().unwrap().0,
+      2,
+      "the baseline that was there when it was judged"
+    );
+
+    // The same for a record that another replica created first.
+    here
+      .store
+      .after_read(0, rival(&there, evaluate_input(Some("p2"), &GUMMIES)));
+    here
+      .evaluate(evaluate_input(Some("p2"), &GUMMIES_EDITED))
+      .await
+      .unwrap();
+    let told = recorder.told();
+    assert_eq!(told.len(), 2, "{told:?}");
+    assert_eq!(told[1].judged.as_ref().unwrap().0, 1);
+  }
+
+  /// A store on which another writer always got there first.
+  struct Contended {
+    inner: MemoryStore,
+    reads: std::sync::atomic::AtomicUsize,
+  }
+
+  impl VectorStore for Contended {
+    async fn get(&self, id: &str) -> Result<Option<StoredRecord>, StoreError> {
+      self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+      self.inner.get(id).await
+    }
+
+    async fn put(&self, record: &StoredRecord) -> Result<(), StoreError> {
+      self.inner.put(record).await
+    }
+
+    async fn put_if(&self, _: &StoredRecord, _: Expected) -> Result<bool, StoreError> {
+      Ok(false)
+    }
+
+    async fn delete(&self, id: &str) -> Result<bool, StoreError> {
+      self.inner.delete(id).await
+    }
+
+    async fn delete_if(&self, _: &str, _: Version) -> Result<bool, StoreError> {
+      Ok(false)
+    }
+
+    async fn search(&self, query: SearchQuery<'_>) -> Result<Vec<Neighbor>, StoreError> {
+      self.inner.search(query).await
+    }
+
+    async fn search_vectors(&self, query: SearchQuery<'_>) -> Result<Vec<Found>, StoreError> {
+      self.inner.search_vectors(query).await
+    }
+  }
+
+  /// Losing the race is tried again, a bounded number of times. After that the request has an answer of its own,
+  /// which says that nothing was written and that sending it again is safe.
+  #[tokio::test]
+  async fn a_record_that_keeps_changing_under_a_request_is_a_conflict_and_nothing_is_written() {
+    let embedder = WordBagEmbedder::new("word-bag-v1");
+    let (layout, dimension) = store_layout(&schema(), &embedder);
+    let store = Contended {
+      inner: MemoryStore::new(layout, dimension),
+      reads: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let recorder = Arc::new(Recorder::default());
+    let engine =
+      Engine::new(store, embedder, schema(), Policy::new(0.75, None).unwrap()).with_observer(recorder.clone());
+    let reads =
+      |engine: &Engine<Contended, WordBagEmbedder>| engine.store.reads.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let conflict = |error: &EngineError, id: &str| {
+      assert!(
+        matches!(error, EngineError::Conflict(message)
+          if message.contains(&format!("`{id}`")) && message.contains("nothing was written") && message.contains("again")),
+        "{error:?}"
+      );
+    };
+
+    // A record nobody has: every attempt to create it finds someone else did.
+    let error = engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap_err();
+    conflict(&error, "p1");
+    assert_eq!(reads(&engine), WRITE_ATTEMPTS);
+    let outcomes = engine.import(vec![import_of("p1", &GUMMIES, None)]).await.unwrap();
+    let [Err(error)] = outcomes.as_slice() else {
+      panic!("expected one failure, got {outcomes:?}")
+    };
+    conflict(error, "p1");
+    // One look before embedding, and one for each attempt.
+    assert_eq!(reads(&engine), WRITE_ATTEMPTS + 1);
+
+    // A record that is there: an edit, a forced write, and a delete all give up the same way.
+    let seed = super::tests::engine();
+    seed.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
+    let gummies = stored(&seed, "p1").await.unwrap();
+    engine.store.inner.put(&gummies).await.unwrap();
+    let error = engine
+      .evaluate(evaluate_input(Some("p1"), &GUMMIES_EDITED))
+      .await
+      .unwrap_err();
+    conflict(&error, "p1");
+    assert_eq!(reads(&engine), WRITE_ATTEMPTS);
+    let forced = EvaluateInput {
+      mode: WriteMode::Force,
+      ..evaluate_input(Some("p1"), &VAPE)
+    };
+    conflict(&engine.evaluate(forced).await.unwrap_err(), "p1");
+    assert_eq!(reads(&engine), WRITE_ATTEMPTS);
+    conflict(&engine.delete("p1".to_owned(), None).await.unwrap_err(), "p1");
+    assert_eq!(reads(&engine), WRITE_ATTEMPTS);
+    assert!(
+      recorder.told().is_empty(),
+      "a request that gave up had no outcome to tell of"
+    );
+
+    // What needs no write is answered at the first attempt: a dry run, a rejection, the same record again.
+    let dry = EvaluateInput {
+      mode: WriteMode::DryRun,
+      ..evaluate_input(Some("p1"), &GUMMIES_EDITED)
+    };
+    assert_eq!(engine.evaluate(dry).await.unwrap().verdict, Verdict::Accepted);
+    let rejected = engine.evaluate(evaluate_input(Some("p1"), &VAPE)).await.unwrap();
+    assert_eq!(rejected.verdict, Verdict::Rejected);
+    let same = engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
+    assert_eq!((same.verdict, same.stored), (Verdict::Accepted, false));
+    assert_eq!(reads(&engine), 3);
+    assert_eq!(recorder.told().len(), 3);
+    assert_eq!(engine.store.inner.get("p1").await.unwrap().unwrap(), gummies);
   }
 
   async fn seeded() -> TestEngine {

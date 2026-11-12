@@ -621,6 +621,7 @@ record: an accepted one is stored and counts as a revision.
 | `NOT_FOUND` | `FindSimilar` by an id that is not stored. | |
 | `FAILED_PRECONDITION` | The stored record belongs to a tenant the request does not name (it names another, or none), or was written under a different model or field set. | Send the record's tenant, or see [Re-indexing](#re-indexing). |
 | `RESOURCE_EXHAUSTED` | The embedding queue is full. | Retry with backoff. |
+| `ABORTED` | Another writer changed the record each of the four times this request had judged it and gone to write. That takes another server working on the same record at the same instant, four times running. | Send the request again as it is. |
 | `UNAVAILABLE` | Qdrant cannot be reached. | Retry with backoff. |
 
 Nothing is written when an error is returned.
@@ -2048,9 +2049,9 @@ What it does, and what it will not do:
   any. `--stop-on-error` stops at the first one instead. `--check` finds the same problems in a second or two,
   before anything is embedded.
 - **It needs the model and a connection to Qdrant**, like the server, and reads the same config. It does not
-  need the server. Run it before the server takes edits for the records being imported: like two replicas
-  ([Limitations](#limitations)), an import and a server that both see a new id at the same instant do not
-  coordinate, and whichever writes second wins.
+  need the server. It can run beside a server that is taking edits: both write a record only if nobody has
+  stored it since they looked, so an id the two see at the same instant is created once, and the import leaves
+  it alone like any other record that is there.
 
 Progress is logged after every batch (`--batch-records`, 64 by default), and the outcome is a `finished` result
 on stdout. This is an export of 48 synthetic records, two of them flawed, with the envelope fields removed:
@@ -2243,8 +2244,11 @@ It shuts down gracefully on `SIGTERM`.
 One thread runs the model, and the backend spreads each forward pass across the machine's cores, so a server scales
 with cores rather than with replicas' thread counts. Under load, requests waiting for the encoder are merged into
 one batch automatically. When more than `model.queue_depth` requests are waiting, new ones are refused immediately
-with `RESOURCE_EXHAUSTED` rather than queued past their deadline. Add replicas for more throughput, with the caveat
-under [Limitations](#limitations).
+with `RESOURCE_EXHAUSTED` rather than queued past their deadline. Add replicas for more throughput. They share
+nothing but the store, and need nothing else: every write is conditional on the record still being the one that
+was judged, so two replicas handed two edits of one record at the same instant cannot both accept against the
+same baseline. One is written, and the other is judged again against it (D35). Against a local Qdrant that costs
+a write one more small read: about 0.2 ms on an edit of 3 ms.
 
 ### Security
 
@@ -2475,7 +2479,7 @@ data/
   regression.snapshot.ndjson      what the pinned model and the example config make of them
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D34)
+  decisions.md               why things are the way they are (D1 to D35)
   data-request-prompt.md     a brief for collecting labeled production data
   import-prompt.md           a brief for loading the real catalog into a running service
   feature-suggestions.md     features that could be added, built and not, the last twelve about production
@@ -2523,10 +2527,9 @@ what that field says.
 
 ## Limitations
 
-- **Concurrent edits to one record across replicas.** One server serializes evaluations of the same id. Two
-  replicas do not coordinate, and Qdrant has no compare-and-swap, so two simultaneous revisions of one record
-  handled by different replicas could both be accepted against the same baseline. If callers do not already
-  serialize edits per record, route by id, or see D6 and D10 in the decisions.
+- **Replicas must all be this version or later to coordinate.** Writes are conditional on what was read (D35),
+  which is what stops two replicas accepting two edits against one baseline. A replica from before that still
+  writes unconditionally, so the guarantee holds once every replica has been upgraded, not during the rollout.
 - **Search scores drop when records have different fields filled in.** `Evaluate` compares only the fields both
   versions have. `FindSimilar` compares whole stored vectors, in which a missing field is a block of zeros, so two
   records that are identical except that one has no description score 1.0 in `Evaluate` but about 0.89 in

@@ -158,14 +158,14 @@ The honest assessment, since the question was asked:
 - **What Qdrant does provide** is everything operational: durable state shared by every server replica,
   tenant-filtered search, snapshots, a dashboard for looking at what is stored, and headroom to millions of records
   without redesign.
-- **What it lacks** is a compare-and-swap. Two replicas evaluating the same id at the same instant can both read
-  the same baseline and both write (see D10). A relational database would close that with a row lock or a version
-  check.
+- **What it was said to lack** was a compare-and-swap, and that was true of the Qdrant this was first written
+  against. The one that is pinned now has a conditional upsert, and every write uses it (D35). A relational
+  database does the same with a row lock or a version check.
 
 So: Qdrant is a reasonable choice because neighbor search is wanted and it is pleasant to operate, not because the
 scale demands it. If the organization already runs Postgres, a table with a `bytea` or `pgvector` column would do
 the same job at this scale with one fewer service and with transactional writes. The store is behind a trait
-(`VectorStore`, four methods, one contract test suite), so that swap is a few hundred lines.
+(`VectorStore`, seven methods, one contract test suite), so that swap is a few hundred lines.
 
 Layout in Qdrant: one collection, one point per record, two named vectors. `current` is HNSW-indexed and is what
 searches match. `anchor` (see D8) is only ever read by id, so its HNSW graph is disabled (`m = 0`) and it lives on
@@ -244,10 +244,11 @@ edit touches one field, so a typical request embeds one short text, about 4 ms.
 ## D10. Per-id locking is in-process
 
 Evaluating is read, compare, write. `Engine` serializes requests for the same id with striped locks, so within one
-server two concurrent revisions cannot both pass against the same baseline. Across replicas there is no such
-guarantee (see D6). This is acceptable when the calling system already serializes edits to one record, which a
-product-editing UI generally does. If it does not, route by id to one replica or move the store to something with
-compare-and-swap.
+server two concurrent revisions cannot both pass against the same baseline. Across replicas the locks do nothing,
+and for a long time nothing else did either: this decision used to end by saying that callers had to serialize
+edits to one record themselves, or route by id. Since D35 every write is conditional on the store still holding
+what was read, which holds across replicas. The locks stay for what they are good at: they save a process from
+racing itself, and they keep one record's requests in order for whoever is watching them (D30).
 
 ## D11. The server takes paths; only `model fetch` touches the network
 
@@ -1489,3 +1490,74 @@ are the record of why Burn stopped serving; the README no longer carries tables 
 (ONNX Runtime may make one thread per core a better design than one thread across cores); an exporter in Rust,
 which would take Python out of the image build and out of the fine-tuning loop; pinned versions for what the
 export script installs.
+
+## D35. Every write is conditional on what was read
+
+Two replicas handed two edits of one record at the same instant could both read the same baseline, both accept,
+and both write: the second write replaced the first unseen, and an edit that should have been judged against
+the other was not. D6 and D10 said the store could not prevent it. The Qdrant that is pinned can.
+
+**The store writes only over what the writer read.** `VectorStore::put_if` takes what the writer expects to
+find: nothing (`Expected::Absent`), or the version it read. It writes if that is still so and says whether it
+did. `delete_if` is the same for a delete. The engine uses nothing else: a first version is written only if
+there is still no record, a revision only over the version it was judged against, a forced write the same (its
+revision number would otherwise be wrong), an import only if there is still no record, and a delete only of the
+record whose tenant was just checked.
+
+**A writer that lost has written nothing, and judges again.** It reads the record as it is now, embeds what
+differs from that, and judges and writes against that, up to four times (`WRITE_ATTEMPTS`). So a request that
+arrives together with another gets the answer it would have got had it arrived second. After four losses in a
+row it is answered `ABORTED`: nothing was written and the request can be sent again. That takes another writer
+changing the same record in the moment between this one's read and its write, four times running, which is not
+contention but something rewriting a record in a loop. A request that writes nothing (a dry run, a rejection,
+the same record again) is answered from what it read and has nothing to lose a race with.
+
+**A version is the revision and the time together.** The revision goes up by one with every write, so within a
+record's life it names one write. A record that is deleted and stored again starts over at 1, and a writer
+still holding the old record's revision 1 must not be taken for one that read the new record. The time of the
+write tells the two lives apart unless both were written in the same second, which leaves this: a record
+created, deleted, and created again within one second, while a request that read the first is still on its way.
+A mark of its own for every write would close that too, at the price of a field on every stored record that
+every caller would have to carry. It was not worth it.
+
+**In Qdrant.** A create is an upsert in insert-only mode. A revision is an upsert in update-only mode with a
+filter on the stored layout, revision, and time: update-only, because a filter alone would let the write through
+as a new point if the record had been deleted in between. Qdrant answers `completed` whether or not the
+condition held, so each conditional write puts a mark of its own in the payload and reads the point's payload
+back: it holds that mark only if that write stored it. A delete is a delete by filter, and then a look. The
+contract test runs the same assertions against the in-memory store and the real one, including eight writers at
+once that all read the same version (one wins, and it is the one that was told so) and two connections racing
+for twenty rounds.
+
+**Held as a property.** Two engines on one store and no shared lock; any history; then any two requests, with
+the second let in between the first one's read and its write. Both answers and what is stored must be what the
+two requests give one after the other, in one order or the other. One answer may differ, and the property names
+it: two deletes of one record at once are both told that there was a record, where one after the other the
+second is told there was none. The store can say that a record is gone and not which of two deletes removed it;
+telling them apart would take a claim written before the delete and two more round trips, for an answer nobody
+acts on.
+
+**What the read-back cannot see.** A writer whose write was applied, and replaced by another writer before it
+looked, finds another mark and concludes it lost. It judges again against the newer record. The result is that
+of the request having been sent twice, which is something a caller that retries does anyway.
+
+**"An import only creates" is now the store's promise** (D20), not one process's lock: the `import` command can
+run beside a server that is taking edits, and a record either of them stored a moment before is left alone by
+the other.
+
+**The locks stay** (D10). Within a process they keep two requests for one record from racing at all, which is
+cheaper than losing and judging again, and they keep the order in which a record's requests are observed (D30).
+
+**What it costs** is one more read of a small payload for every write. Through gRPC against a local Qdrant, one
+caller, medians of two runs before and two after: a create 5.8 ms and then 6.0 ms, an edit 2.9 ms and then
+3.1 ms, a save that changes nothing 0.26 ms both times. With 16 callers editing, about 1,700 edits a second
+became about 1,400: the model serves a batch at a time, and the store's share of each request grew. On the
+in-memory store nothing changed.
+
+**Upgrading.** Nothing stored changes shape: the mark is one more payload key, a point written before has
+none, and its revision and time are what the condition reads. But a replica from before this change still
+writes unconditionally, so two replicas coordinate only once both are this version.
+
+**Not done:** a Postgres store, where the same contract is a version check in a transaction; an index on the
+two payload keys the condition reads, which a Qdrant run in strict mode may ask for before it accepts the
+filter.

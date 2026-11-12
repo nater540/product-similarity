@@ -74,7 +74,7 @@ and because each would put a Python service in the loop.
 | 20 | Menu-item to brand-product matching | Serving | L | Yes |
 | 21 | Readiness that tells the truth, and a drain on shutdown | Production | S | No |
 | 22 | Deadlines honored, writes that survive a cancelled request | Production | M | No |
-| 23 | Conditional writes across replicas | Production | M | No |
+| 23 | Conditional writes across replicas (built) | Production | M | No |
 | 24 | Audit of the store against the catalog | Production | M | An export |
 | 25 | Anchor backup and restore | Production | M | No |
 | 26 | Operational metrics | Production | M | No |
@@ -633,6 +633,12 @@ content is then answered "unchanged".
 
 ### 23. Conditional writes: two replicas cannot both accept against one baseline
 
+**Built** (D35). What came out differently: the condition is the revision and the time together, not the
+revision alone, because a record that is deleted and stored again starts over at revision 1; a create uses
+Qdrant's insert-only mode and an update its update-only mode, so a record deleted in between is not brought back;
+deletes are conditional too; and the property runs two engines on one store with the second request let in
+between the first one's read and its write, and holds the outcome to one of the two orders of arrival.
+
 **What.** Make the store's write conditional on the revision that was judged: update only if the stored record
 is still at revision N, create only if nothing is stored. On a miss, read again and judge again.
 
@@ -800,10 +806,10 @@ who the callers turn out to be; 32 waits for a model change.
 Not features, but found while preparing this list:
 
 - **"Qdrant has no compare-and-swap" is no longer true of the Qdrant this project pins** (found 2026-11-11,
-  preparing section E). The README's first limitation, D6, and D10 rest on it. Upsert takes an `update_filter`
+  preparing section E). The README's first limitation, D6, and D10 rested on it. Upsert takes an `update_filter`
   in 1.20, and a probe of the local server showed it acting as compare-and-swap on a revision, for updates and
-  for creates. The documents are left as they are until feature 23 is decided: they describe what the code does,
-  which is still an unconditional write.
+  for creates. Feature 23 was built on it on 2026-11-12 (D35), and the three documents now say what the code
+  does.
 - **A README figure was derived, not measured end to end.** "Roughly 375 field texts per second when requests
   arrive concurrently" came from the batch throughput measurement, not from a test through the gRPC queue. It has
   been replaced by a measured figure for the bulk import (2,000 four-field records in 19 seconds). Throughput

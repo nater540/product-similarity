@@ -162,8 +162,9 @@ There are two ways. Tell me which you can use; if both, prefer the first when th
 record-similarity import --config CONFIG.toml export.jsonl
 ```
 
-Run it when the application is not yet sending edits for these products: the command and a server that both see
-a new id at the same moment do not coordinate.
+It can run while the application is sending edits: the command and the server both store a record only if
+nobody has stored it since they looked, so an id both see at the same moment is created once and the import
+leaves it alone.
 
 **The stream, through the server.** For when you can reach the server and not the store.
 
