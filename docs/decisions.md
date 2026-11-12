@@ -1336,3 +1336,58 @@ index, since a listing has to be found among everything it could be confused wit
 **Not built:** separate weights for matching (the `match_field` lines carry what would be needed to judge them
 without a model), a `calibrate-match` diff, storing listings, and any use of quantities in the ranking.
 
+## D33. New records can be streamed in; a stream only creates, and shares the model a batch at a time
+
+"No bulk RPC" was a stated limitation: a caller that cannot run the `import` command beside Qdrant loaded a
+catalog one `Evaluate` at a time, and got batching only by the accident of other callers arriving together.
+`Import` is a bidirectional streaming call: records in, one answer for each out, in order.
+
+**It is the import, over a wire, and so it only creates** (D20). The call ends in `Engine::import`, the code the
+command runs. A record whose id is stored is answered `EXISTS` and left exactly alone, so a stream cannot
+replace a baseline, cannot move an anchor, and cannot be used to get an edit past the policy: a change is an
+`Evaluate`. Creating only is also what makes a stream safe to cut off and send again, with no cursor to keep and
+no "how far did it get" to answer. A judged batch (many revisions in one call) is a different thing with
+different rules, and is not this.
+
+**A record that is stored is not embedded.** `Engine::import` used to embed every record of a batch and only then
+look at the store, so sending a file again cost as much as sending it the first time: 29 seconds for 3,000
+records that were all there. "Send it again" is the resume, and "send everything, the new ones will be created"
+is the easiest thing for a caller to build, so that had to be cheap. It now looks first, outside the record's
+lock: a record that is there costs that read. A record that is not there is embedded, and whether it is stored
+is decided again under the lock when it is written, so the early look decides nothing by itself. The offline
+command gets the same saving.
+
+**One record failing does not end the stream.** The answer carries the status code the record would have got from
+`Evaluate` and the sentence. A caller loading fifty thousand records must not lose the stream to the one with a
+field the schema lacks. The call's own status is the transport's; everything about a record is in its answer.
+
+**A stream is batched by its own backlog, in small batches.** The loop takes the first record waiting and
+whatever else has already arrived, up to `server.import_batch_records`, and never waits for more: the worker's
+own rule (D9), one level up. A trickle makes batches of one. What the setting trades was measured, not guessed.
+A batch is one job on the one embedding thread, and every other request waits for the job in front of it. At 8
+records (about one forward pass of four-field records) a stream runs at 81 records a second, the ceiling 64
+concurrent callers of `Evaluate` reach, and a merchant's edit beside it takes a median 86 ms instead of 6 ms.
+At 1 the stream runs at 48 a second and the edit takes 25 ms. The default is 8: a save of 86 ms is still a fast
+save, and a bulk load is the less frequent event. It is a setting because that is a judgment about someone
+else's callers.
+
+**A full queue is waited out.** A single request that finds the model's queue full is refused at once, so that
+it can back off (D9). A stream is its own back-off: it holds its batch, waits (10 ms, doubling to 250 ms), offers
+it again, and meanwhile reads nothing, which the transport turns into back-pressure on the sender. Both channels
+around the loop hold one batch, so nothing is buffered without bound. After ten seconds without room the batch's
+records are answered `RESOURCE_EXHAUSTED` and the stream goes on.
+
+**A cancelled stream loses nothing and leaves nothing half done.** The loop runs in its own task. Each record is
+created whole or not at all (one `put`), what was created stays, and the rest was never taken from the stream.
+
+**Where the code is.** `import_stream.rs` is the loop and knows no protobuf: records in on a channel, answers
+out on a channel, so its batching, its waiting, and what it does when nobody listens are tested without a
+socket. `grpc.rs` converts and spawns. The engine is unchanged apart from the early look.
+
+**Measured through `just load`,** which gained a `stream` phase so that the figure is produced like the others.
+The trade-off table in the README is `load --server` beside a stream that never ran dry.
+
+**Not built:** a streaming or batch `Evaluate`; per-tenant fairness between a stream and other callers (feature
+27), which this makes more pressing; a final summary message on the stream (the caller counts its answers, and
+the server logs one `import` line).
+

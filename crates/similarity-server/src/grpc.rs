@@ -4,6 +4,7 @@
 //! can act on, and logs one line per request. Keeping it that thin is what lets the engine's tests stand in for
 //! tests of the service.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -12,11 +13,16 @@ use similarity_core::{FieldChange, FieldScore, Quantity, QuantityChange, Quantit
 use similarity_proto::v1 as pb;
 use similarity_proto::v1::record_similarity_server::RecordSimilarity;
 use similarity_store::VectorStore;
-use tonic::{Request, Response, Status};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{Stream, StreamExt as _};
+use tonic::{Request, Response, Status, Streaming};
 
 use crate::engine::{
-  Engine, EngineError, EvaluateInput, FindSimilarInput, MatchInput, RecordInput, SimilarTo, Verdict, WriteMode,
+  Engine, EngineError, EvaluateInput, FindSimilarInput, ImportInput, Imported, MatchInput, Original, RecordInput,
+  SimilarTo, Verdict, WriteMode,
 };
+use crate::import_stream::{self, Answer, PATIENCE};
 use crate::worker::TextEmbedder;
 
 /// The tonic service wrapping an [`Engine`].
@@ -57,11 +63,7 @@ fn record_input(record: pb::Record) -> RecordInput {
     tenant: record.tenant,
     fields: record.fields.into_iter().collect(),
     // Passed on exactly as sent. Whether a quantity is a usable measurement is the engine's to decide.
-    quantities: record
-      .quantities
-      .into_iter()
-      .map(|(name, quantity)| (name, Quantity::range(quantity.min, quantity.max, quantity.unit)))
-      .collect(),
+    quantities: quantities(record.quantities),
   }
 }
 
@@ -69,6 +71,44 @@ fn record_input(record: pb::Record) -> RecordInput {
 ///
 /// A value this build does not know is refused rather than defaulted. The default writes, and a newer client
 /// asking for a mode that does not exist yet (a second kind of preview, say) must not get a write instead.
+fn quantities(quantities: std::collections::HashMap<String, pb::Quantity>) -> Vec<(String, Quantity)> {
+  quantities
+    .into_iter()
+    .map(|(name, quantity)| (name, Quantity::range(quantity.min, quantity.max, quantity.unit)))
+    .collect()
+}
+
+fn import_input(request: pb::ImportRequest) -> ImportInput {
+  ImportInput {
+    // A request without a record is a record without an id, and is answered as one.
+    record: request.record.map(record_input).unwrap_or_default(),
+    anchor: request.anchor.map(|original| Original {
+      fields: original.fields.into_iter().collect(),
+      quantities: quantities(original.quantities),
+    }),
+  }
+}
+
+fn import_response(answer: Answer) -> pb::ImportResponse {
+  let (outcome, status_code, message) = match answer.outcome {
+    Ok(Imported::Created) => (pb::ImportOutcome::Created, 0, String::new()),
+    Ok(Imported::Skipped) => (pb::ImportOutcome::Exists, 0, String::new()),
+    Err(error) => {
+      let status = Status::from(error);
+      // A status code is a small non-negative number.
+      let code = u32::try_from(i32::from(status.code())).unwrap_or_default();
+      (pb::ImportOutcome::Failed, code, status.message().to_owned())
+    }
+  };
+  pb::ImportResponse {
+    index: answer.index,
+    id: answer.id,
+    outcome: outcome.into(),
+    status_code,
+    message,
+  }
+}
+
 fn write_mode(mode: i32) -> Result<WriteMode, Status> {
   match pb::WriteMode::try_from(mode) {
     Ok(pb::WriteMode::Unspecified | pb::WriteMode::Enforce) => Ok(WriteMode::Enforce),
@@ -274,6 +314,56 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
     let deleted = self.engine.delete(id.clone(), tenant).await?;
     tracing::info!(%id, deleted, elapsed_ms = milliseconds(started), "delete");
     Ok(Response::new(pb::DeleteResponse { deleted }))
+  }
+
+  type ImportStream = Pin<Box<dyn Stream<Item = Result<pb::ImportResponse, Status>> + Send>>;
+
+  async fn import(
+    &self,
+    request: Request<Streaming<pb::ImportRequest>>,
+  ) -> Result<Response<Self::ImportStream>, Status> {
+    let started = Instant::now();
+    let mut requests = request.into_inner();
+    // Both channels hold one batch: a caller that sends faster than records are imported, or reads answers
+    // slower than they are made, is slowed by the transport and not buffered without bound here.
+    let batch = self.engine.import_batch();
+    let (inputs, incoming) = mpsc::channel(batch);
+    let (answers, answered) = mpsc::channel(batch);
+
+    tokio::spawn(async move {
+      loop {
+        match requests.message().await {
+          Ok(Some(message)) => {
+            if inputs.send(import_input(message)).await.is_err() {
+              break;
+            }
+          }
+          Ok(None) => break,
+          Err(status) => {
+            // The caller broke the stream off. What was imported stays, and the caller knows what it saw.
+            tracing::warn!(code = ?status.code(), "an import stream ended early");
+            break;
+          }
+        }
+      }
+    });
+    let engine = Arc::clone(&self.engine);
+    tokio::spawn(async move {
+      let totals = import_stream::run(&engine, incoming, answers, PATIENCE).await;
+      tracing::info!(
+        records = totals.records,
+        created = totals.created,
+        existing = totals.existing,
+        failed = totals.failed,
+        batches = totals.batches,
+        waits = totals.waits,
+        elapsed_ms = milliseconds(started),
+        "import"
+      );
+    });
+
+    let responses = ReceiverStream::new(answered).map(|answer| Ok(import_response(answer)));
+    Ok(Response::new(Box::pin(responses)))
   }
 
   async fn r#match(&self, request: Request<pb::MatchRequest>) -> Result<Response<pb::MatchResponse>, Status> {

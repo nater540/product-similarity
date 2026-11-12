@@ -9,6 +9,7 @@
 //! - [`grpc`]: protobuf translation and status codes around the engine.
 //! - [`fetch`]: downloading and verifying a model directory.
 //! - [`import`]: loading a whole catalog into the store, a batch at a time.
+//! - [`import_stream`]: the same over a streaming call, sharing the model with live requests.
 //! - [`offline`]: comparing and calibrating from the command line, without a store.
 //! - [`shadow`]: a candidate policy judging live requests without deciding any.
 //! - [`registry`]: the record of which model was put into service, and the gate that lets one in.
@@ -22,6 +23,7 @@ pub mod engine;
 pub mod fetch;
 pub mod grpc;
 pub mod import;
+pub mod import_stream;
 pub mod load;
 pub mod offline;
 #[cfg(test)]
@@ -430,6 +432,147 @@ mod tests {
     assert_eq!(
       (description.match_threshold, description.match_overfetch),
       (Some(0.6), 3)
+    );
+  }
+
+  /// The stream the import tests send: two new records, one that is stored, the same one under another tenant,
+  /// one with a field the schema lacks, one with no record at all, and one with its original version.
+  fn import_requests() -> Vec<pb::ImportRequest> {
+    let request = |record: pb::Record| pb::ImportRequest {
+      record: Some(record),
+      anchor: None,
+    };
+    vec![
+      request(record(Some("a"), Some("brand-1"), &[("name", "sour diesel vape")])),
+      request(record(
+        Some("old"),
+        Some("brand-1"),
+        &[("name", "something else entirely")],
+      )),
+      request(record(
+        Some("old"),
+        Some("brand-2"),
+        &[("name", "another brand's edit")],
+      )),
+      request(record(Some("b"), None, &[("strain", "indica")])),
+      pb::ImportRequest::default(),
+      pb::ImportRequest {
+        anchor: Some(pb::Original {
+          fields: HashMap::from([("name".to_owned(), "indoor flower".to_owned())]),
+          quantities: HashMap::new(),
+        }),
+        ..request(record(Some("c"), Some("brand-2"), &[("name", "indoor flower eighth")]))
+      },
+    ]
+  }
+
+  async fn import(
+    client: &mut RecordSimilarityClient<Channel>,
+    requests: Vec<pb::ImportRequest>,
+  ) -> Vec<pb::ImportResponse> {
+    let mut answers = client.import(tokio_stream::iter(requests)).await.unwrap().into_inner();
+    let mut seen = Vec::new();
+    while let Some(answer) = answers.message().await.unwrap() {
+      seen.push(answer);
+    }
+    seen
+  }
+
+  async fn with_one_stored() -> Running {
+    let mut running = start().await;
+    running
+      .client
+      .evaluate(evaluate(record(
+        Some("old"),
+        Some("brand-1"),
+        &[("name", "blueberry gummies")],
+      )))
+      .await
+      .unwrap();
+    running
+  }
+
+  /// `Import` over the wire: a stream of records in, one answer for each out, in order. What is stored is left
+  /// alone, a bad record fails by itself with the status code `Evaluate` would have given it, and an original
+  /// version becomes the anchor.
+  #[tokio::test]
+  async fn records_are_created_over_a_stream_and_nothing_stored_is_replaced() {
+    let mut running = with_one_stored().await;
+    let client = &mut running.client;
+    let seen = import(client, import_requests()).await;
+    let summary: Vec<(u64, Option<&str>, pb::ImportOutcome, u32)> = seen
+      .iter()
+      .map(|answer| (answer.index, answer.id.as_deref(), answer.outcome(), answer.status_code))
+      .collect();
+    let (invalid, precondition) = (Code::InvalidArgument as u32, Code::FailedPrecondition as u32);
+    assert_eq!(
+      summary,
+      [
+        (0, Some("a"), pb::ImportOutcome::Created, 0),
+        (1, Some("old"), pb::ImportOutcome::Exists, 0),
+        (2, Some("old"), pb::ImportOutcome::Failed, precondition),
+        (3, Some("b"), pb::ImportOutcome::Failed, invalid),
+        (4, None, pb::ImportOutcome::Failed, invalid),
+        (5, Some("c"), pb::ImportOutcome::Created, 0),
+      ]
+    );
+    assert!(seen[0].message.is_empty());
+    assert!(seen[3].message.contains("strain"), "{}", seen[3].message);
+    assert!(seen[4].message.contains("id"), "{}", seen[4].message);
+
+    // The stored record is what it was: the same text is still unchanged against it.
+    let resaved = client
+      .evaluate(evaluate(record(
+        Some("old"),
+        Some("brand-1"),
+        &[("name", "blueberry gummies")],
+      )))
+      .await
+      .unwrap()
+      .into_inner();
+    assert_eq!(
+      (resaved.verdict(), resaved.stored, resaved.revision),
+      (pb::Verdict::Accepted, false, 1)
+    );
+    assert_eq!(resaved.similarity, Some(1.0));
+    // The original version is what drift is measured from.
+    let drifted = client
+      .evaluate(pb::EvaluateRequest {
+        mode: pb::WriteMode::DryRun.into(),
+        ..evaluate(record(Some("c"), Some("brand-2"), &[("name", "indoor flower eighth")]))
+      })
+      .await
+      .unwrap()
+      .into_inner();
+    assert_eq!(drifted.similarity, Some(1.0));
+    assert!(drifted.anchor_similarity.unwrap() < 0.99, "{drifted:?}");
+  }
+
+  /// A stream is safe to send twice: the second time creates nothing, replaces nothing, and fails what failed.
+  #[tokio::test]
+  async fn the_same_stream_sent_again_creates_nothing() {
+    let mut running = with_one_stored().await;
+    let client = &mut running.client;
+    import(client, import_requests()).await;
+    let outcomes: Vec<pb::ImportOutcome> = import(client, import_requests())
+      .await
+      .iter()
+      .map(pb::ImportResponse::outcome)
+      .collect();
+    assert_eq!(
+      outcomes,
+      [
+        pb::ImportOutcome::Exists,
+        pb::ImportOutcome::Exists,
+        pb::ImportOutcome::Failed,
+        pb::ImportOutcome::Failed,
+        pb::ImportOutcome::Failed,
+        pb::ImportOutcome::Exists,
+      ]
+    );
+    assert!(
+      import(client, Vec::new()).await.is_empty(),
+      "an empty stream is answered with nothing"
     );
   }
 

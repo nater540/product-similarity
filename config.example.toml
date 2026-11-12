@@ -6,6 +6,10 @@
 [server]
 # Where the gRPC server listens. Use 0.0.0.0 inside a container.
 listen = "127.0.0.1:50051"
+# The most records of an `Import` stream that are embedded as one batch. A batch is one job on the one embedding
+# thread, and every other request waits while it runs: a larger number loads a catalog faster and makes a
+# merchant's save wait longer while a stream is running. The README has the measurement.
+import_batch_records = 8
 
 [model]
 # A sentence-transformers model directory, as written by `record-similarity model fetch`.

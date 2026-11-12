@@ -28,6 +28,10 @@ use tokio::sync::Mutex;
 
 use crate::worker::{EmbedError, TextEmbedder};
 
+/// The most records of an import stream taken into one batch, unless the configuration says otherwise. With four
+/// text fields that is about one forward pass of the default model.
+pub const DEFAULT_IMPORT_BATCH: usize = 8;
+
 /// How many candidates `match_listing` returns when the caller does not say.
 pub const DEFAULT_MATCHES: usize = 5;
 /// The most records one match fetches to score, whatever the limit and the over-fetch come to.
@@ -380,6 +384,7 @@ pub struct Engine<S, E> {
   schema: Schema,
   policy: Policy,
   matching: Matching,
+  import_batch: usize,
   observer: Option<Arc<dyn Observer>>,
   locks: Vec<Mutex<()>>,
   lock_hasher: RandomState,
@@ -431,10 +436,23 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       schema,
       policy,
       matching: Matching::default(),
+      import_batch: DEFAULT_IMPORT_BATCH,
       observer: None,
       locks: (0..LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
       lock_hasher: RandomState::new(),
     }
+  }
+
+  /// The same engine, taking at most `records` records of an import stream into one batch (at least one).
+  #[must_use]
+  pub fn with_import_batch(mut self, records: usize) -> Self {
+    self.import_batch = records.max(1);
+    self
+  }
+
+  /// The most records of an import stream that are imported as one batch.
+  pub fn import_batch(&self) -> usize {
+    self.import_batch
   }
 
   /// The same engine, matching listings by `matching` from now on.
@@ -458,6 +476,12 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
   /// what a request left behind. Reading only: every write goes through a request.
   pub(crate) fn store(&self) -> &S {
     &self.store
+  }
+
+  /// The embedder, so that a test can ask its stand-in what it was called with.
+  #[cfg(test)]
+  pub(crate) fn embedder(&self) -> &E {
+    &self.embedder
   }
 
   /// Reports the model, schema, and thresholds in force.
@@ -718,27 +742,51 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
   pub async fn import(&self, inputs: Vec<ImportInput>) -> Result<Vec<Result<Imported, EngineError>>, EngineError> {
     let dimension = self.embedder.dimension();
 
-    // Everything that does not need the store, for every record: validate, and work out what to embed. Records
-    // are embedded from scratch (there is no baseline to reuse), so this does not depend on what is stored.
+    // For every record: validate it, see whether it is stored already, and if it is not, work out what to embed.
+    // Records are embedded from scratch (there is no baseline to reuse).
     let mut ready = Vec::with_capacity(inputs.len());
     let mut texts: Vec<String> = Vec::new();
     for input in inputs {
-      ready.push(self.prepare_import(input).and_then(|prepared| {
-        let wanted = |record: &PreparedRecord| -> Result<Vec<String>, EngineError> {
-          let plan = record.plan(&self.schema, dimension, None)?;
-          Ok(plan.texts().into_iter().map(str::to_owned).collect())
-        };
-        // Both lists are worked out before either is queued: the vectors that come back are told apart by
-        // position alone, so a record must put in all of its texts or none.
-        let record_texts = wanted(&prepared.record)?;
+      let prepared = match self.prepare_import(input) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+          ready.push(Err(error));
+          continue;
+        }
+      };
+      // A record that is already stored is left alone, so its text is not worth embedding: sending an export
+      // again, to resume it or to add what is new, costs a read for each record that is there and no more. This
+      // look is not under the record's lock and decides nothing by itself about a record that is absent; that is
+      // decided again, under the lock, when it is written.
+      match self.stored_already(&prepared).await {
+        Ok(false) => {}
+        Ok(true) => {
+          ready.push(Ok(None));
+          continue;
+        }
+        Err(error) => {
+          ready.push(Err(error));
+          continue;
+        }
+      }
+      let wanted = |record: &PreparedRecord| -> Result<Vec<String>, EngineError> {
+        let plan = record.plan(&self.schema, dimension, None)?;
+        Ok(plan.texts().into_iter().map(str::to_owned).collect())
+      };
+      // Both lists are worked out before either is queued: the vectors that come back are told apart by
+      // position alone, so a record must put in all of its texts or none.
+      let counted = wanted(&prepared.record).and_then(|record_texts| {
         let anchor_texts = prepared.anchor.as_ref().map(wanted).transpose()?.unwrap_or_default();
+        Ok((record_texts, anchor_texts))
+      });
+      ready.push(counted.map(|(record_texts, anchor_texts)| {
         let counts = (record_texts.len(), anchor_texts.len());
         texts.extend(record_texts);
         texts.extend(anchor_texts);
-        Ok((prepared, counts.0, counts.1))
+        Some((prepared, counts.0, counts.1))
       }));
     }
-    // Nothing to embed (every record was refused) is not a reason to wake the model.
+    // Nothing to embed (every record was refused, or is stored) is not a reason to wake the model.
     let embedded = if texts.is_empty() {
       Vec::new()
     } else {
@@ -750,7 +798,8 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     for prepared in ready {
       let outcome = match prepared {
         Err(error) => Err(error),
-        Ok((prepared, record_texts, anchor_texts)) => {
+        Ok(None) => Ok(Imported::Skipped),
+        Ok(Some((prepared, record_texts, anchor_texts))) => {
           // Each record's vectors are the next ones in line, whether or not the record ends up being written.
           let record: Vec<Vec<f32>> = vectors.by_ref().take(record_texts).cloned().collect();
           let anchor: Vec<Vec<f32>> = vectors.by_ref().take(anchor_texts).cloned().collect();
@@ -760,6 +809,18 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       outcomes.push(outcome);
     }
     Ok(outcomes)
+  }
+
+  /// Whether a record to be imported is stored already, under a tenant the import may name.
+  async fn stored_already(&self, prepared: &PreparedImport) -> Result<bool, EngineError> {
+    match self.store.get(&prepared.id).await? {
+      Some(stored) => {
+        // Naming another tenant is the mistake the tenant rule exists for, here as anywhere (D14).
+        same_tenant(&stored, prepared.tenant.as_deref())?;
+        Ok(true)
+      }
+      None => Ok(false),
+    }
   }
 
   fn prepare_import(&self, input: ImportInput) -> Result<PreparedImport, EngineError> {
@@ -2769,8 +2830,57 @@ mod tests {
     );
     assert_eq!(
       engine.embedder.embedded() - embedded_before,
-      6,
-      "only records that fit the schema reach the model: `good` and the second `taken`, three fields each"
+      3,
+      "only a record that fits the schema and is not stored reaches the model: `good`, with its three fields"
+    );
+  }
+
+  /// Sending an export again has to be cheap, because that is how an interrupted one is resumed and how new
+  /// records are added to an old one. A record that is already stored costs a read: none of its text, and none
+  /// of its original version's, is embedded, and it is left exactly as it was.
+  #[tokio::test]
+  async fn a_record_that_is_already_stored_costs_an_import_no_embedding() {
+    let engine = engine();
+    let export = || {
+      vec![
+        import_of("p1", &GUMMIES, Some(&GUMMIES_EDITED)),
+        import_of("p2", &VAPE, None),
+      ]
+    };
+    let first = engine.import(export()).await.unwrap();
+    assert_eq!(first, [Ok(Imported::Created), Ok(Imported::Created)]);
+    let (before, embedded) = (
+      [stored(&engine, "p1").await, stored(&engine, "p2").await],
+      engine.embedder.embedded(),
+    );
+    assert_eq!(
+      embedded, 9,
+      "three fields of each record, and three of the one original version"
+    );
+
+    let again = engine.import(export()).await.unwrap();
+    assert_eq!(again, [Ok(Imported::Skipped), Ok(Imported::Skipped)]);
+    assert_eq!(engine.embedder.embedded(), embedded, "nothing more reached the model");
+    assert_eq!([stored(&engine, "p1").await, stored(&engine, "p2").await], before);
+
+    // A batch of stored and new records embeds the new ones only, and each still gets its own answer in order.
+    let mixed = engine
+      .import(vec![
+        import_of("p1", &VAPE, None),
+        import_of("p3", &GUMMIES, None),
+        import_of("p2", &GUMMIES, None),
+      ])
+      .await
+      .unwrap();
+    assert_eq!(
+      mixed,
+      [Ok(Imported::Skipped), Ok(Imported::Created), Ok(Imported::Skipped)]
+    );
+    assert_eq!(engine.embedder.embedded(), embedded + 3);
+    assert_eq!(
+      stored(&engine, "p1").await,
+      before[0],
+      "what the stream said about a stored record changed nothing"
     );
   }
 

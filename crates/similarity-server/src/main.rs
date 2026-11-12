@@ -588,7 +588,9 @@ async fn serve_with<S: VectorStore>(
   // A candidate policy, if the configuration names one. It is told about every judged request and decides none
   // (docs/decisions.md, D30).
   let shadow = PolicyShadow::from_config(config, worker.dimension())?.map(Arc::new);
-  let mut engine = Engine::new(store, worker, schema.clone(), policy).with_matching(config.matching.settings()?);
+  let mut engine = Engine::new(store, worker, schema.clone(), policy)
+    .with_matching(config.matching.settings()?)
+    .with_import_batch(config.server.import_batch_records);
   let mut summaries = None;
   if let (Some(shadow), Some(settings)) = (&shadow, &config.shadow) {
     shadow.announce(&schema, &policy);
@@ -1207,12 +1209,17 @@ impl LoadArgs {
     .context("cannot start the embedding thread")?;
     let schema = config.schema()?;
     let (layout, dimension) = store_layout(&schema, &worker);
-    let engine = Arc::new(Engine::new(
-      MemoryStore::new(layout, dimension),
-      worker.clone(),
-      schema,
-      config.policy()?,
-    ));
+    // The server a caller would get from this configuration, on a store in memory.
+    let engine = Arc::new(
+      Engine::new(
+        MemoryStore::new(layout, dimension),
+        worker.clone(),
+        schema,
+        config.policy()?,
+      )
+      .with_matching(config.matching.settings()?)
+      .with_import_batch(config.server.import_batch_records),
+    );
     runtime.block_on(async {
       let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

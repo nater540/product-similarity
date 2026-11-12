@@ -45,6 +45,8 @@ const WARM_UP: usize = 32;
 
 /// The three things a caller does with a record, in the order they are run.
 pub const PHASES: [&str; 3] = ["create", "edit", "resave"];
+/// The phase that creates records over one `Import` stream, run once, after the levels.
+pub const STREAM_PHASE: &str = "stream";
 
 type Client = RecordSimilarityClient<Channel>;
 
@@ -410,6 +412,24 @@ impl PhaseStats {
     }
   }
 
+  /// A phase in which `requests` records went over one `Import` stream. There is one caller and no latency of a
+  /// single request to speak of: a record's answer comes with its batch's.
+  fn streamed(requests: usize, outcomes: (u64, u64, u64), wall: Duration, worker: Option<WorkerSnapshot>) -> Self {
+    let (created, existing, failed) = outcomes;
+    let tally = Tally {
+      failed,
+      created,
+      ..Tally::default()
+    };
+    let mut stats = Self::of(STREAM_PHASE, 1, requests, tally, wall, worker);
+    stats.ok = created.saturating_add(existing);
+    let seconds = wall.as_secs_f64();
+    if seconds > 0.0 {
+      stats.per_second = (number(stats.ok) / seconds * 10.0).round() / 10.0;
+    }
+    stats
+  }
+
   /// Writes the phase as one `load_phase` result line.
   fn emit(&self, run_id: &str) {
     let latency = |index: usize| self.latency_ms.and_then(|values| values.get(index).copied());
@@ -531,17 +551,82 @@ pub async fn run(
       all.push(stats);
     }
     if !options.keep {
-      for record in created {
-        let request = pb::DeleteRequest {
-          id: record.id.unwrap_or_default(),
-          tenant: record.tenant,
-        };
-        // Tidying up. A record that cannot be deleted is left, and the run's numbers stand.
-        let _ = client.delete(request).await;
-      }
+      delete(&mut client, created).await;
     }
   }
+  if let Some(stats) = stream(&mut client, options, &run_id, (&fields, &quantities), worker).await? {
+    stats.emit(&run_id);
+    tracing::info!(phase = STREAM_PHASE, per_second = stats.per_second, "phase done");
+    all.push(stats);
+  }
   Ok(all)
+}
+
+/// Tidying up. A record that cannot be deleted is left, and the run's numbers stand.
+async fn delete(client: &mut Client, records: Vec<pb::Record>) {
+  for record in records {
+    let request = pb::DeleteRequest {
+      id: record.id.unwrap_or_default(),
+      tenant: record.tenant,
+    };
+    let _ = client.delete(request).await;
+  }
+}
+
+/// Creates `options.records` new records over one `Import` stream and says how fast they went. `None`, with a
+/// warning, against a server too old to have the call.
+async fn stream(
+  client: &mut Client,
+  options: &Options,
+  run_id: &str,
+  schema: (&[(String, bool)], &[String]),
+  worker: Option<&(dyn Fn() -> WorkerSnapshot + Sync)>,
+) -> anyhow::Result<Option<PhaseStats>> {
+  let records = catalog(
+    schema.0,
+    schema.1,
+    options.records,
+    options.seed,
+    &format!("load-{run_id}-stream"),
+  )?;
+  let requests: Vec<pb::ImportRequest> = records
+    .iter()
+    .cloned()
+    .map(|record| pb::ImportRequest {
+      record: Some(record),
+      anchor: None,
+    })
+    .collect();
+  let before = worker.map(|read| read());
+  let started = Instant::now();
+  let mut answers = match client.import(tokio_stream::iter(requests)).await {
+    Ok(answers) => answers.into_inner(),
+    Err(status) if status.code() == tonic::Code::Unimplemented => {
+      tracing::warn!("the server has no `Import` call; the stream phase is left out");
+      return Ok(None);
+    }
+    Err(status) => return Err(status).context("the import stream was refused"),
+  };
+  let (mut created, mut existing, mut failed) = (0_u64, 0_u64, 0_u64);
+  while let Some(answer) = answers.message().await.context("the import stream broke off")? {
+    let slot = match answer.outcome() {
+      pb::ImportOutcome::Created => &mut created,
+      pb::ImportOutcome::Exists => &mut existing,
+      _ => &mut failed,
+    };
+    *slot = slot.saturating_add(1);
+  }
+  let wall = started.elapsed();
+  let window = worker.zip(before).map(|(read, before)| read().since(&before));
+  if !options.keep {
+    delete(client, records).await;
+  }
+  Ok(Some(PhaseStats::streamed(
+    options.records,
+    (created, existing, failed),
+    wall,
+    window,
+  )))
 }
 
 #[cfg(test)]
@@ -723,14 +808,18 @@ mod tests {
         ("resave", 1, 12),
         ("create", 4, 12),
         ("edit", 4, 12),
-        ("resave", 4, 12)
+        ("resave", 4, 12),
+        ("stream", 1, 12)
       ]
     );
     for stats in &captured_stats {
       assert_eq!((stats.failed, stats.overloaded), (0, 0));
-      assert!(stats.latency_ms.is_some() && stats.worker.is_none());
+      assert!(stats.worker.is_none());
+      // One stream has no latency of a single request: a record's answer comes with its batch's.
+      assert_eq!(stats.latency_ms.is_some(), stats.phase != STREAM_PHASE, "{stats:?}");
+      assert!(stats.per_second > 0.0, "{stats:?}");
       match stats.phase {
-        "create" => assert_eq!(stats.verdicts, (12, 0, 0)),
+        "create" | STREAM_PHASE => assert_eq!(stats.verdicts, (12, 0, 0)),
         // Whether an edit passes the threshold is the server's business; that it was judged is this tool's.
         _ => assert_eq!(stats.verdicts.1 + stats.verdicts.2, 12, "{stats:?}"),
       }

@@ -95,12 +95,17 @@ impl MatchingConfig {
 pub struct ServerConfig {
   /// The address the gRPC server listens on.
   pub listen: SocketAddr,
+  /// The most records of an `Import` stream that are embedded as one batch. A batch is one job on the one
+  /// embedding thread, and every other request waits while it runs: larger batches load a catalog faster and
+  /// make a merchant's save wait longer.
+  pub import_batch_records: usize,
 }
 
 impl Default for ServerConfig {
   fn default() -> Self {
     Self {
       listen: SocketAddr::from(([127, 0, 0, 1], 50051)),
+      import_batch_records: crate::engine::DEFAULT_IMPORT_BATCH,
     }
   }
 }
@@ -422,6 +427,9 @@ impl Config {
       bail!("`qdrant.collection` must not be blank");
     }
     config.matching.settings()?;
+    if config.server.import_batch_records == 0 {
+      bail!("`server.import_batch_records` must be at least 1");
+    }
     if let Some(shadow) = &config.shadow {
       if shadow.name.trim().is_empty() {
         bail!("`shadow.name` must not be blank");
@@ -573,6 +581,10 @@ mod tests {
   fn a_minimal_file_gets_every_default() {
     let config = Config::parse(MINIMAL).unwrap();
     assert_eq!(config.server.listen.port(), 50051);
+    assert_eq!(config.server.import_batch_records, 8);
+    assert!(Config::parse(&format!("[server]\nimport_batch_records = 0\n{MINIMAL}")).is_err());
+    let small = Config::parse(&format!("[server]\nimport_batch_records = 2\n{MINIMAL}")).unwrap();
+    assert_eq!(small.server.import_batch_records, 2);
     assert_eq!(config.model.device, DeviceChoice::Cpu);
     assert_eq!(
       config.model.output_dim, None,

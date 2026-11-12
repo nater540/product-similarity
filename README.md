@@ -219,6 +219,7 @@ The API is defined, with full documentation of every field, in
 |---|---|
 | `Evaluate` | Embeds a record. With an `id`, compares it with the stored baseline, returns a verdict with per-field detail, and stores it if allowed. |
 | `FindSimilar` | Returns the stored records most similar to a stored id or to an ad hoc record, optionally within one tenant. |
+| `Import` | Streaming. Creates every record of a stream that is not stored yet and answers each one; a record that is stored is left exactly alone. |
 | `Match` | Returns the stored records a listing from elsewhere describes, best first, each scored over the fields both sides have, and says whether the best is a match. Stores nothing. |
 | `Delete` | Forgets a record. |
 | `Describe` | Reports the model fingerprint, schema, and thresholds in force. |
@@ -248,6 +249,7 @@ The quickest way to poke a server. It is also a small, complete example of a Rus
 just client describe
 just client evaluate <id> <fields.json> [--tenant T] [--dry-run | --force]
 just client similar <id> [--limit N]
+just client import <export.jsonl>
 just client match <listing.json> [--tenant T] [--limit N] [--threshold S]
 just client delete <id> [--tenant T]
 just client --server http://other-host:50051 describe
@@ -548,9 +550,9 @@ Nothing is written when an error is returned.
 **Bootstrapping an existing catalog.** Export every record as one JSON object per line and load the file with
 `record-similarity import` ([Importing a catalog](#importing-a-catalog)). Every record that is not stored yet
 becomes a baseline. On a laptop CPU, 2,000 four-field records were imported in 19 seconds, so 50,000 take about
-eight minutes. Calling `Evaluate` once per record does the same thing one request at a time, for a caller that
-cannot run a command next to Qdrant: each call returns `VERDICT_CREATED`. Keep fewer requests in flight than
-`model.queue_depth` (256 by default) and back off on `RESOURCE_EXHAUSTED`.
+eight minutes. A caller that cannot run a command next to Qdrant sends the same records over one
+[`Import` stream](#creating-records-over-a-stream), at about 80 records a second on that CPU, sharing the model
+with whoever else is calling.
 
 **At edit time.**
 
@@ -598,6 +600,71 @@ Rules for the caller:
   between zero and anything else is reported as a `zero_crossing`.
 - **Send the unit as stored.** The service converts the units it knows. A unit it does not know is still
   accepted, and compared with itself.
+
+### Creating records over a stream
+
+`Import` creates records that are not stored yet, as many as the caller sends, over one call: new products from
+a nightly sync, a merchant's whole catalog on the day it is onboarded, or everything, for a caller that cannot
+run the `import` command beside Qdrant. The caller streams records and gets one answer for each, in order.
+
+```json
+{"id": "sku-1", "tenant": "merchant-1", "record": {"name": "Blueberry Gummies 100mg", "category": "Edibles > Gummies", "weight_per_item": {"value": 40, "unit": "g"}}}
+{"id": "sku-2", "tenant": "merchant-1", "record": {"name": "Peach Gummies 100mg", "category": "Edibles > Gummies"}, "anchor": {"name": "Peach Gummies"}}
+{"id": "sku-3", "tenant": "merchant-2", "record": {"name": "Sour Diesel Vape Cartridge 1g", "strain": "sativa"}}
+```
+
+```text
+$ just client import new-products.jsonl
+failed    record 2 (sku-3): invalid record: unknown field `strain`; the schema has: brand, category, description, name
+records   3 sent in 0.02 s
+created   2
+existing  0 (left as they were)
+failed    1
+
+$ just client import new-products.jsonl        # the same file again
+failed    record 2 (sku-3): invalid record: unknown field `strain`; the schema has: brand, category, description, name
+records   3 sent in 0.00 s
+created   0
+existing  2 (left as they were)
+failed    1
+```
+
+(The client reads the file `import` reads and sends each line as one message. Any gRPC client can do the same:
+the call is `Import(stream ImportRequest) returns (stream ImportResponse)`.)
+
+- **It only creates.** A record whose id is already stored is answered `EXISTS` and left exactly as it is,
+  whatever the stream says about it: nothing is compared, nothing replaced, no drift anchor moved. A change to a
+  stored record is an `Evaluate`, which judges it. A stream cannot be used to get an edit past the policy.
+- **So a stream is safe to send twice, and cheap.** A record that is already stored costs one read and no
+  embedding. Cut off half way, a stream is resumed by sending it again from the start; last night's export plus
+  today's new products is sent whole, and only the new ones reach the model.
+- **One record failing does not end the stream.** It is answered `FAILED`, with the status code the same record
+  would have got from `Evaluate` (`INVALID_ARGUMENT`, or `FAILED_PRECONDITION` for an id stored under another
+  tenant) and the reason, and the next record is taken. The tenant rule holds as everywhere.
+- **`anchor` is the record as it was first created**, if you still have that. Drift is then measured from it and
+  not from the record as it is today, exactly as for the `import` command.
+- **Answers come in batches.** The server takes whatever has arrived, up to `server.import_batch_records` (8),
+  imports it, and answers each record. A caller that sends one record and waits gets one answer; a caller that
+  sends everything gets them eight at a time. There is no latency of a single record to speak of.
+- **A stream shares the one model with everyone else, and slows them down.** While a stream runs, any other
+  request waits for the stream's batch in front of it. Measured with one caller of `Evaluate` beside a stream
+  that never ran dry (`just load ... --server`, separate runs for each setting):
+
+  | `server.import_batch_records` | Stream, records per second | An edit's median, no stream | An edit's median, beside a stream | A create's median, beside a stream |
+  |---|---|---|---|---|
+  | 8 (default) | 81 | 5.6 ms | 86.1 ms | 100.5 ms |
+  | 4 | 69 | 5.7 ms | 54.8 ms | 69.0 ms |
+  | 2 | 60 | 5.7 ms | 36.1 ms | 50.6 ms |
+  | 1 | 48 | 5.7 ms | 25.0 ms | 40.6 ms |
+
+  A merchant's save takes 86 ms instead of 6 ms while a bulk load is running at the default. Nothing was refused
+  in any of these runs. If that is too slow for your callers, lower the setting, or load catalogs when merchants
+  are not editing. A stream that only trickles (a few new products a minute) makes batches of one and costs what
+  the same number of `Evaluate` calls would.
+- **A busy model slows a stream; it does not fail it.** When the queue in front of the model is full the stream
+  waits and offers its batch again, reading nothing more meanwhile, which holds the sender back. Only after ten
+  seconds without room are that batch's records answered `RESOURCE_EXHAUSTED`, and the stream goes on.
+- **A caller that disconnects loses nothing.** What was imported stays imported, and the rest was never taken.
 
 ### Matching a listing to a stored record
 
@@ -1814,6 +1881,7 @@ commented starting point.
 | Key | Default | Meaning |
 |---|---|---|
 | `server.listen` | `127.0.0.1:50051` | Address to serve gRPC on. Use `0.0.0.0:50051` in a container. |
+| `server.import_batch_records` | `8` | The most records of an `Import` stream embedded as one batch. Larger loads a catalog faster and makes every other request wait longer while a stream runs; see [Creating records over a stream](#creating-records-over-a-stream). At least 1. |
 | `model.dir` | `models/mdbr-leaf-mt` | The model directory. |
 | `model.device` | `cpu` | `cpu`, or `metal` in a binary built with `--features metal`. |
 | `model.max_tokens` | `256` | Text beyond this many tokens is ignored. Cost grows with its square. |
@@ -1879,7 +1947,9 @@ What it does, and what it will not do:
 
 - **It only creates.** An id that is already stored is skipped and left exactly as it is. An import can therefore
   never overwrite a baseline, running one twice is harmless, and an import that was interrupted is resumed by
-  running it again.
+  running it again. A record that is already stored costs a read and is not embedded, so the second run is
+  quick. The same rules hold for the [`Import` call](#creating-records-over-a-stream), which does this over gRPC
+  for a caller that cannot run a command here.
 - **`anchor` is the record as it was first created**, if your database still has that version. With it, the
   record's drift is measured from where it really began, as if it had lived here all along: the anchor holds the
   original value of every field and quantity the original had, and today's value for anything it lacked. Without
@@ -2122,45 +2192,50 @@ On the same machine (12 cores, release build, default model, 300 records per lev
 
 | Callers | Phase | Requests per second | Median | 99th percentile | Texts per forward pass | Mean wait in the queue |
 |---|---|---|---|---|---|---|
-| 1 | create | 48 | 21.1 ms | 24.4 ms | 4.0 | 0.0 ms |
-| 1 | edit | 177 | 5.6 ms | 6.3 ms | 1.0 | 0.0 ms |
-| 1 | resave | 10,677 | 0.1 ms | 0.1 ms | | |
-| 4 | create | 60 | 66.7 ms | 77.5 ms | 8.0 | 27.6 ms |
-| 4 | edit | 227 | 17.6 ms | 18.8 ms | 2.0 | 7.8 ms |
-| 16 | create | 79 | 193.6 ms | 383.1 ms | 29.3 | 94.9 ms |
-| 16 | edit | 368 | 41.8 ms | 81.3 ms | 7.5 | 9.0 ms |
-| 64 | create | 80 | 698.6 ms | 1,405.0 ms | 30.8 | 547.1 ms |
-| 64 | edit | 470 | 116.2 ms | 240.3 ms | 23.1 | 52.3 ms |
-| 64 | resave | 26,156 | 2.4 ms | 3.4 ms | | |
+| 1 | create | 48 | 21.2 ms | 24.3 ms | 4.0 | 0.0 ms |
+| 1 | edit | 176 | 5.6 ms | 6.4 ms | 1.0 | 0.0 ms |
+| 1 | resave | 10,744 | 0.1 ms | 0.1 ms | | |
+| 4 | create | 60 | 67.1 ms | 76.9 ms | 8.0 | 32.2 ms |
+| 4 | edit | 229 | 17.4 ms | 18.7 ms | 2.0 | 6.8 ms |
+| 16 | create | 79 | 194.6 ms | 390.4 ms | 29.3 | 95.2 ms |
+| 16 | edit | 363 | 42.5 ms | 83.6 ms | 7.5 | 9.7 ms |
+| 64 | create | 80 | 703.1 ms | 1,501.6 ms | 30.8 | 533.8 ms |
+| 64 | edit | 468 | 114.9 ms | 235.7 ms | 21.4 | 51.7 ms |
+| 64 | resave | 25,557 | 2.4 ms | 4.1 ms | | |
+| 1 | stream | 80 | | | 31.6 | 0.0 ms |
 
 - **create** sends a new record, so all four fields go to the model. **edit** sends it back with the name
   changed, so one short text does: this is edit-time traffic, the figure a replica is sized by. **resave** sends
   the edited record again unchanged, so nothing reaches the model, and what is left is gRPC, the per-record lock,
-  and the store.
+  and the store. **stream** creates the same number of new records over one `Import` call.
 - **More callers buy throughput by sharing forward passes, and pay for it in latency.** From 1 caller to 64,
-  edits per second go from 177 to 470 while the median goes from 6 ms to 116 ms. The model was busy for all of
+  edits per second go from 176 to 468 while the median goes from 6 ms to 115 ms. The model was busy for all of
   every create and edit phase: one replica's ceiling on this machine is a few hundred edits a second.
 - **Creating whole records levels off at about 80 a second**, 320 texts, once a forward pass is full
-  (`model.batch_size` is 32). A catalog is loaded faster with `import`, which does not go through the queue.
+  (`model.batch_size` is 32). **One stream reaches that ceiling from a single caller**: it fills forward passes
+  on purpose, where 64 callers of `Evaluate` fill them by arriving together and wait 700 ms each to do it. The
+  `import` command is no faster a second, but shares the model with nobody.
 - **No request was refused** in any phase: the queue holds 256 (`model.queue_depth`), more than 64 callers can
   fill. A refused request is counted (`overloaded`) and sent again after 5 ms.
 
 The loop is closed: each caller waits for its answer before sending again. That is latency at a fixed number of
 callers, not at a fixed arrival rate, where a server that falls behind makes a queue grow; do not read these as
 the second kind. The store is in memory, so a round trip to Qdrant comes on top. Results are NDJSON on stdout
-(`> load.ndjson`): a `load_run` line, then one `load_phase` line for each level and phase. The table leaves out
-two of the resave rows. One line:
+(`> load.ndjson`): a `load_run` line, then one `load_phase` line for each level and phase, and one for the
+stream. The table leaves out two of the resave rows. One line:
 
 ```json
-{"message":"load_phase","run_id":"1-1794431529","concurrency":16,"phase":"edit","requests":300,"ok":300,"overloaded":0,"failed":0,"created":0,"accepted":300,"rejected":0,"seconds":0.815,"per_second":368.1,"p50_ms":41.78,"p90_ms":44.76,"p99_ms":81.28,"max_ms":114.05,"mean_ms":42.7,"batches":40,"texts":300,"texts_per_batch":7.5,"model_busy":0.999,"queue_wait_ms":9.03}
+{"message":"load_phase","run_id":"1-1794457699","concurrency":16,"phase":"edit","requests":300,"ok":300,"overloaded":0,"failed":0,"created":0,"accepted":300,"rejected":0,"seconds":0.827,"per_second":362.6,"p50_ms":42.48,"p90_ms":44.56,"p99_ms":83.64,"max_ms":86.77,"mean_ms":43.28,"batches":40,"texts":300,"texts_per_batch":7.5,"model_busy":0.999,"queue_wait_ms":9.69}
 ```
 
 `--server http://host:port` drives a server that is already running, instead of starting one. Its records are
 written under the tenant `load-test` and deleted afterwards, and the worker's side (`batches`, `texts_per_batch`,
 `model_busy`, `queue_wait_ms`) is left out, since a client cannot see it. No record text is in any result.
 
-In service, every `evaluate`, `find_similar`, and `delete` log line carries `elapsed_ms`: the time from the first
-line of the handler to the log line.
+In service, every `evaluate`, `find_similar`, `match`, and `delete` log line carries `elapsed_ms`: the time from
+the first line of the handler to the log line. An `Import` stream writes one `import` line when it ends, with how
+many records it created, found stored, and failed, how many batches it made, and how often it waited for the
+model.
 
 ## Development
 
@@ -2256,7 +2331,7 @@ data/
   regression.snapshot.ndjson      what the pinned model and the example config make of them
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D31)
+  decisions.md               why things are the way they are (D1 to D33)
   data-request-prompt.md     a brief for collecting labeled production data
   feature-suggestions.md     features that could be added, built and not, the last twelve about production
   plan-features.md           a plan for the first five of them
@@ -2309,8 +2384,8 @@ what that field says.
   which is most visible when searching by a name alone. `Match` scores its candidates exactly, but it can only
   score what the search returned: a record the search ranks below `limit` times `matching.overfetch` is never
   seen. See D5 and D32.
-- **No bulk RPC.** A catalog is loaded with the `import` command, which has to run where it can reach the model
-  and Qdrant. Over gRPC it is still one `Evaluate` call per record.
+- **No bulk call for revisions.** `Import` streams new records in and only creates. Judging many *changes* is
+  still one `Evaluate` call for each.
 - **English only.** The default model is English. Other languages need another model and a new calibration.
 - **Text and quantities only.** Images are not considered. A recycler who changes only the photo is invisible to
   this service.

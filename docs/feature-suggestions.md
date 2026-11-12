@@ -706,6 +706,9 @@ without a tenant counts as.
 
 ### 28. A batch call
 
+**Half built** (D33): `Import` streams new records in and only creates. What is described here, many *judged*
+revisions in one call, is not built.
+
 **What.** `EvaluateBatch`: many records in one request, each judged and answered on its own, sharing forward
 passes on purpose.
 

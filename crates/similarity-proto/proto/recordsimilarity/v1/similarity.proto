@@ -38,6 +38,25 @@ service RecordSimilarity {
   // Errors: `FAILED_PRECONDITION` if the record is stored under a tenant the request does not name.
   rpc Delete(DeleteRequest) returns (DeleteResponse);
 
+  // Creates records that are not stored yet, as many as the caller sends, over one call.
+  //
+  // The caller streams records and gets one answer for each, in the order they were sent: created, already
+  // stored, or failed. It is how a catalog is loaded, and how new products are added in bulk, without one call
+  // and one wait per record.
+  //
+  // This only creates. A record whose `id` is already stored is left exactly as it is, whatever the stream says
+  // about it, and is answered `IMPORT_OUTCOME_EXISTS`: nothing is compared, nothing is replaced, and no drift
+  // anchor moves. Changing a stored record is an `Evaluate`, which judges the change. That makes a stream safe to
+  // send twice, and safe to cut off and send again from the start.
+  //
+  // One record failing does not end the stream: it is answered `IMPORT_OUTCOME_FAILED` with the status code the
+  // same record would have got from `Evaluate`, and the next record is taken. The stream shares the server's one
+  // model with every other request, a few records at a time, and is slowed down, not refused, while the model is
+  // busy; a record is answered `RESOURCE_EXHAUSTED` only after the server has waited ten seconds for room.
+  //
+  // Errors on the call itself are the transport's. Everything about a record is in its answer.
+  rpc Import(stream ImportRequest) returns (stream ImportResponse);
+
   // Finds the stored records a listing from elsewhere describes (a retailer's menu item, say), best first, and
   // says whether the best is the same product. Read-only: nothing is stored or changed.
   //
@@ -399,6 +418,56 @@ message QuantityDescription {
 
   // A record that puts this quantity in a unit that cannot be compared with the one it had is rejected.
   bool reject_incomparable = 3;
+}
+
+// A record's content at some earlier time: its fields and quantities, with no identity of its own.
+message Original {
+  // Field name to text, as in `Record.fields`.
+  map<string, string> fields = 1;
+
+  // Quantity name to value, as in `Record.quantities`.
+  map<string, Quantity> quantities = 2;
+}
+
+message ImportRequest {
+  // The record as it is now. Its `id` is required. `tenant` is stored with it, as for `Evaluate`.
+  Record record = 1;
+
+  // The record as it was first created, if that is still known. Drift is then measured from this version and not
+  // from the record as it is now, and a field or quantity the record has since lost is remembered. Without it the
+  // record as it is now is its own point of reference, as for any new record.
+  Original anchor = 2;
+}
+
+enum ImportOutcome {
+  IMPORT_OUTCOME_UNSPECIFIED = 0;
+
+  // Nothing was stored under the id. The record is now, at revision 1.
+  IMPORT_OUTCOME_CREATED = 1;
+
+  // A record is already stored under the id. It was left exactly as it was.
+  IMPORT_OUTCOME_EXISTS = 2;
+
+  // The record was not stored. `status_code` and `message` say why.
+  IMPORT_OUTCOME_FAILED = 3;
+}
+
+message ImportResponse {
+  // Which record of the stream this answers, counting from 0. Answers come in order, one for each record.
+  uint64 index = 1;
+
+  // The record's `id`, as it was sent. Absent if the record had none.
+  optional string id = 2;
+
+  ImportOutcome outcome = 3;
+
+  // For `IMPORT_OUTCOME_FAILED`: the gRPC status code the same record would have got from `Evaluate` (3
+  // `INVALID_ARGUMENT`, 9 `FAILED_PRECONDITION` for a record stored under another tenant, 8 `RESOURCE_EXHAUSTED`,
+  // 14 `UNAVAILABLE`). Zero otherwise.
+  uint32 status_code = 4;
+
+  // For `IMPORT_OUTCOME_FAILED`: what was wrong, as a sentence. Empty otherwise.
+  string message = 5;
 }
 
 message MatchRequest {

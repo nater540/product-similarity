@@ -15,12 +15,14 @@
 
 #![allow(clippy::print_stdout, reason = "an example's whole job is to print")]
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use similarity_proto::v1 as pb;
 use similarity_proto::v1::record_similarity_client::RecordSimilarityClient;
+use similarity_server::import::ImportLine;
 use similarity_server::offline::RecordFields;
 
 #[derive(Debug, Parser)]
@@ -59,6 +61,13 @@ enum Command {
     /// How many neighbors to list.
     #[arg(long, default_value_t = 5)]
     limit: u32,
+  },
+  /// Create every record of an export that is not stored yet, over one streaming call. What is stored is left
+  /// alone.
+  Import {
+    /// The export: one JSON object per line, `{"id": ..., "tenant": ..., "record": {...}, "anchor": {...}}`, the
+    /// format `record-similarity import` reads.
+    export: PathBuf,
   },
   /// Find the stored records a listing from elsewhere describes, best first, and whether the best is a match.
   Match {
@@ -257,13 +266,8 @@ fn print_match(response: &pb::MatchResponse) {
   }
 }
 
-/// Reads a record file and turns it into the request message.
-fn read_record(path: &Path, id: Option<String>, tenant: Option<String>) -> anyhow::Result<pb::Record> {
-  let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-  let record: RecordFields = serde_json::from_str(&text)
-    .context("expected a JSON object of text fields and quantities ({\"value\": 3.5, \"unit\": \"g\"})")?;
-  let quantities = record
-    .quantities
+fn quantities(quantities: similarity_core::Quantities) -> HashMap<String, pb::Quantity> {
+  quantities
     .into_iter()
     .map(|(name, quantity)| {
       let quantity = pb::Quantity {
@@ -273,12 +277,45 @@ fn read_record(path: &Path, id: Option<String>, tenant: Option<String>) -> anyho
       };
       (name, quantity)
     })
-    .collect();
+    .collect()
+}
+
+/// Reads an export and turns each line into a message of the stream.
+fn read_export(path: &Path) -> anyhow::Result<Vec<pb::ImportRequest>> {
+  let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+  let mut requests = Vec::new();
+  for (number, line) in (1_u64..).zip(text.lines()) {
+    if line.trim().is_empty() || line.trim_start().starts_with('#') {
+      continue;
+    }
+    let parsed: ImportLine =
+      serde_json::from_str(line).with_context(|| format!("line {number} of {} is not a record", path.display()))?;
+    requests.push(pb::ImportRequest {
+      record: Some(pb::Record {
+        id: Some(parsed.id),
+        tenant: parsed.tenant,
+        fields: parsed.record.texts.into_iter().collect(),
+        quantities: quantities(parsed.record.quantities),
+      }),
+      anchor: parsed.anchor.map(|anchor| pb::Original {
+        fields: anchor.texts.into_iter().collect(),
+        quantities: quantities(anchor.quantities),
+      }),
+    });
+  }
+  Ok(requests)
+}
+
+/// Reads a record file and turns it into the request message.
+fn read_record(path: &Path, id: Option<String>, tenant: Option<String>) -> anyhow::Result<pb::Record> {
+  let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+  let record: RecordFields = serde_json::from_str(&text)
+    .context("expected a JSON object of text fields and quantities ({\"value\": 3.5, \"unit\": \"g\"})")?;
   Ok(pb::Record {
     id,
     tenant,
     fields: record.texts.into_iter().collect(),
-    quantities,
+    quantities: quantities(record.quantities),
   })
 }
 
@@ -326,6 +363,33 @@ async fn main() -> anyhow::Result<()> {
           neighbor.tenant.unwrap_or_default()
         );
       }
+    }
+    Command::Import { export } => {
+      let requests = read_export(&export)?;
+      let sent = requests.len();
+      let started = std::time::Instant::now();
+      let mut answers = client.import(tokio_stream::iter(requests)).await?.into_inner();
+      let (mut created, mut existing, mut failed) = (0_u64, 0_u64, 0_u64);
+      while let Some(answer) = answers.message().await? {
+        match answer.outcome() {
+          pb::ImportOutcome::Created => created = created.saturating_add(1),
+          pb::ImportOutcome::Exists => existing = existing.saturating_add(1),
+          _ => {
+            failed = failed.saturating_add(1);
+            println!(
+              "failed    record {} ({}): {}",
+              answer.index,
+              answer.id.as_deref().unwrap_or("no id"),
+              answer.message
+            );
+          }
+        }
+      }
+      let seconds = started.elapsed().as_secs_f64();
+      println!("records   {sent} sent in {seconds:.2} s");
+      println!("created   {created}");
+      println!("existing  {existing} (left as they were)");
+      println!("failed    {failed}");
     }
     Command::Match {
       listing,

@@ -6,7 +6,7 @@ marketplace listings. Each revision is embedded field by field with a small BERT
 thresholds. A record's quantities (weight, volume, potency) are compared as numbers beside that, never embedded.
 Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D32) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D33) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -72,6 +72,7 @@ changing a design. Infer conventions from the existing code first.
 - `crates/similarity-runs`: the local record of runs (D23): the manifest, starting and ending a run, reading runs
   back. It records and lists; it decides nothing.
 - `crates/similarity-server`: config, the embedding worker thread, `Engine` (all behavior), the thin gRPC layer,
+  `import_stream` (the loop behind the streaming `Import` call),
   `model fetch`, `import`, `compare`/`calibrate`/`calibrate-drift`/`calibrate-match`/`calibrate-sweep` (the `offline` module), `load` (the load
   test), `runs` (reading recorded runs back, comparing and reporting them), `shadow` (a candidate policy judging
   live requests), `registry` (which model was put into service, and the gate), and the `record-similarity`
@@ -114,7 +115,14 @@ changing a design. Infer conventions from the existing code first.
   Put a new statistic there, not in a renderer.
 - **An import only creates** (D20). `Engine::import` writes an id that is not stored and leaves one that is
   exactly alone, timestamp included. That is what makes it safe to run twice and unable to replace an anchor.
-  Never give it an update path; an update is an `Evaluate`, which judges.
+  Never give it an update path; an update is an `Evaluate`, which judges. The streaming `Import` call is the same
+  function behind a wire (D33) and takes the same rule: do not add a mode that replaces, and do not let one bad
+  record end a stream. A record that is already stored must not be embedded; the early look for it is outside
+  the lock and is only a saving, and whether a record is created is still decided under the lock.
+- **A stream shares the one embedding thread, a small batch at a time** (D33). `server.import_batch_records`
+  trades a stream's speed against how long every other request waits; the README's table was measured with
+  `just load`. Do not make the stream wait for a batch to fill, and do not buffer more than one batch on either
+  side of the loop in `import_stream.rs`: back-pressure on the sender is the transport's job.
 - **A tenant, once stored, must be named by every later request for that id**, including `Delete` (D14).
 - **What a supported model directory is lives in one place**, `similarity_core::model::Pipeline`. The loader and
   `model fetch` both use it; never parse `modules.json` anywhere else.

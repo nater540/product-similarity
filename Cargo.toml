@@ -45,6 +45,8 @@ tonic-health = "0.14"
 tonic-reflection = "0.14"
 prost = "0.14"
 tokio = { version = "1.54", features = ["rt-multi-thread", "net", "sync", "time", "signal", "macros"] }
+# The response half of a streaming call is a `Stream`. Already in the tree through `tonic`.
+tokio-stream = { version = "0.1", default-features = false }
 
 # The default features pull in `reqwest` for snapshot downloads, which this service never does.
 qdrant-client = { version = "1.20", default-features = false }
