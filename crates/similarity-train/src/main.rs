@@ -794,7 +794,8 @@ impl Cli {
     } = self.pairs()?;
     let groups = match &self.catalog_groups {
       Some(path) => {
-        let groups = data::group_examples(&data::read(path)?, path, &self.fields, &measured_on)?;
+        let held_out = [self.holdout_split.as_str(), self.validation_split.as_str()];
+        let groups = data::group_examples(&data::read(path)?, path, &self.fields, &measured_on, &held_out)?;
         tracing::info!(
           file = %path.display(),
           examples = groups.examples.len(),

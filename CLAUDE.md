@@ -6,7 +6,7 @@ marketplace listings. Each revision is embedded field by field with a small BERT
 thresholds. A record's quantities (weight, volume, potency) are compared as numbers beside that, never embedded.
 Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D31) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D32) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -66,12 +66,12 @@ changing a design. Infer conventions from the existing code first.
 - `crates/similarity-proto`: the `.proto` (the source of truth for the API, and where its docs live) and generated
   code.
 - `crates/similarity-core`: encoder, strict weight loading and saving, tokenization, composite vectors, quantities,
-  scoring, policy. Synchronous, no I/O beyond reading and writing a model directory, no network code ever (D11).
+  scoring, policy, and scoring a listing against stored records (`matching`). Synchronous, no I/O beyond reading and writing a model directory, no network code ever (D11).
 - `crates/similarity-store`: the `VectorStore` trait, `MemoryStore`, `QdrantStore`.
 - `crates/similarity-runs`: the local record of runs (D23): the manifest, starting and ending a run, reading runs
   back. It records and lists; it decides nothing.
 - `crates/similarity-server`: config, the embedding worker thread, `Engine` (all behavior), the thin gRPC layer,
-  `model fetch`, `import`, `compare`/`calibrate`/`calibrate-drift`/`calibrate-sweep` (the `offline` module), `load` (the load
+  `model fetch`, `import`, `compare`/`calibrate`/`calibrate-drift`/`calibrate-match`/`calibrate-sweep` (the `offline` module), `load` (the load
   test), `runs` (reading recorded runs back, comparing and reporting them), `shadow` (a candidate policy judging
   live requests), `registry` (which model was put into service, and the gate), and the `record-similarity`
   binary. Keep `grpc.rs` free of decisions.
@@ -133,6 +133,15 @@ changing a design. Infer conventions from the existing code first.
   policy: after the first rejection the baseline stops moving and the rest of the history is fiction.
   `anchor_threshold = 0.85` in `config.example.toml` is a starting point, not a measurement; do not replace it
   with a number from `data/drift.sample.jsonl`, which is synthetic.
+- **A match is a read, scored exactly** (D32). `Match` never writes, a listing is mapped onto the product schema
+  and never gets a layout of its own, and a listing that carries an `id` or a `tenant` is refused. The engine and
+  `calibrate-match` both rank with `similarity_core::matching::rank`: do not score a match anywhere else, do not
+  apply a floor or a quantity limit to one, and do not let a quantity move a match score or decision (D16).
+  `matching.threshold` is a measurement and `config.example.toml` ships none; `matching.overfetch` is a cost that
+  `calibrate-match` measures. Never read a threshold from `data/catalog-groups.sample.jsonl`, which is synthetic.
+  The `match_*` event names are an interface like the calibration ones. `VectorStore::search_vectors` must
+  return what `search` returns, in the same order: both are built from one request, and the contract test holds
+  them to it.
 - **The promotion gate measures and chooses nothing** (D31). `model promote` never suggests or writes a
   threshold, and never accepts a calibration of another model or of any split but `holdout`, with or without
   `--override`. Each model is judged under its own config (the candidate's, and the one the model in service was
@@ -192,7 +201,7 @@ changing a design. Infer conventions from the existing code first.
   `just mutants-train`
 - Run: `just serve` (needs Qdrant) or `just serve-in-memory`; then `just client describe`
 - Load a catalog: `just import export.jsonl config.toml` (`--check` validates only)
-- Measure: `just throughput`, `just load`, `just calibrate`, `just calibrate-drift`, `just calibrate-sweep`, `just calibrate-diff`, `just verdict-gate old.ndjson pairs.full.jsonl`
+- Measure: `just throughput`, `just load`, `just calibrate`, `just calibrate-drift`, `just calibrate-match`, `just calibrate-sweep`, `just calibrate-diff`, `just verdict-gate old.ndjson pairs.full.jsonl`
 - Put a model into service: `just promote --config candidate.toml --calibration holdout.ndjson`; then
   `record-similarity model list`, `model register <dir>`, `model retire <digest> --reason "..."`
 - See what was run: `just runs` (`calibrate` and the trainer each leave a directory under `runs/`; `--no-run`

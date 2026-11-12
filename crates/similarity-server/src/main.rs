@@ -68,6 +68,9 @@ enum Command {
   CalibrateDiff(CalibrateDiffArgs),
   /// Replay whole edit histories and report how far products drift, to choose `anchor_threshold`.
   CalibrateDrift(CalibrateDriftArgs),
+  /// Score catalog groups (a product and the listings known to describe it) as `Match` would, to see how often
+  /// the right product comes first and where `matching.threshold` belongs.
+  CalibrateMatch(CalibrateMatchArgs),
   /// Judge one recorded calibration under every combination of a grid of weights, floors, and limits. No model.
   CalibrateSweep(CalibrateSweepArgs),
   /// Load a whole catalog into the store: every record of an export that is not stored yet becomes a baseline.
@@ -983,6 +986,74 @@ impl CalibrateSweepArgs {
   }
 }
 
+#[derive(Debug, Args)]
+struct CalibrateMatchArgs {
+  /// The configuration file (for the model, the schema, and `[matching]`).
+  #[arg(long, short, default_value = "config.toml")]
+  config: PathBuf,
+  /// Catalog groups, one JSON object per line: {"group": ..., "owner": ..., "split": ..., "catalog": {...},
+  /// "listings": [{...}, ...]}. Every group's product is in the index.
+  groups: PathBuf,
+  /// A catalog export, in the format `import` reads: its records join the index as products with no listings,
+  /// so that a listing has more to be confused with.
+  #[arg(long)]
+  catalog: Option<PathBuf>,
+  /// Score only the listings of groups in this split. Every product stays in the index.
+  #[arg(long)]
+  split: Option<String>,
+  /// How many candidates a served ranking returns: the `limit` a caller of `Match` would ask for.
+  #[arg(long, default_value_t = 20)]
+  depth: usize,
+  /// Write the calibration as NDJSON events on stdout, for tools, in place of the report.
+  #[arg(long)]
+  ndjson: bool,
+  /// Fixes the resampling behind the intervals, so that a run can be reproduced.
+  #[arg(long, default_value_t = 0)]
+  seed: u64,
+}
+
+impl CalibrateMatchArgs {
+  fn run(self) -> anyhow::Result<()> {
+    let config = Config::load(&self.config)?;
+    let matching = config.matching.settings()?;
+    if self.depth == 0 {
+      anyhow::bail!("`--depth` must be at least 1");
+    }
+    let read =
+      |path: &PathBuf| std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()));
+    let text = read(&self.groups)?;
+    let catalog = self.catalog.as_ref().map(read).transpose()?;
+    let groups = offline::matching::parse_groups(&text, catalog.as_deref(), &config.schema()?, self.split.as_deref())
+      .with_context(|| format!("in {}", self.groups.display()))?;
+    let (offline, _) = offline(&config)?;
+    let calibration = offline::matching::calibrate_match(&offline, groups, self.depth, matching.overfetch)?;
+    let summary = offline::stats::matching::summarize_match(&calibration, matching.threshold, self.seed);
+    if self.ndjson {
+      let model = offline::drift_report::Model {
+        fingerprint: offline.fingerprint(),
+        dimension: offline.dimension(),
+        max_tokens: offline.max_tokens(),
+      };
+      offline::match_report::emit_match(
+        model,
+        offline.schema(),
+        &calibration,
+        &summary,
+        matching.threshold,
+        self.seed,
+      );
+    } else {
+      write!(
+        std::io::stdout().lock(),
+        "{}{}",
+        offline.model_line(),
+        offline::match_report::render_match(&calibration, &summary)
+      )?;
+    }
+    Ok(())
+  }
+}
+
 impl CalibrateDriftArgs {
   fn run(self) -> anyhow::Result<()> {
     let config = Config::load(&self.config)?;
@@ -1386,6 +1457,7 @@ fn main() -> ExitCode {
     Command::Calibrate(args) => args.run(run.as_ref()),
     Command::CalibrateDiff(args) => args.run(),
     Command::CalibrateDrift(args) => args.run(),
+    Command::CalibrateMatch(args) => args.run(),
     Command::CalibrateSweep(args) => args.run(),
     Command::Import(args) => args.run(),
     Command::Runs(RunsCommand::List(args)) => args.run(),

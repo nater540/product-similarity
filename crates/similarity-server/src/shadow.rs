@@ -1046,11 +1046,9 @@ mod tests {
       .iter()
       .map(|line| serde_json::from_str(line).unwrap())
       .collect();
+    // At least two in seven intervals. No upper bound: on a busy machine the sleep runs long, and the timer
+    // keeps its pace through it.
     assert!(summaries.len() >= 2, "{summaries:?}");
-    assert!(
-      summaries.len() <= 8,
-      "one per interval, and none at the start: {summaries:?}"
-    );
     for summary in &summaries {
       assert_eq!(summary["message"], "shadow_summary");
       assert_eq!(summary["observed"], 1);

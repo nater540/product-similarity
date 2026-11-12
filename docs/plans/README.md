@@ -42,7 +42,7 @@ record has an anchor (plans 11 and 18). `calibrate-diff --config-b` is not affec
 | 17 | [Reviewer feedback](17-reviewer-feedback.md) | medium | | A feedback event cannot nest a pair; a restored field replays differently |
 | 18 | [Shadow evaluation](18-shadow-evaluation.md) | large, **policy half built** | 12 helps | A low-priority thread does nothing: Burn runs on the global rayon pool |
 | 19 | [Reason codes](19-reason-codes.md) | small, **built** | | Mostly exists; a server-side word diff is impossible (only hashes are stored) |
-| 20 | [Menu-item matching](20-menu-item-matching.md) | large | | A brand-name filter is impossible; search returns no vectors |
+| 20 | [Menu-item matching](20-menu-item-matching.md) | large, **built** | | A brand-name filter is impossible; search returns no vectors |
 
 ## Where the plans meet
 
@@ -83,4 +83,4 @@ Each plan ends with its full list of decisions and a recommended default for eac
 6. Before real fine-tuning: **2**, **3**, **5**, and **4** (all built). **6** last; it is large and builds on 3.
 7. Before production: **10** and **12** (12 is built). In production: **17**, then **18** (its policy-only half
    is built, D30; the model half waits for a candidate model).
-8. **20** when the matching question is taken up; it is a separate product question.
+8. **20** is built (D32): the `Match` call and `calibrate-match`. Its threshold waits for held-out groups.

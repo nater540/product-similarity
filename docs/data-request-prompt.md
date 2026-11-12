@@ -168,7 +168,7 @@ retailers. Different retailers describing the same product are naturally occurri
 training data for the model. If no such link exists, say so and skip this.
 
 ```json
-{"group": "<pseudonym>", "owner": "<pseudonym>", "catalog": {"name": "..."},
+{"group": "<pseudonym>", "owner": "<pseudonym>", "split": "calibrate", "catalog": {"name": "..."},
  "listings": [{"name": "..."}, {"name": "..."}]}
 ```
 
@@ -183,8 +183,20 @@ training data for the model. If no such link exists, say so and skip this.
 - Spread the groups across brands: no brand should supply more than about 5% of them. Include several products
   from the same brand and category where you can (three flavors of one gummy line, say). Telling those apart is
   the skill the model most needs.
-- Leave out any brand whose pairs are in the `holdout` split of file 1 (see "Sampling"), so that the model is not
-  trained on the brands it is tested on.
+- Give every group a `split`, assigned by the same brand hash as file 1 (see "Sampling"), and **include** the
+  groups of the `holdout` brands, marked `holdout`. The training tool leaves those out; they are what the tool
+  that measures matching (`record-similarity calibrate-match --split holdout`) is run on. `group` must be unique
+  in the file: it is the product's id in that measurement.
+- Map a menu item's columns onto the same field names as the product's, and tell me how: which menu-item column
+  became `name`, `category`, `brand`, and `description`, and whether a menu item's quantities are per item or per
+  package. Leave out a field that has no counterpart; do not fill it from the product.
+- Tell me, from a uniform sample of menu items, what fraction are linked to no brand product, and whether that
+  is because no such product exists or because nobody linked it. The groups contain only menu items that have a
+  product, so they cannot say how often a menu item should match nothing.
+- Tell me whether a different size or pack of one product (a 1 g and a 3.5 g jar, a single and a five-pack) is
+  a different brand product in your catalog. That decides whether a quantity should ever stop a match.
+- Optional: the brand product catalog itself, in the format of the import export (`{"id", "tenant", "record"}`,
+  pseudonymized the same way), so that listings can be scored against a catalog of the real size.
 
 ### 5. `REPORT.md`
 

@@ -1248,3 +1248,77 @@ gate prints the name and records it. It cannot know what the operator then does.
 **Not built:** a minimum holdout size. The plan proposed warning below 40 recycles, a number nobody measured.
 The report prints each rate with its interval instead, which says the same thing without a constant.
 
+## D32. Matching a listing to a record is a read, scored exactly, with a threshold nobody has measured yet
+
+The same model and the same stored catalog can answer a second question: not "is this edit still the same
+record?" but "which stored record is this listing a listing of?". A retailer's menu item, in the retailer's
+words, often with only a name. `FindSimilar` with an ad hoc record already half-answers it, and D5 says why only
+half.
+
+**The search score is the exact score times a factor, and the factor is known.** For a listing `Q` and a stored
+record `C`, the cosine of the two composites is the weighted mean over the fields both have, multiplied by
+`W(Q∩C) / sqrt(W(Q) * W(C))`, `W` being the sum of the weights of a set of fields. The factor depends only on
+which fields each side filled in. A name-only listing against a record with all four example fields is scaled by
+`4 / sqrt(4 * 10) = 0.63`; against a record with only a name, not at all. So a search ranks the record that
+resembles the listing in *which fields it has* above the one that resembles it in *what they say*. A property
+holds the formula (`the_search_score_is_the_match_score_scaled_by_the_field_overlap`), and the README's example
+shows it on the real model: 0.940 exact, 0.595 in the search.
+
+**So a match searches, then scores what it found.** `matching::rank` in `similarity-core` scores each candidate
+with `score::compare`, stored record as baseline, listing as candidate, no anchor: a field only one side has is
+reported and left out. The engine and `calibrate-match` both call it, so the server and the measurement rank
+alike. A match is a reading, not a revision: no floor and no quantity limit applies, and none is ever reported.
+
+**The over-fetch is a cost, and it is measured.** Only what the search returns can be scored, so `Match`
+fetches `matching.overfetch` records for each candidate it returns, capped at 1,000. The suggestion said five.
+Five is a guess, kept as the default and not defended: `calibrate-match` scores every product exhaustively as
+well and reports how many listings got another ranking, which on a real catalog is what says whether five is
+enough. `VectorStore::search_vectors` exists so that the re-rank is one round trip and not one `get` per
+candidate; both stores build both searches from one request, and the shared contract holds them to the same
+results in the same order.
+
+**A new RPC, not a mode of `FindSimilar`.** `FindSimilar` documents its similarity as the composite cosine and
+returns ids. `Match` returns another score, per-field and per-quantity detail, and a decision. Changing what
+`FindSimilar` reports would silently change a documented number for its callers.
+
+**A listing is mapped onto the product schema and has no layout of its own.** Another set of fields is another
+layout (D12), and a listing under one could not be compared with a product at all. The caller maps the listing's
+columns onto the schema's names, as it does for products, and leaves out what has no counterpart.
+
+**A listing carries no id and no tenant, and a request that sends either is refused.** Both belong to the system
+the listing came from. Accepting a tenant on the listing would invite a caller to pass the retailer where the
+brand is meant. The search is narrowed by the request's own `tenant`. Without one every tenant's records are
+candidates: the owner's decision of 2026-11-11, and what `FindSimilar` has always done. As everywhere, the
+tenant is a consistency check and not access control (D14).
+
+**It never writes.** No listing is stored, no record changes, and D7, D8, and D20 are untouched by construction.
+The property state machine sends `Match` requests among the others and checks the store is exactly what it was.
+
+**Quantities are reported and decide nothing** (D16). A 3.5 g listing of a 1 g product may be the same product
+in one catalog and another product in the next. Each candidate's quantities are compared and returned, and
+`calibrate-match` counts how the listings' agree with their own products'. Whether one should stop a match waits
+for the answer to that question about the real catalog. Containment (a batch's potency inside a product's range)
+would be the right comparison for some of them, and is not built.
+
+**The threshold separates two populations, and the second is a stand-in.** The first is what listings score
+against their own products. The second should be what a listing scores when its product is not in the catalog,
+which the groups cannot contain: every listing in them has a product. The best product that is *not* its own is
+exactly what such a listing would be matched to, so it stands in. These are the two populations a revision
+threshold separates (D17), in another guise, and `stats::matching::populations` writes them as the `edit` and
+`recycle` pairs of a `Calibration` so that the suggestion, the operating points, the AUC, and the
+owner-resampled intervals are the tested ones and not a second copy. What the stand-in cannot give is the base
+rate: how many real listings have no product. The data request now asks for it.
+
+**No threshold is shipped.** `matching.threshold` is a measurement like any other (D3), nobody has made it, and
+without one `Match` ranks and says `NOT_JUDGED`. The sample groups are synthetic and no number may be read from
+them. The decision is on the best candidate's score alone; `margin` is reported, so that a rule on the gap to
+the second can be judged later from the events without scoring anything again.
+
+**Held-out groups.** A group carries a `split`, and the trainer leaves out a group in the holdout or validation
+split as it leaves out a group whose owner has pairs there (D24): a match threshold measured on groups the model
+was trained on would flatter it. `--split` selects whose listings are scored and never which products are in the
+index, since a listing has to be found among everything it could be confused with.
+
+**Not built:** separate weights for matching (the `match_field` lines carry what would be needed to judge them
+without a model), a `calibrate-match` diff, storing listings, and any use of quantities in the ranking.
+

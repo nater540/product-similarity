@@ -978,6 +978,98 @@ The first point gets as many wrong with more room around its threshold (a margin
 Training options are swept by hand, for now: run the trainer once per setting (every option that changes a
 training step is a flag, and every run is [recorded](#recorded-runs)), then `runs compare` or `runs report`.
 
+### A match threshold
+
+`matching.threshold` is what [`Match`](#matching-a-listing-to-a-stored-record) holds its best candidate to, and
+it is read from catalog groups: a stored product and the listings known to describe it.
+
+```json
+{"group": "g-1", "owner": "brand-5", "split": "holdout",
+ "catalog": {"name": "Lemon Tree Pre-Roll 1g", "category": "Pre-Rolls", "weight_per_item": {"value": 1, "unit": "g"}},
+ "listings": [{"name": "Tall Grass Lemon Tree Pre-Roll 1g"}, {"name": "Lemon Tree Preroll 1g - Tall Grass"}]}
+```
+
+`calibrate-match` puts every product in an index, scores every listing against every product the way `Match`
+would, and reports how often a listing's own product comes first and where a threshold could go:
+
+```sh
+just calibrate-match data/catalog-groups.sample.jsonl config.example.toml --split holdout
+```
+
+```text
+model     f46e48ee0ea2dd02-d256-t256 (256 dimensions per field, up to 256 tokens)
+listings  20 of the `holdout` split, scored against 21 products (0 from the catalog export)
+served    the first 20 candidates, from the 100 the search returns (5 for each)
+
+rank    own best other  margin  group                            best other
+   1  0.942      0.839  +0.103  g-preroll-lemon-tree-1g          g-preroll-lemon-tree-5-pack (same owner)
+   1  0.939      0.882  +0.057  g-preroll-lemon-tree-1g          g-preroll-lemon-tree-5-pack (same owner)
+   1  0.931      0.876  +0.055  g-preroll-lemon-tree-5-pack      g-preroll-lemon-tree-1g (same owner)
+   2  0.885      0.900  -0.015  g-preroll-lemon-tree-5-pack      g-preroll-lemon-tree-1g (same owner)
+   ...
+
+ranking
+  own product first          19 of 20  95.0% (87.5% to 100.0%)
+  own product in the first 5 20 of 20  100.0% (100.0% to 100.0%)
+  own product in the first 20 20 of 20  100.0% (100.0% to 100.0%)
+  mean reciprocal rank       0.975
+  first, scoring every product 19 of 20  95.0% (87.5% to 100.0%)
+  served ranking differs from that 0 of 20  0.0% (0.0% to 0.0%)  (what an over-fetch of 5 loses)
+  intervals are the middle 95% over resamples of 2 owners
+
+scores
+  own product        0.836 to 0.963 (20)
+  best other product 0.637 to 0.917 (20)
+  best other is a product of the same owner 17 of 20  85.0% (83.3% to 87.5%)
+  own above best other, over all pairings (AUC) 0.870
+
+threshold
+  best separates the two at 0.850 (margin 0.003): 2 own below it, 5 best other at or above it
+  to match a listing whose product is absent at most 1% of the time: 0.919, where 0.0% (0.0% to 0.0%) would be, and 65.0% (50.0% to 75.0%) of listings score their own product below it
+  to match a listing whose product is absent at most 5% of the time: 0.916, where 5.0% (0.0% to 8.3%) would be, and 60.0% (37.5% to 75.0%) of listings score their own product below it
+  configured: none (`matching.threshold`), so `Match` ranks and decides nothing
+
+quantity           compared   same incomparable listing only product only
+thc_per_item              2      2            0            0            6
+volume_per_item           1      0            0            0            1
+weight_per_item           5      5            0            0            7
+
+left out: 33 listings of other splits
+```
+
+(Twenty synthetic listings of two invented brands. The report shows what to look at; no threshold may be read
+from it.)
+
+- **Two scores for each listing.** `own` is what its own product scores. `best other` is the best product that is
+  not its own, and it stands in for a listing whose product is not in the catalog at all: that is what such a
+  listing would be matched to. The groups cannot show that case directly, since every listing in them has a
+  product. A match threshold belongs at or below the first population and above the second.
+- **The hard case is a sibling.** A five-pack of a pre-roll scores 0.900 against the single, above its own 0.885,
+  and the two capsule products are within 0.05 of each other. Where the best other belongs to the same owner
+  (17 of 20 here), no threshold separates them: the listing has to say what differs, and the name has to count.
+  That is what `margin` is reported for, and it is the case fine-tuning on catalog groups trains.
+- **A threshold trades two errors.** Every operating point says both: how often a listing with no product would
+  be matched anyway, and how many listings score their own product below the line and go unmatched. On these
+  listings the two populations overlap, so keeping the first to 1% leaves 65% unmatched.
+- **`--split` selects listings, never products.** A listing is scored against everything it could be confused
+  with, so every group's product is in the index whatever its split. `--catalog export.jsonl` adds the records of
+  an [import](#importing-a-catalog) export as products with no listings, for an index the size of the real one.
+- **The over-fetch is measured here.** The served ranking scores only what a search returns, `matching.overfetch`
+  records for each candidate. The report says how many listings got another ranking than scoring every product
+  would give them. With 21 products and 100 fetched, none can; on a real catalog this is the line that says
+  whether 5 is enough.
+- **Quantities are counted, not used.** For each quantity: how often the listing and its own product both have a
+  value, how often those agree, and how often only one side has one. Whether a size that differs should stop a
+  match is a decision about the catalog, and this is the evidence for it.
+- `--depth` is the `limit` a caller would ask for (20). `--ndjson` writes the calibration as `match_calibration`,
+  `match_listing`, `match_field`, `match_quantity`, and `match_summary` lines, joined on `listing_id`, with no
+  listing's text. With `matching.threshold` set, the report and the events also say what that threshold does:
+  listings whose own product is below it, listings whose best other reaches it, and listings matched to the
+  wrong product.
+
+Measure it on groups the model was not trained on. The trainer leaves out a group whose `split` is the holdout
+or the validation split, and a group whose owner has pairs in either.
+
 ### The drift threshold
 
 `anchor_threshold` rejects a revision that is too far from the record as first stored, however small each step
@@ -1368,7 +1460,8 @@ and which ones is decided by a hash of the owner's name and `--salt`, so the sam
 owners. Pick the share so that the new split has enough of both labels to tell models apart; the command logs
 how many edits and recycles it moved, and warns if either is none. Catalog groups whose `owner` is in the
 validation or holdout split are left out of training too, so that a brand held back for measuring is not learned
-from by another route.
+from by another route, and so is a group that carries one of those splits itself
+([A match threshold](#a-match-threshold) is measured on those).
 
 Train on the carved file and the trainer does the choosing. It scores the model it started from, every
 checkpoint, and the final model on the validation pairs, and names the best in its `finished` line
@@ -2127,6 +2220,7 @@ data/
   calibration.sample.jsonl        synthetic labeled pairs, in the strict format
   calibration.sample.full.jsonl   the same pairs in the full format a data export uses
   drift.sample.jsonl              synthetic edit histories, for `calibrate-drift`
+  catalog-groups.sample.jsonl     synthetic products with listings of them, for `calibrate-match`
   regression.jsonl                curated hard cases, synthetic, whose verdicts are pinned
   regression.snapshot.ndjson      what the pinned model and the example config make of them
   examples/                  sample records for the client

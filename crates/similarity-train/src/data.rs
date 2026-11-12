@@ -82,6 +82,8 @@ struct PairLine {
 struct GroupLine {
   #[serde(default)]
   owner: Option<String>,
+  #[serde(default)]
+  split: Option<String>,
   catalog: BTreeMap<String, Value>,
   listings: Vec<BTreeMap<String, Value>>,
 }
@@ -201,7 +203,8 @@ pub fn owners_in(jsonl: &str, origin: &Path, splits: &[&str]) -> Result<BTreeSet
 pub struct GroupExamples {
   /// The usable examples.
   pub examples: Vec<GroupExample>,
-  /// Groups left out because their owner is one a model is measured on.
+  /// Groups left out because their owner is one a model is measured on, or because they are themselves in a
+  /// split that is.
   pub excluded_groups: usize,
   /// Groups that name no owner. They are trained on, since there is nothing to check them against.
   pub groups_without_owner: usize,
@@ -211,7 +214,9 @@ pub struct GroupExamples {
 ///
 /// A listing whose text is identical to the catalog's is left out: it is already at similarity 1. A group whose
 /// `owner` is in `exclude` is left out whole: a brand whose pairs are held back for measuring must not be learned
-/// from through its catalog either, or the measurement is of something the model has seen.
+/// from through its catalog either, or the measurement is of something the model has seen. So is a group whose
+/// own `split` is one of `held_out`: those are the groups a match threshold is measured on (`calibrate-match`).
+/// A group with no `split` is training data, as a pair with none is.
 ///
 /// # Errors
 ///
@@ -221,9 +226,14 @@ pub fn group_examples(
   origin: &Path,
   fields: &[String],
   exclude: &BTreeSet<String>,
+  held_out: &[&str],
 ) -> Result<GroupExamples> {
   let mut found = GroupExamples::default();
   for line in parse_lines::<GroupLine>(jsonl, origin)? {
+    if line.split.as_deref().is_some_and(|split| held_out.contains(&split)) {
+      found.excluded_groups = found.excluded_groups.saturating_add(1);
+      continue;
+    }
     match &line.owner {
       Some(owner) if exclude.contains(owner) => {
         found.excluded_groups = found.excluded_groups.saturating_add(1);
@@ -454,6 +464,7 @@ mod tests {
       origin(),
       &fields(&["name", "weight_per_item"]),
       &BTreeSet::new(),
+      &[],
     )
     .unwrap()
     .examples;
@@ -496,9 +507,15 @@ mod tests {
       r#"{"group": "g1", "catalog": {"name": "Wyld Blueberry Gummies"}, "#,
       r#""listings": [{"name": "WYLD blueberry"}, {"name": "Wyld Blueberry Gummies"}, {"brand": "Wyld"}]}"#
     );
-    let examples = group_examples(jsonl, Path::new("groups.jsonl"), &fields(&["name"]), &BTreeSet::new())
-      .unwrap()
-      .examples;
+    let examples = group_examples(
+      jsonl,
+      Path::new("groups.jsonl"),
+      &fields(&["name"]),
+      &BTreeSet::new(),
+      &[],
+    )
+    .unwrap()
+    .examples;
     // The second listing is identical to the catalog entry and the third has no name.
     assert_eq!(
       examples,
@@ -663,9 +680,56 @@ mod tests {
       group(None, "tincture"),
     ]
     .join("\n");
-    let found = group_examples(&groups, Path::new("groups.jsonl"), &fields(&["name"]), &measured_on).unwrap();
+    let found = group_examples(
+      &groups,
+      Path::new("groups.jsonl"),
+      &fields(&["name"]),
+      &measured_on,
+      &[],
+    )
+    .unwrap();
     let kept: Vec<&str> = found.examples.iter().map(|example| example.catalog.as_str()).collect();
     assert_eq!(kept, ["gummies", "tincture"]);
     assert_eq!((found.excluded_groups, found.groups_without_owner), (2, 1));
+  }
+
+  /// A group can say which split it is in itself. The held-out ones are what a match threshold is measured on
+  /// (`calibrate-match --split holdout`), so they are not trained on, whoever owns them.
+  #[test]
+  fn a_catalog_group_in_a_held_out_split_is_not_trained_on_and_one_without_a_split_is() {
+    let group = |split: Option<&str>, name: &str| {
+      let split = split.map_or_else(String::new, |split| format!(r#""split": "{split}", "#));
+      format!(
+        r#"{{{split}"owner": "brand-9", "catalog": {{"name": "{name}"}}, "listings": [{{"name": "{name} 10pk"}}]}}"#
+      )
+    };
+    let groups = [
+      group(Some("calibrate"), "gummies"),
+      group(Some("holdout"), "flower"),
+      group(Some("validation"), "vape"),
+      group(None, "tincture"),
+    ]
+    .join("\n");
+    let found = group_examples(
+      &groups,
+      Path::new("groups.jsonl"),
+      &fields(&["name"]),
+      &BTreeSet::new(),
+      &["holdout", "validation"],
+    )
+    .unwrap();
+    let kept: Vec<&str> = found.examples.iter().map(|example| example.catalog.as_str()).collect();
+    assert_eq!(kept, ["gummies", "tincture"]);
+    assert_eq!((found.excluded_groups, found.groups_without_owner), (2, 0));
+
+    let all = group_examples(
+      &groups,
+      Path::new("groups.jsonl"),
+      &fields(&["name"]),
+      &BTreeSet::new(),
+      &[],
+    )
+    .unwrap();
+    assert_eq!((all.examples.len(), all.excluded_groups), (4, 0));
   }
 }

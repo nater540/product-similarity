@@ -553,6 +553,12 @@ flag, so the common path stays one lookup. The diff is plain string work.
 
 ### 20. Menu-item to brand-product matching
 
+**Built** (D32). What came out differently: there is no brand-name hint (the server stores no text; the brand's
+key goes in `tenant`, or its name in the `brand` field); the over-fetch is a setting that `calibrate-match`
+measures, not a fixed five; a listing has no field configuration of its own (that would be another layout);
+the threshold separates each listing's own product from the best other one, with intervals, and none is shipped;
+and quantities are reported per candidate and used for nothing.
+
 **What.** A `Match` RPC. It takes a retailer menu item's fields (often only a name), searches brand products
 across tenants, optionally narrowed by a brand-name hint, over-fetches five times the wanted number of
 candidates from Qdrant, and re-ranks them with the exact weighted score over the fields both sides have. It

@@ -14,6 +14,7 @@ use similarity_core::FieldChange;
 use similarity_core::rng::Rng;
 
 pub mod drift;
+pub mod matching;
 
 use super::calibrate::{Calibration, ScoredPair};
 use super::pairs::Label;

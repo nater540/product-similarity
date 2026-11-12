@@ -27,6 +27,8 @@ pub mod drift;
 pub mod drift_report;
 pub mod events;
 pub mod histories;
+pub mod match_report;
+pub mod matching;
 pub mod pairs;
 pub mod report;
 pub mod stats;

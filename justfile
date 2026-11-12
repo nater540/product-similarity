@@ -148,6 +148,11 @@ promote *args:
 calibrate-drift histories="data/drift.sample.jsonl" config="config.example.toml" *flags:
     RUST_LOG=warn cargo run --release -q -p similarity-server -- calibrate-drift --config {{ config }} {{ histories }} {{ flags }}
 
+# Score catalog groups as `Match` would, to see how often the right product comes first and where
+# `matching.threshold` belongs: `just calibrate-match catalog-groups.jsonl config.toml --split holdout`
+calibrate-match groups="data/catalog-groups.sample.jsonl" config="config.example.toml" *flags:
+    RUST_LOG=warn cargo run --release -q -p similarity-server -- calibrate-match --config {{ config }} {{ groups }} {{ flags }}
+
 # Judge one recorded calibration under a grid of weights, floors, and limits, with no model:
 # `just calibrate-sweep select.ndjson --grid grid.toml --config config.toml [--evaluate other.ndjson]`
 calibrate-sweep *args:

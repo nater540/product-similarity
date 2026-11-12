@@ -1,5 +1,10 @@
 # Plan: menu-item to brand-product matching (feature 20)
 
+**Built (D32).** What differs from this plan: the trainer already left out groups by owner (D24), and now also
+by a group's own `split`; the two populations are written as a `Calibration` so the existing statistics apply;
+`Describe` and the client report the match settings; the request log line is written by `grpc.rs` like the
+others; and there is no `MAX_MATCH_FETCH` setting, only the constant.
+
 A plan for answering a second question with the same model and the same stored catalog: not "is this edit still the
 same brand product?" but "which brand product is this retailer's menu item a listing of?". It was written before
 any of it was built, against `initial-implementation` at `545ef20`. Read `CLAUDE.md` first, then
