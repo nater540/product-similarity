@@ -6,7 +6,7 @@ marketplace listings. Each revision is embedded field by field with a small BERT
 thresholds. A record's quantities (weight, volume, potency) are compared as numbers beside that, never embedded.
 Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D30) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D31) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -73,7 +73,8 @@ changing a design. Infer conventions from the existing code first.
 - `crates/similarity-server`: config, the embedding worker thread, `Engine` (all behavior), the thin gRPC layer,
   `model fetch`, `import`, `compare`/`calibrate`/`calibrate-drift`/`calibrate-sweep` (the `offline` module), `load` (the load
   test), `runs` (reading recorded runs back, comparing and reporting them), `shadow` (a candidate policy judging
-  live requests), and the `record-similarity` binary. Keep `grpc.rs` free of decisions.
+  live requests), `registry` (which model was put into service, and the gate), and the `record-similarity`
+  binary. Keep `grpc.rs` free of decisions.
 - `crates/similarity-train`: fine-tuning (data, losses, schedule, training loop) and the `record-similarity-train`
   binary. The only crate that enables Burn's `autodiff` and `optim`; the server must never depend on it (D13).
 
@@ -81,7 +82,9 @@ changing a design. Infer conventions from the existing code first.
 
 - **Thresholds are measurements, not opinions.** Never change `threshold`, `anchor_threshold`, or a `reject_below`
   in `config.example.toml` without re-running `just calibrate` and updating the numbers quoted in the config
-  comments, `README.md`, and `docs/decisions.md` (D3). Thresholds do not transfer between models.
+  comments, `README.md`, and `docs/decisions.md` (D3). Thresholds do not transfer between models:
+  `model.expected_fingerprint` is how a config says which model its thresholds belong to, and it is opt-in by the
+  owner's choice. Do not set it in `config.example.toml`, and do not make it part of the fingerprint or layout.
 - **The model fingerprint and the layout id guard stored data** (D12). Anything that changes what vectors mean
   (model files, `output_dim`, `max_tokens`, the set of field names) must change the fingerprint or layout. Weights
   and thresholds must not.
@@ -130,6 +133,12 @@ changing a design. Infer conventions from the existing code first.
   policy: after the first rejection the baseline stops moving and the rest of the history is fiction.
   `anchor_threshold = 0.85` in `config.example.toml` is a starting point, not a measurement; do not replace it
   with a number from `data/drift.sample.jsonl`, which is synthetic.
+- **The promotion gate measures and chooses nothing** (D31). `model promote` never suggests or writes a
+  threshold, and never accepts a calibration of another model or of any split but `holdout`, with or without
+  `--override`. Each model is judged under its own config (the candidate's, and the one the model in service was
+  promoted with), never one model at another's thresholds. The registry (`models/registry.ndjson`) is appended
+  to and never rewritten, lives beside the model directories and never in one, and is never read by the server.
+  Its entry names are an interface: add fields, never rename or repurpose one.
 - **A shadow decides nothing** (D30). `[shadow]` is a candidate policy that the engine tells about each judged
   request through `Observer`, after the outcome is final and anything it writes is written. Never give `observe`
   a return value, a way to fail the request, or anything to wait on, and never let a shadow judge with
@@ -184,6 +193,8 @@ changing a design. Infer conventions from the existing code first.
 - Run: `just serve` (needs Qdrant) or `just serve-in-memory`; then `just client describe`
 - Load a catalog: `just import export.jsonl config.toml` (`--check` validates only)
 - Measure: `just throughput`, `just load`, `just calibrate`, `just calibrate-drift`, `just calibrate-sweep`, `just calibrate-diff`, `just verdict-gate old.ndjson pairs.full.jsonl`
+- Put a model into service: `just promote --config candidate.toml --calibration holdout.ndjson`; then
+  `record-similarity model list`, `model register <dir>`, `model retire <digest> --reason "..."`
 - See what was run: `just runs` (`calibrate` and the trainer each leave a directory under `runs/`; `--no-run`
   turns that off); `record-similarity runs compare A B`; `record-similarity runs report A B --out report.html`
 - Make a validation split: `record-similarity pairs carve pairs.full.jsonl --fraction F > pairs.carved.jsonl`

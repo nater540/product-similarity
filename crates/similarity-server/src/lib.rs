@@ -11,6 +11,7 @@
 //! - [`import`]: loading a whole catalog into the store, a batch at a time.
 //! - [`offline`]: comparing and calibrating from the command line, without a store.
 //! - [`shadow`]: a candidate policy judging live requests without deciding any.
+//! - [`registry`]: the record of which model was put into service, and the gate that lets one in.
 
 // Tests compute expected values with ordinary arithmetic and compare exact floats where exactness is the point.
 #![cfg_attr(test, allow(clippy::arithmetic_side_effects, clippy::float_cmp))]
@@ -25,6 +26,7 @@ pub mod load;
 pub mod offline;
 #[cfg(test)]
 mod properties;
+pub mod registry;
 pub mod runs;
 pub mod shadow;
 pub mod worker;

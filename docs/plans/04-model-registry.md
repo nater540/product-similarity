@@ -1,5 +1,10 @@
 # Plan: model registry and promotion gate (feature 4)
 
+**Built (D31).** What differs from this plan: `expected_fingerprint` is opt-in and not in `config.example.toml`
+(the owner's choice); `Stamp` is `provenance::Stamp` inside a `Written`; a new layout keeps a collection name the
+config already changed; there is no warning below 40 recycles; a run directory is accepted for `--calibration`
+and `--baseline`; the AUC is recorded and printed beside the error counts.
+
 A plan for feature 4 of `docs/feature-suggestions.md`, written against the code on `initial-implementation` as of
 2026-11-11, before any of it was built. Read `CLAUDE.md` first, then D3, D11, D12, D17, D18, and D20 in
 `docs/decisions.md`. Delete this file, or fold what is still true into a decision record, when the work is done.

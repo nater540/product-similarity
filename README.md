@@ -1360,13 +1360,123 @@ A fine-tuned model is a different model. Its fingerprint differs, so:
 2. Set the thresholds from the calibration of the new model on the `validation` split (step 3). The old
    thresholds do not carry over. If the holdout is all there is, use it, and expect production to be somewhat
    worse than the error rates it then reports.
-3. Re-index: see [Re-indexing](#re-indexing).
-4. To ship it in the container image, `COPY` the directory into the image in place of the `model fetch` step in
+3. [Promote it](#5-promote-it): the holdout, once, under the new configuration, against the model in service.
+   Copy the two lines it prints into the config.
+4. Re-index: see [Re-indexing](#re-indexing).
+5. To ship it in the container image, `COPY` the directory into the image in place of the `model fetch` step in
    the `Dockerfile`, and remove `/models` from `.dockerignore` so the build can see it.
 
 The saved directory is also a valid sentence-transformers model. If you want a second opinion from PyTorch,
 `just verify-model models/mdbr-leaf-mt-ft` (needs `uv`) loads it there and requires the Burn encoder to reproduce
 PyTorch's embeddings. Nothing in the workflow depends on it.
+
+### 5. Promote it
+
+Two mistakes are easy to make with a second model: serving it under the first one's thresholds, and writing its
+vectors into the first one's collection. `model promote` checks for both, and keeps a record of which model was
+put into service on what evidence.
+
+It takes the candidate configuration and the candidate's calibration on the `holdout` split, the one measurement
+of what was already chosen on other pairs:
+
+```sh
+just calibrate data/calibration.sample.full.jsonl config.example.toml --full --split holdout --ndjson > holdout.ndjson
+just promote --config config.example.toml --calibration holdout.ndjson
+```
+
+```text
+promoted  f46e48ee0ea2dd02-d256-t256 (models/mdbr-leaf-mt)
+holdout   0 of 3 edits rejected [0.0% (0.0% to 0.0%)], 0 of 4 recycles accepted [0.0% (0.0% to 0.0%)], AUC 1.000
+against   nothing: no model is in service in this registry, so this is what later ones are compared with
+
+Add to config.example.toml:
+
+  [model]
+  expected_fingerprint = "f46e48ee0ea2dd02-d256-t256"
+
+  [qdrant]
+  collection = "records"   # unchanged: the stored vectors are the ones this model reads
+```
+
+The first promotion has nothing to be compared with. Do it for the model that is serving now, so that every later
+candidate is compared with it. The `expected_fingerprint` line is what makes `serve` and `import` refuse any
+other model under these thresholds (see the [configuration reference](#configuration-reference)).
+
+A second candidate is compared with the model in service, on the same holdout pairs. Here the candidate is the
+same files at half the width, which is a different model as far as stored vectors go:
+
+```sh
+sed 's/^output_dim = 256/output_dim = 128/' config.example.toml > candidate.toml
+just calibrate data/calibration.sample.full.jsonl candidate.toml --full --split holdout --ndjson > candidate.ndjson
+just promote --config candidate.toml --calibration candidate.ndjson
+```
+
+```text
+promoted  f46e48ee0ea2dd02-d128-t256 (models/mdbr-leaf-mt)
+holdout   0 of 3 edits rejected [0.0% (0.0% to 0.0%)], 0 of 4 recycles accepted [0.0% (0.0% to 0.0%)], AUC 1.000
+against   f46e48ee0ea2dd02-d256-t256 on the same pairs
+          0 of 3 edits rejected [0.0% (0.0% to 0.0%)], 0 of 4 recycles accepted [0.0% (0.0% to 0.0%)], AUC 1.000
+          0 verdict(s) differ between the two
+
+Add to candidate.toml:
+
+  [model]
+  expected_fingerprint = "f46e48ee0ea2dd02-d128-t256"
+
+  [qdrant]
+  collection = "records-91520f0d447c"   # a new layout: import into it before serving (README, Re-indexing)
+```
+
+(Seven synthetic holdout pairs: the report shows the shape, and measures nothing.)
+
+- **Each model is judged under its own configuration.** The candidate's holdout pairs are judged again under the
+  candidate config's `[policy]`, `[fields]`, and `[quantities]`, whatever thresholds the calibration was run
+  with; the model in service under the configuration it was promoted with, which the registry kept. A threshold
+  belongs to the model it was measured on, so this is the only way to hold two models to thresholds at once. The
+  AUC beside each needs no threshold at all.
+- **The gate measures. It chooses nothing, and it never prints a threshold.** Thresholds are chosen on the
+  `validation` split (step 3) before this. A candidate refused here and adjusted until it passes has been fitted
+  to the holdout, and its numbers mean less each time.
+- **What it refuses.** A calibration of another model than the configuration loads; one that is not of the
+  `holdout` split; a holdout without both labels; a configuration with other fields than the calibration; a
+  candidate that gets more holdout pairs wrong than the model in service (`--fail-on errors-up`, the default;
+  the other choices are `calibrate-diff`'s); a model that was retired. `--override "why"`
+  passes the last two and records the reason. Nothing passes the first four. A refusal writes nothing:
+
+  ```text
+  the calibration is of the `calibrate` split, and a model is promoted on its `holdout` split, which chose
+  nothing: run `calibrate --full --split holdout --ndjson`
+  ```
+
+- **The model in service must have been calibrated on the same holdout pairs.** Its calibration is read from the
+  path its promotion recorded, and has to be the file it was. When the holdout has grown, or the file is gone,
+  calibrate the model in service on the new holdout and pass that as `--baseline`.
+- **The collection.** A candidate with the layout in service keeps its collection: a change of thresholds or
+  weights needs no re-indexing. A new layout must not share a collection with the old one. If the candidate
+  config still names the collection in service, the name printed is that name and twelve hex digits of a hash of
+  the layout (the same name for the same layout every time); a new name the config already has is kept.
+- `--calibration` and `--baseline` take a file of `calibrate --ndjson`, or the directory of a
+  [recorded run](#recorded-runs), and the entry then names the run.
+
+The record is `models/registry.ndjson` (`--registry`, or `RECORD_SIMILARITY_REGISTRY`): one JSON object per line,
+only ever appended to, beside the model directories and never inside one. It names local paths, so it is ignored
+by git with the models. The server never reads it; what reaches production is the `expected_fingerprint` line.
+
+```text
+$ record-similarity model list
+f46e48ee0ea2dd02  models/mdbr-leaf-mt  written by record-similarity model fetch
+  promoted f46e48ee0ea2dd02-d256-t256 at 20261112T021631Z  collection records  holdout: 0 of 3 edits rejected, 0 of 4 recycles accepted
+  promoted f46e48ee0ea2dd02-d128-t256 at 20261112T021928Z  collection records-91520f0d447c  holdout: 0 of 3 edits rejected, 0 of 4 recycles accepted  << in service
+```
+
+```sh
+record-similarity model register models/mdbr-leaf-mt-ft            # make a directory known, without promoting it
+record-similarity model retire <digest> --reason "worse on live edits"
+```
+
+**The model in service is the latest promotion of a model not retired since.** Retiring it puts the one promoted
+before it back in service, which is how a rollback is recorded; `retire` says which model that is. A model is
+retired by its digest, so with every width it was promoted at, and is promoted again only with `--override`.
 
 ### Where a model came from
 
@@ -1527,7 +1637,8 @@ record-similarity model fetch --repo sentence-transformers/all-MiniLM-L6-v2 \
 ```
 
 Then, in the config: set `model.dir`, **remove `output_dim`** unless the model was trained to be truncated, choose a
-new `qdrant.collection`, and re-calibrate. Use a commit hash for `--revision`; checksums are pinned only for the
+new `qdrant.collection`, and re-calibrate. [`model promote`](#5-promote-it) checks the result against the model
+in service and prints the fingerprint line and a collection name for it. Use a commit hash for `--revision`; checksums are pinned only for the
 default model, and for others the command prints the digests of what it downloaded.
 
 Measured on the bundled sample pairs (`just calibrate`), each model at the width shown. "Gap" is the distance
@@ -1590,7 +1701,7 @@ What a change costs:
 | `[shadow]` added, changed, or removed | None for any verdict or stored record. Takes effect on restart. With a shadow the server writes result lines on stdout, which is otherwise empty. |
 | A quantity added, removed, or given a limit | None. Quantities are stored beside the vectors, not in them. A record stored before a quantity existed reports it as `ADDED` the first time it arrives. |
 | A field weight | Verdicts use the new weight at once. Search rankings use the weights records were written with until they are rewritten. |
-| `model.dir`, `output_dim`, `max_tokens`, or the set of fields | Stored vectors are no longer comparable. Use a new collection and re-index. The server refuses to mix them. |
+| `model.dir`, `output_dim`, `max_tokens`, or the set of fields | Stored vectors are no longer comparable. Use a new collection and re-index. The server refuses to mix them. With `model.expected_fingerprint` set, `serve` and `import` also refuse to start until it names the new model, which is the reminder that the thresholds have to be measured again. |
 
 ## Operations
 
@@ -1762,7 +1873,7 @@ of the model and field layout that produced them, and the server will not compar
 record returns `FAILED_PRECONDITION`, and a collection whose vectors have the wrong width stops the server at
 start-up.
 
-1. Point `qdrant.collection` at a new, empty collection.
+1. Point `qdrant.collection` at a new, empty collection ([`model promote`](#5-promote-it) names one).
 2. Export every record from your own database and [import](#importing-a-catalog) it. The service stores vectors
    and never the text, so the text has to come from you.
 3. Restart the server on the new collection, and drop the old one when you are satisfied.
@@ -1960,7 +2071,7 @@ data/
   regression.snapshot.ndjson      what the pinned model and the example config make of them
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D30)
+  decisions.md               why things are the way they are (D1 to D31)
   data-request-prompt.md     a brief for collecting labeled production data
   feature-suggestions.md     twenty features that could be added, and which of them are built
   plan-features.md           a plan for the first five of them

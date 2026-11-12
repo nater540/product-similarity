@@ -139,6 +139,10 @@ calibrate pairs="data/calibration.sample.jsonl" config="config.example.toml" *fl
 calibrate-diff *args:
     cargo run --release -q -p similarity-server -- calibrate-diff {{ args }}
 
+# Put a model into service if its holdout calibration passes the gate: `just promote --config c.toml --calibration holdout.ndjson`
+promote *args:
+    RUST_LOG=warn cargo run --release -q -p similarity-server -- model promote {{ args }}
+
 # Replay whole edit histories to see how far products drift and where `anchor_threshold` belongs:
 # `just calibrate-drift sequences.jsonl config.toml`
 calibrate-drift histories="data/drift.sample.jsonl" config="config.example.toml" *flags:

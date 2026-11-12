@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use similarity_core::{EmbedderOptions, FieldSpec, Policy, QuantitySpec, Schema};
 use similarity_store::QdrantSettings;
 
@@ -190,14 +190,14 @@ impl QdrantConfig {
 }
 
 /// `[policy]`
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyConfig {
   /// Reject a revision whose overall similarity to its baseline is below this.
   pub threshold: f32,
   /// Reject a revision whose overall similarity to the record's original form is below this. Omit to report drift
   /// without enforcing it.
-  #[serde(default)]
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   pub anchor_threshold: Option<f32>,
   /// Reject a revision that changes which measures the record is described by: a quantity that became
   /// incomparable with its old value, or one quantity traded for another.
@@ -206,7 +206,7 @@ pub struct PolicyConfig {
 }
 
 /// `[fields.<name>]`
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FieldConfig {
   /// Relative importance in the overall score.
@@ -215,7 +215,7 @@ pub struct FieldConfig {
   #[serde(default)]
   pub required: bool,
   /// Reject a revision whose similarity for this field alone is below this.
-  #[serde(default)]
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   pub reject_below: Option<f32>,
 }
 
@@ -223,11 +223,11 @@ pub struct FieldConfig {
 ///
 /// Both keys are optional, and with neither the quantity is compared and reported and never rejects. That is the
 /// default on purpose: a limit is a measurement, chosen from `calibrate` on labeled pairs, like a threshold.
-#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuantityConfig {
   /// Reject a revision that changes this quantity by more than this factor, in either direction.
-  #[serde(default)]
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   pub reject_above_factor: Option<f64>,
   /// Reject a revision that puts this quantity in a unit of another dimension.
   #[serde(default)]
@@ -457,26 +457,7 @@ impl Config {
   /// Returns an error if the schema is invalid (no fields, a bad name, a non-positive weight, a quantity named
   /// like a field, a factor limit below 1, ...).
   pub fn schema(&self) -> anyhow::Result<Schema> {
-    let fields = self
-      .fields
-      .iter()
-      .map(|(name, field)| FieldSpec {
-        name: name.clone(),
-        weight: field.weight,
-        required: field.required,
-        reject_below: field.reject_below,
-      })
-      .collect();
-    let quantities = self
-      .quantities
-      .iter()
-      .map(|(name, quantity)| QuantitySpec {
-        name: name.clone(),
-        reject_above_factor: quantity.reject_above_factor,
-        reject_incomparable: quantity.reject_incomparable,
-      })
-      .collect();
-    Ok(Schema::new(fields)?.with_quantities(quantities)?)
+    schema_of(&self.fields, &self.quantities)
   }
 
   /// The thresholds described by `[policy]`.
@@ -485,10 +466,48 @@ impl Config {
   ///
   /// Returns an error if a threshold lies outside the cosine range.
   pub fn policy(&self) -> anyhow::Result<Policy> {
-    let mut policy = Policy::new(self.policy.threshold, self.policy.anchor_threshold)?;
-    policy.reject_on_measure_change = self.policy.reject_on_measure_change;
-    Ok(policy)
+    policy_of(&self.policy)
   }
+}
+
+/// The schema that a `[fields]` and a `[quantities]` table describe.
+///
+/// # Errors
+///
+/// As [`Config::schema`].
+pub fn schema_of(
+  fields: &BTreeMap<String, FieldConfig>,
+  quantities: &BTreeMap<String, QuantityConfig>,
+) -> anyhow::Result<Schema> {
+  let fields = fields
+    .iter()
+    .map(|(name, field)| FieldSpec {
+      name: name.clone(),
+      weight: field.weight,
+      required: field.required,
+      reject_below: field.reject_below,
+    })
+    .collect();
+  let quantities = quantities
+    .iter()
+    .map(|(name, quantity)| QuantitySpec {
+      name: name.clone(),
+      reject_above_factor: quantity.reject_above_factor,
+      reject_incomparable: quantity.reject_incomparable,
+    })
+    .collect();
+  Ok(Schema::new(fields)?.with_quantities(quantities)?)
+}
+
+/// The policy that a `[policy]` table describes.
+///
+/// # Errors
+///
+/// As [`Config::policy`].
+pub fn policy_of(table: &PolicyConfig) -> anyhow::Result<Policy> {
+  let mut policy = Policy::new(table.threshold, table.anchor_threshold)?;
+  policy.reject_on_measure_change = table.reject_on_measure_change;
+  Ok(policy)
 }
 
 #[cfg(test)]

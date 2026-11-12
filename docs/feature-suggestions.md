@@ -153,6 +153,11 @@ forward pass over the split per checkpoint.
 
 ### 4. Model registry and promotion gate
 
+**Built** (D31). What came out differently: there is no `calibrated` entry (the calibration file is the record);
+a model is keyed by digest and a promotion by fingerprint; the gate prints no thresholds, because reading them
+off the holdout would fit them to it; each model is judged under its own configuration; and the server reads no
+registry: a config names its model with `model.expected_fingerprint`, which is opt-in.
+
 **What.** An append-only `models/registry.ndjson` of `registered`, `calibrated`, `promoted`, and `retired` events,
 keyed by model fingerprint. `record-similarity model promote models/x --calibration runs/<id>` refuses when:
 

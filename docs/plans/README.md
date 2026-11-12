@@ -30,7 +30,7 @@ record has an anchor (plans 11 and 18). `calibrate-diff --config-b` is not affec
 |---|---|---|---|---|
 | 2 | [Run registry](02-run-registry.md) | medium, **built** | | Loss lines are filterable logs, so a tee loses them; a killed run is worked out on read |
 | 3 | [Checkpoint evaluation](03-checkpoint-evaluation.md) | medium, **built** | | Results cannot go in a checkpoint (D18); catalog groups leak validation brands |
-| 4 | [Model registry and gate](04-model-registry.md) | medium | | A model has a digest, not a fingerprint; the server cannot read a local registry |
+| 4 | [Model registry and gate](04-model-registry.md) | medium, **built** | | A model has a digest, not a fingerprint; the server cannot read a local registry |
 | 5 | [Run report and compare](05-run-report.md) | medium, **built** | 2, 3 for curves | Comparing calibrations is already `calibrate-diff`; resumes need a chain |
 | 6 | [Sweeps](06-hyperparameter-sweeps.md) | large, **half built** (the policy sweep) | 3 | Calibration code is not in core; epochs cannot be swept by picking checkpoints |
 | 9 | [Verdict snapshot](09-verdict-snapshot.md) | medium, **built** | | Refill cases need an anchor on a pair; output has timestamps, so not byte-stable |
@@ -66,6 +66,8 @@ record has an anchor (plans 11 and 18). `calibrate-diff --config-b` is not affec
 - **17:** reviewer feedback puts product text on the server's stdout (the plan's default is yes).
 - **20:** a match searches every tenant unless the request names one (the plan's default).
 - **10:** the tenant is logged as given. **2:** a run records the hostname and CPU model.
+- **Answered on 2026-11-11:** a tenant may be written as given (D30); `model.expected_fingerprint` refuses and is
+  opt-in (D31); a match with no tenant searches every tenant (20). **Not to be built yet:** 10, 14, and 17.
 - **Numbers proposed as defaults that nothing has measured:** a 15% validation split (3), a warning below 40
   holdout recycles (4), a 0.001 score tolerance (9), a 5 times over-fetch (20).
 
@@ -78,7 +80,7 @@ Each plan ends with its full list of decisions and a recommended default for eac
 3. **19** and **9**: both built. Both small to medium, and 9 turns "run `just test-real`" from a rule into a check.
 4. **15** (built) and **14**, at any point. 14's first targets confirm the two predicted findings above.
 5. **11** is built, on synthetic histories; it is run for real once `sequences.jsonl` exists.
-6. Before real fine-tuning: **2**, **3**, and **5** (all built), then **4**. **6** last; it is large and builds on 3.
+6. Before real fine-tuning: **2**, **3**, **5**, and **4** (all built). **6** last; it is large and builds on 3.
 7. Before production: **10** and **12** (12 is built). In production: **17**, then **18** (its policy-only half
    is built, D30; the model half waits for a candidate model).
 8. **20** when the matching question is taken up; it is a separate product question.

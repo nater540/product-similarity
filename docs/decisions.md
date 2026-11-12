@@ -1182,3 +1182,69 @@ would plug into, so building the policy half first cost it nothing.
 **Not built with it:** a `shadow-report` command (the summary line has the counts and `jq` lists the ids; a
 report with intervals resampled by tenant can now be written, since the tenant is on the line), the shadow in
 `Describe`, and more than one shadow.
+
+## D31. A config names the model its thresholds were measured with, and a gate records what was put into service
+
+D3 says thresholds do not transfer between models, and D12 that a new model needs a new collection. Both were
+rules a person had to remember. Three small things turn them into checks.
+
+**`model.expected_fingerprint`, opt-in.** A config may name the fingerprint its thresholds were measured with.
+With the key, `serve` and `import` refuse to run with any other model; the commands that measure (`compare`,
+`calibrate`, `calibrate-drift`, `load`) warn and go on, because measuring a new model under a copy of the old
+config is exactly how one is evaluated. Without the key nothing is checked, and `serve` and `import` say so in
+one warning that carries the fingerprint to copy. The owner chose opt-in on 2026-11-11: `config.example.toml`
+does not set it, so no existing config changes behavior, and a production config that sets it cannot be pointed
+at another model by an edit to `model.dir` alone. It is an assertion and not an input: no part of the
+fingerprint or the layout id (D12), and it changes no vector.
+
+**The server does not read a registry.** The registry is a local file that names local paths; a container does
+not have it, and a server that needed it could not start without it. What has to hold at start-up is that the
+config and the model agree, and that travels in the config.
+
+**The registry is a file of entries, appended and never rewritten.** `models/registry.ndjson`, beside the model
+directories and never inside one (D18), ignored by git with them. `registered`, `promoted`, `retired`. It is a
+data file the tool owns, like `provenance.json`, not a result stream, so it is not written through
+`similarity-log` and D17's flatness (which `tracing`'s scalar fields force) does not apply: a `promoted` entry
+nests the config it was judged under and a reference to its calibration. Its names are an interface all the
+same. A line that is not an entry, or is of a newer format, is an error naming the line, not something guessed
+at. An append is one write of one line, synced. Two promotions at the same instant both compare with the same
+model in service; that is accepted and not locked against.
+
+**There is no `calibrated` entry.** The suggestion had one, holding a calibration's numbers. The calibration
+file, or its run directory (D23), is the record; a copy of its numbers would be a second source. A promotion
+points at its calibration by path and SHA-256 and carries only the counts the gate compared, from the same
+`Calibration` the report is rendered from, plus the AUC.
+
+**A model is keyed by digest, a promotion by fingerprint.** One directory has one digest and as many
+fingerprints as there are widths and token limits to load it at. The model in service is the latest promotion of
+a model not retired since, so retiring it puts the one before it back, which is what a rollback is. A model is
+retired with every width it was promoted at; going back to another width of the same model is a promotion.
+
+**The gate measures and chooses nothing** (D24). It never suggests or writes a threshold: the suggestion's
+"prints the thresholds from that calibration" would have made the holdout a validation set. It judges the
+candidate's holdout pairs again under the candidate's own config (`diff::rejudge`), so what is promoted is the
+config, whatever thresholds the calibration happened to be run with. Four things are refused whatever is said:
+a calibration of another model than the config loads, one not restricted to the `holdout` split, a holdout
+without both labels, and a config whose fields are not the calibration's.
+
+**Each model is held to its own thresholds.** With a model in service, its calibration is judged under the
+config it was promoted with, which is why the entry keeps that config, and the two are compared over the same
+pairs (`diff::same_pairs`, or the comparison is refused and `--baseline` asked for). D24 rules out judging a
+model at another model's threshold; this does not do that. Counting errors under each model's own policy is
+the question a promotion asks ("will this config do worse in service than the one there now"), and the report
+prints the AUC of each beside it, which needs no threshold. The default refusal is `errors-up`: counts, not
+intervals. The intervals are printed, so a person can see when one pair decided it. `--override` with a reason
+passes a failed comparison and a retirement, and the reason is in the entry.
+
+**The recorded baseline has to be the file it was.** The model in service is compared through the calibration
+its promotion recorded, checked against the recorded hash. A calibration given by hand (`--baseline`) is a
+fresh measurement and is held only to being of that model on the same pairs.
+
+**The collection is named, not created.** A candidate with the layout in service keeps its collection (D12:
+thresholds and weights need no re-index). A new layout whose config still names the collection in service gets
+that name's stem and twelve hex digits of the layout's hash; a new name the config already has is kept. The
+gate prints the name and records it. It cannot know what the operator then does.
+
+**Not built:** a minimum holdout size. The plan proposed warning below 40 recycles, a number nobody measured.
+The report prints each rate with its interval instead, which says the same thing without a constant.
+

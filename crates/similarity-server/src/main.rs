@@ -31,6 +31,7 @@ use similarity_server::import::{self, Failure, Summary};
 use similarity_server::load;
 use similarity_server::offline::events::{self, Run};
 use similarity_server::offline::{self, Confidence, Offline, RecordFields, Selection, diff};
+use similarity_server::registry::{self, Registry};
 use similarity_server::runs;
 use similarity_server::shadow::{self, PolicyShadow};
 use similarity_server::worker::{DirectEmbedder, EmbedWorker, TextEmbedder};
@@ -199,6 +200,70 @@ struct ServeArgs {
 enum ModelCommand {
   /// Download a sentence-transformers model from the Hugging Face Hub and verify it loads.
   Fetch(FetchArgs),
+  /// Put a model into service under a configuration, if its holdout calibration lets it through the gate, and
+  /// print the lines that tie the configuration to it.
+  Promote(PromoteArgs),
+  /// Make a model directory known to the registry, without promoting it.
+  Register(RegisterArgs),
+  /// Take a model out of service. If it is the one in service, the one promoted before it is again.
+  Retire(RetireArgs),
+  /// List the models the registry knows: where each is, its promotions, and which is in service.
+  List(RegistryArgs),
+}
+
+/// Where the registry is.
+#[derive(Debug, Args)]
+struct RegistryArgs {
+  /// The registry file. It names local paths, so it is kept beside the models and out of git.
+  #[arg(long, env = "RECORD_SIMILARITY_REGISTRY", default_value = "models/registry.ndjson")]
+  registry: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct PromoteArgs {
+  /// The candidate configuration: the model it loads is the candidate, and its `[policy]`, `[fields]`, and
+  /// `[quantities]` are what the holdout is judged under.
+  #[arg(short, long, default_value = "config.toml")]
+  config: PathBuf,
+  /// The candidate's holdout calibration: the output of `calibrate --full --split holdout --ndjson` under this
+  /// configuration, or the directory of the run that recorded it.
+  #[arg(long)]
+  calibration: PathBuf,
+  /// A calibration of the model in service on the same holdout pairs, for when the one it was promoted on
+  /// cannot be used (the holdout has grown, or the file is gone).
+  #[arg(long)]
+  baseline: Option<PathBuf>,
+  /// What makes the comparison with the model in service a refusal.
+  #[arg(long, value_enum, default_value = "errors-up")]
+  fail_on: FailOn,
+  /// Promote a candidate the comparison refuses, or a model that was retired, and record this reason. It never
+  /// passes a calibration of another model or of another split.
+  #[arg(long = "override", value_name = "REASON")]
+  override_reason: Option<String>,
+  /// Fixes the resampling behind the report's intervals.
+  #[arg(long, default_value_t = 0)]
+  seed: u64,
+  #[command(flatten)]
+  registry: RegistryArgs,
+}
+
+#[derive(Debug, Args)]
+struct RegisterArgs {
+  /// The model directory.
+  dir: PathBuf,
+  #[command(flatten)]
+  registry: RegistryArgs,
+}
+
+#[derive(Debug, Args)]
+struct RetireArgs {
+  /// The model's content digest, as `model list` prints it.
+  digest: String,
+  /// Why it is being retired. Recorded.
+  #[arg(long)]
+  reason: String,
+  #[command(flatten)]
+  registry: RegistryArgs,
 }
 
 #[derive(Debug, Args)]
@@ -408,12 +473,14 @@ enum Tie {
   Enforced,
   /// Say so and go on: measuring a new model under a copy of the old configuration is how one is evaluated.
   Reported,
+  /// Say nothing: `model promote` is where the line that names the model comes from.
+  Unchecked,
 }
 
 /// Holds the loaded model to `model.expected_fingerprint` (docs/decisions.md, D31).
 fn check_tie(config: &Config, fingerprint: &str, tie: Tie) -> anyhow::Result<()> {
   match (config.model.check_fingerprint(fingerprint), tie) {
-    (Ok(true), _) | (Ok(false), Tie::Reported) => {}
+    (Ok(_) | Err(_), Tie::Unchecked) | (Ok(true), _) | (Ok(false), Tie::Reported) => {}
     (Ok(false), Tie::Enforced) => tracing::warn!(
       fingerprint,
       "the configuration does not name the model its thresholds were measured with \
@@ -652,6 +719,94 @@ fn read_fields(path: &Path) -> anyhow::Result<RecordFields> {
       path.display()
     )
   })
+}
+
+/// This build, as an entry of the registry is stamped with it.
+fn registry_stamp(tool: &'static str) -> registry::Written {
+  registry::Written::now(Build { tool, ..BUILD }.stamp())
+}
+
+impl PromoteArgs {
+  fn run(self) -> anyhow::Result<()> {
+    let config = Config::load(&self.config)?;
+    // Loaded as the server would load it, so that the fingerprint is the one the server would state.
+    let embedder = load_embedder(&config, Tie::Unchecked)?;
+    let provenance = Provenance::read(&config.model.dir).unwrap_or(None);
+    let report = registry::promote(&registry::Promotion {
+      registry: &self.registry.registry,
+      model: registry::Model {
+        digest: embedder.content_digest(),
+        dir: &config.model.dir.display().to_string(),
+        provenance: provenance.as_ref(),
+      },
+      fingerprint: embedder.fingerprint(),
+      config: &config,
+      config_path: &self.config.display().to_string(),
+      calibration: &self.calibration,
+      baseline: self.baseline.as_deref(),
+      options: registry::GateOptions {
+        written: registry_stamp("record-similarity model promote"),
+        fail_on: self.fail_on.into(),
+        override_reason: self.override_reason.as_deref(),
+        seed: self.seed,
+      },
+    })?;
+    write!(std::io::stdout().lock(), "{report}")?;
+    Ok(())
+  }
+}
+
+impl RegisterArgs {
+  fn run(self) -> anyhow::Result<()> {
+    // Loading is what says the directory holds a model, and which one.
+    let embedder = Embedder::load(&self.dir, Device::flex(), &similarity_core::EmbedderOptions::default())
+      .with_context(|| format!("{} does not load as a model", self.dir.display()))?;
+    let provenance = Provenance::read(&self.dir).unwrap_or(None);
+    let model = registry::Model {
+      digest: embedder.content_digest(),
+      dir: &self.dir.display().to_string(),
+      provenance: provenance.as_ref(),
+    };
+    let added = registry::register(
+      &self.registry.registry,
+      &model,
+      &registry_stamp("record-similarity model register"),
+    )?;
+    let mut out = std::io::stdout().lock();
+    if added {
+      writeln!(out, "registered {}  {}", model.digest, model.dir)?;
+    } else {
+      writeln!(out, "already registered: {}  {}", model.digest, model.dir)?;
+    }
+    Ok(())
+  }
+}
+
+impl RetireArgs {
+  fn run(self) -> anyhow::Result<()> {
+    let path = &self.registry.registry;
+    registry::retire(
+      path,
+      &self.digest,
+      &self.reason,
+      &registry_stamp("record-similarity model retire"),
+    )?;
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "retired {}: {}", self.digest, self.reason)?;
+    match Registry::read(path)?.current() {
+      Some(promoted) => writeln!(out, "in service now: {} ({})", promoted.fingerprint, promoted.model_dir)?,
+      None => writeln!(out, "no model is in service now")?,
+    }
+    Ok(())
+  }
+}
+
+impl RegistryArgs {
+  fn run(self) -> anyhow::Result<()> {
+    let registry = Registry::read(&self.registry)?;
+    write!(std::io::stdout().lock(), "{}", registry::render_list(&registry))?;
+    Ok(())
+  }
 }
 
 fn offline(config: &Config) -> anyhow::Result<(Offline, similarity_core::Policy)> {
@@ -1223,6 +1378,10 @@ fn main() -> ExitCode {
   let outcome = match cli.command {
     Command::Serve(args) => args.run(),
     Command::Model(ModelCommand::Fetch(args)) => args.run(),
+    Command::Model(ModelCommand::Promote(args)) => args.run(),
+    Command::Model(ModelCommand::Register(args)) => args.run(),
+    Command::Model(ModelCommand::Retire(args)) => args.run(),
+    Command::Model(ModelCommand::List(args)) => args.run(),
     Command::Compare(args) => args.run(),
     Command::Calibrate(args) => args.run(run.as_ref()),
     Command::CalibrateDiff(args) => args.run(),
@@ -1313,6 +1472,48 @@ mod tests {
     let refused = check_tie(&tied, "def-d256-t256", Tie::Enforced).unwrap_err();
     assert!(refused.to_string().contains("def-d256-t256"), "{refused}");
     assert!(check_tie(&tied, "def-d256-t256", Tie::Reported).is_ok());
+  }
+
+  #[test]
+  fn the_registry_commands_say_what_they_need_and_default_to_the_file_beside_the_models() {
+    let parse = |args: &[&str]| Cli::try_parse_from([&["record-similarity", "model"], args].concat());
+    assert!(parse(&["promote"]).is_err(), "a calibration is required");
+    assert!(parse(&["retire", "abc"]).is_err(), "a reason is required");
+    assert!(parse(&["register"]).is_err(), "a directory is required");
+
+    let Command::Model(ModelCommand::Promote(args)) =
+      parse(&["promote", "--calibration", "holdout.ndjson"]).unwrap().command
+    else {
+      panic!("expected promote")
+    };
+    assert_eq!(args.config, PathBuf::from("config.toml"));
+    assert_eq!(args.fail_on, FailOn::ErrorsUp);
+    assert_eq!((args.baseline, args.override_reason, args.seed), (None, None, 0));
+    assert_eq!(args.registry.registry, PathBuf::from("models/registry.ndjson"));
+
+    let Command::Model(ModelCommand::Promote(args)) = parse(&[
+      "promote",
+      "--calibration",
+      "runs/x",
+      "--override",
+      "the vendor is gone",
+      "--fail-on",
+      "new-false-accepts",
+      "--registry",
+      "/shared/registry.ndjson",
+    ])
+    .unwrap()
+    .command
+    else {
+      panic!("expected promote")
+    };
+    assert_eq!(args.override_reason.as_deref(), Some("the vendor is gone"));
+    assert_eq!(args.fail_on, FailOn::NewFalseAccepts);
+    assert_eq!(args.registry.registry, PathBuf::from("/shared/registry.ndjson"));
+    assert!(matches!(
+      parse(&["list"]).unwrap().command,
+      Command::Model(ModelCommand::List(_))
+    ));
   }
 
   #[test]

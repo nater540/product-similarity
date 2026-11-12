@@ -941,3 +941,63 @@ proptest! {
     })?;
   }
 }
+
+proptest! {
+  #![proptest_config(cases())]
+
+  /// Whatever was promoted and retired in whatever order, the model in service is a promotion whose model has
+  /// not been retired since, and the latest such; and a model's retirement stands exactly until it is promoted
+  /// again.
+  #[test]
+  fn the_model_in_service_is_the_latest_promotion_not_retired_since(
+    history in proptest::collection::vec((any::<bool>(), 0_usize..3), 0..24),
+  ) {
+    use crate::registry::testing::{Held, PAIRS, calibration, promoted, written};
+    use crate::registry::{Entry, HOLDOUT, Registry, Retired};
+
+    const DIGESTS: [&str; 3] = ["a", "b", "c"];
+    let entries: Vec<Entry> = history
+      .iter()
+      .enumerate()
+      .map(|(index, (promote, model))| {
+        let digest = DIGESTS[*model];
+        if *promote {
+          let text = calibration(&format!("{digest}-d8-t16"), Some(HOLDOUT), "aa", &PAIRS);
+          let mut entry = promoted(digest, 0.75, &Held::of(&text, "holdout.ndjson"));
+          entry.written = written(index as u64);
+          Entry::Promoted(Box::new(entry))
+        } else {
+          Entry::Retired(Retired {
+            written: written(index as u64),
+            digest: digest.to_owned(),
+            reason: "retired".to_owned(),
+          })
+        }
+      })
+      .collect();
+    let registry = Registry { entries };
+
+    // Said the long way round: for each model, what happened to it last.
+    let last = |digest: &str, promote: bool| {
+      history
+        .iter()
+        .rposition(|(promoted, model)| *promoted == promote && DIGESTS[*model] == digest)
+    };
+    let standing: Vec<usize> = DIGESTS
+      .iter()
+      .filter_map(|digest| match (last(digest, true), last(digest, false)) {
+        (Some(promoted), Some(retired)) if retired > promoted => None,
+        (promoted, _) => promoted,
+      })
+      .collect();
+    let expected = standing.iter().max().map(|index| (DIGESTS[history[*index].1], *index as u64));
+    let current = registry.current().map(|promoted| (promoted.digest.as_str(), promoted.written.at));
+    prop_assert_eq!(current, expected);
+
+    for digest in DIGESTS {
+      let retired = matches!((last(digest, true), last(digest, false)), (promoted, Some(retired)) if promoted.is_none_or(|promoted| retired > promoted));
+      prop_assert_eq!(registry.retirement(digest).is_some(), retired, "{}", digest);
+      prop_assert_eq!(registry.knows(digest), last(digest, true).is_some() || last(digest, false).is_some());
+    }
+  }
+}

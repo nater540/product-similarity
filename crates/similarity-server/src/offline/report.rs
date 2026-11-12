@@ -208,7 +208,7 @@ fn percent_interval(interval: Option<Interval>) -> String {
   })
 }
 
-fn describe_rate(rate: &Rate) -> String {
+pub(crate) fn describe_rate(rate: &Rate) -> String {
   match rate.rate {
     Some(value) => format!("{}{}", percent(value), percent_interval(rate.interval)),
     None => "-".to_owned(),
