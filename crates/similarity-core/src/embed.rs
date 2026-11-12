@@ -13,6 +13,55 @@ use crate::model::SentenceEncoder;
 use crate::tokenize::{TextTokenizer, pad_batch};
 use crate::vector::normalize;
 
+/// What runs a model's forward pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EngineChoice {
+  /// Burn, in Rust, from the directory's weights. Always available, and the definition of what a model computes.
+  #[default]
+  Burn,
+  /// ONNX Runtime (C++), from `onnx/model.onnx` in the directory. Several times faster on a CPU. It needs a
+  /// binary built with the `onnx` feature and a directory `tools/export_onnx.py` has been run on, and it is
+  /// checked against Burn before it is used.
+  Onnx,
+}
+
+impl EngineChoice {
+  /// The engine's name, as the configuration and the logs spell it.
+  pub fn as_str(self) -> &'static str {
+    match self {
+      Self::Burn => "burn",
+      Self::Onnx => "onnx",
+    }
+  }
+}
+
+/// The texts both engines are run on before the ONNX one is trusted: short and long, so that padding, the mask,
+/// and pooling are all exercised, and in one batch, so that they are padded against each other.
+#[cfg(feature = "onnx")]
+const PROBES: [&str; 4] = [
+  "Blueberry Gummies 100mg",
+  "Edibles > Gummies",
+  "Ten vegan gummies infused with hybrid enhanced botanical terpenes. 10mg THC per piece, 100mg per package. Made \
+   with real fruit and natural flavoring. Keep out of reach of children.",
+  "a",
+];
+/// How far a component of a unit vector may differ between the two engines. They run the same arithmetic in
+/// another order, which on the default model moves a component by two ten-millionths at most; a graph exported
+/// from other weights moves them by far more.
+#[cfg(feature = "onnx")]
+const ENGINE_TOLERANCE: f32 = 1e-5;
+
+#[derive(Debug)]
+enum Engine {
+  // Boxed: there is one engine in an embedder, and the two are very different sizes.
+  Burn {
+    encoder: Box<SentenceEncoder>,
+    device: Device,
+  },
+  #[cfg(feature = "onnx")]
+  Onnx(crate::model::onnx::OnnxEncoder),
+}
+
 /// Knobs that trade accuracy, latency, and storage against each other.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbedderOptions {
@@ -40,8 +89,9 @@ impl Default for EmbedderOptions {
 #[derive(Debug)]
 pub struct Embedder {
   tokenizer: TextTokenizer,
-  encoder: SentenceEncoder,
-  device: Device,
+  engine: Engine,
+  /// The width the model itself produces, of which `dimension` components are kept.
+  native: usize,
   batch_size: usize,
   dimension: usize,
   digest: String,
@@ -62,6 +112,75 @@ impl Embedder {
     let digest = encoder.files().digest()?;
 
     Self::assemble(tokenizer, encoder, device, options, &digest, dir)
+  }
+
+  /// Loads a model directory to run on `engine`.
+  ///
+  /// With [`EngineChoice::Burn`] this is [`Self::load`]. With [`EngineChoice::Onnx`] the directory's weights are
+  /// loaded in Burn all the same, a set of texts is embedded by both, and the ONNX graph is used only if every
+  /// component of every vector agrees: the graph is a second copy of the model that nothing else ties to the
+  /// weights beside it. The Burn encoder is dropped once it has vouched for the graph. The fingerprint is the
+  /// same under either engine, because the vectors are.
+  ///
+  /// # Errors
+  ///
+  /// As [`Self::load`], and [`Error::UnsupportedModel`] if the ONNX engine is asked for in a build without the
+  /// `onnx` feature, if the directory has no `onnx/model.onnx`, or if that file does not compute what the
+  /// directory's weights compute.
+  pub fn load_with(dir: &Path, device: Device, options: &EmbedderOptions, engine: EngineChoice) -> Result<Self> {
+    // Said before anything is loaded: it is a fact about the binary, not about the directory.
+    #[cfg(not(feature = "onnx"))]
+    if engine == EngineChoice::Onnx {
+      return Err(Error::unsupported(
+        dir,
+        "the ONNX engine needs a binary built with `--features onnx`; this one runs models with Burn only",
+      ));
+    }
+    let burn = Self::load(dir, device, options)?;
+    match engine {
+      EngineChoice::Burn => Ok(burn),
+      #[cfg(feature = "onnx")]
+      EngineChoice::Onnx => burn.onto_onnx(dir),
+      #[cfg(not(feature = "onnx"))]
+      EngineChoice::Onnx => Ok(burn),
+    }
+  }
+
+  /// The same embedder with its forward pass on ONNX Runtime, if the directory's graph agrees with it.
+  #[cfg(feature = "onnx")]
+  fn onto_onnx(self, dir: &Path) -> Result<Self> {
+    let expected = self.embed(&PROBES)?;
+    let onnx = Self {
+      engine: Engine::Onnx(crate::model::onnx::OnnxEncoder::load(dir, self.native)?),
+      ..self
+    };
+    let found = onnx.embed(&PROBES)?;
+    let worst = expected
+      .iter()
+      .flatten()
+      .zip(found.iter().flatten())
+      .map(|(expected, found)| (expected - found).abs())
+      .fold(0.0_f32, f32::max);
+    if worst > ENGINE_TOLERANCE || worst.is_nan() {
+      return Err(Error::unsupported(
+        dir,
+        format!(
+          "`{}` does not compute what the directory's weights compute (a component differs by {worst:.1e}, and \
+           {ENGINE_TOLERANCE:.0e} is allowed). It was exported from other weights: run `just export-onnx <dir>` again",
+          crate::model::onnx::ONNX_FILE
+        ),
+      ));
+    }
+    Ok(onnx)
+  }
+
+  /// Which engine runs this embedder's forward pass.
+  pub fn engine(&self) -> EngineChoice {
+    match self.engine {
+      Engine::Burn { .. } => EngineChoice::Burn,
+      #[cfg(feature = "onnx")]
+      Engine::Onnx(_) => EngineChoice::Onnx,
+    }
   }
 
   fn assemble(
@@ -104,8 +223,11 @@ impl Embedder {
     let fingerprint = format!("{digest}-d{dimension}-t{}", options.max_tokens);
     let embedder = Self {
       tokenizer,
-      encoder,
-      device,
+      native: encoder.dimension(),
+      engine: Engine::Burn {
+        encoder: Box::new(encoder),
+        device,
+      },
       batch_size: options.batch_size,
       dimension,
       digest: digest.to_owned(),
@@ -164,17 +286,25 @@ impl Embedder {
 
   fn forward(&self, chunk: &[(usize, Vec<u32>)]) -> Result<Vec<Vec<f32>>> {
     let rows: Vec<&[u32]> = chunk.iter().map(|(_, ids)| ids.as_slice()).collect();
-    let Some((ids, padding)) = pad_batch(&rows, &self.device) else {
-      return Ok(Vec::new());
+    let native = self.native;
+    let flat = match &self.engine {
+      Engine::Burn { encoder, device } => {
+        let Some((ids, padding)) = pad_batch(&rows, device) else {
+          return Ok(Vec::new());
+        };
+        encoder
+          .forward(ids, padding)
+          .into_data()
+          .convert::<f32>()
+          .try_into_vec::<f32>()
+          .map_err(|source| Error::Inference(format!("backend returned unreadable tensor data: {source:?}")))?
+      }
+      #[cfg(feature = "onnx")]
+      Engine::Onnx(encoder) => encoder.forward(&rows)?,
     };
-    let native = self.encoder.dimension();
-    let flat = self
-      .encoder
-      .forward(ids, padding)
-      .into_data()
-      .convert::<f32>()
-      .try_into_vec::<f32>()
-      .map_err(|source| Error::Inference(format!("backend returned unreadable tensor data: {source:?}")))?;
+    if flat.is_empty() && rows.iter().all(|row| row.is_empty()) {
+      return Ok(Vec::new());
+    }
     if flat.len() != chunk.len().saturating_mul(native) {
       return Err(Error::Inference(format!(
         "backend returned {} values for {} texts of dimension {native}",
@@ -270,6 +400,30 @@ mod tests {
       batch_size,
       output_dim,
     }
+  }
+
+  /// The default build has no ONNX Runtime in it, and says so plainly when asked for it, before it looks at the
+  /// directory at all.
+  #[cfg(not(feature = "onnx"))]
+  #[test]
+  fn the_onnx_engine_is_refused_by_a_build_without_it() {
+    let nowhere = Path::new("/no/such/model");
+    let error =
+      Embedder::load_with(nowhere, Device::flex(), &EmbedderOptions::default(), EngineChoice::Onnx).unwrap_err();
+    assert!(error.to_string().contains("--features onnx"), "{error}");
+    assert_eq!(
+      (
+        EngineChoice::default(),
+        EngineChoice::Burn.as_str(),
+        EngineChoice::Onnx.as_str()
+      ),
+      (EngineChoice::Burn, "burn", "onnx")
+    );
+  }
+
+  #[test]
+  fn the_tiny_embedder_runs_on_burn() {
+    assert_eq!(tiny_embedder(&options(16, 8, None)).engine(), EngineChoice::Burn);
   }
 
   #[test]

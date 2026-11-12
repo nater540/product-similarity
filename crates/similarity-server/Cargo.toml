@@ -16,6 +16,9 @@ path = "src/main.rs"
 # Run the encoder on the GPU through Metal. For development on Apple silicon; production images build without it
 # and run on the CPU (`flex`) backend. Select it at runtime with `device = "metal"` in the config.
 metal = ["burn/metal"]
+# Run the encoder through ONNX Runtime (C++), which is several times faster on a CPU than Burn's backend. Select it
+# at run time with `engine = "onnx"` under `[model]`, for a model directory that `just export-onnx` has been run on.
+onnx = ["similarity-core/onnx"]
 
 [dependencies]
 similarity-core.workspace = true

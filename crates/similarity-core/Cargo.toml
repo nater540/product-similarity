@@ -11,6 +11,9 @@ publish = false
 [features]
 # Exposes `similarity_core::testing` (tiny in-memory models) to the tests of crates built on this one.
 testing = []
+# Lets an `Embedder` run its forward pass through ONNX Runtime (C++) from `onnx/model.onnx`, where the model
+# directory has one. Off by default: the default build is Rust all the way down.
+onnx = ["dep:ort"]
 
 [dependencies]
 burn.workspace = true
@@ -20,6 +23,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
+ort = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest.workspace = true

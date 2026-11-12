@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! cargo run --release -p similarity-core --example throughput -- models/mdbr-leaf-mt
+//! cargo run --release -p similarity-core --features onnx --example throughput -- models/mdbr-leaf-mt onnx
 //! ```
 //!
 //! The shapes mirror real traffic: a single short field (one edited name), one whole record (four fields, one of
@@ -13,7 +14,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use similarity_core::{Device, Embedder, EmbedderOptions};
+use similarity_core::{Device, Embedder, EmbedderOptions, EngineChoice};
 
 const NAME: &str = "Blueberry Gummies 100mg";
 const CATEGORY: &str = "Edibles > Gummies";
@@ -28,14 +29,24 @@ fn median(mut samples: Vec<Duration>) -> Duration {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-  let dir = PathBuf::from(std::env::args().nth(1).ok_or("usage: throughput <model-dir>")?);
+  let dir = PathBuf::from(
+    std::env::args()
+      .nth(1)
+      .ok_or("usage: throughput <model-dir> [burn|onnx]")?,
+  );
+  let engine = match std::env::args().nth(2).as_deref() {
+    None | Some("burn") => EngineChoice::Burn,
+    Some("onnx") => EngineChoice::Onnx,
+    Some(other) => return Err(format!("`{other}` is not an engine; it is `burn` or `onnx`").into()),
+  };
   let started = Instant::now();
-  let embedder = Embedder::load(&dir, Device::flex(), &EmbedderOptions::default())?;
+  let embedder = Embedder::load_with(&dir, Device::flex(), &EmbedderOptions::default(), engine)?;
   println!(
-    "loaded {} in {:.0?} (dimension {})",
+    "loaded {} in {:.0?} (dimension {}, engine {})",
     dir.display(),
     started.elapsed(),
-    embedder.dimension()
+    embedder.dimension(),
+    embedder.engine().as_str()
   );
 
   let record = [NAME, CATEGORY, BRAND, DESCRIPTION];

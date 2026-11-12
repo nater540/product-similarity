@@ -96,7 +96,7 @@ Optional, by task:
 | Tool | Needed for | Install |
 |---|---|---|
 | [`just`](https://just.systems) | The short commands used throughout this README. Every recipe is a plain `cargo`, `docker`, or `uv` command you can read in the `justfile` and run by hand. | `brew install just` or `cargo install just` |
-| [`uv`](https://docs.astral.sh/uv/) | Only for regenerating the PyTorch reference fixtures (`just golden`) and the optional `just verify-model`. Building, testing, serving, and fine-tuning are all Rust and need no Python. It installs PyTorch itself on first use, a download of several hundred megabytes or more. | `brew install uv` |
+| [`uv`](https://docs.astral.sh/uv/) | For regenerating the PyTorch reference fixtures (`just golden`), the optional `just verify-model`, and `just export-onnx`, which writes the file the ONNX engine runs. Building, testing, serving, and fine-tuning are all Rust and need no Python. It installs PyTorch itself on first use, a download of several hundred megabytes or more. | `brew install uv` |
 | `cargo-deny` | `just deny` and `just ci`. | `cargo install cargo-deny --locked` |
 | `grpcurl` | Calling the server from a shell. | `brew install grpcurl` |
 | `jq` | Reading NDJSON logs and results at a terminal. | `brew install jq` |
@@ -1886,6 +1886,7 @@ commented starting point.
 | `server.import_batch_records` | `8` | The most records of an `Import` stream embedded as one batch. Larger loads a catalog faster and makes every other request wait longer while a stream runs; see [Creating records over a stream](#creating-records-over-a-stream). At least 1. |
 | `model.dir` | `models/mdbr-leaf-mt` | The model directory. |
 | `model.device` | `cpu` | `cpu`, or `metal` in a binary built with `--features metal`. |
+| `model.engine` | `burn` | What runs the forward pass: `burn`, or `onnx` in a binary built with `--features onnx`, for a model directory `just export-onnx` has been run on. Same vectors, same fingerprint, same thresholds. See [The ONNX engine](#the-onnx-engine). |
 | `model.max_tokens` | `256` | Text beyond this many tokens is ignored. Cost grows with its square. |
 | `model.output_dim` | none (native width) | Keep only the first N components of each field vector. Only for models trained for it. The example config sets 256 for the default model. |
 | `model.batch_size` | `32` | The most texts in one forward pass. |
@@ -2166,16 +2167,18 @@ that provides both. The Qdrant API key is taken from the environment, never from
 
 ## Performance
 
-Measured with `just throughput` on an Apple-silicon laptop CPU, release build, default model:
+Measured with `just throughput` on an Apple-silicon laptop CPU (12 cores), release build, default model, under
+each of the two engines ([The ONNX engine](#the-onnx-engine)):
 
-| Input | Time |
-|---|---|
-| One short field (the usual edit) | 4 ms |
-| One description | 12 ms |
-| One whole record, four fields | 20 ms |
-| Eight whole records in one batch | 86 ms |
+| Input | Burn (`just throughput`) | ONNX Runtime (`just throughput models/mdbr-leaf-mt onnx`) |
+|---|---|---|
+| One short field (the usual edit) | 4.3 ms | 1.2 ms |
+| One description | 12.5 ms | 2.6 ms |
+| One whole record, four fields | 20.2 ms | 4.2 ms |
+| Eight whole records in one batch | 85.9 ms | 15.8 ms |
 
-Model load is about 0.3 s. A stored composite at the example settings is 1024 floats, so 50,000 records are about
+Model load is about 0.3 s under Burn and 0.4 s under ONNX Runtime, which loads both to check one against the
+other. A stored composite at the example settings is 1024 floats, so 50,000 records are about
 400 MB in Qdrant across the two vectors each record keeps, of which half is memory-mapped from disk. Run
 `just throughput` on your own hardware before sizing anything.
 
@@ -2220,6 +2223,25 @@ On the same machine (12 cores, release build, default model, 300 records per lev
 - **No request was refused** in any phase: the queue holds 256 (`model.queue_depth`), more than 64 callers can
   fill. A refused request is counted (`overloaded`) and sent again after 5 ms.
 
+The same test with `engine = "onnx"` (a binary built with `just release-onnx`, same machine, same day):
+
+| Callers | Phase | Requests per second | Median | 99th percentile | Texts per forward pass | Mean wait in the queue |
+|---|---|---|---|---|---|---|
+| 1 | create | 213 | 4.8 ms | 5.3 ms | 4.0 | 0.0 ms |
+| 1 | edit | 623 | 1.6 ms | 1.7 ms | 1.0 | 0.0 ms |
+| 4 | create | 288 | 13.9 ms | 15.6 ms | 8.0 | 6.0 ms |
+| 4 | edit | 1,031 | 3.9 ms | 4.1 ms | 2.0 | 1.4 ms |
+| 16 | create | 398 | 39.3 ms | 60.1 ms | 30.0 | 19.0 ms |
+| 16 | edit | 1,834 | 8.4 ms | 16.0 ms | 7.5 | 1.8 ms |
+| 64 | create | 398 | 139.6 ms | 279.6 ms | 30.0 | 104.2 ms |
+| 64 | edit | 2,397 | 22.0 ms | 49.9 ms | 20.0 | 8.9 ms |
+| 1 | stream | 404 | | | 31.6 | 0.0 ms |
+
+Four to five times the throughput at every level, and a single edit in 1.6 ms where Burn takes 5.6 ms. Nothing
+else about the server differs between the two tables: the queue, the batching, and the one embedding thread are
+the same, and the model was still busy for all of every create and edit phase. The resave rows are left out;
+they do not touch the model and do not change.
+
 The loop is closed: each caller waits for its answer before sending again. That is latency at a fixed number of
 callers, not at a fixed arrival rate, where a server that falls behind makes a queue grow; do not read these as
 the second kind. The store is in memory, so a round trip to Qdrant comes on top. Results are NDJSON on stdout
@@ -2238,6 +2260,44 @@ In service, every `evaluate`, `find_similar`, `match`, and `delete` log line car
 the first line of the handler to the log line. An `Import` stream writes one `import` line when it ends, with how
 many records it created, found stored, and failed, how many batches it made, and how often it waited for the
 model.
+
+### The ONNX engine
+
+The forward pass is nearly all of what a request costs, and Burn's CPU backend is not the fastest way to run it.
+The server can run the same model through [ONNX Runtime](https://onnxruntime.ai) instead, which on this machine
+is four to five times faster (the tables above). It is off unless you turn it on, in three steps:
+
+```sh
+just export-onnx models/mdbr-leaf-mt     # writes models/mdbr-leaf-mt/onnx/model.onnx (needs uv; PyTorch does the export)
+just release-onnx                        # a server binary with ONNX Runtime linked in
+```
+
+```toml
+[model]
+engine = "onnx"
+```
+
+- **It is C++, not Rust.** The `ort` crate is a binding to Microsoft's runtime. `just release-onnx` downloads a
+  prebuilt static library for the target at build time (from the crate author's distribution, pinned by the
+  crate's exact version) and links it in: the binary grows from 13 MB to 31 MB and needs nothing installed
+  beside it. The default build has none of this. Whether a production build should take that prebuilt library,
+  or link one you built or obtained yourselves, is worth deciding before it ships.
+- **The vectors are the same.** On the default model the two engines differ by at most two ten-millionths in any
+  component of a unit vector, far below what a 32-bit cosine resolves. So the fingerprint is the same, a
+  collection written under one engine is read under the other, the thresholds do not move, and two replicas may
+  run different engines. `just test-onnx` holds the ONNX engine to the same PyTorch fixture and the same bounds
+  as Burn, and holds the two to each other.
+- **The exported file is checked, every time the server starts.** `onnx/model.onnx` is a second copy of the
+  model, and nothing in it says which weights it was made from. A directory that was fine-tuned after the export
+  still has the old file. So the server loads the directory's weights in Burn as well, embeds a few texts with
+  both, and refuses to start if any component differs by more than 0.00001, naming the file and the command that
+  remakes it. Burn stays the definition of what the model computes; ONNX Runtime is a faster way to compute it.
+- **Export again after fine-tuning.** `just export-onnx <dir>` for the new directory. The trainer is unchanged
+  and still runs in Burn.
+- **On macOS it runs on the CPU**, not through CoreML, which ONNX Runtime would otherwise pick and which is slower
+  for a model this size. `device = "metal"` applies to Burn only.
+- **Not measured yet: Linux.** Everything above is one Apple-silicon machine. The ratio between the engines will
+  differ on the hardware you serve on; run `just throughput` both ways there before sizing anything.
 
 ## Development
 
@@ -2333,15 +2393,16 @@ data/
   regression.snapshot.ndjson      what the pinned model and the example config make of them
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D33)
+  decisions.md               why things are the way they are (D1 to D34)
   data-request-prompt.md     a brief for collecting labeled production data
   import-prompt.md           a brief for loading the real catalog into a running service
   feature-suggestions.md     features that could be added, built and not, the last twelve about production
   plan-features.md           a plan for the first five of them
 models/                 fetched and fine-tuned model directories (ignored by git)
-tools/                  referees, not part of any pipeline: they write the fixtures the parity tests compare with
-  golden.py             PyTorch reference embeddings
-  train_golden.py       PyTorch reference training steps
+tools/                  Python, where Python is the right tool, and never at run time
+  golden.py             PyTorch reference embeddings, for the parity tests
+  train_golden.py       PyTorch reference training steps, for the parity tests
+  export_onnx.py        writes `onnx/model.onnx` into a model directory, for the ONNX engine
 ```
 
 Conventions (two-space indentation, no `unwrap` in library code, tests first) are in [`CLAUDE.md`](CLAUDE.md).

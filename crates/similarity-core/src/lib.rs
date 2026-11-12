@@ -42,7 +42,7 @@ pub mod testing;
 pub mod tokenize;
 pub mod vector;
 
-pub use embed::{Embedder, EmbedderOptions};
+pub use embed::{Embedder, EmbedderOptions, EngineChoice};
 pub use error::{Error, Result};
 pub use provenance::Provenance;
 pub use quantity::{Quantities, Quantity, QuantityChange, QuantityScore};

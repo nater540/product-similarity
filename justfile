@@ -23,6 +23,14 @@ release:
 release-metal:
     cargo build --release -p similarity-server --features metal
 
+# Release build that can also run the encoder through ONNX Runtime (`engine = "onnx"` under `[model]`)
+release-onnx:
+    cargo build --release -p similarity-server --features onnx
+
+# Write `onnx/model.onnx` into a model directory, for the ONNX engine (needs `uv`; again after fine-tuning)
+export-onnx model="models/mdbr-leaf-mt":
+    uv run tools/export_onnx.py {{ model }}
+
 # Release build of the fine-tuning binary; `just release-train metal` or `cuda` adds that GPU backend
 release-train backend="":
     cargo build --release -p similarity-train {{ if backend == "" { "" } else { "--features " + backend } }}
@@ -45,6 +53,10 @@ test-real: test-parity test-snapshot
 test-parity:
     cargo test -p similarity-core --test real_parity -- --ignored
     cargo test -p similarity-train --test real_parity -- --ignored
+
+# The ONNX Runtime engine against PyTorch and against Burn, on the real model (needs `just export-onnx`)
+test-onnx:
+    cargo test -p similarity-core --features onnx --test real_onnx -- --ignored
 
 # The curated hard cases against the committed verdict snapshot, and the README's quoted calibration reports
 # against what `calibrate` prints (needs `just fetch-model`)
@@ -127,8 +139,8 @@ verify-model dir:
     PARITY_MODEL_DIR={{ dir }} PARITY_FIXTURE=target/parity-fixture.json cargo test -p similarity-core --test real_parity -- --ignored
 
 # Forward-pass latency on this machine's CPU
-throughput model="models/mdbr-leaf-mt":
-    cargo run --release -p similarity-core --example throughput -- {{ model }}
+throughput model="models/mdbr-leaf-mt" engine="burn":
+    cargo run --release -p similarity-core {{ if engine == "onnx" { "--features onnx" } else { "" } }} --example throughput -- {{ model }} {{ engine }}
 
 # Score the labeled pairs and report the threshold that separates edits from recycled records.
 # Flags go last: `just calibrate data/calibration.sample.full.jsonl config.example.toml --full --split holdout`

@@ -121,6 +121,27 @@ pub enum DeviceChoice {
   Metal,
 }
 
+/// What runs the model's forward pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EngineChoice {
+  /// Burn, in Rust. Always available.
+  #[default]
+  Burn,
+  /// ONNX Runtime, in C++, from `onnx/model.onnx`. Requires a binary built with `--features onnx`, and a model
+  /// directory that `just export-onnx` has been run on.
+  Onnx,
+}
+
+impl From<EngineChoice> for similarity_core::EngineChoice {
+  fn from(choice: EngineChoice) -> Self {
+    match choice {
+      EngineChoice::Burn => Self::Burn,
+      EngineChoice::Onnx => Self::Onnx,
+    }
+  }
+}
+
 /// `[model]`
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -129,6 +150,8 @@ pub struct ModelConfig {
   pub dir: PathBuf,
   /// Where the encoder runs.
   pub device: DeviceChoice,
+  /// What runs the forward pass: Burn, or ONNX Runtime from the directory's `onnx/model.onnx`.
+  pub engine: EngineChoice,
   /// Texts longer than this many tokens are truncated.
   pub max_tokens: usize,
   /// The most texts in one forward pass.
@@ -167,6 +190,7 @@ impl Default for ModelConfig {
     Self {
       dir: PathBuf::from("models/mdbr-leaf-mt"),
       device: DeviceChoice::Cpu,
+      engine: EngineChoice::Burn,
       max_tokens: options.max_tokens,
       batch_size: options.batch_size,
       // Deliberately not 256, even though that is what `config.example.toml` sets for the default model: a
@@ -586,6 +610,17 @@ mod tests {
     let small = Config::parse(&format!("[server]\nimport_batch_records = 2\n{MINIMAL}")).unwrap();
     assert_eq!(small.server.import_batch_records, 2);
     assert_eq!(config.model.device, DeviceChoice::Cpu);
+    assert_eq!(
+      config.model.engine,
+      EngineChoice::Burn,
+      "the engine that needs nothing but this binary"
+    );
+    let onnx = Config::parse(&format!("[model]\nengine = \"onnx\"\n{MINIMAL}")).unwrap();
+    assert_eq!(
+      similarity_core::EngineChoice::from(onnx.model.engine),
+      similarity_core::EngineChoice::Onnx
+    );
+    assert!(Config::parse(&format!("[model]\nengine = \"tensorrt\"\n{MINIMAL}")).is_err());
     assert_eq!(
       config.model.output_dim, None,
       "truncation is opt-in: it is only safe for some models"

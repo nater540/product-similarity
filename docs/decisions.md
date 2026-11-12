@@ -1391,3 +1391,65 @@ The trade-off table in the README is `load --server` beside a stream that never 
 27), which this makes more pressing; a final summary message on the stream (the caller counts its answers, and
 the server logs one `import` line).
 
+## D34. The forward pass can run on ONNX Runtime; Burn stays the definition of the model
+
+Asked how this would compare with a Python or a Node service, the honest answer had to be measured, and it was
+not the expected one. On the same machine, model, and texts, the Burn CPU backend had the slowest forward pass
+of everything tried: PyTorch was up to three times faster, and ONNX Runtime, which is what a Node service would
+call, up to five times. The language around the model hardly matters; nearly all of a request is the forward
+pass, and every stack hands that to native code. What this service had over the others was its queueing,
+its memory, and one stack for training and serving, not its arithmetic.
+
+**What was tried, in the order of the owner's preference.** Pure Rust first. Candle was no faster than Burn.
+Tract was two to three times faster on one core, but could not analyse the exported graph with variable input
+sizes and needed a plan per size. Thread count was not the cause: Burn takes the same four milliseconds for a
+short field on one core as on twelve. Then ONNX Runtime through the `ort` crate, which the owner had taken for a
+Rust port and accepted for its speed once told it is a binding to C++, on condition that the gRPC service stays
+a Rust binary. It does.
+
+**An engine, behind a feature, chosen in the config.** `Embedder` runs its forward pass on one of two engines.
+Everything else is shared: the tokenizer and its D21 rule, the length buckets, truncation to `output_dim`,
+normalization, the worker thread and its batching. `engine = "onnx"` needs a binary built with `--features
+onnx`; the default build links no C++ and says so if asked for the engine. The trainer does not have the
+feature and is untouched (D13).
+
+**One model, two engines, one fingerprint.** The graph is exported from the directory's weights and computes
+the same function in another order of operations. On the pinned model the engines differ by at most 2e-7 in a
+component of a unit vector. So the fingerprint and the layout id do not say which engine made a vector (D12):
+they say what the vector means, and that is the same. Thresholds are measurements of the model (D3), not of
+the engine.
+
+**The exported file is checked against the weights at every load.** This is the decision the rest depends on.
+`ModelFiles::digest` hashes what the Burn encoder reads; under the ONNX engine the numbers come from another
+file, which the digest does not cover and which goes stale silently when a directory is fine-tuned or an `onnx`
+folder is copied from another model. A sidecar recording which weights the graph was made from would be trusted
+on its word. Instead the loader builds the Burn embedder as always, embeds four texts in one batch with both,
+and refuses the graph if any component differs by more than 1e-5, fifty times what the engines really differ
+by. The Burn encoder is then dropped. It costs a tenth of a second at start-up, and it means a wrong graph
+cannot serve one request. A real test damages a copy of the weights and expects the refusal.
+
+**The export is Python.** PyTorch's exporter is the tool that turns a PyTorch module into a graph, and writing
+a second one in Rust would be work with no benefit. The owner relaxed the rule on 2026-11-12: Python where it is
+the best tool, not for everything. `tools/export_onnx.py` exports the sentence-transformers pipeline up to, and
+not including, normalization, checks the result against PyTorch on batches of other shapes than it was traced
+with, and writes the file by rename. Nothing at run time needs Python.
+
+**Where the C++ comes from is not settled.** The `ort` crate's `download-binaries` feature fetches a prebuilt
+static library at build time from the crate author's distribution. That is convenient and it is a third party's
+binary inside the server. The crate is pinned to an exact version, and the alternative (`load-dynamic`, with a
+runtime library the organization builds or takes from Microsoft's releases) is a change of features, not of
+code. It is the owner's decision before this engine serves production traffic.
+
+**Two things the platform needed.** On macOS the prebuilt library has Objective-C that calls into the compiler's
+runtime library, which Rust does not link unless told (`.cargo/config.toml`); and ONNX Runtime hands graphs to
+CoreML by default there, which was slower and failed on a batch, so the session is told to prefer the CPU.
+Neither applies to Linux, where none of this has been run yet.
+
+**Measured.** `just throughput`: a four-field record in 4.2 ms against 20.2 ms. `just load`, through gRPC: one
+edit in 1.6 ms against 5.6 ms, and a ceiling of about 2,400 edits a second against 470, with the queue, the
+batching, and the single embedding thread unchanged. An `Import` stream runs at 404 records a second against 80.
+
+**Not done:** a Linux build and measurement; several embedding threads (ONNX Runtime may make one thread per
+core a better design than one thread across cores, and that is unmeasured); the container image, which still
+builds the default engine.
+

@@ -6,7 +6,7 @@ marketplace listings. Each revision is embedded field by field with a small BERT
 thresholds. A record's quantities (weight, volume, potency) are compared as numbers beside that, never embedded.
 Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D33) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D34) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -135,8 +135,17 @@ changing a design. Infer conventions from the existing code first.
   comparing models with `calibrate`, check the logged `dimension=` to confirm each ran at the width you meant.
 - **Every command and number in `README.md` was run and measured.** Keep it that way: re-run an example before
   editing it, and never quote a figure that was not produced by `just throughput`, `just load`, or `just calibrate`.
-- **Rust end to end, by the owner's choice** (D13): training is `similarity-train`, in Burn. Do not add Python to
-  any pipeline. `tools/*.py` are referees that write PyTorch fixtures for the parity tests and nothing else.
+- **Rust first, by the owner's choice** (D13, revised 2026-11-12): serving, training, and evaluation are Rust,
+  and nothing at run time may need Python. Python is allowed where it is the best tool for a job, and not as a
+  default: say why in the change. `tools/golden.py` and `tools/train_golden.py` write PyTorch fixtures for the
+  parity tests; `tools/export_onnx.py` converts a model directory for the ONNX engine.
+- **Burn defines the model; ONNX Runtime may compute it** (D34). `engine = "onnx"` (a build with `--features
+  onnx`) runs the forward pass in C++ from `onnx/model.onnx`. Never let that file be used unchecked: the loader
+  compares it with the directory's weights in Burn at every load and refuses a graph that differs, because the
+  file goes stale silently when the weights change. Never put the engine into the fingerprint or the layout id:
+  the vectors are the same, and that is what the check is for. Keep `ort` behind the feature, pinned exactly, and
+  out of the trainer. After changing the encoder, the pooling, or the export, run `just test-onnx` (it needs
+  `just export-onnx` first).
 - **Histories are measured first and judged afterwards** (D27). `calibrate-drift` replays every version on an
   engine that can reject nothing, then judges each step under the config. Never replay under the configured
   policy: after the first rejection the baseline stops moving and the rest of the history is fiction.
@@ -208,6 +217,8 @@ changing a design. Infer conventions from the existing code first.
 - Model: `just fetch-model`; Qdrant: `just qdrant-up` / `just qdrant-down`
 - Slow tests: `just test-parity`, `just test-snapshot`, `just test-qdrant`, `just test-real`; `just snapshot` rewrites
   the pinned verdicts
+- The ONNX engine: `just export-onnx <model-dir>` (needs `uv`), `just release-onnx`, `just test-onnx`,
+  `just throughput <model-dir> onnx`
 - Mutation testing (needs `cargo install cargo-mutants`): `just mutants -j 3`, `just mutants-diff`,
   `just mutants-train`
 - Run: `just serve` (needs Qdrant) or `just serve-in-memory`; then `just client describe`

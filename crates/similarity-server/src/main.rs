@@ -505,10 +505,11 @@ fn check_tie(config: &Config, fingerprint: &str, tie: Tie) -> anyhow::Result<()>
 
 fn load_embedder(config: &Config, tie: Tie) -> anyhow::Result<Embedder> {
   let started = std::time::Instant::now();
-  let embedder = Embedder::load(
+  let embedder = Embedder::load_with(
     &config.model.dir,
     device(config.model.device)?,
     &config.model.embedder_options(),
+    config.model.engine.into(),
   )
   .with_context(|| {
     format!(
@@ -529,6 +530,7 @@ fn load_embedder(config: &Config, tie: Tie) -> anyhow::Result<Embedder> {
     fingerprint = embedder.fingerprint(),
     dimension = embedder.dimension(),
     device = ?config.model.device,
+    engine = embedder.engine().as_str(),
     elapsed = ?started.elapsed(),
     written_by = origin.as_ref().map(|origin| origin.tool.as_str()),
     written_at = origin.as_ref().map(|origin| origin.written_at),
