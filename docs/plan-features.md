@@ -96,7 +96,7 @@ Not planned in detail. What the review would add to each when its turn comes:
 | 6 | Hyperparameter sweeps | The scoring it needs is in `similarity-core` already (step 0). Needs real data. |
 | 9 | Pinned verdict snapshot in CI | **Built** (D22): curated cases, a snapshot checked with and without the model, `calibrate-diff --fail-on moved`, pairs with an `anchor`. |
 | 10 | Production score telemetry | `measure_changed` is already on the `evaluate` log line. Round the similarities there. Add per-quantity factors and reason codes (`Reason::code`). |
-| 11 | Drift-threshold calibration | Replays `sequences.jsonl` through the engine; `Engine::import` with `anchor` is the way to seed each history. Also report, per history, the largest factor each quantity reaches against its first value. |
+| 11 | Drift-threshold calibration | **Built** (D27): `calibrate-drift` replays histories, measured first and judged afterwards; reports legitimate drift, the suggestion, and quantities walked. |
 | 12 | Latency tracking and a load test | **Built** (D26): `record-similarity load`, worker counters, `elapsed_ms` on request lines. The figure is in README "Performance". |
 | 14 | Fuzzing | The state machine in `similarity-server`'s `properties` module is the structure-aware target, ready to be driven by a fuzzer. Add a target for `RecordFields` and `Quantity` parsing. |
 | 15 | Mutation testing | **Built** (D25): `just mutants` over eight files; 400 mutants, none surviving, after a test for each of the 18 the first runs found. |
@@ -114,6 +114,6 @@ With real labeled pairs about to exist, in this order:
    run: it is what the next one is compared against.
 2. **Feature 19** (reason codes on the wire). Built.
 3. **Feature 9** (a pinned snapshot in CI). Built.
-4. **Feature 11** (drift calibration from histories), once `sequences.jsonl` exists. It answers the two open
+4. **Feature 11** (drift calibration from histories). Built; run it once `sequences.jsonl` exists. It answers the two open
    questions about drift: where `anchor_threshold` belongs, and whether quantities need a drift check.
 5. **Feature 2** (the run registry). Built.

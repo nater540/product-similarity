@@ -40,6 +40,10 @@ timeout_ms = 5000
 threshold = 0.90
 # Reject a revision that has drifted this far from the record as first stored, however small each step was.
 # Omit to report drift (`anchor_similarity` in the response) without enforcing it.
+#
+# 0.85 is not a measurement. It is a place to start, below the overall threshold so that a record's first edit is
+# never held to something stricter than that. Where it belongs is read from whole edit histories:
+# `record-similarity calibrate-drift` on real ones (README, "The drift threshold").
 anchor_threshold = 0.85
 # Reject a revision that changes which measures a record is described by: a quantity whose unit can no longer be
 # compared with its old one (THC in % becoming THC in mg), or one quantity removed as another appears (a weight

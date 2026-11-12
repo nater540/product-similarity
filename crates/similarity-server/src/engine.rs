@@ -333,8 +333,8 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     }
   }
 
-  /// The store, for tests that check what a request left behind.
-  #[cfg(test)]
+  /// The store, for the drift replay, which reads a record's anchor before each step, and for tests that check
+  /// what a request left behind. Reading only: every write goes through a request.
   pub(crate) fn store(&self) -> &S {
     &self.store
   }

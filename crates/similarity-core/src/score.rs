@@ -214,17 +214,51 @@ pub fn extend_anchor(schema: &Schema, dimension: usize, anchor: &[f32], candidat
 ///
 /// Returns [`Error::Incompatible`] if either composite does not have this schema's layout.
 pub fn weighted_similarity(schema: &Schema, dimension: usize, left: &[f32], right: &[f32]) -> Result<f32> {
-  let left_blocks = schema.blocks(dimension, left)?;
-  let right_blocks = schema.blocks(dimension, right)?;
   let mut weighted = 0.0_f64;
   let mut total = 0.0_f64;
-  for ((spec, a), b) in schema.fields().iter().zip(left_blocks).zip(right_blocks) {
-    if let (Some(a), Some(b)) = (a, b) {
-      weighted += f64::from(spec.weight) * f64::from(cosine(a, b)?);
+  for (spec, (_, similarity)) in schema
+    .fields()
+    .iter()
+    .zip(field_similarities(schema, dimension, left, right)?)
+  {
+    if let Some(similarity) = similarity {
+      weighted += f64::from(spec.weight) * f64::from(similarity);
       total += f64::from(spec.weight);
     }
   }
   Ok(weighted_mean(weighted, total))
+}
+
+/// The cosine of each field's block in two bare composites, in the schema's field order: `None` for a field
+/// either side has no value for.
+///
+/// These are the parts [`weighted_similarity`] is the weighted mean of. On their own they say which field a
+/// record's drift from its anchor is in, and they are what lets drift be judged again under other weights.
+///
+/// # Errors
+///
+/// Returns [`Error::Incompatible`] if either composite does not have this schema's layout.
+pub fn field_similarities(
+  schema: &Schema,
+  dimension: usize,
+  left: &[f32],
+  right: &[f32],
+) -> Result<Vec<(String, Option<f32>)>> {
+  let left_blocks = schema.blocks(dimension, left)?;
+  let right_blocks = schema.blocks(dimension, right)?;
+  schema
+    .fields()
+    .iter()
+    .zip(left_blocks)
+    .zip(right_blocks)
+    .map(|((spec, a), b)| {
+      let similarity = match (a, b) {
+        (Some(a), Some(b)) => Some(cosine(a, b)?),
+        _ => None,
+      };
+      Ok((spec.name.clone(), similarity))
+    })
+    .collect()
 }
 
 fn weighted_mean(weighted: f64, total: f64) -> f32 {
@@ -1382,6 +1416,33 @@ mod tests {
     evaluation.rejudge(&bare, &policy);
     assert!(evaluation.accepted(), "{:?}", evaluation.reasons);
     assert!(!evaluation.quantities[0].beyond_limit);
+  }
+
+  #[test]
+  fn field_similarities_are_the_parts_the_weighted_similarity_is_the_mean_of() {
+    let schema = product_schema();
+    let old = record(&schema, &[("name", 0.0, "n1"), ("category", 10.0, "c1")]);
+    let new = record(
+      &schema,
+      &[
+        ("name", 60.0, "n2"),
+        ("category", 10.0, "c1"),
+        ("description", 5.0, "d"),
+      ],
+    );
+    let parts = field_similarities(&schema, DIM, &old.composite, &new.composite).unwrap();
+    let names: Vec<&str> = parts.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["category", "description", "name"], "the schema's order");
+    assert!((parts[0].1.unwrap() - 1.0).abs() < 1e-5, "the category did not move");
+    assert_eq!(parts[1].1, None, "only one side has a description");
+    assert!((parts[2].1.unwrap() - 0.5).abs() < 1e-4, "sixty degrees apart");
+
+    let mean = weighted_similarity(&schema, DIM, &old.composite, &new.composite).unwrap();
+    let weight = |name: &str| f64::from(schema.field(name).unwrap().weight);
+    let expected = (weight("category") * f64::from(parts[0].1.unwrap())
+      + weight("name") * f64::from(parts[2].1.unwrap()))
+      / (weight("category") + weight("name"));
+    assert!((f64::from(mean) - expected).abs() < 1e-6);
   }
 
   #[test]

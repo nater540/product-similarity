@@ -33,13 +33,13 @@ pub(super) fn six(value: f32) -> f64 {
   (f64::from(value) * 1e6).round() / 1e6
 }
 
-fn six_wide(value: f64) -> f64 {
+pub(super) fn six_wide(value: f64) -> f64 {
   (value * 1e6).round() / 1e6
 }
 
 /// The schema the run was scored under, one line per field and per quantity, so that a file of events says what
 /// produced it and a later re-judging can check that it is being asked about the same fields.
-fn emit_schema(schema: &Schema) {
+pub(super) fn emit_schema(schema: &Schema) {
   for field in schema.fields() {
     tracing::info!(
       target: RESULT,

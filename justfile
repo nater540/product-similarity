@@ -139,6 +139,11 @@ calibrate pairs="data/calibration.sample.jsonl" config="config.example.toml" *fl
 calibrate-diff *args:
     cargo run --release -q -p similarity-server -- calibrate-diff {{ args }}
 
+# Replay whole edit histories to see how far products drift and where `anchor_threshold` belongs:
+# `just calibrate-drift sequences.jsonl config.toml`
+calibrate-drift histories="data/drift.sample.jsonl" config="config.example.toml" *flags:
+    RUST_LOG=warn cargo run --release -q -p similarity-server -- calibrate-drift --config {{ config }} {{ histories }} {{ flags }}
+
 # What was recorded: every calibration and every training run, newest first (`--kind train`, `--limit 5`)
 runs *flags:
     cargo run --release -q -p similarity-server -- runs list {{ flags }}

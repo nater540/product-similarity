@@ -35,7 +35,7 @@ record has an anchor (plans 11 and 18). `calibrate-diff --config-b` is not affec
 | 6 | [Sweeps](06-hyperparameter-sweeps.md) | large | 3 | Calibration code is not in core; epochs cannot be swept by picking checkpoints |
 | 9 | [Verdict snapshot](09-verdict-snapshot.md) | medium, **built** | | Refill cases need an anchor on a pair; output has timestamps, so not byte-stable |
 | 10 | [Score telemetry](10-score-telemetry.md) | medium | shares a step with 19 | Per-field values need flat lines joined on a request id; nothing is timed today |
-| 11 | [Drift calibration](11-drift-calibration.md) | medium | `sequences.jsonl` | Replaying in `ENFORCE` makes up everything after the first rejection |
+| 11 | [Drift calibration](11-drift-calibration.md) | medium, **built** | `sequences.jsonl` to be useful | Replaying in `ENFORCE` makes up everything after the first rejection |
 | 12 | [Latency and load test](12-latency-load-test.md) | medium, **built** | | Batch sizes are invisible to a client; the worker needs counters |
 | 14 | [Fuzzing](14-fuzzing.md) | medium | | Does not need nightly; the state machine is private and index-driven |
 | 15 | [Mutation testing](15-mutation-testing.md) | small, **built** | | The tool never mutates method calls or constants; proptest seeds must be fixed |
@@ -77,7 +77,7 @@ Each plan ends with its full list of decisions and a recommended default for eac
 2. Run `calibrate --full` on the real pairs (nothing to build).
 3. **19** and **9**: both built. Both small to medium, and 9 turns "run `just test-real`" from a rule into a check.
 4. **15** (built) and **14**, at any point. 14's first targets confirm the two predicted findings above.
-5. **11**, once `sequences.jsonl` exists.
+5. **11** is built, on synthetic histories; it is run for real once `sequences.jsonl` exists.
 6. Before real fine-tuning: **2** and **3** (both built), then **4** and **5**. **6** last; it is large and builds on 3.
 7. Before production: **10** and **12** (12 is built). In production: **17**, then **18** (its policy-only half is a day or two).
 8. **20** when the matching question is taken up; it is a separate product question.

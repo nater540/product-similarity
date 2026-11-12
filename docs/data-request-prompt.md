@@ -150,6 +150,16 @@ a legitimate product drifts over its lifetime.
  "versions": [{"at": "2025-11-02T09:00:00Z", "fields": {"name": "..."}}]}
 ```
 
+- `label` is `edit` for a product that stayed the same product throughout, `recycle` for one that became another,
+  and `unsure` otherwise. `label_source` and `label_confidence` mean what they mean in `pairs.full.jsonl`.
+- For a `recycle`, add `"recycled_at": N` where you can tell: the index in `versions` (from 0) of the first
+  version that is no longer the original product. The versions before it are then a legitimate history.
+- If `versions[0]` is not the product as it was first created (older versions were not kept, or the history was
+  cut for length), add `"original": {...}` with the fields it was created with if those are known, and
+  `"truncated": true` if they are not.
+- `fields` uses the same keys as a record in `pairs.full.jsonl`, quantities included.
+- No other top-level keys: an unknown key is refused, so that a misspelled one is noticed.
+
 ### 4. `catalog-groups.jsonl` (only if menu items are linked to brand products)
 
 If retailers' menu items are linked to the brand product they are a listing of, export about 2,000 groups: one

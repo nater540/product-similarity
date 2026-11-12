@@ -178,7 +178,7 @@ pub struct Pairs {
 }
 
 /// The lines of a JSONL document that hold data, with their one-based line numbers.
-fn data_lines(jsonl: &str) -> impl Iterator<Item = (usize, &str)> {
+pub(super) fn data_lines(jsonl: &str) -> impl Iterator<Item = (usize, &str)> {
   jsonl
     .lines()
     .enumerate()
@@ -289,7 +289,7 @@ pub struct Selection<'a> {
 /// Keeps the keys of `record` that the schema can compare, and counts the rest.
 ///
 /// A `null` is "no value", as an absent key is, and is not counted as anything.
-fn project(
+pub(super) fn project(
   record: BTreeMap<String, Value>,
   schema: &Schema,
   ignored: &mut BTreeMap<(String, Ignored), usize>,

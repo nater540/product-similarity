@@ -23,7 +23,10 @@
 
 pub mod calibrate;
 pub mod diff;
+pub mod drift;
+pub mod drift_report;
 pub mod events;
+pub mod histories;
 pub mod pairs;
 pub mod report;
 pub mod stats;

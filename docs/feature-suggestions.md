@@ -1,7 +1,7 @@
 # Feature suggestions
 
 Twenty features that could be added to this project, with what each is, why it matters here, how it would fit the
-code, and what it would cost. **Features 1, 2, 3, 7, 8, 9, 12, 13, 15, 16, and 19 are built** (D17 to D26, and the README); the rest are not. They were proposed in November 2026 from a read of the
+code, and what it would cost. **Features 1, 2, 3, 7, 8, 9, 11, 12, 13, 15, 16, and 19 are built** (D17 to D27, and the README); the rest are not. They were proposed in November 2026 from a read of the
 repository as it stood then (`README.md`, `docs/decisions.md`, and the crates); check a suggestion against the
 code before starting on it, since the code will have moved. It has moved once already: records now carry
 quantities, compared as numbers (D16), and the features that touch a verdict or a report say below what that
@@ -323,6 +323,11 @@ would use `metrics` and `metrics-exporter-prometheus`, which need a `cargo deny`
 **Effort.** M; the log enrichment alone is S and should go first. **Needs real data:** real traffic, not labels.
 
 ### 11. Drift-threshold calibration from histories
+
+**Built** (D27). What came out differently: every version is replayed with nothing able to reject and judged
+afterwards, since a replay under the configured policy invents everything after the first rejection; the
+threshold is placed below legitimate drift and above the recycles the per-step rules miss, not in a gap between
+labels; and the history format gained `recycled_at`, `original`, and `truncated`.
 
 **What.** `record-similarity calibrate-drift sequences.jsonl` replays each edit history, version by version,
 through the real engine on an in-memory store in `ENFORCE` mode. For each legitimate history it reports the

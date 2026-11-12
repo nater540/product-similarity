@@ -975,3 +975,52 @@ other event's are (the last line that printed a 32-bit value's conversion noise)
 
 **Left out:** an open-loop mode, a Qdrant store in process, records read from a real export, and a regression
 gate on these figures. A gate on wall time would fail on a busy machine and be switched off.
+
+## D27. The drift threshold is read from whole histories, measured first and judged afterwards
+
+`anchor_threshold` shipped at 0.85 and enforced, and nothing recorded where the number came from. D8 explains
+the anchor, not the value. A threshold is a measurement (D3), and this one cannot be measured on before/after
+pairs: it is about how far a product moves over its whole life.
+
+`calibrate-drift` replays edit histories (`sequences.jsonl`, every version of a product in order) through the
+engine and reports, for each, the lowest similarity to its anchor.
+
+**Measured first, judged afterwards.** The obvious replay, under the configured policy, is wrong. After the
+first rejected version the stored record no longer moves, so every later version is compared with a baseline the
+real product left behind, and the rest of the history is fiction. The replay runs on an engine with the same
+fields and weights and every limit cleared, so that every version is written and the anchor follows the engine's
+own rules (D8, D20). Each step's measurements are then judged under the configured schema and policy with
+`Evaluation::rejudge`. A test replays histories both ways and requires the same first rejection, with the same
+reasons, as the server gives.
+
+**It is not placed like the overall threshold.** There is no gap between two labels to put it in: most recycles
+are one large step, which the per-step rules catch, and such a history says nothing about drift. What a drift
+threshold must do is stay below every legitimate history. What it can add is the recycles the per-step rules
+miss. The suggestion is halfway between the lowest legitimate history and the highest missed recycle below it,
+and there is none when no missed recycle is below every legitimate history.
+
+**A history has a legitimate part and a recycled part.** `recycled_at` names the first version that is no longer
+the product. Without it, a recycled history could contribute nothing to "how far does a legitimate product
+drift", and its first rejection could not be called early, on time, or late.
+
+**A truncated history places nothing.** One whose first version is not its creation has already drifted by an
+unknown amount. `original`, when the export has it, seeds the anchor through the same path as an import (D20);
+without it the history is marked `truncated`, replayed, and left out of the ranges and the suggestion.
+
+**Quantities: counted, not built.** The open question from D16 is whether quantities need a drift check, since
+a factor limit holds each version only to the one before it. The run counts the recycles that end further from
+a quantity's first value than any legitimate history does, in steps no larger than a legitimate history's
+largest (`walked`). A check would be built on that count being more than a curiosity on real data, and not
+before.
+
+**The shipped 0.85 stays, and now says what it is.** Removing it would stop enforcing drift for anyone who
+copied the example config, and replacing it with the sample's suggestion would be reading a threshold from
+synthetic data. Its comment says it is a starting point and where the real value comes from.
+
+**One store, in memory, per run.** The replay needs the engine's write path and nothing durable. `Engine::store`
+is readable inside the crate so that the anchor a step is held to can be read before the step.
+
+The drift events are new names (`drift_run`, `history`, `step`, ...), so nothing that reads a calibration is
+affected. They carry each field's similarity to the anchor, which is what would let a drift run be judged again
+under other weights. That re-judging is not built: the overall anchor similarity is weight-dependent, and
+`rejudge` reuses it as measured.

@@ -62,6 +62,8 @@ enum Command {
   Calibrate(CalibrateArgs),
   /// Compare two calibrations written with `calibrate --ndjson`, or one of them under a second configuration.
   CalibrateDiff(CalibrateDiffArgs),
+  /// Replay whole edit histories and report how far products drift, to choose `anchor_threshold`.
+  CalibrateDrift(CalibrateDriftArgs),
   /// Load a whole catalog into the store: every record of an export that is not stored yet becomes a baseline.
   Import(ImportArgs),
   /// Look at the runs that were recorded.
@@ -224,6 +226,25 @@ struct CalibrateArgs {
   /// Do not record this run.
   #[arg(long)]
   no_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct CalibrateDriftArgs {
+  /// The configuration file (for the model, schema, and thresholds).
+  #[arg(long, short, default_value = "config.toml")]
+  config: PathBuf,
+  /// Edit histories, one JSON object per line: {"product": ..., "label": "edit" | "recycle", "versions": [{"fields":
+  /// {...}}, ...]}, with `owner`, `recycled_at`, `original`, and `truncated` where they are known.
+  histories: PathBuf,
+  /// Leave out labeled histories whose `label_confidence` is below this: high, medium, or low.
+  #[arg(long, default_value = "medium")]
+  min_confidence: Confidence,
+  /// Write the run as NDJSON events on stdout, for tools, in place of the report.
+  #[arg(long)]
+  ndjson: bool,
+  /// Fixes the resampling behind the intervals, so that a run can be reproduced.
+  #[arg(long, default_value_t = 0)]
+  seed: u64,
 }
 
 #[derive(Debug, Args)]
@@ -658,6 +679,48 @@ fn duration(seconds: f64) -> String {
   }
 }
 
+impl CalibrateDriftArgs {
+  fn run(self) -> anyhow::Result<()> {
+    let config = Config::load(&self.config)?;
+    let (schema, policy) = (config.schema()?, config.policy()?);
+    let text =
+      std::fs::read_to_string(&self.histories).with_context(|| format!("cannot read {}", self.histories.display()))?;
+    let histories = offline::histories::parse_histories(&text, &schema, Some(self.min_confidence))
+      .with_context(|| format!("in {}", self.histories.display()))?;
+    let embedder = load_embedder(&config)?;
+    let (fingerprint, dimension, max_tokens) = (
+      embedder.fingerprint().to_owned(),
+      embedder.dimension(),
+      embedder.max_tokens(),
+    );
+    // One caller and nothing to wait behind, as for an import: the model runs on this thread.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .build()
+      .context("cannot start tokio")?;
+    let run = runtime.block_on(offline::drift::replay(
+      DirectEmbedder(embedder),
+      &schema,
+      &policy,
+      histories,
+    ))?;
+    if self.ndjson {
+      let model = offline::drift_report::Model {
+        fingerprint: &fingerprint,
+        dimension,
+        max_tokens,
+      };
+      offline::drift_report::emit_drift(model, &schema, &policy, &run, self.seed);
+    } else {
+      write!(
+        std::io::stdout().lock(),
+        "model     {fingerprint} ({dimension} dimensions per field, up to {max_tokens} tokens)\n{}",
+        offline::drift_report::render_drift(&run, &policy, self.seed)
+      )?;
+    }
+    Ok(())
+  }
+}
+
 impl CarveArgs {
   fn run(self) -> anyhow::Result<()> {
     let text = std::fs::read_to_string(&self.pairs).with_context(|| format!("cannot read {}", self.pairs.display()))?;
@@ -988,6 +1051,7 @@ fn main() -> ExitCode {
     Command::Compare(args) => args.run(),
     Command::Calibrate(args) => args.run(run.as_ref()),
     Command::CalibrateDiff(args) => args.run(),
+    Command::CalibrateDrift(args) => args.run(),
     Command::Import(args) => args.run(),
     Command::Runs(RunsCommand::List(args)) => args.run(),
     Command::Pairs(PairsCommand::Carve(args)) => args.run(),

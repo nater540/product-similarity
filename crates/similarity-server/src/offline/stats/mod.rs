@@ -13,6 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use similarity_core::FieldChange;
 use similarity_core::rng::Rng;
 
+pub mod drift;
+
 use super::calibrate::{Calibration, ScoredPair};
 use super::pairs::Label;
 

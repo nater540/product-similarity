@@ -287,6 +287,15 @@ fn measure(field: &str, change: QuantityChange, reference: &Quantity, candidate:
   score
 }
 
+/// Compares a quantity with the first value the record ever had for it, as [`compare`] compares it with the
+/// version before: how far it has come in all, however small each step was.
+///
+/// `Added` when the record has never had the quantity before this version, `Removed` when this version lacks it.
+/// `None` when neither has it.
+pub fn against_first(field: &str, first: Option<&Quantity>, candidate: Option<&Quantity>) -> Option<QuantityScore> {
+  compare(field, first, first, candidate)
+}
+
 /// Compares one quantity across two versions of a record.
 ///
 /// `anchor` is the first value the record ever had for this quantity. It matters only when the baseline has none:
@@ -361,6 +370,26 @@ mod tests {
         factor.to_bits()
       );
     }
+  }
+
+  /// Four doublings, each within a limit of two, are sixteen times the first value.
+  #[test]
+  fn a_quantity_is_also_measured_against_its_first_value() {
+    let first = grams(3.5);
+    let walked = against_first("q", Some(&first), Some(&grams(56.0))).unwrap();
+    assert_eq!(walked.change, QuantityChange::Modified);
+    assert!((walked.factor.unwrap() - 16.0).abs() < 1e-9);
+    assert_eq!(
+      against_first("q", None, Some(&first)).unwrap().change,
+      QuantityChange::Added
+    );
+    assert_eq!(
+      against_first("q", Some(&first), None).unwrap().change,
+      QuantityChange::Removed
+    );
+    assert_eq!(against_first("q", None, None), None);
+    let same = against_first("q", Some(&first), Some(&Quantity::single(3500.0, "mg"))).unwrap();
+    assert_eq!(same.change, QuantityChange::Unchanged);
   }
 
   #[test]

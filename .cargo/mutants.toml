@@ -11,7 +11,8 @@ examine_globs = [
   "crates/similarity-core/src/vector.rs",
   "crates/similarity-core/src/record.rs",
   "crates/similarity-server/src/engine.rs",
-  "crates/similarity-server/src/offline/stats.rs",
+  "crates/similarity-server/src/offline/stats/mod.rs",
+  "crates/similarity-server/src/offline/stats/drift.rs",
   "crates/similarity-server/src/offline/calibrate.rs",
 ]
 

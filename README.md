@@ -165,6 +165,7 @@ The binary is `record-similarity` (`target/release/record-similarity` after `jus
 | `record-similarity compare [--config config.toml] BEFORE.json AFTER.json` | Scores one before/after pair offline. |
 | `record-similarity calibrate [--config config.toml] PAIRS.jsonl [--full] [--split S] [--model DIR] [--ndjson]` | Scores labeled pairs and suggests a threshold. See [Choosing thresholds](#choosing-thresholds). |
 | `record-similarity calibrate-diff OLD.ndjson (NEW.ndjson \| --config-b CONFIG) [--fail-on WHAT]` | Compares two calibrations, or one under a second configuration. See [Comparing two calibrations](#comparing-two-calibrations). |
+| `record-similarity calibrate-drift [--config config.toml] HISTORIES.jsonl [--ndjson]` | Replays whole edit histories and reports how far products drift. See [The drift threshold](#the-drift-threshold). |
 | `record-similarity runs list [--runs DIR] [--kind KIND] [--limit N]` | Lists what was recorded: every calibration and every training run. See [Recorded runs](#recorded-runs). |
 | `record-similarity pairs carve PAIRS.jsonl --fraction F [--from S] [--into S] [--salt TEXT]` | Gives a share of one split's owners a split of their own. See [Choose a model, then measure it once](#3-choose-a-model-then-measure-it-once). |
 | `record-similarity load [--config config.toml] [--server URL] [--concurrency 1,4,16] [--records N]` | Measures latency and throughput through the API with synthetic records. See [Under concurrent callers](#under-concurrent-callers). |
@@ -723,7 +724,7 @@ Reading it:
 - **Weights** are worth adjusting when a field separates the groups well but is weighted low, or the reverse.
   Change them in the config and re-run; nothing needs re-indexing.
 - **`policy.anchor_threshold`** is chosen from whole edit histories rather than pairs: it should sit below how far
-  a legitimate record drifts over its lifetime.
+  a legitimate record drifts over its lifetime. See [The drift threshold](#the-drift-threshold).
 - **`reject_above_factor` for a quantity** belongs above the largest factor that quantity shows in any edit. A
   quantity limit is an extra way to reject, beside the text checks, so what matters is that it rejects no edit;
   most recycles leave a quantity alone (another strain at the same weight) and are for the text to catch. Each
@@ -859,6 +860,90 @@ and the API's `reason_details` carry the same six as `REASON_CODE_` plus the cod
 A pair's `pair_id` is the one the file gave it; a pair without one gets a fingerprint of its content, so the same
 pair has the same id in every run. Similarities are rounded to six places. `schema_field` and `schema_quantity`
 lines after the first say which fields and quantities the run was scored with, and their weights and limits.
+
+### The drift threshold
+
+`anchor_threshold` rejects a revision that is too far from the record as first stored, however small each step
+was. A before/after pair cannot say where it belongs: that is a question about a product's whole life. It is read
+from edit histories, every version of a product in order:
+
+```json
+{"product": "h7", "owner": "brand-4", "label": "recycle", "recycled_at": 2, "versions": [{"at": "2026-01-01T09:00:00Z", "fields": {"name": "Blueberry Gummies 100mg"}}, {"fields": {"name": "Blueberry Gummies 100mg (Indica)"}}, {"fields": {"name": "Sour Diesel Live Resin Cartridge 1g"}}]}
+```
+
+`label` is `edit` for a product that stayed itself and `recycle` for one that became another; any other label is
+replayed and counted nowhere. `recycled_at` is the index of the first version that is no longer the product (the first version is 0), so
+that what came before it counts as legitimate. `original` is the product as created, when the first version in
+the file is not that, and `truncated: true` says the first version is not the creation and nobody knows what was.
+Each version's `fields` is a record, reduced to what the schema compares.
+
+```sh
+just calibrate-drift                                   # the bundled sample, the example config
+just calibrate-drift sequences.jsonl config.toml       # real histories
+```
+
+Every history is replayed through the engine, on a store in memory. On the bundled sample (shortened):
+
+```text
+model     f46e48ee0ea2dd02-d256-t256 (256 dimensions per field, up to 256 tokens)
+histories 13 (7 edit, 5 recycle, 1 other), 36 steps
+
+label    steps  lowest to anchor  first rejected                     history
+edit         7        0.977 at 7  -                                  h-reworded
+edit         4        0.967 at 2  -                                  h-suffix
+...
+recycle      6        0.568 at 6  step 4 (below_threshold, anchor_drift) h-walk, recycled at 3
+recycle      3        1.000 at 1  -                                  h-weight-walk
+recycle      1        0.515 at 1  step 1 (anchor_drift)              h-original
+...
+
+lowest similarity to the anchor    count  lowest      p5  median highest
+legitimate histories                   9   0.950   0.950   0.985   1.000
+recycles, once recycled                5   0.513   0.513   0.568   1.000
+
+configured policy (threshold 0.900, anchor_threshold 0.850, field floors and any quantity limits):
+  legitimate histories blocked: 0 of 7, 0.0% to 0.0% (by the pair rules 0, by the drift check alone 0)
+  recycles first rejected: at the recycled version 2, later 1, before it 0, somewhere 1, never 1; by the drift check alone 1
+
+anchor_threshold 0.733 is below every legitimate history (lowest 0.950) and rejects 1 of the 2 recycle(s) the pair rules miss (margin 0.218)
+
+quantity (factor)    legitimate: step, vs first   recycles: step, vs first     walked
+...
+weight_per_item      1.00, 1.00                   40.00, 40.00                 1
+```
+
+Reading it:
+
+- **`lowest to anchor`** is the furthest a history gets from what it first was, and the step it is at. The
+  description reworded seven times is still at 0.977.
+- **A drift threshold has to be below every legitimate history,** or it blocks a product that only ever was
+  itself. It is useful only for the recycles the per-step rules miss, which are few: most recycles are one large
+  step, and the overall threshold catches them. So it is not placed in a gap between two labels. The suggestion is
+  halfway between the lowest legitimate history and the highest of the missed recycles below it. When no missed
+  recycle is below every legitimate history, there is nothing to suggest, and the report says what the threshold
+  must stay under.
+- **`legitimate histories blocked`** is what the configured policy costs: products that stayed themselves and
+  were rejected at some step, with a 95% interval from resampling owners. `by the drift check alone` is how many
+  of those the drift check is to blame for.
+- **`recycles first rejected`** says when: at the version that was no longer the product, later (recycled
+  versions were accepted first), before it (a legitimate version was the one refused), or never.
+- **`walked`** counts recycles that end further from a quantity's first value than any legitimate history does,
+  in steps no larger than a legitimate history's largest. A limit on each step cannot catch those. It is the
+  evidence for or against a drift check on quantities, which does not exist.
+- **A truncated history is left out of the ranges and the suggestion.** It started after its creation, so it
+  drifted further than it shows.
+
+Each version is measured first and judged afterwards. Replaying under the configured policy would be wrong:
+after the first rejected version the stored record stops moving, and every later version would be compared with
+a baseline the real product left long ago. So the replay runs with nothing able to reject, and each step's
+measurements are then judged under the config. Up to and including the first rejection that is exactly what the
+server would have decided.
+
+**The sample is there to show the report.** Its thirteen histories were written by hand, and no threshold may be
+read from them. `anchor_threshold = 0.85` in `config.example.toml` is not a measurement either; it is a place to
+start, to be replaced by what this prints on real histories. `--ndjson` writes the run as flat events (`drift_run`,
+`history`, `step`, `step_field`, `step_quantity`, `step_reason`, `history_quantity`, `drift_range`, `drift_blocked`,
+`drift_suggestion`, `drift_quantity`, `drift_summary`), joined on `history_id` and `step`.
 
 ### Comparing two calibrations
 
@@ -1645,11 +1730,12 @@ crates/
 data/
   calibration.sample.jsonl        synthetic labeled pairs, in the strict format
   calibration.sample.full.jsonl   the same pairs in the full format a data export uses
+  drift.sample.jsonl              synthetic edit histories, for `calibrate-drift`
   regression.jsonl                curated hard cases, synthetic, whose verdicts are pinned
   regression.snapshot.ndjson      what the pinned model and the example config make of them
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D26)
+  decisions.md               why things are the way they are (D1 to D27)
   data-request-prompt.md     a brief for collecting labeled production data
   feature-suggestions.md     twenty features that could be added, none built yet
   plan-features.md           a plan for the first five of them
@@ -1707,7 +1793,8 @@ what that field says.
   this service.
 - **No drift check for quantities.** A factor limit applies to each revision against the one before it. A quantity
   can still be moved a long way in steps that each stay under the limit; the text drift check
-  (`anchor_threshold`) does not see quantities.
+  (`anchor_threshold`) does not see quantities. `calibrate-drift` counts the recycles that do this (`walked`), which
+  is the evidence for or against building one.
 - **Quantities play no part in search.** `FindSimilar` compares vectors, which hold text only.
 - **Truncation.** Text beyond `max_tokens` (256 by default) is ignored. A long field is tokenized a part at a
   time and no further than it takes to fill that limit, so an enormous description costs little more than an
