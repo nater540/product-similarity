@@ -873,14 +873,37 @@ mod tests {
     let mut run = run;
     run.done = true;
     drop(run);
-    let read = open(&dir).unwrap();
+    let read = once_nothing_holds_the_lock(&dir);
     assert_eq!(read.manifest.status, Stored::Running, "nothing wrote to it");
     assert_eq!(read.status, Status::Killed);
-    assert_eq!(open(&dir).unwrap().status, Status::Killed, "reading does not change it");
+    assert_eq!(
+      once_nothing_holds_the_lock(&dir).status,
+      Status::Killed,
+      "reading does not change it"
+    );
 
     // The same without a lock file at all, as in a run directory copied from elsewhere.
     std::fs::remove_file(dir.join(LOCK_FILE)).unwrap();
     assert_eq!(open(&dir).unwrap().status, Status::Killed);
+  }
+
+  /// The run as it reads once no process holds its lock, giving up after two seconds and returning what was read.
+  ///
+  /// Dropping a `Run` closes this process's handle on the lock file, and that does not always free the lock at
+  /// once in a test: the tests run on threads of one process, starting a run asks the system who and where it is
+  /// by running a command, and a process made on another thread at that moment starts with a copy of every open
+  /// file, this lock among them, until the command it becomes replaces it. For that instant the lock has a
+  /// second holder and the run reads as running, which is the right answer to give. A process that was really
+  /// killed has no such sibling.
+  fn once_nothing_holds_the_lock(dir: &Path) -> Listed {
+    for _ in 0..400 {
+      let read = open(dir).unwrap();
+      if read.status != Status::Running {
+        return read;
+      }
+      std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    open(dir).unwrap()
   }
 
   #[test]

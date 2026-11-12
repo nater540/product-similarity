@@ -480,7 +480,7 @@ mod tests {
     assert_eq!(worker.stats(), WorkerSnapshot::default());
 
     worker.embed(vec!["blueberry gummies".to_owned()]).await.unwrap();
-    let first = worker.stats();
+    let first = busy_beyond(&worker, 0).await;
     assert_eq!((first.batches, first.jobs, first.texts, first.overloaded), (1, 1, 1, 0));
     assert!(first.busy_ns > 0);
 
@@ -490,13 +490,31 @@ mod tests {
       .unwrap();
     // An empty request never reaches the thread.
     worker.embed(Vec::new()).await.unwrap();
-    let window = worker.stats().since(&first);
+    let window = busy_beyond(&worker, first.busy_ns).await.since(&first);
     assert_eq!(
       (window.batches, window.jobs, window.texts),
       (1, 1, 2),
       "only what happened since"
     );
-    assert!(window.busy_ns > 0 && worker.stats().busy_ns >= first.busy_ns);
+    assert!(
+      window.busy_ns > 0,
+      "the second batch's time is counted, and only its own"
+    );
+  }
+
+  /// The worker's counters once its time in the model has passed `busy_ns`. The thread answers a batch and then
+  /// adds the batch's time, so a caller that reads the counters the moment it is answered may read them first:
+  /// the counts are there by then, and the time arrives a moment later. Gives up after two seconds and returns
+  /// what is there, for the assertion to fail on.
+  async fn busy_beyond(worker: &EmbedWorker, busy_ns: u64) -> WorkerSnapshot {
+    for _ in 0..400 {
+      let stats = worker.stats();
+      if stats.busy_ns > busy_ns {
+        return stats;
+      }
+      tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    worker.stats()
   }
 
   /// A full queue refuses a request at once, and that is counted where a load test can read it.
