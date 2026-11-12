@@ -1745,7 +1745,8 @@ sku-1	rejected	accepted	0.878707	0.942242
 - **It costs one more comparison of vectors already in memory**: no model, no store, nothing waited for. Against
   this server with `just load ... --server`, one caller, 300 records: edits took a median of 5.63 ms with no
   shadow, 5.63 ms with this one, and 5.69 ms with `events = "all"`; resaves, which never reach the model,
-  0.10 ms, 0.11 ms, and 0.11 ms. One run each, so differences of that size are noise.
+  0.10 ms, 0.11 ms, and 0.11 ms. One run each, so differences of that size are noise. (`load` without
+  `--server` starts a server of its own, which has no shadow.)
 - **Only a policy can be shadowed, and one at a time.** A candidate model is compared with `calibrate --model`
   on labeled pairs ([Choose a model, then measure it once](#3-choose-a-model-then-measure-it-once)); running one
   beside the live model is not built, and `[shadow.model]` is refused with that reason. Changing or removing

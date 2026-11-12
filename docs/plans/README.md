@@ -79,5 +79,6 @@ Each plan ends with its full list of decisions and a recommended default for eac
 4. **15** (built) and **14**, at any point. 14's first targets confirm the two predicted findings above.
 5. **11** is built, on synthetic histories; it is run for real once `sequences.jsonl` exists.
 6. Before real fine-tuning: **2**, **3**, and **5** (all built), then **4**. **6** last; it is large and builds on 3.
-7. Before production: **10** and **12** (12 is built). In production: **17**, then **18** (its policy-only half is built, D30; the model half waits for a candidate model).
+7. Before production: **10** and **12** (12 is built). In production: **17**, then **18** (its policy-only half
+   is built, D30; the model half waits for a candidate model).
 8. **20** when the matching question is taken up; it is a separate product question.

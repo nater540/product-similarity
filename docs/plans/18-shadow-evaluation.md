@@ -1,8 +1,23 @@
 # Plan: shadow evaluation (feature 18)
 
 A plan for running a candidate beside the live configuration on real traffic, written so that a session with no
-memory of the conversation that produced it can carry it out. Nothing here is built. Read `CLAUDE.md` first, then
-D7, D8, D9, D12, D15, D17, and D20 in `docs/decisions.md`, then this file.
+memory of the conversation that produced it can carry it out. Read `CLAUDE.md` first, then D7, D8, D9, D12, D15,
+D17, D20, and D30 in `docs/decisions.md`, then this file.
+
+**Status: the policy half is built (D30); the model half is not.** What exists differs from steps 1 and 2 below
+in these ways, and the model half has to start from what exists:
+
+- The seam is `engine::Observer`, with one method. `Observation` borrows (`id`, `mode`, the request's
+  `threshold`, the live `policy`, `stored`, `revision`, and `judged`: the baseline, the candidate's vectors and
+  quantities, the live evaluation). A model shadow that queues work has to copy what it keeps, and needs the
+  prepared texts added to the observation. There is no `deleted` callback yet.
+- `next_anchor` was not extracted; the mirror write will want it.
+- The events have no `tenant` (the owner has not decided whether one may be logged), `shadow_reason` says
+  `subject`, and a policy shadow writes no `shadow_field` or `shadow_quantity` lines: both sides measured the
+  same values. `in_sync`, `missing`, `queued_ms`, and `embed_ms` belong to the model shadow and are not written.
+- `events = "disagreements"` is the default; `"all"` writes every judged revision.
+- `[shadow.model]` and `[shadow.qdrant]` are parsed only to be refused with the reason. There is no `queue` key.
+- Not built: `shadow-report`, the shadow in `Describe`, `import --shadow`.
 
 ## Contents
 
