@@ -1,0 +1,37 @@
+meta {
+  name: Match [With Threshold]
+  type: grpc
+  seq: 14
+}
+
+grpc {
+  url: {{server}}
+  method: /recordsimilarity.v1.RecordSimilarity/Match
+  body: grpc
+  protoPath: ../crates/similarity-proto/proto/recordsimilarity/v1/similarity.proto
+  auth: none
+  methodType: unary
+}
+
+body:grpc {
+  name: message 1
+  content: '''
+    {
+      "menu_item": {
+        "fields": {
+          "name": "Blueberry Gummies 10pk 100mg",
+          "brand": "Sunny Orchard",
+          "category": "Edibles"
+        }
+      },
+      "limit": 3,
+      "brand_id": "brand-1",
+      "threshold": 0.9
+    }
+  '''
+}
+
+docs {
+  `brand_id` here narrows the candidates to one brand's records. `threshold` holds the best candidate to a score
+  for this request, so the decision is `MATCHED` or `NO_MATCH`. 0.9 is an example, not a measured value.
+}

@@ -1,7 +1,7 @@
 meta {
-  name: Evaluate - force
+  name: Evaluate [Accepted Update]
   type: grpc
-  seq: 7
+  seq: 5
 }
 
 grpc {
@@ -21,30 +21,29 @@ body:grpc {
         "id": "bruno-1",
         "brand_id": "brand-1",
         "fields": {
-          "name": "Sour Diesel Live Resin Cartridge 1g",
-          "category": "Vape Pens > Cartridges",
+          "name": "Blueberry Gummies 100mg (10-pack)",
+          "category": "Edibles > Gummies",
           "brand": "Sunny Orchard",
-          "description": "A 1 gram 510-thread cartridge of Sour Diesel live resin, a sativa with notes of citrus and fuel. No cutting agents."
+          "description": "Ten vegan fruit gummies with a ripe blueberry flavor, indica-leaning and made with real fruit. 10mg THC per piece, 100mg per pouch."
         },
         "quantities": {
           "weight_per_item": {
-            "min": 1,
-            "max": 1,
+            "min": 40,
+            "max": 40,
             "unit": "g"
           },
           "thc_per_item": {
-            "min": 84,
-            "max": 88,
-            "unit": "%"
+            "min": 100,
+            "max": 100,
+            "unit": "mg"
           }
         }
       },
-      "mode": "WRITE_MODE_FORCE"
+      "mode": "WRITE_MODE_ENFORCE"
     }
   '''
 }
 
 docs {
-  Writes whatever the verdict (a reviewer approved the change), and makes this version the point drift is
-  measured from.
+  Example `Evaluate` request that successfully updates the record. A pack size in the name and a reworded description are the only changes.
 }

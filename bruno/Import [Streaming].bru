@@ -1,7 +1,7 @@
 meta {
-  name: Import - a stream
+  name: Import [Streaming]
   type: grpc
-  seq: 2
+  seq: 3
 }
 
 grpc {
@@ -99,7 +99,7 @@ docs {
   Creates records that are not stored yet: send each message, then end the stream. One answer comes back for
   each record, in order. A record that is already stored is answered `IMPORT_OUTCOME_EXISTS` and left exactly as
   it is, so the stream can be sent twice. `anchor` is the record as it was first created, if you have it.
-
+  
   The third record has a field the schema does not define and is answered `IMPORT_OUTCOME_FAILED` by itself; the
   stream goes on. The requests after this one search and match against what it creates.
 }

@@ -1,7 +1,7 @@
 meta {
-  name: Evaluate - an ordinary edit
+  name: Evaluate [Dry-Run]
   type: grpc
-  seq: 4
+  seq: 6
 }
 
 grpc {
@@ -21,30 +21,29 @@ body:grpc {
         "id": "bruno-1",
         "brand_id": "brand-1",
         "fields": {
-          "name": "Blueberry Gummies 100mg (10-pack)",
-          "category": "Edibles > Gummies",
+          "name": "Sour Diesel Live Resin Cartridge 1g",
+          "category": "Vape Pens > Cartridges",
           "brand": "Sunny Orchard",
-          "description": "Ten vegan fruit gummies with a ripe blueberry flavor, indica-leaning and made with real fruit. 10mg THC per piece, 100mg per pouch."
+          "description": "A 1 gram 510-thread cartridge of Sour Diesel live resin, a sativa with notes of citrus and fuel. No cutting agents."
         },
         "quantities": {
           "weight_per_item": {
-            "min": 40,
-            "max": 40,
+            "min": 1,
+            "max": 1,
             "unit": "g"
           },
           "thc_per_item": {
-            "min": 100,
-            "max": 100,
-            "unit": "mg"
+            "min": 84,
+            "max": 88,
+            "unit": "%"
           }
         }
       },
-      "mode": "WRITE_MODE_ENFORCE"
+      "mode": "WRITE_MODE_DRY_RUN"
     }
   '''
 }
 
 docs {
-  A pack size in the name and a reworded description. Run "Evaluate - create" first. Accepted, stored, and the
-  revision goes to 2.
+  Judges and never writes: `stored` is false whatever the verdict. Use it to preview a verdict.
 }

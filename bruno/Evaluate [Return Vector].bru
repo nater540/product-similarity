@@ -1,12 +1,12 @@
 meta {
-  name: FindSimilar - by record
+  name: Evaluate [Return Vector]
   type: grpc
-  seq: 10
+  seq: 9
 }
 
 grpc {
   url: {{server}}
-  method: /recordsimilarity.v1.RecordSimilarity/FindSimilar
+  method: /recordsimilarity.v1.RecordSimilarity/Evaluate
   body: grpc
   protoPath: ../crates/similarity-proto/proto/recordsimilarity/v1/similarity.proto
   auth: none
@@ -19,15 +19,14 @@ body:grpc {
     {
       "record": {
         "fields": {
-          "name": "blueberry gummy 100 mg"
+          "name": "Blueberry Gummies"
         }
       },
-      "limit": 3,
-      "min_similarity": 0.5
+      "return_vector": true
     }
   '''
 }
 
 docs {
-  The stored records most similar to text that is not stored.
+  No `id`: the record is embedded and nothing is compared or stored. `return_vector` returns the vector.
 }

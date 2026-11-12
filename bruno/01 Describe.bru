@@ -1,7 +1,7 @@
 meta {
   name: Describe
   type: grpc
-  seq: 1
+  seq: 2
 }
 
 grpc {
@@ -21,6 +21,9 @@ body:grpc {
 }
 
 docs {
-  What the server is running: the model's fingerprint, the fields it compares with their weights, the quantities,
-  and the thresholds in force. The field and quantity names it lists are the only keys a record may have.
+  What the server is running; returns:
+  
+  - model's fingerprint
+  - the fields it compares with their weights, the quantities, and the thresholds in force.
+  - The field and quantity names it lists are the only keys a record may have.
 }

@@ -1,7 +1,7 @@
 meta {
-  name: Evaluate - dry run
+  name: Evaluate [Forced Update]
   type: grpc
-  seq: 5
+  seq: 8
 }
 
 grpc {
@@ -39,11 +39,12 @@ body:grpc {
           }
         }
       },
-      "mode": "WRITE_MODE_DRY_RUN"
+      "mode": "WRITE_MODE_FORCE"
     }
   '''
 }
 
 docs {
-  Judges and never writes: `stored` is false whatever the verdict. Use it to preview a verdict.
+  Writes whatever the verdict (a reviewer approved the change), and makes this version the point drift is
+  measured from.
 }
