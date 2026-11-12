@@ -10,7 +10,7 @@ use std::sync::RwLock;
 
 use similarity_core::vector::cosine;
 
-use crate::{Neighbor, Result, SearchQuery, StoreError, StoredRecord, VectorStore};
+use crate::{Found, Neighbor, Result, SearchQuery, StoreError, StoredRecord, VectorStore};
 
 /// A [`VectorStore`] that keeps everything in memory.
 #[derive(Debug)]
@@ -55,6 +55,46 @@ impl MemoryStore {
   fn poisoned() -> StoreError {
     StoreError::Unavailable("in-memory store lock was poisoned by a panicking writer".to_owned())
   }
+
+  /// The records a query matches, most similar first, each turned into a result by `found`. One loop for both
+  /// kinds of search, so that they cannot differ in what they match or in what order.
+  fn hits<T>(&self, query: SearchQuery<'_>, found: impl Fn(&StoredRecord, f32) -> T) -> Result<Vec<T>> {
+    self.check_length("the query vector", query.vector)?;
+    let records = self.records.read().map_err(|_| Self::poisoned())?;
+
+    let mut hits = Vec::new();
+    for (layout, record) in records.values() {
+      let excluded = query.exclude_id == Some(record.id.as_str());
+      let other_tenant = query.tenant.is_some() && query.tenant != record.tenant.as_deref();
+      if *layout != self.layout || excluded || other_tenant {
+        continue;
+      }
+      let similarity = cosine(query.vector, &record.vectors.composite).map_err(|source| StoreError::Corrupt {
+        id: record.id.clone(),
+        reason: source.to_string(),
+      })?;
+      if query.min_similarity.is_none_or(|minimum| similarity >= minimum) {
+        hits.push((similarity, record));
+      }
+    }
+    // Ties are broken by id so that results are stable across runs and hash-map iteration orders.
+    hits.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.id.cmp(&b.1.id)));
+    hits.truncate(query.limit);
+    Ok(
+      hits
+        .into_iter()
+        .map(|(similarity, record)| found(record, similarity))
+        .collect(),
+    )
+  }
+}
+
+fn neighbor(record: &StoredRecord, similarity: f32) -> Neighbor {
+  Neighbor {
+    id: record.id.clone(),
+    tenant: record.tenant.clone(),
+    similarity,
+  }
 }
 
 impl VectorStore for MemoryStore {
@@ -85,31 +125,14 @@ impl VectorStore for MemoryStore {
   }
 
   async fn search(&self, query: SearchQuery<'_>) -> Result<Vec<Neighbor>> {
-    self.check_length("the query vector", query.vector)?;
-    let records = self.records.read().map_err(|_| Self::poisoned())?;
+    self.hits(query, neighbor)
+  }
 
-    let mut neighbors = Vec::new();
-    for (layout, record) in records.values() {
-      let excluded = query.exclude_id == Some(record.id.as_str());
-      let other_tenant = query.tenant.is_some() && query.tenant != record.tenant.as_deref();
-      if *layout != self.layout || excluded || other_tenant {
-        continue;
-      }
-      let similarity = cosine(query.vector, &record.vectors.composite).map_err(|source| StoreError::Corrupt {
-        id: record.id.clone(),
-        reason: source.to_string(),
-      })?;
-      if query.min_similarity.is_none_or(|minimum| similarity >= minimum) {
-        neighbors.push(Neighbor {
-          id: record.id.clone(),
-          tenant: record.tenant.clone(),
-          similarity,
-        });
-      }
-    }
-    // Ties are broken by id so that results are stable across runs and hash-map iteration orders.
-    neighbors.sort_by(|a, b| b.similarity.total_cmp(&a.similarity).then_with(|| a.id.cmp(&b.id)));
-    neighbors.truncate(query.limit);
-    Ok(neighbors)
+  async fn search_vectors(&self, query: SearchQuery<'_>) -> Result<Vec<Found>> {
+    self.hits(query, |record, similarity| Found {
+      neighbor: neighbor(record, similarity),
+      vectors: record.vectors.clone(),
+      quantities: record.quantities.clone(),
+    })
   }
 }

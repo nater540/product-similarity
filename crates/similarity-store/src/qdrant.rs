@@ -22,13 +22,14 @@ use qdrant_client::qdrant::{
   Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, DeletePointsBuilder, Distance, FieldType,
   Filter, GetPointsBuilder, HnswConfigDiffBuilder, KeywordIndexParamsBuilder, NamedVectors, PointId, PointStruct,
   PointsIdsList, QueryPointsBuilder, UpsertPointsBuilder, Value, VectorParamsBuilder, VectorsConfigBuilder,
+  VectorsOutput, VectorsSelector,
 };
 use qdrant_client::{Payload, Qdrant, QdrantError};
 use serde::{Deserialize, Serialize};
 use similarity_core::{Quantities, RecordVectors};
 use uuid::Uuid;
 
-use crate::{Neighbor, Result, SearchQuery, StoreError, StoredRecord, VectorStore};
+use crate::{Found, Neighbor, Result, SearchQuery, StoreError, StoredRecord, VectorStore};
 
 const CURRENT: &str = "current";
 const ANCHOR: &str = "anchor";
@@ -268,6 +269,57 @@ impl QdrantStore {
   }
 }
 
+impl QdrantStore {
+  /// The dense vector `name` of the point holding record `id`, checked to have this store's width.
+  fn dense(&self, id: &str, vectors: Option<&VectorsOutput>, name: &str) -> Result<Vec<f32>> {
+    match vectors.and_then(|vectors| vectors.get_vector_by_name(name)) {
+      Some(StoredVector::Dense(dense)) if dense.data.len() == self.dimension => Ok(dense.data),
+      Some(StoredVector::Dense(dense)) => Err(StoreError::Corrupt {
+        id: id.to_owned(),
+        reason: format!(
+          "vector `{name}` has {} components, expected {}",
+          dense.data.len(),
+          self.dimension
+        ),
+      }),
+      _ => Err(StoreError::Corrupt {
+        id: id.to_owned(),
+        reason: format!("dense vector `{name}` is missing"),
+      }),
+    }
+  }
+
+  /// The request both kinds of search send, or `None` for a search that asks for nothing. One place, so that
+  /// they cannot differ in what they match.
+  fn query_request(&self, query: SearchQuery<'_>) -> Result<Option<QueryPointsBuilder>> {
+    self.check_length("the query vector", query.vector)?;
+    let limit = u64::try_from(query.limit).unwrap_or(u64::MAX);
+    if limit == 0 {
+      return Ok(None);
+    }
+
+    let mut must = vec![Condition::matches(LAYOUT_KEY, self.layout.clone())];
+    if let Some(tenant) = query.tenant {
+      must.push(Condition::matches(TENANT_KEY, tenant.to_owned()));
+    }
+    let mut filter = Filter::must(must);
+    if let Some(excluded) = query.exclude_id {
+      filter.must_not.push(Condition::has_id([point_id(excluded)]));
+    }
+
+    let mut request = QueryPointsBuilder::new(self.collection.as_str())
+      .query(query.vector.to_vec())
+      .using(CURRENT)
+      .filter(filter)
+      .limit(limit)
+      .with_payload(true);
+    if let Some(minimum) = query.min_similarity {
+      request = request.score_threshold(minimum);
+    }
+    Ok(Some(request))
+  }
+}
+
 fn decode_payload(id: &str, payload: HashMap<String, Value>) -> Result<PointPayload> {
   Payload::from(payload)
     .deserialize()
@@ -309,23 +361,7 @@ impl VectorStore for QdrantStore {
     }
 
     let vectors = point.vectors;
-    let named = |name: &str| -> Result<Vec<f32>> {
-      match vectors.as_ref().and_then(|vectors| vectors.get_vector_by_name(name)) {
-        Some(StoredVector::Dense(dense)) if dense.data.len() == self.dimension => Ok(dense.data),
-        Some(StoredVector::Dense(dense)) => Err(StoreError::Corrupt {
-          id: id.to_owned(),
-          reason: format!(
-            "vector `{name}` has {} components, expected {}",
-            dense.data.len(),
-            self.dimension
-          ),
-        }),
-        _ => Err(StoreError::Corrupt {
-          id: id.to_owned(),
-          reason: format!("dense vector `{name}` is missing"),
-        }),
-      }
-    };
+    let named = |name: &str| self.dense(id, vectors.as_ref(), name);
     Ok(Some(StoredRecord {
       id: payload.record_id,
       tenant: payload.tenant,
@@ -406,30 +442,9 @@ impl VectorStore for QdrantStore {
   }
 
   async fn search(&self, query: SearchQuery<'_>) -> Result<Vec<Neighbor>> {
-    self.check_length("the query vector", query.vector)?;
-    let limit = u64::try_from(query.limit).unwrap_or(u64::MAX);
-    if limit == 0 {
+    let Some(request) = self.query_request(query)? else {
       return Ok(Vec::new());
-    }
-
-    let mut must = vec![Condition::matches(LAYOUT_KEY, self.layout.clone())];
-    if let Some(tenant) = query.tenant {
-      must.push(Condition::matches(TENANT_KEY, tenant.to_owned()));
-    }
-    let mut filter = Filter::must(must);
-    if let Some(excluded) = query.exclude_id {
-      filter.must_not.push(Condition::has_id([point_id(excluded)]));
-    }
-
-    let mut request = QueryPointsBuilder::new(self.collection.as_str())
-      .query(query.vector.to_vec())
-      .using(CURRENT)
-      .filter(filter)
-      .limit(limit)
-      .with_payload(true);
-    if let Some(minimum) = query.min_similarity {
-      request = request.score_threshold(minimum);
-    }
+    };
     let response = self
       .client
       .query(request)
@@ -445,6 +460,42 @@ impl VectorStore for QdrantStore {
           id: payload.record_id,
           tenant: payload.tenant,
           similarity: point.score,
+        })
+      })
+      .collect()
+  }
+
+  async fn search_vectors(&self, query: SearchQuery<'_>) -> Result<Vec<Found>> {
+    let Some(request) = self.query_request(query)? else {
+      return Ok(Vec::new());
+    };
+    // Only the current vector: the anchor is not needed to score a result, and stays where it is.
+    let request = request.with_vectors(VectorsSelector {
+      names: vec![CURRENT.to_owned()],
+    });
+    let response = self
+      .client
+      .query(request)
+      .await
+      .map_err(|source| unavailable(&source))?;
+
+    response
+      .result
+      .into_iter()
+      .map(|point| {
+        let payload = decode_payload("<search result>", point.payload)?;
+        let composite = self.dense(&payload.record_id, point.vectors.as_ref(), CURRENT)?;
+        Ok(Found {
+          neighbor: Neighbor {
+            id: payload.record_id,
+            tenant: payload.tenant,
+            similarity: point.score,
+          },
+          vectors: RecordVectors {
+            composite,
+            hashes: payload.hashes,
+          },
+          quantities: payload.quantities,
         })
       })
       .collect()

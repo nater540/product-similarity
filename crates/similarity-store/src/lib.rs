@@ -115,6 +115,17 @@ pub struct Neighbor {
   pub similarity: f32,
 }
 
+/// A search result with what scoring it exactly needs: the record's current vectors and quantities.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Found {
+  /// The result as [`VectorStore::search`] would give it.
+  pub neighbor: Neighbor,
+  /// The record's current composite and the fingerprints of its texts.
+  pub vectors: RecordVectors,
+  /// The record's current quantities.
+  pub quantities: Quantities,
+}
+
 /// The storage contract.
 ///
 /// Methods return `impl Future + Send` rather than using `async fn` so that a server generic over the store can
@@ -151,4 +162,13 @@ pub trait VectorStore: Send + Sync + 'static {
   /// [`StoreError::Invalid`] if the query vector has the wrong length, [`StoreError::Unavailable`] if the search
   /// fails.
   fn search(&self, query: SearchQuery<'_>) -> impl Future<Output = Result<Vec<Neighbor>>> + Send;
+
+  /// [`Self::search`], with each result's current vectors and quantities: the same filters, the same order, the
+  /// same limit. It is what a caller that scores the results again (a match) asks for in place of one `get` per
+  /// result. The anchor is not returned.
+  ///
+  /// # Errors
+  ///
+  /// As [`Self::search`], and [`StoreError::Corrupt`] if a result's vectors cannot be read.
+  fn search_vectors(&self, query: SearchQuery<'_>) -> impl Future<Output = Result<Vec<Found>>> + Send;
 }

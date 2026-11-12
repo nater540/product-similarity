@@ -857,7 +857,7 @@ mod tests {
   use std::sync::Arc;
 
   use similarity_core::{FieldSpec, QuantitySpec};
-  use similarity_store::MemoryStore;
+  use similarity_store::{Found, MemoryStore};
 
   use super::*;
   use crate::worker::testing::WordBagEmbedder;
@@ -995,6 +995,10 @@ mod tests {
 
     async fn search(&self, query: SearchQuery<'_>) -> Result<Vec<Neighbor>, StoreError> {
       self.0.search(query).await
+    }
+
+    async fn search_vectors(&self, query: SearchQuery<'_>) -> Result<Vec<Found>, StoreError> {
+      self.0.search_vectors(query).await
     }
   }
 
@@ -1151,6 +1155,10 @@ mod tests {
 
     async fn search(&self, query: SearchQuery<'_>) -> Result<Vec<Neighbor>, StoreError> {
       self.inner.search(query).await
+    }
+
+    async fn search_vectors(&self, query: SearchQuery<'_>) -> Result<Vec<Found>, StoreError> {
+      self.inner.search_vectors(query).await
     }
   }
 

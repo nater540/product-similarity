@@ -229,6 +229,64 @@ async fn contract<S: VectorStore>(store: &S, other_layout: &S) {
     ["gummies", "chocolate"]
   );
 
+  // A search with vectors is the same search: the same results in the same order under every filter, each with
+  // the record's current vectors and quantities as `get` returns them.
+  let mut weighed = record("chocolate", Some("merchant-1"), [0.8, 0.6, 0.0, 0.0, 0.0, 0.0]);
+  weighed.quantities = quantities(&[("weight", Quantity::single(3.5, "g"))]);
+  store.put(&weighed).await.unwrap();
+  let variants = [
+    query(&probe),
+    SearchQuery {
+      limit: 1,
+      ..query(&probe)
+    },
+    SearchQuery {
+      limit: 0,
+      ..query(&probe)
+    },
+    SearchQuery {
+      tenant: Some("merchant-2"),
+      ..query(&probe)
+    },
+    SearchQuery {
+      tenant: Some("nobody"),
+      ..query(&probe)
+    },
+    SearchQuery {
+      exclude_id: Some("gummies"),
+      ..query(&probe)
+    },
+    SearchQuery {
+      min_similarity: Some(0.5),
+      ..query(&probe)
+    },
+  ];
+  for variant in variants {
+    let plain = store.search(variant).await.unwrap();
+    let with_vectors = store.search_vectors(variant).await.unwrap();
+    assert_eq!(plain.len(), with_vectors.len(), "{variant:?}");
+    for (neighbor, found) in plain.iter().zip(&with_vectors) {
+      assert_eq!(
+        (&neighbor.id, &neighbor.tenant),
+        (&found.neighbor.id, &found.neighbor.tenant)
+      );
+      assert!((neighbor.similarity - found.neighbor.similarity).abs() < 1e-6);
+      let stored = store.get(&neighbor.id).await.unwrap().unwrap();
+      assert_same_direction(&found.vectors.composite, &stored.vectors.composite);
+      assert_eq!(found.vectors.hashes, stored.vectors.hashes);
+      assert_eq!(found.quantities, stored.quantities);
+    }
+  }
+  let found = store.search_vectors(query(&probe)).await.unwrap();
+  assert_eq!(
+    found[1].quantities, weighed.quantities,
+    "the chocolate, with its weight"
+  );
+  assert!(matches!(
+    store.search_vectors(query(&[1.0, 0.0])).await,
+    Err(StoreError::Invalid(_))
+  ));
+
   // Vectors of the wrong width are refused before they reach storage.
   let mut short = record("short", None, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
   short.vectors.composite.pop();
@@ -253,6 +311,7 @@ async fn contract<S: VectorStore>(store: &S, other_layout: &S) {
     other => panic!("expected a layout mismatch, got {other:?}"),
   }
   assert!(other_layout.search(query(&probe)).await.unwrap().is_empty());
+  assert!(other_layout.search_vectors(query(&probe)).await.unwrap().is_empty());
   assert_eq!(other_layout.get("never-stored").await.unwrap(), None);
   assert!(other_layout.delete("vape").await.unwrap());
   assert_eq!(store.get("vape").await.unwrap(), None);
@@ -296,6 +355,10 @@ impl VectorStore for SharedMemory {
 
   async fn delete(&self, id: &str) -> similarity_store::Result<bool> {
     self.with(async |store| store.delete(id).await).await
+  }
+
+  async fn search_vectors(&self, query: SearchQuery<'_>) -> similarity_store::Result<Vec<similarity_store::Found>> {
+    self.with(async |store| store.search_vectors(query).await).await
   }
 
   async fn search(&self, query: SearchQuery<'_>) -> similarity_store::Result<Vec<similarity_store::Neighbor>> {
