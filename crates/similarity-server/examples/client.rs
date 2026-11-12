@@ -60,6 +60,20 @@ enum Command {
     #[arg(long, default_value_t = 5)]
     limit: u32,
   },
+  /// Find the stored records a listing from elsewhere describes, best first, and whether the best is a match.
+  Match {
+    /// The JSON file holding the listing, under the server's field and quantity names.
+    listing: PathBuf,
+    /// Only consider records of this tenant.
+    #[arg(long)]
+    tenant: Option<String>,
+    /// How many candidates to list.
+    #[arg(long, default_value_t = 5)]
+    limit: u32,
+    /// Hold the best candidate to this in place of the server's match threshold.
+    #[arg(long)]
+    threshold: Option<f32>,
+  },
   /// Forget a record.
   Delete {
     /// The record's id.
@@ -184,10 +198,67 @@ fn print_description(description: pb::DescribeResponse) {
   if description.reject_on_measure_change {
     println!("measures  a change of measure is rejected");
   }
+  match description.match_threshold {
+    Some(threshold) => println!(
+      "matching  a listing matches at {threshold:.2}; {} records are scored for each one returned",
+      description.match_overfetch
+    ),
+    None => println!(
+      "matching  no threshold: listings are ranked, not judged; {} records are scored for each one returned",
+      description.match_overfetch
+    ),
+  }
+}
+
+fn print_match(response: &pb::MatchResponse) {
+  match response.threshold {
+    Some(threshold) => println!("decision  {:?} at a threshold of {threshold:.3}", response.decision()),
+    None => println!("decision  {:?}: the server has no match threshold", response.decision()),
+  }
+  for (rank, candidate) in (1_u32..).zip(&response.candidates) {
+    println!(
+      "{:<9} {:.3}  {}  {}  (the search scored it {:.3})",
+      rank,
+      candidate.similarity,
+      candidate.id,
+      candidate.tenant.as_deref().unwrap_or("-"),
+      candidate.search_similarity
+    );
+    for field in &candidate.fields {
+      let similarity = field
+        .similarity
+        .map_or_else(|| "-".to_owned(), |value| format!("{value:.3}"));
+      // Read with the stored record as the baseline: `Added` is a field only the listing has.
+      let side = match field.change() {
+        pb::FieldChange::Added => "  only the listing has it",
+        pb::FieldChange::Removed => "  only the stored record has it",
+        _ => "",
+      };
+      println!("  field     {:<14} {similarity:>6}{side}", field.field);
+    }
+    for quantity in &candidate.quantities {
+      let factor = match quantity.factor {
+        Some(factor) => format!("x{factor:.2}"),
+        None => "-".to_owned(),
+      };
+      let unit = |unit: &Option<String>| unit.clone().unwrap_or_else(|| "-".to_owned());
+      // The same reading: the stored record's value is the one before, the listing's the one after.
+      let what = match quantity.change() {
+        pb::QuantityChange::Added => "only the listing has it".to_owned(),
+        pb::QuantityChange::Removed => "only the stored record has it".to_owned(),
+        change => format!(
+          "{change:?} ({} in the record, {} in the listing)",
+          unit(&quantity.previous_unit),
+          unit(&quantity.unit)
+        ),
+      };
+      println!("  quantity  {:<16} {factor:>8}  {what}", quantity.field);
+    }
+  }
 }
 
 /// Reads a record file and turns it into the request message.
-fn read_record(path: &Path, id: String, tenant: Option<String>) -> anyhow::Result<pb::Record> {
+fn read_record(path: &Path, id: Option<String>, tenant: Option<String>) -> anyhow::Result<pb::Record> {
   let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
   let record: RecordFields = serde_json::from_str(&text)
     .context("expected a JSON object of text fields and quantities ({\"value\": 3.5, \"unit\": \"g\"})")?;
@@ -204,7 +275,7 @@ fn read_record(path: &Path, id: String, tenant: Option<String>) -> anyhow::Resul
     })
     .collect();
   Ok(pb::Record {
-    id: Some(id),
+    id,
     tenant,
     fields: record.texts.into_iter().collect(),
     quantities,
@@ -235,7 +306,7 @@ async fn main() -> anyhow::Result<()> {
         _ => pb::WriteMode::Enforce,
       };
       let request = pb::EvaluateRequest {
-        record: Some(read_record(&fields, id, tenant)?),
+        record: Some(read_record(&fields, Some(id), tenant)?),
         mode: mode.into(),
         ..pb::EvaluateRequest::default()
       };
@@ -255,6 +326,21 @@ async fn main() -> anyhow::Result<()> {
           neighbor.tenant.unwrap_or_default()
         );
       }
+    }
+    Command::Match {
+      listing,
+      tenant,
+      limit,
+      threshold,
+    } => {
+      let request = pb::MatchRequest {
+        // A listing carries no id and no tenant of its own; the tenant here narrows the search.
+        listing: Some(read_record(&listing, None, None)?),
+        limit,
+        tenant,
+        threshold,
+      };
+      print_match(&client.r#match(request).await?.into_inner());
     }
     Command::Delete { id, tenant } => {
       let request = pb::DeleteRequest { id, tenant };

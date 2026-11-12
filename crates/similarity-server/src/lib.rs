@@ -104,7 +104,7 @@ mod tests {
   use tonic::transport::Channel;
 
   use super::*;
-  use crate::engine::store_layout;
+  use crate::engine::{Matching, store_layout};
   use crate::worker::testing::WordBagEmbedder;
 
   struct Running {
@@ -135,12 +135,18 @@ mod tests {
     .unwrap();
     let embedder = WordBagEmbedder::new("word-bag-v1");
     let (layout, dimension) = store_layout(&schema, &embedder);
-    let engine = Arc::new(Engine::new(
-      MemoryStore::new(layout, dimension),
-      embedder,
-      schema,
-      Policy::new(0.75, None).unwrap(),
-    ));
+    let engine = Arc::new(
+      Engine::new(
+        MemoryStore::new(layout, dimension),
+        embedder,
+        schema,
+        Policy::new(0.75, None).unwrap(),
+      )
+      .with_matching(Matching {
+        threshold: Some(0.6),
+        overfetch: 3,
+      }),
+    );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -421,6 +427,106 @@ mod tests {
       .collect();
     assert_eq!(quantities, [("thc", None, false), ("weight", Some(4.0), false)]);
     assert!(!description.reject_on_measure_change);
+    assert_eq!(
+      (description.match_threshold, description.match_overfetch),
+      (Some(0.6), 3)
+    );
+  }
+
+  /// `Match` over the wire: the listing without an id, the candidates best first with both scores, the decision
+  /// as an enum, the fields read with the stored record as the baseline, and the refusals as status codes.
+  #[tokio::test]
+  async fn a_listing_is_matched_over_grpc() {
+    let mut running = start().await;
+    let client = &mut running.client;
+    for (id, tenant, fields) in [
+      (
+        "gummies",
+        "brand-1",
+        [("name", "blueberry gummies 100mg"), ("category", "edibles gummies")].as_slice(),
+      ),
+      ("tin", "brand-2", [("name", "blueberry gummies 10pk tin")].as_slice()),
+    ] {
+      client
+        .evaluate(evaluate(record(Some(id), Some(tenant), fields)))
+        .await
+        .unwrap();
+    }
+    let listing = || record(None, None, &[("name", "blueberry gummies 100mg 10pk")]);
+
+    let response = client
+      .r#match(pb::MatchRequest {
+        listing: Some(listing()),
+        ..pb::MatchRequest::default()
+      })
+      .await
+      .unwrap()
+      .into_inner();
+    assert_eq!(response.decision(), pb::MatchDecision::Matched);
+    assert_eq!(response.threshold, Some(0.6));
+    let ids: Vec<(&str, Option<&str>)> = response
+      .candidates
+      .iter()
+      .map(|candidate| (candidate.id.as_str(), candidate.tenant.as_deref()))
+      .collect();
+    assert_eq!(ids, [("gummies", Some("brand-1")), ("tin", Some("brand-2"))]);
+    let best = &response.candidates[0];
+    assert!(best.similarity > best.search_similarity, "{best:?}");
+    assert!(best.similarity > response.candidates[1].similarity);
+    let fields: Vec<(&str, pb::FieldChange, bool)> = best
+      .fields
+      .iter()
+      .map(|field| (field.field.as_str(), field.change(), field.similarity.is_some()))
+      .collect();
+    assert_eq!(
+      fields,
+      [
+        ("category", pb::FieldChange::Removed, false),
+        ("name", pb::FieldChange::Modified, true)
+      ]
+    );
+    assert!(best.fields.iter().all(|field| !field.below_floor));
+
+    // The request's own threshold, its tenant, and its limit.
+    let narrowed = client
+      .r#match(pb::MatchRequest {
+        listing: Some(listing()),
+        limit: 1,
+        tenant: Some("brand-2".to_owned()),
+        threshold: Some(0.99),
+      })
+      .await
+      .unwrap()
+      .into_inner();
+    assert_eq!(narrowed.decision(), pb::MatchDecision::NoMatch);
+    assert_eq!(
+      (narrowed.candidates.len(), narrowed.candidates[0].id.as_str()),
+      (1, "tin")
+    );
+    assert_eq!(narrowed.threshold, Some(0.99));
+
+    // Refused: no listing, a listing with an id, a limit too large, a threshold off the scale.
+    let refused = [
+      pb::MatchRequest::default(),
+      pb::MatchRequest {
+        listing: Some(record(Some("menu-7"), None, &[("name", "x")])),
+        ..pb::MatchRequest::default()
+      },
+      pb::MatchRequest {
+        listing: Some(listing()),
+        limit: 101,
+        ..pb::MatchRequest::default()
+      },
+      pb::MatchRequest {
+        listing: Some(listing()),
+        threshold: Some(2.0),
+        ..pb::MatchRequest::default()
+      },
+    ];
+    for request in refused {
+      let status = client.r#match(request.clone()).await.unwrap_err();
+      assert_eq!(status.code(), Code::InvalidArgument, "{request:?}");
+    }
   }
 
   #[tokio::test]

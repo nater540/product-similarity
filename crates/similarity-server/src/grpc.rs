@@ -7,13 +7,16 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use similarity_core::{FieldChange, Quantity, QuantityChange, QuantityScore, Reason};
+use similarity_core::matching::Decision;
+use similarity_core::{FieldChange, FieldScore, Quantity, QuantityChange, QuantityScore, Reason};
 use similarity_proto::v1 as pb;
 use similarity_proto::v1::record_similarity_server::RecordSimilarity;
 use similarity_store::VectorStore;
 use tonic::{Request, Response, Status};
 
-use crate::engine::{Engine, EngineError, EvaluateInput, FindSimilarInput, RecordInput, SimilarTo, Verdict, WriteMode};
+use crate::engine::{
+  Engine, EngineError, EvaluateInput, FindSimilarInput, MatchInput, RecordInput, SimilarTo, Verdict, WriteMode,
+};
 use crate::worker::TextEmbedder;
 
 /// The tonic service wrapping an [`Engine`].
@@ -93,6 +96,24 @@ fn field_change(change: FieldChange) -> pb::FieldChange {
     FieldChange::Added => pb::FieldChange::Added,
     FieldChange::Removed => pb::FieldChange::Removed,
     FieldChange::Restored => pb::FieldChange::Restored,
+  }
+}
+
+fn field_score(score: FieldScore) -> pb::FieldScore {
+  pb::FieldScore {
+    field: score.field,
+    change: field_change(score.change).into(),
+    similarity: score.similarity,
+    weight: score.weight,
+    below_floor: score.below_floor,
+  }
+}
+
+fn match_decision(decision: Decision) -> pb::MatchDecision {
+  match decision {
+    Decision::NotJudged => pb::MatchDecision::NotJudged,
+    Decision::Matched => pb::MatchDecision::Matched,
+    Decision::NoMatch => pb::MatchDecision::NoMatch,
   }
 }
 
@@ -192,17 +213,7 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
       verdict: verdict(output.verdict).into(),
       similarity: output.similarity,
       threshold: output.threshold,
-      fields: output
-        .fields
-        .into_iter()
-        .map(|score| pb::FieldScore {
-          field: score.field,
-          change: field_change(score.change).into(),
-          similarity: score.similarity,
-          weight: score.weight,
-          below_floor: score.below_floor,
-        })
-        .collect(),
+      fields: output.fields.into_iter().map(field_score).collect(),
       anchor_similarity: output.anchor_similarity,
       stored: output.stored,
       // The sentence and the data are two renderings of one list, so they cannot fall out of step.
@@ -265,6 +276,51 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
     Ok(Response::new(pb::DeleteResponse { deleted }))
   }
 
+  async fn r#match(&self, request: Request<pb::MatchRequest>) -> Result<Response<pb::MatchResponse>, Status> {
+    let started = Instant::now();
+    let request = request.into_inner();
+    let Some(listing) = request.listing else {
+      return Err(Status::invalid_argument("`listing` is required"));
+    };
+    let output = self
+      .engine
+      .match_listing(MatchInput {
+        listing: record_input(listing),
+        limit: usize::try_from(request.limit).unwrap_or(usize::MAX),
+        tenant: request.tenant,
+        threshold: request.threshold,
+      })
+      .await?;
+    tracing::info!(
+      candidates = output.candidates.len(),
+      fetched = output.fetched,
+      top_similarity = output
+        .candidates
+        .first()
+        .map(|candidate| six(candidate.comparison.similarity)),
+      decision = ?output.decision,
+      elapsed_ms = milliseconds(started),
+      "match"
+    );
+
+    Ok(Response::new(pb::MatchResponse {
+      candidates: output
+        .candidates
+        .into_iter()
+        .map(|candidate| pb::MatchCandidate {
+          id: candidate.id,
+          tenant: candidate.tenant,
+          similarity: candidate.comparison.similarity,
+          search_similarity: candidate.search_similarity,
+          fields: candidate.comparison.fields.into_iter().map(field_score).collect(),
+          quantities: candidate.quantities.into_iter().map(quantity_score).collect(),
+        })
+        .collect(),
+      decision: match_decision(output.decision).into(),
+      threshold: output.threshold,
+    }))
+  }
+
   async fn describe(&self, _: Request<pb::DescribeRequest>) -> Result<Response<pb::DescribeResponse>, Status> {
     let description = self.engine.describe();
     Ok(Response::new(pb::DescribeResponse {
@@ -295,6 +351,8 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
         })
         .collect(),
       reject_on_measure_change: description.policy.reject_on_measure_change,
+      match_threshold: description.matching.threshold,
+      match_overfetch: width(description.matching.overfetch),
     }))
   }
 }

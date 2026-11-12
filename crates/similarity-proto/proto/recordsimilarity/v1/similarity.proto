@@ -38,6 +38,18 @@ service RecordSimilarity {
   // Errors: `FAILED_PRECONDITION` if the record is stored under a tenant the request does not name.
   rpc Delete(DeleteRequest) returns (DeleteResponse);
 
+  // Finds the stored records a listing from elsewhere describes (a retailer's menu item, say), best first, and
+  // says whether the best is the same product. Read-only: nothing is stored or changed.
+  //
+  // Unlike `FindSimilar`, each candidate is scored exactly over the fields both it and the listing have, so a
+  // listing with only a name is scored on its name whatever else a stored record has filled in. Quantities are
+  // compared and reported for each candidate and never move a similarity or the decision.
+  //
+  // Errors: `INVALID_ARGUMENT` for a listing that does not fit the schema, that carries an `id` or a `tenant`,
+  // for a `limit` above 100, or for a `threshold` outside [-1, 1]; `RESOURCE_EXHAUSTED` and `UNAVAILABLE` as for
+  // `Evaluate`.
+  rpc Match(MatchRequest) returns (MatchResponse);
+
   // Reports the model, schema, and thresholds this server is running with.
   rpc Describe(DescribeRequest) returns (DescribeResponse);
 }
@@ -389,6 +401,69 @@ message QuantityDescription {
   bool reject_incomparable = 3;
 }
 
+message MatchRequest {
+  // The listing, under the field and quantity names the server's schema defines (see `Describe`). Map the
+  // listing's own fields onto these names and leave out one with no counterpart. `id` and `tenant` must be
+  // absent: a listing's id and its seller belong to another system.
+  Record listing = 1;
+
+  // How many candidates to return. Defaults to 5; at most 100.
+  uint32 limit = 2;
+
+  // Only consider records of this tenant (the brand, when the caller knows it). Without it every tenant's
+  // records are candidates.
+  optional string tenant = 3;
+
+  // Holds the best candidate to this in place of the server's match threshold. Cosine scale, [-1, 1].
+  optional float threshold = 4;
+}
+
+// What was decided about the best candidate.
+enum MatchDecision {
+  MATCH_DECISION_UNSPECIFIED = 0;
+
+  // No match threshold is configured and the request gave none: the candidates are ranked, and nothing is
+  // claimed about the best.
+  MATCH_DECISION_NOT_JUDGED = 1;
+
+  // The first candidate's similarity is at or above the threshold.
+  MATCH_DECISION_MATCHED = 2;
+
+  // The first candidate's similarity is below the threshold, or there are no candidates.
+  MATCH_DECISION_NO_MATCH = 3;
+}
+
+message MatchCandidate {
+  string id = 1;
+
+  optional string tenant = 2;
+
+  // The weighted mean of the per-field similarities over the fields both the stored record and the listing have:
+  // what the decision is made on. `0` if they share no field.
+  float similarity = 3;
+
+  // The score the search found this candidate by: what `FindSimilar` would report for it.
+  float search_similarity = 4;
+
+  // Read with the stored record as the baseline and the listing as the record: `FIELD_CHANGE_ADDED` is a field
+  // only the listing has and `FIELD_CHANGE_REMOVED` one only the stored record has, neither of which is scored.
+  // Never `FIELD_CHANGE_RESTORED`, and `below_floor` is never set: a floor is a rule for revisions.
+  repeated FieldScore fields = 5;
+
+  // The same reading for quantities. `beyond_limit` is never set.
+  repeated QuantityScore quantities = 6;
+}
+
+message MatchResponse {
+  // Best first. Equal similarities are ordered by id.
+  repeated MatchCandidate candidates = 1;
+
+  MatchDecision decision = 2;
+
+  // The threshold the best candidate was held to, if there was one.
+  optional float threshold = 3;
+}
+
 message DescribeResponse {
   // Identifies the model, tokenizer, vector width, and truncation limit. Vectors are only comparable under the
   // same fingerprint.
@@ -414,4 +489,10 @@ message DescribeResponse {
 
   // Whether a record whose measures changed (`EvaluateResponse.measure_changed`) is rejected.
   bool reject_on_measure_change = 8;
+
+  // The threshold `Match` holds its best candidate to, if one is configured.
+  optional float match_threshold = 9;
+
+  // How many candidates `Match` fetches for each one it returns, before scoring them exactly.
+  uint32 match_overfetch = 10;
 }

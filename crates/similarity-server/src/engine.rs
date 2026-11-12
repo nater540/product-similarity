@@ -16,6 +16,7 @@ use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use similarity_core::matching::{self, Candidate, Decision, Ranked};
 use similarity_core::quantity::first_values;
 use similarity_core::score::{self, Evaluation, FieldScore};
 use similarity_core::{
@@ -26,6 +27,11 @@ use similarity_store::{Neighbor, SearchQuery, StoreError, StoredRecord, VectorSt
 use tokio::sync::Mutex;
 
 use crate::worker::{EmbedError, TextEmbedder};
+
+/// How many candidates `match_listing` returns when the caller does not say.
+pub const DEFAULT_MATCHES: usize = 5;
+/// The most records one match fetches to score, whatever the limit and the over-fetch come to.
+pub const MAX_MATCH_FETCH: usize = 1000;
 
 /// How many neighbors `find_similar` returns when the caller does not say.
 pub const DEFAULT_NEIGHBORS: usize = 10;
@@ -233,6 +239,51 @@ pub struct FindSimilarInput {
   pub min_similarity: Option<f32>,
 }
 
+/// How a listing is matched (see [`Engine::match_listing`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Matching {
+  /// The similarity the best candidate has to reach to be called a match. `None`: candidates are ranked and
+  /// nothing is decided.
+  pub threshold: Option<f32>,
+  /// How many candidates are fetched for each one returned, before they are scored exactly. At least 1.
+  pub overfetch: usize,
+}
+
+impl Default for Matching {
+  fn default() -> Self {
+    Self {
+      threshold: None,
+      overfetch: 5,
+    }
+  }
+}
+
+/// A request to match a listing.
+#[derive(Debug, Clone, Default)]
+pub struct MatchInput {
+  /// The listing, under the schema's field and quantity names. It must carry no id and no tenant.
+  pub listing: RecordInput,
+  /// How many candidates to return; zero means [`DEFAULT_MATCHES`].
+  pub limit: usize,
+  /// Only consider records of this tenant.
+  pub tenant: Option<String>,
+  /// Holds the best candidate to this in place of the configured threshold.
+  pub threshold: Option<f32>,
+}
+
+/// The answer to a [`MatchInput`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchOutput {
+  /// The candidates, best first.
+  pub candidates: Vec<Ranked>,
+  /// What was decided about the first of them.
+  pub decision: Decision,
+  /// The threshold it was held to, if there was one.
+  pub threshold: Option<f32>,
+  /// How many records the search returned to be scored.
+  pub fetched: usize,
+}
+
 /// What the server is running with.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Description {
@@ -246,6 +297,8 @@ pub struct Description {
   pub schema: Schema,
   /// The thresholds.
   pub policy: Policy,
+  /// How listings are matched.
+  pub matching: Matching,
 }
 
 /// The layout id and composite width a store must be opened with to serve `schema` with `embedder`.
@@ -326,6 +379,7 @@ pub struct Engine<S, E> {
   embedder: E,
   schema: Schema,
   policy: Policy,
+  matching: Matching,
   observer: Option<Arc<dyn Observer>>,
   locks: Vec<Mutex<()>>,
   lock_hasher: RandomState,
@@ -376,10 +430,18 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       embedder,
       schema,
       policy,
+      matching: Matching::default(),
       observer: None,
       locks: (0..LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
       lock_hasher: RandomState::new(),
     }
+  }
+
+  /// The same engine, matching listings by `matching` from now on.
+  #[must_use]
+  pub fn with_matching(mut self, matching: Matching) -> Self {
+    self.matching = matching;
+    self
   }
 
   /// The same engine, telling `observer` about every judged request from now on.
@@ -407,6 +469,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       composite_dimension,
       schema: self.schema.clone(),
       policy: self.policy,
+      matching: self.matching,
     }
   }
 
@@ -833,6 +896,81 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     Ok(self.store.search(query).await?)
   }
 
+  /// Finds the stored records `input.listing` describes, best first, and decides whether the best is a match.
+  ///
+  /// The listing is embedded under the schema like any record and searched for like any record, among every
+  /// tenant's records unless `input.tenant` narrows it. Then each of the records the search returned is scored
+  /// exactly over the fields it shares with the listing ([`matching::rank`]), which is what the search score
+  /// cannot do, and the best is held to the threshold if there is one. More records are fetched than are
+  /// returned ([`Matching::overfetch`]), because the search order is not the exact order.
+  ///
+  /// Nothing is written, whatever is decided.
+  ///
+  /// # Errors
+  ///
+  /// [`EngineError::InvalidArgument`] for a listing that does not fit the schema or carries an id or a tenant,
+  /// a limit above [`MAX_NEIGHBORS`], or a threshold outside the cosine range; otherwise as [`Self::evaluate`].
+  pub async fn match_listing(&self, input: MatchInput) -> Result<MatchOutput, EngineError> {
+    if input.listing.id.is_some() || input.listing.tenant.is_some() {
+      return Err(EngineError::InvalidArgument(
+        "a listing carries no `id` and no `tenant`: both belong to the system the listing came from. To match \
+         within one tenant, name it in the request's `tenant`"
+          .to_owned(),
+      ));
+    }
+    let limit = match input.limit {
+      0 => DEFAULT_MATCHES,
+      limit if limit <= MAX_NEIGHBORS => limit,
+      limit => {
+        return Err(EngineError::InvalidArgument(format!(
+          "`limit` is {limit}; the most candidates one request may return is {MAX_NEIGHBORS}"
+        )));
+      }
+    };
+    let threshold = input.threshold.or(self.matching.threshold);
+    if let Some(threshold) = input.threshold
+      && !(-1.0..=1.0).contains(&threshold)
+    {
+      return Err(EngineError::InvalidArgument(format!(
+        "`threshold` is {threshold}, outside the cosine range [-1, 1]"
+      )));
+    }
+    let tenant = required_text("tenant", input.tenant)?;
+    let prepared = self.prepare(&input.listing)?;
+    let listing = self.embed(&prepared, None).await?;
+
+    let found = self
+      .store
+      .search_vectors(SearchQuery {
+        vector: &listing.composite,
+        limit: limit.saturating_mul(self.matching.overfetch).min(MAX_MATCH_FETCH),
+        tenant: tenant.as_deref(),
+        exclude_id: None,
+        min_similarity: None,
+      })
+      .await?;
+    let candidates = matching::rank(
+      &self.schema,
+      self.embedder.dimension(),
+      &listing,
+      prepared.quantities(),
+      found.iter().map(|found| Candidate {
+        id: &found.neighbor.id,
+        tenant: found.neighbor.tenant.as_deref(),
+        search_similarity: found.neighbor.similarity,
+        vectors: &found.vectors,
+        quantities: &found.quantities,
+      }),
+      limit,
+    )?;
+    Ok(MatchOutput {
+      decision: matching::decide(threshold, &candidates),
+      candidates,
+      threshold,
+      fetched: found.len(),
+    })
+  }
+
   /// Forgets a record. Returns whether there was one.
   ///
   /// # Errors
@@ -1000,6 +1138,320 @@ mod tests {
     async fn search_vectors(&self, query: SearchQuery<'_>) -> Result<Vec<Found>, StoreError> {
       self.0.search_vectors(query).await
     }
+  }
+
+  const RIGHT: [(&str, &str); 3] = [
+    ("name", "blueberry gummies 100mg"),
+    ("category", "edibles gummies"),
+    ("description", "ten vegan gummies with real fruit"),
+  ];
+  /// Closer to nothing but the search: one field, so its composite is all name.
+  const WRONG: [(&str, &str); 1] = [("name", "blueberry gummies 10pk tin")];
+  const LISTING: [(&str, &str); 1] = [("name", "blueberry gummies 100mg 10pk")];
+
+  fn listing(fields: &[(&str, &str)]) -> MatchInput {
+    MatchInput {
+      listing: record(None, fields),
+      ..MatchInput::default()
+    }
+  }
+
+  async fn catalog(matching: Matching) -> TestEngine {
+    let engine = engine().with_matching(matching);
+    for (id, tenant, fields) in [
+      ("right", "brand-1", RIGHT.as_slice()),
+      ("wrong", "brand-2", WRONG.as_slice()),
+      ("vape", "brand-2", VAPE.as_slice()),
+    ] {
+      let mut input = evaluate_input(Some(id), fields);
+      input.record.tenant = Some(tenant.to_owned());
+      engine.evaluate(input).await.unwrap();
+    }
+    engine
+  }
+
+  /// D5's skew, and what a match does about it. A menu item has a name and nothing else. The search puts a
+  /// record that also has only a name ahead of the right product, which has every field filled in; scored over
+  /// the field both sides have, the right product is first.
+  #[tokio::test]
+  async fn a_name_only_listing_finds_its_product_ahead_of_a_wrong_one_the_search_prefers() {
+    let engine = catalog(Matching::default()).await;
+    let searched = engine
+      .find_similar(FindSimilarInput {
+        query: SimilarTo::Record(record(None, &LISTING)),
+        limit: 3,
+        tenant: None,
+        min_similarity: None,
+      })
+      .await
+      .unwrap();
+    assert_eq!(
+      searched[0].id, "wrong",
+      "the search prefers the record with as few fields as the listing"
+    );
+
+    let output = engine.match_listing(listing(&LISTING)).await.unwrap();
+    let ids: Vec<&str> = output
+      .candidates
+      .iter()
+      .map(|candidate| candidate.id.as_str())
+      .collect();
+    assert_eq!(ids, ["right", "wrong", "vape"]);
+    assert_eq!(
+      (output.decision, output.threshold, output.fetched),
+      (Decision::NotJudged, None, 3)
+    );
+
+    let best = &output.candidates[0];
+    assert_eq!(best.tenant.as_deref(), Some("brand-1"));
+    let name = best
+      .comparison
+      .fields
+      .iter()
+      .find(|field| field.field == "name")
+      .unwrap();
+    assert_eq!(
+      Some(best.comparison.similarity),
+      name.similarity,
+      "the name is all they share"
+    );
+    assert!(best.comparison.similarity > best.search_similarity + 0.1, "{best:?}");
+    let changes: Vec<_> = best
+      .comparison
+      .fields
+      .iter()
+      .map(|field| (field.field.as_str(), field.change, field.below_floor))
+      .collect();
+    assert_eq!(
+      changes,
+      [
+        ("category", FieldChange::Removed, false),
+        ("description", FieldChange::Removed, false),
+        ("name", FieldChange::Modified, false),
+      ]
+    );
+    let searched_right = searched.iter().find(|neighbor| neighbor.id == "right").unwrap();
+    assert_eq!(
+      best.search_similarity, searched_right.similarity,
+      "what `FindSimilar` reports for it"
+    );
+  }
+
+  /// The over-fetch is what the exact score costs: only what the search returns can be scored. Fetching one
+  /// record for the one that is wanted returns the search's favorite.
+  #[tokio::test]
+  async fn only_what_the_search_fetched_can_be_ranked() {
+    let narrow = catalog(Matching {
+      threshold: None,
+      overfetch: 1,
+    })
+    .await;
+    let one = MatchInput {
+      limit: 1,
+      ..listing(&LISTING)
+    };
+    let output = narrow.match_listing(one.clone()).await.unwrap();
+    assert_eq!((output.candidates[0].id.as_str(), output.fetched), ("wrong", 1));
+
+    let wide = catalog(Matching {
+      threshold: None,
+      overfetch: 2,
+    })
+    .await;
+    let output = wide.match_listing(one).await.unwrap();
+    assert_eq!(
+      (
+        output.candidates[0].id.as_str(),
+        output.candidates.len(),
+        output.fetched
+      ),
+      ("right", 1, 2)
+    );
+
+    // Zero means five, and the fetch is the limit times the over-fetch, as far as there are records.
+    let output = wide.match_listing(listing(&LISTING)).await.unwrap();
+    assert_eq!((output.candidates.len(), output.fetched), (3, 3));
+  }
+
+  #[tokio::test]
+  async fn the_best_candidate_is_held_to_the_configured_threshold_or_to_the_requests() {
+    let plain = catalog(Matching::default()).await;
+    let score = plain.match_listing(listing(&LISTING)).await.unwrap().candidates[0]
+      .comparison
+      .similarity;
+    let with = |threshold: Option<f32>| MatchInput {
+      threshold,
+      ..listing(&LISTING)
+    };
+    assert_eq!(
+      plain.match_listing(with(Some(score))).await.unwrap().decision,
+      Decision::Matched
+    );
+    let above = plain.match_listing(with(Some(score.next_up()))).await.unwrap();
+    assert_eq!(
+      (above.decision, above.threshold),
+      (Decision::NoMatch, Some(score.next_up()))
+    );
+    assert_eq!(
+      above.candidates.len(),
+      3,
+      "the candidates are returned whatever is decided"
+    );
+
+    let configured = catalog(Matching {
+      threshold: Some(0.99),
+      overfetch: 5,
+    })
+    .await;
+    let output = configured.match_listing(with(None)).await.unwrap();
+    assert_eq!((output.decision, output.threshold), (Decision::NoMatch, Some(0.99)));
+    let output = configured.match_listing(with(Some(0.5))).await.unwrap();
+    assert_eq!((output.decision, output.threshold), (Decision::Matched, Some(0.5)));
+    assert_eq!(configured.describe().matching.threshold, Some(0.99));
+
+    for outside in [1.5, -1.5, f32::NAN] {
+      let error = plain.match_listing(with(Some(outside))).await.unwrap_err();
+      assert!(matches!(error, EngineError::InvalidArgument(_)), "{error:?}");
+    }
+  }
+
+  #[tokio::test]
+  async fn a_match_can_be_limited_to_one_tenant() {
+    let engine = catalog(Matching::default()).await;
+    let within = |tenant: &str| MatchInput {
+      tenant: Some(tenant.to_owned()),
+      ..listing(&LISTING)
+    };
+    let ids =
+      |output: MatchOutput| -> Vec<String> { output.candidates.into_iter().map(|candidate| candidate.id).collect() };
+    assert_eq!(ids(engine.match_listing(within("brand-1")).await.unwrap()), ["right"]);
+    assert_eq!(
+      ids(engine.match_listing(within("brand-2")).await.unwrap()),
+      ["wrong", "vape"]
+    );
+    let nobody = engine.match_listing(within("brand-3")).await.unwrap();
+    assert_eq!(
+      (nobody.candidates.len(), nobody.fetched, nobody.decision),
+      (0, 0, Decision::NotJudged)
+    );
+    assert!(
+      engine.match_listing(within("  ")).await.is_err(),
+      "a blank tenant is not no tenant"
+    );
+  }
+
+  /// A listing's id and its seller are another system's. Taking them would invite a caller to confuse the
+  /// retailer with the brand whose records are being searched.
+  #[tokio::test]
+  async fn a_listing_that_does_not_fit_is_refused() {
+    let engine = catalog(Matching::default()).await;
+    let refused = |input: MatchInput| {
+      let engine = &engine;
+      async move {
+        let error = engine.match_listing(input).await.unwrap_err();
+        assert!(matches!(error, EngineError::InvalidArgument(_)), "{error:?}");
+        error.to_string()
+      }
+    };
+    let mut with_id = listing(&LISTING);
+    with_id.listing.id = Some("menu-item-7".to_owned());
+    assert!(refused(with_id).await.contains("no `id` and no `tenant`"));
+    let mut with_tenant = listing(&LISTING);
+    with_tenant.listing.tenant = Some("retailer-1".to_owned());
+    refused(with_tenant).await;
+
+    refused(listing(&[("name", "x"), ("strain", "indica")])).await;
+    refused(listing(&[("category", "edibles")])).await;
+    refused(MatchInput {
+      limit: MAX_NEIGHBORS + 1,
+      ..listing(&LISTING)
+    })
+    .await;
+    let at_most = MatchInput {
+      limit: MAX_NEIGHBORS,
+      ..listing(&LISTING)
+    };
+    assert_eq!(engine.match_listing(at_most).await.unwrap().candidates.len(), 3);
+  }
+
+  #[tokio::test]
+  async fn matching_against_an_empty_store_finds_nothing_and_writes_nothing() {
+    let engine = engine().with_matching(Matching {
+      threshold: Some(0.5),
+      overfetch: 5,
+    });
+    let output = engine.match_listing(listing(&LISTING)).await.unwrap();
+    assert_eq!(
+      (output.candidates.len(), output.decision, output.fetched),
+      (0, Decision::NoMatch, 0)
+    );
+    assert_eq!(stored(&engine, "right").await, None);
+  }
+
+  /// A match is a read. Every stored record is exactly what it was, quantities and timestamps included.
+  #[tokio::test]
+  async fn matching_never_changes_what_is_stored() {
+    let engine = catalog(Matching {
+      threshold: Some(0.1),
+      overfetch: 5,
+    })
+    .await;
+    let mut before = Vec::new();
+    for id in ["right", "wrong", "vape"] {
+      before.push(stored(&engine, id).await);
+    }
+    for input in [listing(&LISTING), listing(&RIGHT), listing(&VAPE)] {
+      let output = engine.match_listing(input).await.unwrap();
+      assert_eq!(output.decision, Decision::Matched);
+    }
+    let mut after = Vec::new();
+    for id in ["right", "wrong", "vape"] {
+      after.push(stored(&engine, id).await);
+    }
+    assert_eq!(before, after);
+
+    // The product's own text finds the product, unchanged in every field.
+    let own = engine.match_listing(listing(&RIGHT)).await.unwrap();
+    assert_eq!(own.candidates[0].id, "right");
+    assert_eq!(own.candidates[0].comparison.similarity, 1.0);
+    assert!(
+      own.candidates[0]
+        .comparison
+        .fields
+        .iter()
+        .all(|field| field.change == FieldChange::Unchanged)
+    );
+  }
+
+  /// Quantities are compared for each candidate, with the stored record as the baseline, and change no score.
+  #[tokio::test]
+  async fn a_match_reports_each_candidates_quantities_and_scores_none_of_them() {
+    let engine = engine_over(measured_schema((Some(1.5), true)), Policy::new(0.75, None).unwrap());
+    engine.evaluate(measured(&[("weight", grams(1.0))])).await.unwrap();
+    let ask = |quantities: Vec<(String, Quantity)>| MatchInput {
+      listing: RecordInput {
+        quantities,
+        ..record(None, &GUMMIES)
+      },
+      ..MatchInput::default()
+    };
+    let plain = engine.match_listing(ask(Vec::new())).await.unwrap();
+    let tenfold = engine
+      .match_listing(ask(vec![("weight".to_owned(), grams(10.0))]))
+      .await
+      .unwrap();
+    assert_eq!(tenfold.candidates[0].comparison, plain.candidates[0].comparison);
+    assert_eq!(plain.candidates[0].quantities[0].change, QuantityChange::Removed);
+    let weight = &tenfold.candidates[0].quantities[0];
+    assert_eq!(
+      (weight.change, weight.factor, weight.beyond_limit),
+      (QuantityChange::Modified, Some(10.0), false)
+    );
+
+    let unknown = engine
+      .match_listing(ask(vec![("potency".to_owned(), grams(1.0))]))
+      .await;
+    assert!(matches!(unknown, Err(EngineError::InvalidArgument(_))));
   }
 
   /// What an observer was told, kept: an [`Observation`] only borrows.

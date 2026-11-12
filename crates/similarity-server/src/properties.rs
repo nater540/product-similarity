@@ -19,6 +19,7 @@
 
 use proptest::prelude::*;
 use proptest::test_runner::Config;
+use similarity_core::matching::Decision;
 use similarity_core::score::Evaluation;
 use similarity_core::testing::{WORDS, tiny_embedder};
 use similarity_core::vector::cosine;
@@ -27,8 +28,8 @@ use similarity_store::{MemoryStore, StoredRecord, VectorStore};
 
 use crate::config::ShadowEvents;
 use crate::engine::{
-  Engine, EngineError, EvaluateInput, FindSimilarInput, ImportInput, Imported, Original, RecordInput, SimilarTo,
-  Verdict, WriteMode, store_layout,
+  Engine, EngineError, EvaluateInput, FindSimilarInput, ImportInput, Imported, MatchInput, Original, RecordInput,
+  SimilarTo, Verdict, WriteMode, store_layout,
 };
 use crate::offline::calibrate::suggest_threshold;
 use crate::offline::pairs::Label;
@@ -94,6 +95,13 @@ enum Request {
   Search {
     id: usize,
   },
+  /// A listing from elsewhere, to be matched against whatever is stored.
+  Match {
+    name: usize,
+    category: Option<usize>,
+    tenant: Option<usize>,
+    threshold: Option<f32>,
+  },
 }
 
 fn quantity() -> impl Strategy<Value = (f64, &'static str)> {
@@ -157,7 +165,19 @@ fn request() -> impl Strategy<Value = Request> {
       weight,
       original,
     });
-  prop_oneof![12 => evaluate, 2 => delete, 3 => import, 1 => search]
+  let matched = (
+    prop_oneof![9 => 0..NAMES.len() - 1, 1 => Just(NAMES.len() - 1)],
+    proptest::option::of(0..CATEGORIES.len()),
+    proptest::option::of(0..TENANTS.len()),
+    prop_oneof![2 => Just(None), 1 => Just(Some(0.5_f32)), 1 => Just(Some(7.0_f32))],
+  )
+    .prop_map(|(name, category, tenant, threshold)| Request::Match {
+      name,
+      category,
+      tenant,
+      threshold,
+    });
+  prop_oneof![12 => evaluate, 2 => delete, 3 => import, 1 => search, 2 => matched]
 }
 
 fn schema() -> Schema {
@@ -555,6 +575,67 @@ async fn step(engine: &TestEngine, request: &Request) -> Result<(), TestCaseErro
               "the first weight it had"
             );
           }
+        }
+      }
+    }
+    Request::Match {
+      name,
+      category,
+      tenant,
+      threshold,
+    } => {
+      let mut fields = vec![("name".to_owned(), NAMES[name].to_owned())];
+      fields.extend(category.map(|index| ("category".to_owned(), CATEGORIES[index].to_owned())));
+      let tenant = tenant.map(|index| TENANTS[index].to_owned());
+      let outcome = engine
+        .match_listing(MatchInput {
+          listing: RecordInput {
+            id: None,
+            tenant: None,
+            fields,
+            quantities: Vec::new(),
+          },
+          limit: 0,
+          tenant: tenant.clone(),
+          threshold,
+        })
+        .await;
+      // A match is a read, whatever it finds and however it ends.
+      prop_assert_eq!(&before, &stored(engine).await, "a match wrote something");
+      let invalid = NAMES[name].trim().is_empty() || threshold.is_some_and(|threshold| threshold > 1.0);
+      match outcome {
+        Err(error) => prop_assert!(
+          invalid && matches!(error, EngineError::InvalidArgument(_)),
+          "{:?}",
+          error
+        ),
+        Ok(output) => {
+          prop_assert!(!invalid, "an unusable listing was matched");
+          // Every stored record the request may see is a candidate (there are fewer than the limit), best first.
+          let visible = before
+            .iter()
+            .flatten()
+            .filter(|record| tenant.is_none() || record.tenant == tenant)
+            .count();
+          prop_assert_eq!(output.candidates.len(), visible);
+          prop_assert_eq!(output.fetched, visible);
+          for pair in output.candidates.windows(2) {
+            prop_assert!(pair[0].comparison.similarity >= pair[1].comparison.similarity);
+          }
+          for candidate in &output.candidates {
+            prop_assert!(candidate.comparison.fields.iter().all(|field| !field.below_floor));
+            prop_assert!(candidate.quantities.iter().all(|quantity| !quantity.beyond_limit));
+          }
+          let best = output
+            .candidates
+            .first()
+            .map(|candidate| candidate.comparison.similarity);
+          let expected = match (threshold, best) {
+            (None, _) => Decision::NotJudged,
+            (Some(threshold), Some(best)) if best >= threshold => Decision::Matched,
+            (Some(_), _) => Decision::NoMatch,
+          };
+          prop_assert_eq!(output.decision, expected);
         }
       }
     }

@@ -96,6 +96,18 @@ weight = 2.0
 
 [quantities.cbd_per_item]
 
+# Matching a listing from elsewhere (a retailer's menu item) to the stored record it describes: the `Match` call.
+[matching]
+# The similarity the best candidate has to reach to be called a match. NOT SET HERE, ON PURPOSE: it is a
+# measurement, like `policy.threshold`, read from `record-similarity calibrate-match` on held-out catalog groups.
+# Without it, `Match` ranks its candidates and decides nothing.
+# threshold = ...
+#
+# How many records are fetched and scored exactly for each candidate returned. A cost, not a threshold: the
+# search that finds candidates under-scores records with more fields filled in than the listing has, so the
+# right one may not be among the first few. `calibrate-match` reports what a given value loses.
+overfetch = 5
+
 # A candidate policy, judged in the shadow of the one above. Optional, and off unless the table is there.
 #
 # With it, the server judges every revision a second time under the candidate (the same vectors, against the same

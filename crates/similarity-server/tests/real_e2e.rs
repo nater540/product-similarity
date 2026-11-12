@@ -327,6 +327,56 @@ async fn scenario(mut client: RecordSimilarityClient<Channel>) {
     "sku-3"
   );
 
+  // "Which stored product is this menu item a listing of?" The listing has a name and nothing else, in a
+  // retailer's words. The vape it describes has every field filled in, so the search scores it low; scored on
+  // the name alone, which is all the two share, it is well ahead. The shipped configuration has no match
+  // threshold, so the candidates are ranked and nothing is claimed.
+  let listing = pb::MatchRequest {
+    listing: Some(pb::Record {
+      id: None,
+      tenant: None,
+      fields: HashMap::from([("name".to_owned(), "sour diesel 510 cart".to_owned())]),
+      quantities: HashMap::new(),
+    }),
+    ..pb::MatchRequest::default()
+  };
+  let matched = client.r#match(listing.clone()).await.unwrap().into_inner();
+  assert_eq!(matched.decision(), pb::MatchDecision::NotJudged);
+  assert_eq!(matched.threshold, None);
+  assert_eq!(matched.candidates.len(), 3, "{matched:?}");
+  let best = &matched.candidates[0];
+  assert_eq!(
+    (best.id.as_str(), best.tenant.as_deref()),
+    ("sku-3", Some("merchant-2"))
+  );
+  assert!(
+    best.similarity > best.search_similarity + 0.1,
+    "the match score is not the search score: {best:?}"
+  );
+  assert!(best.similarity > matched.candidates[1].similarity + 0.05, "{matched:?}");
+  let scored: Vec<&str> = best
+    .fields
+    .iter()
+    .filter(|field| field.similarity.is_some())
+    .map(|field| field.field.as_str())
+    .collect();
+  assert_eq!(scored, ["name"], "only the field both sides have");
+  assert!(
+    best
+      .fields
+      .iter()
+      .all(|field| field.field == "name" || field.change() == pb::FieldChange::Removed)
+  );
+  // Within the other merchant's records there is no vape to find, and a threshold says so.
+  let elsewhere = pb::MatchRequest {
+    tenant: Some("merchant-1".to_owned()),
+    threshold: Some(best.similarity),
+    ..listing
+  };
+  let elsewhere = client.r#match(elsewhere).await.unwrap().into_inner();
+  assert_eq!(elsewhere.decision(), pb::MatchDecision::NoMatch, "{elsewhere:?}");
+  assert!(elsewhere.candidates.iter().all(|candidate| candidate.id != "sku-3"));
+
   // A reviewer can force the change through; after that the vape is the record.
   let force = pb::EvaluateRequest {
     mode: pb::WriteMode::Force.into(),

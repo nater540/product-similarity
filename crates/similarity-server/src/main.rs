@@ -582,7 +582,7 @@ async fn serve_with<S: VectorStore>(
   // A candidate policy, if the configuration names one. It is told about every judged request and decides none
   // (docs/decisions.md, D30).
   let shadow = PolicyShadow::from_config(config, worker.dimension())?.map(Arc::new);
-  let mut engine = Engine::new(store, worker, schema.clone(), policy);
+  let mut engine = Engine::new(store, worker, schema.clone(), policy).with_matching(config.matching.settings()?);
   let mut summaries = None;
   if let (Some(shadow), Some(settings)) = (&shadow, &config.shadow) {
     shadow.announce(&schema, &policy);

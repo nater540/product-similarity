@@ -219,6 +219,7 @@ The API is defined, with full documentation of every field, in
 |---|---|
 | `Evaluate` | Embeds a record. With an `id`, compares it with the stored baseline, returns a verdict with per-field detail, and stores it if allowed. |
 | `FindSimilar` | Returns the stored records most similar to a stored id or to an ad hoc record, optionally within one tenant. |
+| `Match` | Returns the stored records a listing from elsewhere describes, best first, each scored over the fields both sides have, and says whether the best is a match. Stores nothing. |
 | `Delete` | Forgets a record. |
 | `Describe` | Reports the model fingerprint, schema, and thresholds in force. |
 
@@ -247,6 +248,7 @@ The quickest way to poke a server. It is also a small, complete example of a Rus
 just client describe
 just client evaluate <id> <fields.json> [--tenant T] [--dry-run | --force]
 just client similar <id> [--limit N]
+just client match <listing.json> [--tenant T] [--limit N] [--threshold S]
 just client delete <id> [--tenant T]
 just client --server http://other-host:50051 describe
 ```
@@ -596,6 +598,62 @@ Rules for the caller:
   between zero and anything else is reported as a `zero_crossing`.
 - **Send the unit as stored.** The service converts the units it knows. A unit it does not know is still
   accepted, and compared with itself.
+
+### Matching a listing to a stored record
+
+`Match` answers a second question with the same model and the same stored catalog: not "is this edit still the
+same product?" but "which stored product is this listing a listing of?". A retailer's menu item, say, in the
+retailer's words and often with nothing but a name.
+
+```text
+$ just client evaluate sku-1 data/examples/gummies.json --tenant merchant-1
+$ just client evaluate sku-2 data/examples/vape.json --tenant merchant-2
+
+$ cat data/examples/menu-item.json
+{
+  "name": "Blueberry Indica Gummies 100mg (10pk)",
+  "weight_per_item": {"value": 40, "unit": "g"}
+}
+
+$ just client match data/examples/menu-item.json
+decision  NotJudged: the server has no match threshold
+1         0.940  sku-1  merchant-1  (the search scored it 0.595)
+  field     brand               -  only the stored record has it
+  field     category            -  only the stored record has it
+  field     description         -  only the stored record has it
+  field     name            0.940
+  quantity  thc_per_item            -  only the stored record has it
+  quantity  weight_per_item     x1.00  Unchanged (g in the record, g in the listing)
+2         0.501  sku-2  merchant-2  (the search scored it 0.317)
+  field     brand               -  only the stored record has it
+  field     category            -  only the stored record has it
+  field     description         -  only the stored record has it
+  field     name            0.501
+  quantity  thc_per_item            -  only the stored record has it
+  quantity  weight_per_item    x40.00  Modified (g in the record, g in the listing)
+```
+
+- **Each candidate is scored over the fields both sides have.** The listing has only a name, so each candidate's
+  similarity is its name's. A search cannot do that: it compares whole stored vectors, in which a field one side
+  lacks counts against the pair, and the gummies it found at 0.595 are a 0.940 match. So `Match` searches, fetches
+  more records than it will return (`matching.overfetch` for each one), scores those exactly, and orders them by
+  that score. `search_similarity` is returned beside it, and is what `FindSimilar` would report.
+- **Map the listing onto the schema's names.** A listing has no schema of its own: its fields go under `name`,
+  `category`, and the rest, as a product's do ([Mapping your records](#mapping-your-records)), and a field with
+  no counterpart is left out. A listing carries no `id` and no `tenant`; both belong to the system it came from,
+  and a request that sends either is refused.
+- **Every tenant's records are candidates, unless the request names one.** A caller that knows the brand passes
+  its key as `tenant`. A caller that knows only the brand's name puts it in the `brand` field, where it is scored
+  like any other field.
+- **The decision is about the best candidate alone,** and only where there is a threshold: `MATCHED` at or above
+  it, `NO_MATCH` below it or with no candidates, `NOT_JUDGED` when the server has none and the request gave none
+  (`--threshold`, or `threshold` in the request). The example configuration has none, because a match threshold
+  is a measurement and nobody has made it.
+- **Quantities are reported for each candidate and decide nothing.** They are compared with the stored record's
+  value as the one before and the listing's as the one after, and do not move a similarity or the decision.
+  Whether a 3.5 g listing can be a listing of a 1 g product is a question about your catalog.
+- **Nothing is written.** A match stores no listing and changes no record, floors and limits do not apply to it,
+  and it never appears in a record's history.
 
 ## How a verdict is reached
 
@@ -1682,6 +1740,8 @@ commented starting point.
 | `[quantities.<name>]` | none defined | Naming the table defines the quantity, even with nothing in it. It is then accepted in requests, compared, and reported. |
 | `quantities.<name>.reject_above_factor` | none | Reject a revision that changes this quantity by more than this factor, in either direction, or moves it between zero and a value above zero. At least 1. |
 | `quantities.<name>.reject_incomparable` | `false` | Reject a revision that puts this quantity in a unit that cannot be compared with the one it had. |
+| `matching.threshold` | none | The similarity the best candidate of a `Match` has to reach to be called a match. Without it `Match` ranks and decides nothing. A measurement; the example configuration sets none. |
+| `matching.overfetch` | `5` | How many records `Match` fetches and scores exactly for each candidate it returns. At least 1; one request scores at most 1,000. |
 | `[shadow]` | none | A candidate policy that judges every revision as well and decides none. See [A candidate policy in the shadow](#a-candidate-policy-in-the-shadow). |
 | `shadow.name` | (required) | What the candidate is called on every line it writes. |
 | `shadow.events` | `disagreements` | `disagreements` writes a line for each revision the candidate would have decided the other way; `all` writes one for every judged revision. |
@@ -2121,7 +2181,9 @@ what that field says.
   versions have. `FindSimilar` compares whole stored vectors, in which a missing field is a block of zeros, so two
   records that are identical except that one has no description score 1.0 in `Evaluate` but about 0.89 in
   `FindSimilar`. Verdicts are unaffected; rankings favor records with the same fields filled in as the query,
-  which is most visible when searching by a name alone. See D5.
+  which is most visible when searching by a name alone. `Match` scores its candidates exactly, but it can only
+  score what the search returned: a record the search ranks below `limit` times `matching.overfetch` is never
+  seen. See D5 and D32.
 - **No bulk RPC.** A catalog is loaded with the `import` command, which has to run where it can reach the model
   and Qdrant. Over gRPC it is still one `Evaluate` call per record.
 - **English only.** The default model is English. Other languages need another model and a new calibration.
@@ -2131,7 +2193,8 @@ what that field says.
   can still be moved a long way in steps that each stay under the limit; the text drift check
   (`anchor_threshold`) does not see quantities. `calibrate-drift` counts the recycles that do this (`walked`), which
   is the evidence for or against building one.
-- **Quantities play no part in search.** `FindSimilar` compares vectors, which hold text only.
+- **Quantities play no part in search, and none in a match decision.** `FindSimilar` compares vectors, which hold
+  text only. `Match` reports each candidate's quantities beside its score and decides on the text.
 - **Truncation.** Text beyond `max_tokens` (256 by default) is ignored. A long field is tokenized a part at a
   time and no further than it takes to fill that limit, so an enormous description costs little more than an
   ordinary one (D21). The whole text still decides whether a field counts as changed.

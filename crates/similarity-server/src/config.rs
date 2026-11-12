@@ -41,6 +41,52 @@ pub struct Config {
   /// nothing is shadowed.
   #[serde(default)]
   pub shadow: Option<ShadowConfig>,
+  /// How `Match` decides and how far it looks.
+  #[serde(default)]
+  pub matching: MatchingConfig,
+}
+
+/// `[matching]`. The table is not called `match` because that is a keyword of the language this is written in.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MatchingConfig {
+  /// Call the best candidate a match only at or above this similarity. A measurement, like `policy.threshold`,
+  /// read from `calibrate-match` on held-out catalog groups. Without it `Match` ranks and decides nothing.
+  pub threshold: Option<f32>,
+  /// How many candidates to fetch for each one returned, before they are scored exactly. A cost, not a
+  /// threshold: `calibrate-match` reports what a given value loses against scoring the whole catalog.
+  pub overfetch: usize,
+}
+
+impl Default for MatchingConfig {
+  fn default() -> Self {
+    Self {
+      threshold: None,
+      overfetch: crate::engine::Matching::default().overfetch,
+    }
+  }
+}
+
+impl MatchingConfig {
+  /// The settings the engine matches by.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error if the threshold lies outside the cosine range or the over-fetch is zero.
+  pub fn settings(&self) -> anyhow::Result<crate::engine::Matching> {
+    if let Some(threshold) = self.threshold
+      && !(-1.0..=1.0).contains(&threshold)
+    {
+      bail!("`matching.threshold` is {threshold}, outside the cosine range [-1, 1]");
+    }
+    if self.overfetch == 0 {
+      bail!("`matching.overfetch` must be at least 1");
+    }
+    Ok(crate::engine::Matching {
+      threshold: self.threshold,
+      overfetch: self.overfetch,
+    })
+  }
 }
 
 /// `[server]`
@@ -375,6 +421,7 @@ impl Config {
     if config.qdrant.collection.trim().is_empty() {
       bail!("`qdrant.collection` must not be blank");
     }
+    config.matching.settings()?;
     if let Some(shadow) = &config.shadow {
       if shadow.name.trim().is_empty() {
         bail!("`shadow.name` must not be blank");
@@ -676,6 +723,28 @@ mod tests {
         "{bad}"
       );
     }
+  }
+
+  /// A match threshold is a measurement, so none is shipped; the over-fetch is a cost with a default.
+  #[test]
+  fn matching_has_no_threshold_unless_one_was_measured_and_an_overfetch_of_at_least_one() {
+    let default = Config::parse(MINIMAL).unwrap().matching.settings().unwrap();
+    assert_eq!((default.threshold, default.overfetch), (None, 5));
+    let shipped = Config::parse(include_str!("../../../config.example.toml")).unwrap();
+    assert_eq!(shipped.matching.threshold, None, "the example ships no match threshold");
+
+    let with = |table: &str| Config::parse(&format!("{MINIMAL}\n[matching]\n{table}"));
+    let set = with("threshold = 0.8\noverfetch = 12")
+      .unwrap()
+      .matching
+      .settings()
+      .unwrap();
+    assert_eq!((set.threshold, set.overfetch), (Some(0.8), 12));
+    assert_eq!(with("overfetch = 1").unwrap().matching.overfetch, 1);
+    assert!(with("overfetch = 0").is_err());
+    assert!(with("threshold = 1.5").is_err());
+    assert!(with("threshold = -1.5").is_err());
+    assert!(with("threshhold = 0.8").is_err(), "a misspelled key");
   }
 
   const SHADOWED: &str = r#"
