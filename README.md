@@ -552,7 +552,9 @@ Nothing is written when an error is returned.
 becomes a baseline. On a laptop CPU, 2,000 four-field records were imported in 19 seconds, so 50,000 take about
 eight minutes. A caller that cannot run a command next to Qdrant sends the same records over one
 [`Import` stream](#creating-records-over-a-stream), at about 80 records a second on that CPU, sharing the model
-with whoever else is calling.
+with whoever else is calling. [`docs/import-prompt.md`](docs/import-prompt.md) is a ready-made brief for doing
+this with the real catalog, where the data lives: what to find out first, the export, the checks before and
+after, and what never to do.
 
 **At edit time.**
 
@@ -2333,6 +2335,7 @@ data/
 docs/
   decisions.md               why things are the way they are (D1 to D33)
   data-request-prompt.md     a brief for collecting labeled production data
+  import-prompt.md           a brief for loading the real catalog into a running service
   feature-suggestions.md     features that could be added, built and not, the last twelve about production
   plan-features.md           a plan for the first five of them
 models/                 fetched and fine-tuned model directories (ignored by git)

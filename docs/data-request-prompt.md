@@ -2,6 +2,9 @@
 
 Paste everything below the line into a Claude session that has read access to the product data.
 
+This brief collects labeled pairs for choosing thresholds, and its files are pseudonymized. Loading the real
+catalog into a running service is a different job with a brief of its own, `docs/import-prompt.md`.
+
 ---
 
 I need your help assembling a labeled dataset from our brand product data. You will be working inside our
