@@ -14,7 +14,7 @@
 > - `Policy::with_threshold` replaces the engine's `Policy::new(threshold, anchor)` for a per-request threshold,
 >   which would otherwise have dropped `reject_on_measure_change`.
 > - The calibration report's summary line now reads "plus field floors and any quantity limits".
-> - The README's `merchant-1` tenant was left alone, as the plan asks.
+> - The README's `merchant-1` brand was left alone, as the plan asks.
 
 A plan for teaching the service about the numeric fields on a product record (weight, volume, THC, CBD), written
 so that a session with no memory of the conversation that produced it can carry it out. It was written before any
@@ -51,7 +51,7 @@ Read `CLAUDE.md` first (conventions, invariants, commands), then this file. `REA
 
 The owner's decisions and facts. Treat them as settled:
 
-- **First use is brand products, not retailers' menu items.** The tenant is the brand that owns the product.
+- **First use is brand products, not retailers' menu items.** The brand is the brand that owns the product.
 - **`brand` on the record is a numeric foreign key.** The caller sends the brand's *name* as the `brand` text
   field. The field is kept in the schema, although it is constant per brand, because a later use may match menu
   items to brand products.
@@ -86,7 +86,7 @@ cbd_per_item_min_value      cbd_per_item_max_value      cbd_per_item_unit
 
 | On the record | In the request | Notes |
 |---|---|---|
-| Brand foreign key | `tenant`, as a string | A product moving to another brand is refused by the tenant check (D14). |
+| Brand foreign key | `brand_id`, as a string | A product moving to another brand is refused by the brand check (D14). |
 | Brand name, looked up from the key | `fields["brand"]` | Constant per brand. Kept for later matching. |
 | Root and sub category, through the join | `fields["category"]`, e.g. `Edibles > Gummies` | Names, never ids. Root first, then sub. If a product has several category rows, a fixed sort order, or a reordering looks like an edit. |
 | `name`, `description` | `fields["name"]`, `fields["description"]` | Unchanged from today. |
@@ -334,7 +334,7 @@ The text thresholds must not move. `just calibrate` should print the same text n
   - "How a verdict is reached": the quantity rules.
   - "Choosing thresholds": reading the new calibration section.
   - "Configuration reference": `[quantities.*]` and `policy.reject_on_measure_change`.
-  - The examples still use `merchant-1` as the tenant. The owner has not asked for that to change; ask before
+  - The examples still use `merchant-1` as the brand. The owner has not asked for that to change; ask before
     renaming it to a brand.
 - **`CLAUDE.md`**: quantities never enter the weighted score or the layout id; limits are measurements, like
   thresholds.

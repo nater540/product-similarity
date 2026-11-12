@@ -305,7 +305,7 @@ fn emit_histories(run: &DriftRun, policy: &Policy) {
       target: RESULT,
       history_id,
       label = history.label_text.as_str(),
-      owner = history.owner.as_deref(),
+      brand_id = history.brand_id.as_deref(),
       label_source = history.label_source.as_deref(),
       label_confidence = history.label_confidence.map(Confidence::as_str),
       recycled_at = history.recycled_at,
@@ -474,15 +474,15 @@ mod tests {
       ("sativa vape resin cartridge vegan", None, Some(40.0)),
     ];
     replayed(&[
-      line("steady", r#""owner": "b1", "label": "edit", "#, &steady),
+      line("steady", r#""brand_id": "b1", "label": "edit", "#, &steady),
       line(
         "steady-2",
-        r#""owner": "b2", "label": "edit", "label_confidence": "high", "#,
+        r#""brand_id": "b2", "label": "edit", "label_confidence": "high", "#,
         &steady,
       ),
       line(
         "walk",
-        r#""owner": "b3", "label": "recycle", "recycled_at": 2, "#,
+        r#""brand_id": "b3", "label": "recycle", "recycled_at": 2, "#,
         &walk,
       ),
     ])

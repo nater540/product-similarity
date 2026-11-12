@@ -33,7 +33,7 @@
 //! also the front of every `key`: a file that several runs of a server wrote into can be told apart by it, and
 //! `shadow-report` adds up the last summary of each.
 //!
-//! A line names a record by its id and the tenant the request named, and carries scores and codes: never a
+//! A line names a record by its id and the brand the request named, and carries scores and codes: never a
 //! record's text.
 
 use std::sync::Arc;
@@ -274,7 +274,7 @@ impl PolicyShadow {
       target: RESULT,
       key = key.as_str(),
       id = observation.id,
-      tenant = observation.tenant,
+      brand_id = observation.brand_id,
       shadow = name,
       kind = KIND,
       run = self.started,
@@ -377,7 +377,7 @@ mod tests {
   type TestEngine = Engine<MemoryStore, WordBagEmbedder>;
 
   const ID: &str = "p1";
-  const TENANT: &str = "brand-1";
+  const BRAND_ID: &str = "brand-1";
   const NAME: &str = "blueberry gummies vegan fruit chews";
   /// One word of five is different.
   const RENAMED: &str = "blueberry gummies vegan fruit cartridge";
@@ -424,7 +424,7 @@ mod tests {
     EvaluateInput {
       record: RecordInput {
         id: Some(ID.to_owned()),
-        tenant: Some(TENANT.to_owned()),
+        brand_id: Some(BRAND_ID.to_owned()),
         fields: vec![
           ("name".to_owned(), name.to_owned()),
           ("description".to_owned(), description.to_owned()),
@@ -567,7 +567,7 @@ mod tests {
     assert_eq!(events.len(), 1, "{:?}", watched.results);
     let event = events[0];
     assert_eq!(event["id"], ID);
-    assert_eq!(event["tenant"], TENANT);
+    assert_eq!(event["brand_id"], BRAND_ID);
     assert_eq!(event["shadow"], "candidate");
     assert_eq!(event["kind"], "policy");
     assert_eq!(event["mode"], "enforce");
@@ -640,22 +640,22 @@ mod tests {
     );
   }
 
-  /// The tenant on a line is the one the request named. A request that named none gets a line without the key.
+  /// The brand on a line is the one the request named. A request that named none gets a line without the key.
   #[test]
-  fn a_line_names_the_tenant_only_when_the_request_did() {
-    let untenanted = |name: &str| {
+  fn a_line_names_the_brand_only_when_the_request_did() {
+    let unbranded = |name: &str| {
       let mut request = request(name, DESCRIPTION, None);
-      request.record.tenant = None;
+      request.record.brand_id = None;
       request
     };
     let watched = run(
       (plain(), policy(0.5, None)),
       (plain(), policy(0.99, None), ShadowEvents::Disagreements),
-      &[untenanted(NAME), untenanted(RENAMED)],
+      &[unbranded(NAME), unbranded(RENAMED)],
     );
     let event = watched.events("shadow")[0];
     assert_eq!(event["id"], ID);
-    assert!(event.get("tenant").is_none(), "{event}");
+    assert!(event.get("brand_id").is_none(), "{event}");
   }
 
   /// A candidate with other weights scores the same vectors differently, against the baseline and against the

@@ -47,7 +47,7 @@ PAIRS = [
   ("Ten vegan gummies infused with hybrid terpenes. 10mg THC per piece.", "Ten mints infused with hybrid terpenes. 5mg THC per piece.", False),
 ]
 
-# (catalog entry, a merchant's listing of it). Several flavors of one product line, so that telling them apart
+# (catalog entry, a retailer's menu item for it). Several flavors of one product line, so that telling them apart
 # takes more than the brand name.
 GROUPS = [
   ("WYLD Raspberry Sativa Gummies 100mg", "Wyld - Raspberry Gummies (Sativa) 10pk"),
@@ -132,7 +132,7 @@ def main() -> None:
     "learning_rate": LEARNING_RATE,
     "max_grad_norm": MAX_GRAD_NORM,
     "pairs": [{"before": before_, "after": after, "same": same} for before_, after, same in PAIRS],
-    "groups": [{"catalog": catalog, "listing": listing} for catalog, listing in GROUPS],
+    "groups": [{"catalog": catalog, "menu_item": menu_item} for catalog, menu_item in GROUPS],
     "steps": steps,
     "probes": PROBES,
     "probes_before": before,

@@ -29,7 +29,7 @@ pub(crate) fn scored_as(label: Label, similarity: f32, accepted: bool, adjust: i
     label_text: label.as_str().to_owned(),
     note: format!("{label:?} at {similarity}"),
     split: None,
-    owner: None,
+    brand_id: None,
     variant_change: None,
     label_source: None,
     label_confidence: None,

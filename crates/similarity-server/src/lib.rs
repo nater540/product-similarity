@@ -169,10 +169,10 @@ mod tests {
     }
   }
 
-  fn record(id: Option<&str>, tenant: Option<&str>, fields: &[(&str, &str)]) -> pb::Record {
+  fn record(id: Option<&str>, brand_id: Option<&str>, fields: &[(&str, &str)]) -> pb::Record {
     pb::Record {
       id: id.map(str::to_owned),
-      tenant: tenant.map(str::to_owned),
+      brand_id: brand_id.map(str::to_owned),
       fields: fields
         .iter()
         .map(|(name, text)| ((*name).to_owned(), (*text).to_owned()))
@@ -435,7 +435,7 @@ mod tests {
     );
   }
 
-  /// The stream the import tests send: two new records, one that is stored, the same one under another tenant,
+  /// The stream the import tests send: two new records, one that is stored, the same one under another brand,
   /// one with a field the schema lacks, one with no record at all, and one with its original version.
   fn import_requests() -> Vec<pb::ImportRequest> {
     let request = |record: pb::Record| pb::ImportRequest {
@@ -576,13 +576,13 @@ mod tests {
     );
   }
 
-  /// `Match` over the wire: the listing without an id, the candidates best first with both scores, the decision
+  /// `Match` over the wire: the menu item without an id, the candidates best first with both scores, the decision
   /// as an enum, the fields read with the stored record as the baseline, and the refusals as status codes.
   #[tokio::test]
-  async fn a_listing_is_matched_over_grpc() {
+  async fn a_menu_item_is_matched_over_grpc() {
     let mut running = start().await;
     let client = &mut running.client;
-    for (id, tenant, fields) in [
+    for (id, brand_id, fields) in [
       (
         "gummies",
         "brand-1",
@@ -591,15 +591,15 @@ mod tests {
       ("tin", "brand-2", [("name", "blueberry gummies 10pk tin")].as_slice()),
     ] {
       client
-        .evaluate(evaluate(record(Some(id), Some(tenant), fields)))
+        .evaluate(evaluate(record(Some(id), Some(brand_id), fields)))
         .await
         .unwrap();
     }
-    let listing = || record(None, None, &[("name", "blueberry gummies 100mg 10pk")]);
+    let menu_item = || record(None, None, &[("name", "blueberry gummies 100mg 10pk")]);
 
     let response = client
       .r#match(pb::MatchRequest {
-        listing: Some(listing()),
+        menu_item: Some(menu_item()),
         ..pb::MatchRequest::default()
       })
       .await
@@ -610,7 +610,7 @@ mod tests {
     let ids: Vec<(&str, Option<&str>)> = response
       .candidates
       .iter()
-      .map(|candidate| (candidate.id.as_str(), candidate.tenant.as_deref()))
+      .map(|candidate| (candidate.id.as_str(), candidate.brand_id.as_deref()))
       .collect();
     assert_eq!(ids, [("gummies", Some("brand-1")), ("tin", Some("brand-2"))]);
     let best = &response.candidates[0];
@@ -630,12 +630,12 @@ mod tests {
     );
     assert!(best.fields.iter().all(|field| !field.below_floor));
 
-    // The request's own threshold, its tenant, and its limit.
+    // The request's own threshold, its brand, and its limit.
     let narrowed = client
       .r#match(pb::MatchRequest {
-        listing: Some(listing()),
+        menu_item: Some(menu_item()),
         limit: 1,
-        tenant: Some("brand-2".to_owned()),
+        brand_id: Some("brand-2".to_owned()),
         threshold: Some(0.99),
       })
       .await
@@ -648,20 +648,20 @@ mod tests {
     );
     assert_eq!(narrowed.threshold, Some(0.99));
 
-    // Refused: no listing, a listing with an id, a limit too large, a threshold off the scale.
+    // Refused: no menu item, a menu item with an id, a limit too large, a threshold off the scale.
     let refused = [
       pb::MatchRequest::default(),
       pb::MatchRequest {
-        listing: Some(record(Some("menu-7"), None, &[("name", "x")])),
+        menu_item: Some(record(Some("menu-7"), None, &[("name", "x")])),
         ..pb::MatchRequest::default()
       },
       pb::MatchRequest {
-        listing: Some(listing()),
+        menu_item: Some(menu_item()),
         limit: 101,
         ..pb::MatchRequest::default()
       },
       pb::MatchRequest {
-        listing: Some(listing()),
+        menu_item: Some(menu_item()),
         threshold: Some(2.0),
         ..pb::MatchRequest::default()
       },
@@ -676,13 +676,13 @@ mod tests {
   async fn records_are_searchable_and_deletable_over_grpc() {
     let mut running = start().await;
     let client = &mut running.client;
-    for (id, tenant, fields) in [
+    for (id, brand_id, fields) in [
       ("gummies", "m1", &GUMMIES),
       ("gummies-100", "m2", &GUMMIES_EDITED),
       ("vape", "m1", &VAPE),
     ] {
       client
-        .evaluate(evaluate(record(Some(id), Some(tenant), fields)))
+        .evaluate(evaluate(record(Some(id), Some(brand_id), fields)))
         .await
         .unwrap();
     }
@@ -694,11 +694,11 @@ mod tests {
     let neighbors = client.find_similar(by_id.clone()).await.unwrap().into_inner().neighbors;
     let ids: Vec<&str> = neighbors.iter().map(|neighbor| neighbor.id.as_str()).collect();
     assert_eq!(ids, ["gummies-100", "vape"]);
-    assert_eq!(neighbors[0].tenant.as_deref(), Some("m2"));
+    assert_eq!(neighbors[0].brand_id.as_deref(), Some("m2"));
     assert!(neighbors[0].similarity > neighbors[1].similarity);
 
     let filtered = pb::FindSimilarRequest {
-      tenant: Some("m1".to_owned()),
+      brand_id: Some("m1".to_owned()),
       limit: 5,
       min_similarity: Some(-1.0),
       ..by_id
@@ -720,9 +720,9 @@ mod tests {
     let neighbors = client.find_similar(by_record).await.unwrap().into_inner().neighbors;
     assert_eq!(neighbors[0].id, "vape");
 
-    let delete = |tenant: Option<&str>| pb::DeleteRequest {
+    let delete = |brand_id: Option<&str>| pb::DeleteRequest {
       id: "vape".to_owned(),
-      tenant: tenant.map(str::to_owned),
+      brand_id: brand_id.map(str::to_owned),
     };
     // The record belongs to `m1`, so a request that does not say so is refused.
     for wrong in [None, Some("m2")] {

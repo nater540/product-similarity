@@ -27,7 +27,7 @@ struct JudgmentLine {
   run: Option<u64>,
   id: String,
   #[serde(default)]
-  tenant: Option<String>,
+  brand_id: Option<String>,
   shadow: String,
   live_verdict: String,
   shadow_verdict: String,
@@ -101,7 +101,7 @@ pub fn read(ndjson: &str) -> anyhow::Result<BTreeMap<String, ShadowLog>> {
           key: parsed.key,
           run: parsed.run,
           id: parsed.id,
-          tenant: parsed.tenant,
+          brand_id: parsed.brand_id,
           live_similarity: parsed.live_similarity,
           shadow_similarity: parsed.shadow_similarity,
         };
@@ -188,26 +188,26 @@ fn direction_text(direction: Direction) -> &'static str {
   }
 }
 
-fn render_tenants(report: &ShadowReport, out: &mut String) {
-  if !report.tenants.is_empty() {
+fn render_brands(report: &ShadowReport, out: &mut String) {
+  if !report.brands.is_empty() {
     let _ = writeln!(
       out,
       "\n{:<28} {:>8} {:>22} {:>20}",
-      "tenant", "lines", "only candidate rejects", "only live rejects"
+      "brand", "lines", "only candidate rejects", "only live rejects"
     );
-    for row in &report.tenants {
+    for row in &report.brands {
       let _ = writeln!(
         out,
         "{:<28} {:>8} {:>22} {:>20}",
-        row.tenant.as_deref().unwrap_or("(none named)"),
+        row.brand_id.as_deref().unwrap_or("(none named)"),
         row.lines,
         row.only_shadow_rejected,
         row.only_live_rejected
       );
     }
-    let more = report.tenants_disagreed_on.saturating_sub(report.tenants.len());
+    let more = report.brands_disagreed_on.saturating_sub(report.brands.len());
     if more > 0 {
-      let _ = writeln!(out, "and {more} more tenant(s) with a disagreement");
+      let _ = writeln!(out, "and {more} more brand(s) with a disagreement");
     }
   }
 }
@@ -248,11 +248,11 @@ pub fn render(report: &ShadowReport) -> String {
       direction_text(direction)
     );
   }
-  match report.tenants_resampled {
-    Some(tenants) => {
+  match report.brands_resampled {
+    Some(brands) => {
       let _ = writeln!(
         out,
-        "          intervals are the middle 95% over resamples of {tenants} tenants"
+        "          intervals are the middle 95% over resamples of {brands} brands"
       );
     }
     None if !report.complete => {
@@ -266,7 +266,7 @@ pub fn render(report: &ShadowReport) -> String {
     None => {
       let _ = writeln!(
         out,
-        "          no intervals: they need every revision to name one of several tenants"
+        "          no intervals: they need every revision to name one of several brands"
       );
     }
   }
@@ -292,7 +292,7 @@ pub fn render(report: &ShadowReport) -> String {
     }
   }
 
-  render_tenants(report, &mut out);
+  render_brands(report, &mut out);
   let _ = writeln!(
     out,
     "\nA disagreement says the two policies differ on a revision, not which is right. Label the revisions \
@@ -307,7 +307,7 @@ struct Disagreement<'a> {
   key: &'a str,
   id: &'a str,
   #[serde(skip_serializing_if = "Option::is_none")]
-  tenant: Option<&'a str>,
+  brand_id: Option<&'a str>,
   live_verdict: &'static str,
   shadow_verdict: &'static str,
   live_similarity: f64,
@@ -327,7 +327,7 @@ pub fn ids(log: &ShadowLog) -> anyhow::Result<String> {
     let line = serde_json::to_string(&Disagreement {
       key: &judgment.key,
       id: &judgment.id,
-      tenant: judgment.tenant.as_deref(),
+      brand_id: judgment.brand_id.as_deref(),
       live_verdict: verdict(judgment.live_accepted),
       shadow_verdict: verdict(judgment.shadow_accepted),
       live_similarity: judgment.live_similarity,
@@ -340,7 +340,7 @@ pub fn ids(log: &ShadowLog) -> anyhow::Result<String> {
   Ok(out)
 }
 
-/// Writes a report as events: one `shadow_report` line, then one line per tenant, reason, and direction listed.
+/// Writes a report as events: one `shadow_report` line, then one line per brand, reason, and direction listed.
 pub fn emit(report: &ShadowReport) {
   let shadow = report.shadow.as_str();
   let counts = report.counts.as_ref();
@@ -371,8 +371,8 @@ pub fn emit(report: &ShadowReport) {
     only_live_rejected_rate = report.only_live_rejected.rate.map(six_wide),
     only_live_rejected_low = live_low,
     only_live_rejected_high = live_high,
-    tenants_resampled = report.tenants_resampled,
-    tenants_disagreed_on = report.tenants_disagreed_on,
+    brands_resampled = report.brands_resampled,
+    brands_disagreed_on = report.brands_disagreed_on,
     "shadow_report"
   );
   for scores in &report.scores {
@@ -399,15 +399,15 @@ pub fn emit(report: &ShadowReport) {
       "shadow_report_reason"
     );
   }
-  for row in &report.tenants {
+  for row in &report.brands {
     tracing::info!(
       target: RESULT,
       shadow,
-      tenant = row.tenant.as_deref(),
+      brand_id = row.brand_id.as_deref(),
       lines = row.lines,
       only_shadow_rejected = row.only_shadow_rejected,
       only_live_rejected = row.only_live_rejected,
-      "shadow_report_tenant"
+      "shadow_report_brand"
     );
   }
 }
@@ -433,11 +433,11 @@ mod tests {
   /// Nothing in common.
   const REPLACED: &str = "sour diesel resin vape pen";
 
-  fn request(id: &str, tenant: Option<&str>, name: &str) -> EvaluateInput {
+  fn request(id: &str, brand_id: Option<&str>, name: &str) -> EvaluateInput {
     EvaluateInput {
       record: RecordInput {
         id: Some(id.to_owned()),
-        tenant: tenant.map(str::to_owned),
+        brand_id: brand_id.map(str::to_owned),
         fields: vec![("name".to_owned(), name.to_owned())],
         quantities: Vec::new(),
       },
@@ -482,18 +482,18 @@ mod tests {
     (captured.results.join("\n"), shadow.summary())
   }
 
-  /// Three tenants. `brand-1` renames two records (two disagreements) and resaves one; `brand-2` renames one
+  /// Three brands. `brand-1` renames two records (two disagreements) and resaves one; `brand-2` renames one
   /// and recycles one (rejected by both); `brand-3` only resaves.
   fn traffic() -> Vec<EvaluateInput> {
     let mut requests = Vec::new();
-    for (id, tenant) in [
+    for (id, brand_id) in [
       ("a", "brand-1"),
       ("b", "brand-1"),
       ("c", "brand-2"),
       ("d", "brand-2"),
       ("e", "brand-3"),
     ] {
-      requests.push(request(id, Some(tenant), NAME));
+      requests.push(request(id, Some(brand_id), NAME));
     }
     requests.push(request("a", Some("brand-1"), RENAMED));
     requests.push(request("b", Some("brand-1"), RENAMED));
@@ -542,15 +542,15 @@ mod tests {
     assert_eq!(made.only_shadow_rejected.rate, Some(0.5));
     let interval = made.only_shadow_rejected.interval.unwrap();
     assert!(interval.low <= 0.5 && interval.high >= 0.5, "{interval:?}");
-    assert_eq!(made.tenants_resampled, Some(3));
+    assert_eq!(made.brands_resampled, Some(3));
 
-    // Most disagreements first; a tenant with none is not listed.
+    // Most disagreements first; a brand with none is not listed.
     let rows: Vec<(Option<&str>, usize, usize, usize)> = made
-      .tenants
+      .brands
       .iter()
       .map(|row| {
         (
-          row.tenant.as_deref(),
+          row.brand_id.as_deref(),
           row.lines,
           row.only_shadow_rejected,
           row.only_live_rejected,
@@ -558,10 +558,10 @@ mod tests {
       })
       .collect();
     assert_eq!(rows, [(Some("brand-1"), 3, 2, 0), (Some("brand-2"), 2, 1, 0)]);
-    assert_eq!(made.tenants_disagreed_on, 2);
-    assert_eq!(report(&log, 1, 0).tenants.len(), 1);
+    assert_eq!(made.brands_disagreed_on, 2);
+    assert_eq!(report(&log, 1, 0).brands.len(), 1);
     assert_eq!(
-      report(&log, 1, 0).tenants_disagreed_on,
+      report(&log, 1, 0).brands_disagreed_on,
       2,
       "cut to one, and still two of them"
     );
@@ -591,7 +591,7 @@ mod tests {
   }
 
   /// By default a shadow writes a line only for a disagreement. The totals still come out, from the summary; what
-  /// cannot is an interval, which needs to know how many revisions each tenant had judged.
+  /// cannot is an interval, which needs to know how many revisions each brand had judged.
   #[test]
   fn with_only_disagreements_written_the_rates_are_the_summarys_and_have_no_interval() {
     let (ndjson, summary) = written(ShadowEvents::Disagreements, &traffic());
@@ -603,10 +603,10 @@ mod tests {
     );
     assert_eq!(made.only_shadow_rejected.rate, Some(0.5));
     assert_eq!(
-      (made.only_shadow_rejected.interval, made.tenants_resampled),
+      (made.only_shadow_rejected.interval, made.brands_resampled),
       (None, None)
     );
-    assert_eq!(made.tenants[0].lines, 2, "only the lines that were written");
+    assert_eq!(made.brands[0].lines, 2, "only the lines that were written");
     let text = render(&made);
     assert!(
       text.contains("no intervals: the file has a line for 3 of the judged revisions"),
@@ -713,7 +713,7 @@ mod tests {
       .map(|line| {
         (
           line["id"].as_str().unwrap(),
-          line["tenant"].as_str().unwrap(),
+          line["brand_id"].as_str().unwrap(),
           line["live_verdict"].as_str().unwrap(),
           line["shadow_verdict"].as_str().unwrap(),
         )
@@ -742,7 +742,7 @@ mod tests {
     assert!(text.contains("disagreed 3 of 6  50.00% ("), "{text}");
     assert!(text.contains("disagreed 0 of 6  0.00% ("), "{text}");
     assert!(
-      text.contains("intervals are the middle 95% over resamples of 3 tenants"),
+      text.contains("intervals are the middle 95% over resamples of 3 brands"),
       "{text}"
     );
     assert!(text.contains("       3  below_threshold"), "{text}");
@@ -773,8 +773,8 @@ mod tests {
         "shadow_report",
         "shadow_report_scores",
         "shadow_report_reason",
-        "shadow_report_tenant",
-        "shadow_report_tenant"
+        "shadow_report_brand",
+        "shadow_report_brand"
       ]
     );
     let line = &events[0];
@@ -786,14 +786,17 @@ mod tests {
         line["only_live_rejected"].as_u64(),
         line["lines"].as_u64(),
         line["complete"].as_bool(),
-        line["tenants_resampled"].as_u64(),
+        line["brands_resampled"].as_u64(),
       ),
       (Some(6), Some(3), Some(3), Some(0), Some(6), Some(true), Some(3))
     );
     let interval = made.only_shadow_rejected.interval.unwrap();
     assert!((line["only_shadow_rejected_low"].as_f64().unwrap() - interval.low).abs() < 1e-6);
     assert_eq!(
-      (events[3]["tenant"].as_str(), events[3]["only_shadow_rejected"].as_u64()),
+      (
+        events[3]["brand_id"].as_str(),
+        events[3]["only_shadow_rejected"].as_u64()
+      ),
       (Some("brand-1"), Some(2))
     );
   }

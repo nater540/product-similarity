@@ -65,8 +65,8 @@ impl MemoryStore {
     let mut hits = Vec::new();
     for (layout, record) in records.values() {
       let excluded = query.exclude_id == Some(record.id.as_str());
-      let other_tenant = query.tenant.is_some() && query.tenant != record.tenant.as_deref();
-      if *layout != self.layout || excluded || other_tenant {
+      let other_brand = query.brand_id.is_some() && query.brand_id != record.brand_id.as_deref();
+      if *layout != self.layout || excluded || other_brand {
         continue;
       }
       let similarity = cosine(query.vector, &record.vectors.composite).map_err(|source| StoreError::Corrupt {
@@ -92,7 +92,7 @@ impl MemoryStore {
 fn neighbor(record: &StoredRecord, similarity: f32) -> Neighbor {
   Neighbor {
     id: record.id.clone(),
-    tenant: record.tenant.clone(),
+    brand_id: record.brand_id.clone(),
     similarity,
   }
 }

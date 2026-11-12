@@ -1022,7 +1022,7 @@ pub fn list(registry: &Registry) -> Vec<Listed<'_>> {
     .collect()
 }
 
-/// The registry as a listing, for a person.
+/// The registry as a list, for a person.
 pub fn render_list(registry: &Registry) -> String {
   let mut out = String::new();
   let models = list(registry);

@@ -3,8 +3,8 @@
 //! Two losses, one per kind of example (see [`crate::data`]), both computed on unit vectors:
 //!
 //! - [`contrastive`], for labeled pairs: pull the two versions of an ordinary edit together, push the two sides of
-//!   a recycled listing at least a margin apart.
-//! - [`ranking`], for catalog groups: each catalog entry must pick out its own listing from every listing in the
+//!   a recycled product at least a margin apart.
+//! - [`ranking`], for catalog groups: each catalog entry must pick out its own menu item from every menu item in the
 //!   batch.
 //!
 //! Either is applied at several truncated widths and averaged ([`truncated`]). The server keeps only the first
@@ -16,7 +16,7 @@ use burn::nn::loss::CrossEntropyLossConfig;
 use burn::tensor::activation::relu;
 use burn::tensor::{Int, Tensor};
 
-/// How far apart, in cosine distance, the two sides of a recycled listing are pushed before the loss stops caring.
+/// How far apart, in cosine distance, the two sides of a recycled product are pushed before the loss stops caring.
 pub const DEFAULT_MARGIN: f64 = 0.5;
 
 /// The factor cosine similarities are multiplied by before the ranking loss's softmax (an inverse temperature).

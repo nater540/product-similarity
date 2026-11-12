@@ -7,7 +7,7 @@
 //! **Two sources, and they are not mixed.** The `shadow_summary` lines count every request the candidate saw,
 //! whatever was written about it; the `shadow` lines describe single revisions, and by default only the ones the
 //! two policies disagree on. Totals and rates come from the summaries. Everything about *which* revisions (by
-//! tenant, by reason, by score) comes from the lines. An interval needs to know how many revisions each tenant
+//! brand, by reason, by score) comes from the lines. An interval needs to know how many revisions each brand
 //! had judged, which only a file written with `events = "all"` holds, so there is one only then.
 //!
 //! **This measures agreement, not quality.** Nothing here ranks a candidate. A disagreement is a revision to
@@ -45,8 +45,8 @@ pub struct Judgment {
   pub run: Option<u64>,
   /// The record's id.
   pub id: String,
-  /// The tenant the request named.
-  pub tenant: Option<String>,
+  /// The brand the request named.
+  pub brand_id: Option<String>,
   /// Whether the live policy accepted it.
   pub live_accepted: bool,
   /// Whether the candidate would have.
@@ -113,11 +113,11 @@ pub struct ShadowLog {
   pub reasons: Vec<GivenReason>,
 }
 
-/// How many disagreements one tenant's revisions account for.
+/// How many disagreements one brand's revisions account for.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TenantRow {
-  /// The tenant, or `None` for requests that named none.
-  pub tenant: Option<String>,
+pub struct BrandRow {
+  /// The brand, or `None` for requests that named none.
+  pub brand_id: Option<String>,
   /// Its revisions that have a line: all that were judged, in a file written with `events = "all"`.
   pub lines: usize,
   /// Of those, the ones only the candidate would have rejected.
@@ -168,12 +168,12 @@ pub struct ShadowReport {
   pub only_shadow_rejected: Rate,
   /// Revisions only the live policy rejected, over all that were judged.
   pub only_live_rejected: Rate,
-  /// How many tenants the intervals were resampled from, when there are intervals.
-  pub tenants_resampled: Option<usize>,
-  /// The tenants with the most disagreements, most first.
-  pub tenants: Vec<TenantRow>,
-  /// How many tenants have a disagreement, listed or not.
-  pub tenants_disagreed_on: usize,
+  /// How many brands the intervals were resampled from, when there are intervals.
+  pub brands_resampled: Option<usize>,
+  /// The brands with the most disagreements, most first.
+  pub brands: Vec<BrandRow>,
+  /// How many brands have a disagreement, listed or not.
+  pub brands_disagreed_on: usize,
   /// The reasons the rejecting side gave for the revisions disagreed on, most frequent first.
   pub reasons: Vec<ReasonRow>,
   /// The scores of the revisions disagreed on, each way.
@@ -184,12 +184,12 @@ fn count(value: u64) -> usize {
   usize::try_from(value).unwrap_or(usize::MAX)
 }
 
-/// The revisions that have a line, grouped by tenant, or `None` if they cannot be resampled by tenant: some
+/// The revisions that have a line, grouped by brand, or `None` if they cannot be resampled by brand: some
 /// request named none, or they all named the same one.
-fn tenants(log: &ShadowLog) -> Option<Vec<Vec<&Judgment>>> {
+fn brands(log: &ShadowLog) -> Option<Vec<Vec<&Judgment>>> {
   let mut groups: BTreeMap<&str, Vec<&Judgment>> = BTreeMap::new();
   for judgment in &log.judgments {
-    groups.entry(judgment.tenant.as_deref()?).or_default().push(judgment);
+    groups.entry(judgment.brand_id.as_deref()?).or_default().push(judgment);
   }
   (groups.len() > 1).then(|| groups.into_values().collect())
 }
@@ -208,12 +208,12 @@ fn rate(log: &ShadowLog, direction: Direction, counted: Option<(u64, u64)>, comp
     Some((errors, of)) => (count(errors), count(of)),
     None => among(&mut log.judgments.iter()),
   };
-  let interval = complete.then(|| tenants(log)).flatten().and_then(|clusters| {
-    let per_tenant: Vec<(usize, usize)> = clusters
+  let interval = complete.then(|| brands(log)).flatten().and_then(|clusters| {
+    let per_brand: Vec<(usize, usize)> = clusters
       .iter()
       .map(|judgments| among(&mut judgments.iter().copied()))
       .collect();
-    bootstrap(&per_tenant, seed)
+    bootstrap(&per_brand, seed)
   });
   Rate {
     errors,
@@ -238,14 +238,14 @@ fn totals(log: &ShadowLog) -> Option<Counts> {
   })
 }
 
-/// The tenants with a disagreement, most first, cut to `top`, and how many there are in all.
-fn tenant_rows(log: &ShadowLog, top: usize) -> (Vec<TenantRow>, usize) {
-  let mut by_tenant: BTreeMap<Option<&str>, TenantRow> = BTreeMap::new();
+/// The brands with a disagreement, most first, cut to `top`, and how many there are in all.
+fn brand_rows(log: &ShadowLog, top: usize) -> (Vec<BrandRow>, usize) {
+  let mut by_brand: BTreeMap<Option<&str>, BrandRow> = BTreeMap::new();
   for judgment in &log.judgments {
-    let row = by_tenant
-      .entry(judgment.tenant.as_deref())
-      .or_insert_with(|| TenantRow {
-        tenant: judgment.tenant.clone(),
+    let row = by_brand
+      .entry(judgment.brand_id.as_deref())
+      .or_insert_with(|| BrandRow {
+        brand_id: judgment.brand_id.clone(),
         lines: 0,
         only_shadow_rejected: 0,
         only_live_rejected: 0,
@@ -257,13 +257,13 @@ fn tenant_rows(log: &ShadowLog, top: usize) -> (Vec<TenantRow>, usize) {
       None => {}
     }
   }
-  let disagreements = |row: &TenantRow| row.only_shadow_rejected.saturating_add(row.only_live_rejected);
-  let mut tenant_rows: Vec<TenantRow> = by_tenant.into_values().filter(|row| disagreements(row) > 0).collect();
+  let disagreements = |row: &BrandRow| row.only_shadow_rejected.saturating_add(row.only_live_rejected);
+  let mut brand_rows: Vec<BrandRow> = by_brand.into_values().filter(|row| disagreements(row) > 0).collect();
   // Most disagreements first; ties in name order, which is the order they are in.
-  tenant_rows.sort_by_key(|row| std::cmp::Reverse(disagreements(row)));
-  let tenants_disagreed_on = tenant_rows.len();
-  tenant_rows.truncate(top);
-  (tenant_rows, tenants_disagreed_on)
+  brand_rows.sort_by_key(|row| std::cmp::Reverse(disagreements(row)));
+  let brands_disagreed_on = brand_rows.len();
+  brand_rows.truncate(top);
+  (brand_rows, brands_disagreed_on)
 }
 
 /// The reasons the rejecting side gave for each revision disagreed on, most frequent first within a direction.
@@ -325,12 +325,12 @@ fn score_ranges(log: &ShadowLog) -> Vec<Scores> {
     .collect()
 }
 
-/// Reports on one candidate's events. `top` is how many tenants to list; `seed` fixes the resampling.
+/// Reports on one candidate's events. `top` is how many brands to list; `seed` fixes the resampling.
 pub fn report(log: &ShadowLog, top: usize, seed: u64) -> ShadowReport {
   let counts = totals(log);
   // Without a summary there is nothing to hold the lines against, and they are taken for all there is.
   let complete = counts.is_none_or(|counts| count(counts.judged) == log.judgments.len());
-  let (tenants_listed, tenants_disagreed_on) = tenant_rows(log, top);
+  let (brands_listed, brands_disagreed_on) = brand_rows(log, top);
   let counted = |pick: fn(&Counts) -> u64| counts.as_ref().map(|counts| (pick(counts), counts.judged));
   ShadowReport {
     shadow: log.shadow.clone(),
@@ -352,9 +352,9 @@ pub fn report(log: &ShadowLog, top: usize, seed: u64) -> ShadowReport {
       complete,
       seed,
     ),
-    tenants_resampled: complete.then(|| tenants(log)).flatten().map(|clusters| clusters.len()),
-    tenants: tenants_listed,
-    tenants_disagreed_on,
+    brands_resampled: complete.then(|| brands(log)).flatten().map(|clusters| clusters.len()),
+    brands: brands_listed,
+    brands_disagreed_on,
     reasons: reason_rows(log),
     scores: score_ranges(log),
   }

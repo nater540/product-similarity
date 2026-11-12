@@ -97,7 +97,7 @@ pub struct ServerConfig {
   pub listen: SocketAddr,
   /// The most records of an `Import` stream that are embedded as one batch. A batch is one job on the one
   /// embedding thread, and every other request waits while it runs: larger batches load a catalog faster and
-  /// make a merchant's save wait longer.
+  /// make somebody's save wait longer.
   pub import_batch_records: usize,
 }
 

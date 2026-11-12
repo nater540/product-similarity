@@ -19,7 +19,7 @@
 //! - [`provenance`]: the note a model directory carries about where it came from.
 //! - [`rng`]: a small seeded generator, for results that must be reproducible from a seed.
 //! - [`score`]: comparing a revision against its baseline and deciding whether to accept it.
-//! - [`matching`]: scoring a listing from elsewhere against the stored records it might describe.
+//! - [`matching`]: scoring a menu item from elsewhere against the stored records it might describe.
 
 // Tests compute expected values with ordinary arithmetic and compare exact floats where exactness is the point.
 #![cfg_attr(test, allow(clippy::arithmetic_side_effects, clippy::float_cmp))]

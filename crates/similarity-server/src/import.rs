@@ -9,7 +9,7 @@
 //! One line of the export is one record:
 //!
 //! ```json
-//! {"id": "sku-1", "tenant": "brand-7", "record": {"name": "...", "weight_per_item": {"value": 3.5, "unit": "g"}},
+//! {"id": "sku-1", "brand_id": "brand-7", "record": {"name": "...", "weight_per_item": {"value": 3.5, "unit": "g"}},
 //!  "anchor": {"name": "..."}}
 //! ```
 //!
@@ -37,9 +37,9 @@ use crate::worker::TextEmbedder;
 pub struct ImportLine {
   /// The record's id.
   pub id: String,
-  /// The record's owner, if records have owners.
+  /// The key of the brand that owns the record, if records have brands.
   #[serde(default)]
-  pub tenant: Option<String>,
+  pub brand_id: Option<String>,
   /// The record as it is now.
   pub record: RecordFields,
   /// The record as it was first created, if that is still known.
@@ -52,7 +52,7 @@ impl From<ImportLine> for ImportInput {
     Self {
       record: RecordInput {
         id: Some(line.id),
-        tenant: line.tenant,
+        brand_id: line.brand_id,
         fields: line.record.texts.into_iter().collect(),
         quantities: line.record.quantities.into_iter().collect(),
       },
@@ -82,7 +82,7 @@ pub struct Summary {
   pub imported: usize,
   /// Records whose id was already stored. They were left as they were.
   pub skipped: usize,
-  /// Records that could not be imported: not valid JSON, not fitting the schema, or stored under another tenant.
+  /// Records that could not be imported: not valid JSON, not fitting the schema, or stored under another brand.
   pub failed: usize,
 }
 
@@ -272,11 +272,11 @@ mod tests {
 
   const EXPORT: &str = concat!(
     "# three records and a comment\n",
-    r#"{"id": "sku-1", "tenant": "brand-1", "record": {"name": "blueberry gummies", "category": "edibles", "weight": {"value": 40, "unit": "g"}}}"#,
+    r#"{"id": "sku-1", "brand_id": "brand-1", "record": {"name": "blueberry gummies", "category": "edibles", "weight": {"value": 40, "unit": "g"}}}"#,
     "\n\n",
     r#"{"id": "sku-2", "record": {"name": "sour diesel vape cartridge"}, "anchor": {"name": "sour diesel cartridge", "weight": {"value": 1, "unit": "g"}}}"#,
     "\n",
-    r#"{"id": "sku-3", "tenant": "brand-1", "record": {"name": "og kush pre-roll"}}"#,
+    r#"{"id": "sku-3", "brand_id": "brand-1", "record": {"name": "og kush pre-roll"}}"#,
     "\n",
   );
 
@@ -319,7 +319,7 @@ mod tests {
     assert_eq!(batches, 2, "two records, then the one that was left");
 
     let first = engine.store().get("sku-1").await.unwrap().unwrap();
-    assert_eq!((first.revision, first.tenant.as_deref()), (1, Some("brand-1")));
+    assert_eq!((first.revision, first.brand_id.as_deref()), (1, Some("brand-1")));
     assert_eq!(first.quantities["weight"], similarity_core::Quantity::single(40.0, "g"));
     let second = engine.store().get("sku-2").await.unwrap().unwrap();
     assert_ne!(

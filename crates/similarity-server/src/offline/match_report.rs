@@ -2,9 +2,9 @@
 //!
 //! Both are drawn from one [`MatchSummary`](super::stats::matching::MatchSummary), so the report and the events
 //! cannot disagree. The events are flat, like a calibration's (D17): one `match_calibration` line, the schema,
-//! then one `match_listing` line per listing with a `match_field` and `match_quantity` line per item, joined on
-//! `listing_id`, and a `match_summary` at the end. Their names are an interface once written: fields are added,
-//! never renamed. No listing's text is in any of them.
+//! then one `match_menu_item` line per menu item with a `match_field` and `match_quantity` line per item, joined on
+//! `menu_item_id`, and a `match_summary` at the end. Their names are an interface once written: fields are added,
+//! never renamed. No menu item's text is in any of them.
 
 use std::fmt::Write as _;
 
@@ -39,24 +39,24 @@ fn range(range: Option<Range>) -> String {
   )
 }
 
-/// Which side has a field: both, the listing alone, or the product alone. A match reads a comparison with the
-/// product as the baseline, so `Added` is the listing's and `Removed` the product's.
+/// Which side has a field: both, the menu item alone, or the product alone. A match reads a comparison with the
+/// product as the baseline, so `Added` is the menu item's and `Removed` the product's.
 fn presence(change: FieldChange) -> &'static str {
   match change {
-    FieldChange::Added | FieldChange::Restored => "listing",
+    FieldChange::Added | FieldChange::Restored => "menu_item",
     FieldChange::Removed => "product",
     FieldChange::Unchanged | FieldChange::Modified => "both",
   }
 }
 
-fn render_listings(calibration: &MatchCalibration, out: &mut String) {
+fn render_menu_items(calibration: &MatchCalibration, out: &mut String) {
   // Writing to a `String` cannot fail, here and below.
   let _ = writeln!(
     out,
     "{:>4} {:>6} {:>10} {:>7}  {:<32} best other",
     "rank", "own", "best other", "margin", "group"
   );
-  for scored in &calibration.listings {
+  for scored in &calibration.menu_items {
     let rank = scored
       .own_rank
       .map_or_else(|| format!(">{}", calibration.depth), |rank| rank.to_string());
@@ -65,7 +65,7 @@ fn render_listings(calibration: &MatchCalibration, out: &mut String) {
       || ("-".to_owned(), "-".to_owned(), String::new()),
       |other| {
         let similarity = other.ranked.comparison.similarity;
-        let sibling = if other.same_owner { " (same owner)" } else { "" };
+        let sibling = if other.same_brand { " (same brand)" } else { "" };
         (
           format!("{similarity:.3}"),
           format!("{:+.3}", own - similarity),
@@ -77,7 +77,7 @@ fn render_listings(calibration: &MatchCalibration, out: &mut String) {
     let _ = writeln!(
       out,
       "{rank:>4} {own:>6.3} {other:>10} {margin:>7}  {:<32} {name}{lost}",
-      scored.listing.group
+      scored.menu_item.group
     );
   }
 }
@@ -106,8 +106,8 @@ fn render_ranking(calibration: &MatchCalibration, summary: &MatchSummary, out: &
     counted(&summary.overfetch_lost),
     calibration.overfetch
   );
-  if let Some(owners) = summary.owners {
-    let _ = writeln!(out, "  intervals are the middle 95% over resamples of {owners} owners");
+  if let Some(brands) = summary.brands {
+    let _ = writeln!(out, "  intervals are the middle 95% over resamples of {brands} brands");
   }
 }
 
@@ -117,7 +117,7 @@ fn render_scores(summary: &MatchSummary, out: &mut String) {
   let _ = writeln!(out, "  best other product {}", range(summary.best_other));
   let _ = writeln!(
     out,
-    "  best other is a product of the same owner {}",
+    "  best other is a product of the same brand {}",
     counted(&summary.siblings)
   );
   if let Some(auc) = summary.auc {
@@ -136,7 +136,7 @@ fn render_threshold(summary: &MatchSummary, out: &mut String) {
       );
     }
     None => {
-      let _ = writeln!(out, "  no suggestion: it takes listings and at least two products");
+      let _ = writeln!(out, "  no suggestion: it takes menu items and at least two products");
     }
   }
   for point in &summary.operating_points {
@@ -151,8 +151,8 @@ fn render_threshold(summary: &MatchSummary, out: &mut String) {
     };
     let _ = writeln!(
       out,
-      "  to match a listing whose product is absent at most {:.0}% of the time: {threshold:.3}, where {} would be, \
-       and {} of listings score their own product below it",
+      "  to match a menu item whose product is absent at most {:.0}% of the time: {threshold:.3}, where {} would be, \
+       and {} of menu items score their own product below it",
       point.target * 100.0,
       percent(accept),
       percent(reject)
@@ -180,7 +180,7 @@ fn render_quantities_and_left_out(calibration: &MatchCalibration, summary: &Matc
     let _ = writeln!(
       out,
       "\n{:<18} {:>8} {:>6} {:>12} {:>12} {:>12}",
-      "quantity", "compared", "same", "incomparable", "listing only", "product only"
+      "quantity", "compared", "same", "incomparable", "menu item only", "product only"
     );
     for quantity in &summary.quantities {
       let _ = writeln!(
@@ -190,7 +190,7 @@ fn render_quantities_and_left_out(calibration: &MatchCalibration, summary: &Matc
         quantity.compared,
         quantity.same,
         quantity.incomparable,
-        quantity.only_listing,
+        quantity.only_menu_item,
         quantity.only_product
       );
     }
@@ -198,12 +198,12 @@ fn render_quantities_and_left_out(calibration: &MatchCalibration, summary: &Matc
 
   let mut left_out = Vec::new();
   if input.skipped_split > 0 {
-    left_out.push(format!("{} listings of other splits", input.skipped_split));
+    left_out.push(format!("{} menu items of other splits", input.skipped_split));
   }
-  if input.duplicate_listings > 0 {
+  if input.duplicate_menu_items > 0 {
     left_out.push(format!(
-      "{} listings identical to another of their group",
-      input.duplicate_listings
+      "{} menu items identical to another of their group",
+      input.duplicate_menu_items
     ));
   }
   for ((key, reason), count) in &input.ignored {
@@ -224,8 +224,8 @@ pub fn render_match(calibration: &MatchCalibration, summary: &MatchSummary) -> S
     .map_or_else(String::new, |split| format!(" of the `{split}` split"));
   let _ = writeln!(
     out,
-    "listings  {}{split}, scored against {} products ({} from the catalog export)",
-    summary.listings, calibration.products, input.distractors
+    "menu items  {}{split}, scored against {} products ({} from the catalog export)",
+    summary.menu_items, calibration.products, input.distractors
   );
   let _ = writeln!(
     out,
@@ -234,7 +234,7 @@ pub fn render_match(calibration: &MatchCalibration, summary: &MatchSummary) -> S
     calibration.depth.saturating_mul(calibration.overfetch),
     calibration.overfetch
   );
-  render_listings(calibration, &mut out);
+  render_menu_items(calibration, &mut out);
 
   render_ranking(calibration, summary, &mut out);
   render_scores(summary, &mut out);
@@ -251,9 +251,9 @@ fn parts(rate: &Rate) -> (Option<f64>, Option<f64>, Option<f64>) {
   )
 }
 
-fn emit_listings(calibration: &MatchCalibration, threshold: Option<f32>) {
-  for scored in &calibration.listings {
-    let listing = &scored.listing;
+fn emit_menu_items(calibration: &MatchCalibration, threshold: Option<f32>) {
+  for scored in &calibration.menu_items {
+    let menu_item = &scored.menu_item;
     let own = scored.own.comparison.similarity;
     let other = scored.best_other.as_ref();
     let best_other = other.map(|other| other.ranked.comparison.similarity);
@@ -263,22 +263,22 @@ fn emit_listings(calibration: &MatchCalibration, threshold: Option<f32>) {
     let matched = threshold.map(|threshold| top.is_some_and(|top| top >= threshold));
     tracing::info!(
       target: RESULT,
-      listing_id = listing.id.as_str(),
-      group = listing.group.as_str(),
-      owner = listing.owner.as_deref(),
-      split = listing.split.as_deref(),
+      menu_item_id = menu_item.id.as_str(),
+      group = menu_item.group.as_str(),
+      brand_id = menu_item.brand_id.as_deref(),
+      split = menu_item.split.as_deref(),
       own_rank = scored.own_rank,
       exhaustive_own_rank = scored.exhaustive_own_rank,
       own_similarity = six(own),
       own_search_similarity = six(scored.own.search_similarity),
       best_other = other.map(|other| other.ranked.id.as_str()),
       best_other_similarity = best_other.map(six),
-      best_other_same_owner = other.map(|other| other.same_owner),
+      best_other_same_brand = other.map(|other| other.same_brand),
       margin = best_other.map(|best_other| six(own) - six(best_other)).map(six_wide),
       overfetch_lost = scored.overfetch_lost,
       matched,
       correct = matched.map(|matched| matched && top_is_own),
-      "match_listing"
+      "match_menu_item"
     );
     for field in &scored.own.comparison.fields {
       let against_other = other.and_then(|other| {
@@ -292,7 +292,7 @@ fn emit_listings(calibration: &MatchCalibration, threshold: Option<f32>) {
       });
       tracing::info!(
         target: RESULT,
-        listing_id = listing.id.as_str(),
+        menu_item_id = menu_item.id.as_str(),
         field = field.field.as_str(),
         presence = presence(field.change),
         weight = six(field.weight),
@@ -304,7 +304,7 @@ fn emit_listings(calibration: &MatchCalibration, threshold: Option<f32>) {
     for quantity in &scored.own.quantities {
       tracing::info!(
         target: RESULT,
-        listing_id = listing.id.as_str(),
+        menu_item_id = menu_item.id.as_str(),
         quantity = quantity.field.as_str(),
         change = quantity_change_name(quantity.change),
         factor = quantity.factor,
@@ -316,7 +316,7 @@ fn emit_listings(calibration: &MatchCalibration, threshold: Option<f32>) {
   }
 }
 
-/// Writes a match calibration as events: what it was, the schema, every listing, and the summary.
+/// Writes a match calibration as events: what it was, the schema, every menu item, and the summary.
 pub fn emit_match(
   model: Model<'_>,
   schema: &Schema,
@@ -338,14 +338,14 @@ pub fn emit_match(
     split = input.split.as_deref(),
     products = calibration.products,
     distractors = input.distractors,
-    listings = calibration.listings.len(),
+    menu_items = calibration.menu_items.len(),
     skipped_split = input.skipped_split,
-    duplicate_listings = input.duplicate_listings,
+    duplicate_menu_items = input.duplicate_menu_items,
     seed,
     "match_calibration"
   );
   emit_schema(schema);
-  emit_listings(calibration, threshold);
+  emit_menu_items(calibration, threshold);
   for quantity in &summary.quantities {
     tracing::info!(
       target: RESULT,
@@ -353,7 +353,7 @@ pub fn emit_match(
       compared = quantity.compared,
       same = quantity.same,
       incomparable = quantity.incomparable,
-      only_listing = quantity.only_listing,
+      only_menu_item = quantity.only_menu_item,
       only_product = quantity.only_product,
       "match_quantity_summary"
     );
@@ -384,8 +384,8 @@ pub fn emit_match(
   let at = summary.at_threshold.as_ref();
   tracing::info!(
     target: RESULT,
-    listings = summary.listings,
-    owners = summary.owners,
+    menu_items = summary.menu_items,
+    brands = summary.brands,
     recall_at_1,
     recall_at_1_low,
     recall_at_1_high,
@@ -402,7 +402,7 @@ pub fn emit_match(
     own_high = summary.own.map(|range| six_wide(range.high)),
     best_other_low = summary.best_other.map(|range| six_wide(range.low)),
     best_other_high = summary.best_other.map(|range| six_wide(range.high)),
-    best_other_same_owner = summary.siblings.errors,
+    best_other_same_brand = summary.siblings.errors,
     auc = summary.auc.map(six_wide),
     suggested_threshold = summary.suggestion.map(|suggestion| six(suggestion.threshold)),
     suggested_margin = summary.suggestion.map(|suggestion| six(suggestion.margin)),
@@ -427,9 +427,9 @@ mod tests {
   use super::*;
 
   const GROUPS: &str = r#"
-    {"group": "gummies", "owner": "brand-1", "split": "holdout", "catalog": {"name": "blueberry gummies", "category": "edibles", "weight": {"value": 40, "unit": "g"}}, "listings": [{"name": "wyld blueberry gummies mg", "strain": "indica"}, {"name": "blueberry gummies", "weight": {"value": 40000, "unit": "mg"}}]}
-    {"group": "vape", "owner": "brand-1", "split": "holdout", "catalog": {"name": "sativa vape cartridge", "category": "vape"}, "listings": [{"name": "vape cartridge sativa resin"}]}
-    {"group": "flower", "owner": "brand-2", "split": "calibrate", "catalog": {"name": "hybrid flower"}, "listings": [{"name": "flower hybrid indica", "category": "flower"}]}
+    {"group": "gummies", "brand_id": "brand-1", "split": "holdout", "catalog": {"name": "blueberry gummies", "category": "edibles", "weight": {"value": 40, "unit": "g"}}, "menu_items": [{"name": "wyld blueberry gummies mg", "strain": "indica"}, {"name": "blueberry gummies", "weight": {"value": 40000, "unit": "mg"}}]}
+    {"group": "vape", "brand_id": "brand-1", "split": "holdout", "catalog": {"name": "sativa vape cartridge", "category": "vape"}, "menu_items": [{"name": "vape cartridge sativa resin"}]}
+    {"group": "flower", "brand_id": "brand-2", "split": "calibrate", "catalog": {"name": "hybrid flower"}, "menu_items": [{"name": "flower hybrid indica", "category": "flower"}]}
   "#;
 
   fn offline() -> Offline {
@@ -455,7 +455,7 @@ mod tests {
     Offline::new(tiny_embedder(&options), schema, Policy::new(0.5, None).unwrap())
   }
 
-  /// A calibration of the holdout listings, summarized at a threshold, with its report and its events.
+  /// A calibration of the holdout menu items, summarized at a threshold, with its report and its events.
   fn written(threshold: Option<f32>) -> (MatchCalibration, MatchSummary, String, Vec<String>, Vec<Value>) {
     let offline = offline();
     let groups = parse_groups(GROUPS, None, offline.schema(), Some("holdout")).unwrap();
@@ -482,9 +482,9 @@ mod tests {
     events.iter().filter(|event| event["message"] == name).collect()
   }
 
-  /// D15 and D17: one flat object per line, an absent value left out, and no word of a listing or a product.
+  /// D15 and D17: one flat object per line, an absent value left out, and no word of a menu item or a product.
   #[test]
-  fn match_events_are_flat_joined_on_the_listing_and_carry_no_text() {
+  fn match_events_are_flat_joined_on_the_menu_item_and_carry_no_text() {
     let (calibration, _, _, lines, events) = written(Some(0.5));
     for (line, event) in lines.iter().zip(&events) {
       for (key, value) in event.as_object().unwrap() {
@@ -509,7 +509,7 @@ mod tests {
       (
         header["split"].as_str(),
         header["products"].as_u64(),
-        header["listings"].as_u64(),
+        header["menu_items"].as_u64(),
         header["depth"].as_u64(),
         header["overfetch"].as_u64(),
         header["skipped_split"].as_u64(),
@@ -520,12 +520,12 @@ mod tests {
     assert!((header["threshold"].as_f64().unwrap() - 0.5).abs() < 1e-6);
     assert_eq!(header["groups_sha256"].as_str().unwrap().len(), 64);
 
-    let listings = named(&events, "match_listing");
-    assert_eq!(listings.len(), 3);
-    for (event, scored) in listings.iter().zip(&calibration.listings) {
-      assert_eq!(event["listing_id"], scored.listing.id.as_str());
-      assert_eq!(event["group"], scored.listing.group.as_str());
-      assert_eq!(event["owner"], "brand-1");
+    let menu_items = named(&events, "match_menu_item");
+    assert_eq!(menu_items.len(), 3);
+    for (event, scored) in menu_items.iter().zip(&calibration.menu_items) {
+      assert_eq!(event["menu_item_id"], scored.menu_item.id.as_str());
+      assert_eq!(event["group"], scored.menu_item.group.as_str());
+      assert_eq!(event["brand_id"], "brand-1");
       assert_eq!(event["split"], "holdout");
       assert_eq!(
         event["own_rank"].as_u64(),
@@ -539,28 +539,28 @@ mod tests {
       assert!((event["own_similarity"].as_f64().unwrap() - own).abs() < 1e-6);
       let other = scored.best_other.as_ref().unwrap();
       assert_eq!(event["best_other"], other.ranked.id.as_str());
-      assert_eq!(event["best_other_same_owner"], other.same_owner);
+      assert_eq!(event["best_other_same_brand"], other.same_brand);
       let best_other = f64::from(other.ranked.comparison.similarity);
       assert!((event["margin"].as_f64().unwrap() - (own - best_other)).abs() < 1e-5);
-      // Matched means the first served candidate reaches the threshold; correct, that it is the listing's own.
+      // Matched means the first served candidate reaches the threshold; correct, that it is the menu item's own.
       let top = if scored.own_rank == Some(1) { own } else { best_other };
       assert_eq!(event["matched"], top >= 0.5);
       assert_eq!(event["correct"], top >= 0.5 && scored.own_rank == Some(1));
     }
-    // Every field and quantity line belongs to a listing.
-    let ids: Vec<&str> = listings
+    // Every field and quantity line belongs to a menu item.
+    let ids: Vec<&str> = menu_items
       .iter()
-      .map(|event| event["listing_id"].as_str().unwrap())
+      .map(|event| event["menu_item_id"].as_str().unwrap())
       .collect();
     let fields = named(&events, "match_field");
     assert!(!fields.is_empty());
     for line in fields.iter().chain(&named(&events, "match_quantity")) {
-      assert!(ids.contains(&line["listing_id"].as_str().unwrap()));
+      assert!(ids.contains(&line["menu_item_id"].as_str().unwrap()));
     }
-    // The first listing has a name and its product a name and a category.
+    // The first menu item has a name and its product a name and a category.
     let first: Vec<(&str, &str, bool)> = fields
       .iter()
-      .filter(|field| field["listing_id"] == ids[0])
+      .filter(|field| field["menu_item_id"] == ids[0])
       .map(|field| {
         (
           field["field"].as_str().unwrap(),
@@ -572,7 +572,7 @@ mod tests {
     assert_eq!(first, [("category", "product", false), ("name", "both", true)]);
     let quantity = named(&events, "match_quantity")
       .into_iter()
-      .find(|line| line["listing_id"] == ids[1])
+      .find(|line| line["menu_item_id"] == ids[1])
       .unwrap();
     assert_eq!(
       (quantity["quantity"].as_str(), quantity["change"].as_str()),
@@ -588,9 +588,9 @@ mod tests {
     let (calibration, summary, report, _, events) = written(Some(0.5));
     let line = named(&events, "match_summary")[0];
     let count = |key: &str| line[key].as_u64().map(|count| usize::try_from(count).unwrap());
-    assert_eq!(count("listings"), Some(summary.listings));
+    assert_eq!(count("menu_items"), Some(summary.menu_items));
     assert_eq!(count("overfetch_lost"), Some(summary.overfetch_lost.errors));
-    assert_eq!(count("best_other_same_owner"), Some(summary.siblings.errors));
+    assert_eq!(count("best_other_same_brand"), Some(summary.siblings.errors));
     let at = summary.at_threshold.unwrap();
     assert_eq!(
       (count("own_below"), count("other_reaches"), count("wrong")),
@@ -616,15 +616,16 @@ mod tests {
       summary.suggestion.map(|suggestion| f64::from(suggestion.threshold)),
     );
     assert_eq!(
-      line.get("owners"),
+      line.get("brands"),
       None,
-      "one owner: no intervals, and no count of owners"
+      "one brand: no intervals, and no count of brands"
     );
     assert_eq!(line.get("recall_at_1_low"), None);
 
     // And the same numbers are in the text.
     assert!(
-      report.starts_with("listings  3 of the `holdout` split, scored against 3 products (0 from the catalog export)\n")
+      report
+        .starts_with("menu items  3 of the `holdout` split, scored against 3 products (0 from the catalog export)\n")
     );
     assert!(report.contains("served    the first 2 candidates, from the 10 the search returns (5 for each)"));
     let counted = |rate: &Rate| format!("{} of {}", rate.errors, rate.of);
@@ -642,16 +643,16 @@ mod tests {
     );
     assert!(report.contains("configured: 0.500"), "{report}");
     assert!(
-      report.contains("left out: 1 listings of other splits; 1 values of `strain` (not in the schema)"),
+      report.contains("left out: 1 menu items of other splits; 1 values of `strain` (not in the schema)"),
       "{report}"
     );
     assert!(report.contains("weight                    1      1"), "{report}");
-    for scored in &calibration.listings {
+    for scored in &calibration.menu_items {
       assert!(report.contains(&format!("{:.3}", scored.own.comparison.similarity)));
     }
     assert!(
       !report.contains("blueberry"),
-      "a report names groups, never a listing's text"
+      "a report names groups, never a menu item's text"
     );
 
     // Without a configured threshold nothing is said to be matched, in either rendering.
@@ -660,7 +661,7 @@ mod tests {
     let line = named(&events, "match_summary")[0];
     assert_eq!((line.get("own_below"), line.get("wrong")), (None, None));
     assert!(
-      named(&events, "match_listing")
+      named(&events, "match_menu_item")
         .iter()
         .all(|event| event.get("matched").is_none())
     );

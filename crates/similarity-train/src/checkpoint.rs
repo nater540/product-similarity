@@ -131,7 +131,7 @@ pub fn data_digest(examples: &Examples) -> String {
   hasher.update(u64::try_from(examples.groups.len()).unwrap_or(u64::MAX).to_le_bytes());
   for group in &examples.groups {
     text(&mut hasher, &group.catalog);
-    text(&mut hasher, &group.listing);
+    text(&mut hasher, &group.menu_item);
   }
   hex_prefix(&hasher.finalize(), 16)
 }
@@ -436,7 +436,7 @@ mod tests {
       }],
       groups: vec![GroupExample {
         catalog: "vape cartridge".to_owned(),
-        listing: "sativa vape cartridge".to_owned(),
+        menu_item: "sativa vape cartridge".to_owned(),
       }],
     }
   }
@@ -451,7 +451,7 @@ mod tests {
     let mut relabeled = examples();
     relabeled.pairs[0].same = false;
     let mut reworded = examples();
-    reworded.groups[0].listing.push('s');
+    reworded.groups[0].menu_item.push('s');
     let mut reordered = examples();
     reordered.pairs.push(reordered.pairs[0].clone());
     reordered.pairs[0].after = "other".to_owned();

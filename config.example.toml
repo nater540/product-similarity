@@ -8,7 +8,7 @@
 listen = "127.0.0.1:50051"
 # The most records of an `Import` stream that are embedded as one batch. A batch is one job on the one embedding
 # thread, and every other request waits while it runs: a larger number loads a catalog faster and makes a
-# merchant's save wait longer while a stream is running. The README has the measurement.
+# save by anybody else wait longer while a stream is running. The README has the measurement.
 import_batch_records = 8
 
 [model]
@@ -100,7 +100,7 @@ weight = 2.0
 
 [quantities.cbd_per_item]
 
-# Matching a listing from elsewhere (a retailer's menu item) to the stored record it describes: the `Match` call.
+# Matching a menu item (an entry on a retailer's menu) to the stored record it describes: the `Match` call.
 [matching]
 # The similarity the best candidate has to reach to be called a match. NOT SET HERE, ON PURPOSE: it is a
 # measurement, like `policy.threshold`, read from `record-similarity calibrate-match` on held-out catalog groups.
@@ -108,7 +108,7 @@ weight = 2.0
 # threshold = ...
 #
 # How many records are fetched and scored exactly for each candidate returned. A cost, not a threshold: the
-# search that finds candidates under-scores records with more fields filled in than the listing has, so the
+# search that finds candidates under-scores records with more fields filled in than the menu item has, so the
 # right one may not be among the first few. `calibrate-match` reports what a given value loses.
 overfetch = 5
 

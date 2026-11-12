@@ -1,5 +1,9 @@
 # Plans for the fifteen features that are not built
 
+**On names.** These plans were written before 2026-11-12, when the words were changed to the ones the owner's
+company uses (`docs/decisions.md`, D36). Where a plan says `tenant` or `owner` for the brand a record belongs to,
+the code says `brand_id`; where it says "listing" for what `Match` is given, the code says "menu item".
+
 One plan per remaining suggestion in `docs/feature-suggestions.md`, each written by a separate planner that read
 the code as it stands and checked the suggestion against it. Nothing here is built. This file is the index: what
 the plans found, where they meet, and an order. Delete a plan when its feature lands.

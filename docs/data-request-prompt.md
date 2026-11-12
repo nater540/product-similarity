@@ -82,7 +82,7 @@ Write everything into one new directory outside any git repository.
 One JSON object per line, one line per edit to a brand product:
 
 ```json
-{"pair_id": "p000123", "product": "<pseudonym>", "owner": "<pseudonym>", "edited_at": "2026-03-14T17:02:11Z",
+{"pair_id": "p000123", "product": "<pseudonym>", "brand_id": "<pseudonym>", "edited_at": "2026-03-14T17:02:11Z",
  "label": "recycle", "label_source": "moderator_revert", "label_confidence": "high", "variant_change": null,
  "split": "calibrate", "note": "gummies product became a vape cartridge",
  "before": {"name": "...", "category": "Edibles > Gummies", "brand": "...", "description": "...",
@@ -94,7 +94,7 @@ One JSON object per line, one line per edit to a brand product:
 ```
 
 - `before` is the version immediately preceding the edit, `after` the version it produced.
-- `owner` is the brand that owns the product, as a pseudonym (see "Handling"). It is a separate key from the
+- `brand_id` is the brand that owns the product, as a pseudonym (see "Handling"). It is a separate key from the
   `brand` field inside `before` and `after`, which is the brand's name as text.
 - Include **every** field that describes what the product is, as text: name, category, brand name, description,
   and anything else we have (strain, genetics, flavor, tags). Where a field is an id or enum, give its display
@@ -149,7 +149,7 @@ many brands as you can. Include products known to have been recycled if any exis
 a legitimate product drifts over its lifetime.
 
 ```json
-{"product": "<pseudonym>", "owner": "<pseudonym>", "label": "edit",
+{"product": "<pseudonym>", "brand_id": "<pseudonym>", "label": "edit",
  "versions": [{"at": "2025-11-02T09:00:00Z", "fields": {"name": "..."}}]}
 ```
 
@@ -165,21 +165,21 @@ a legitimate product drifts over its lifetime.
 
 ### 4. `catalog-groups.jsonl` (only if menu items are linked to brand products)
 
-If retailers' menu items are linked to the brand product they are a listing of, export about 2,000 groups: one
+If retailers' menu items are linked to the brand product they are an entry for, export about 2,000 groups: one
 brand product's fields, plus the fields of up to ten menu items linked to it, preferably from ten different
 retailers. Different retailers describing the same product are naturally occurring paraphrases of it, which is
 training data for the model. If no such link exists, say so and skip this.
 
 ```json
-{"group": "<pseudonym>", "owner": "<pseudonym>", "split": "calibrate", "catalog": {"name": "..."},
- "listings": [{"name": "..."}, {"name": "..."}]}
+{"group": "<pseudonym>", "brand_id": "<pseudonym>", "split": "calibrate", "catalog": {"name": "..."},
+ "menu_items": [{"name": "..."}, {"name": "..."}]}
 ```
 
-- `catalog` is the brand product and `listings` are the menu items. Keep those two key names; the training tool
+- `catalog` is the brand product and `menu_items` are the menu items. Keep those two key names; the training tool
   reads them.
 - Use the same fields and the same no-cleaning rule as file 1, for both the product and the menu items.
 - Take the product's text as it was when the menu items were linked to it, if that can be determined. A product
-  that was recycled after its menu items were linked would otherwise be paired with listings of what it used to be.
+  that was recycled after its menu items were linked would otherwise be paired with menu items of what it used to be.
   If it cannot be determined, leave out products with a `recycle` label in file 1 and say that you did.
 - Only use links you have reason to trust (made by the retailer or verified, not guessed by a matching job), and
   tell me which kind they are.
@@ -198,8 +198,8 @@ training data for the model. If no such link exists, say so and skip this.
   product, so they cannot say how often a menu item should match nothing.
 - Tell me whether a different size or pack of one product (a 1 g and a 3.5 g jar, a single and a five-pack) is
   a different brand product in your catalog. That decides whether a quantity should ever stop a match.
-- Optional: the brand product catalog itself, in the format of the import export (`{"id", "tenant", "record"}`,
-  pseudonymized the same way), so that listings can be scored against a catalog of the real size.
+- Optional: the brand product catalog itself, in the format of the import export (`{"id", "brand_id", "record"}`,
+  pseudonymized the same way), so that menu items can be scored against a catalog of the real size.
 
 ### 5. `REPORT.md`
 

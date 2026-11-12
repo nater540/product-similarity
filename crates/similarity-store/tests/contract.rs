@@ -38,10 +38,10 @@ fn unit(components: [f32; DIM]) -> Vec<f32> {
   vector
 }
 
-fn record(id: &str, tenant: Option<&str>, composite: [f32; DIM]) -> StoredRecord {
+fn record(id: &str, brand_id: Option<&str>, composite: [f32; DIM]) -> StoredRecord {
   StoredRecord {
     id: id.to_owned(),
-    tenant: tenant.map(str::to_owned),
+    brand_id: brand_id.map(str::to_owned),
     vectors: RecordVectors {
       composite: unit(composite),
       hashes: BTreeMap::from([("name".to_owned(), format!("hash-of-{id}"))]),
@@ -65,7 +65,7 @@ fn query(vector: &[f32]) -> SearchQuery<'_> {
   SearchQuery {
     vector,
     limit: 10,
-    tenant: None,
+    brand_id: None,
     exclude_id: None,
     min_similarity: None,
   }
@@ -89,12 +89,12 @@ async fn contract<S: VectorStore>(store: &S, other_layout: &S) {
   );
 
   // A write is immediately readable, with everything intact.
-  let gummies = record("gummies", Some("merchant-1"), [1.0, 0.1, 0.0, 0.0, 0.0, 0.0]);
+  let gummies = record("gummies", Some("brand-1"), [1.0, 0.1, 0.0, 0.0, 0.0, 0.0]);
   store.put(&gummies).await.unwrap();
   let read = store.get("gummies").await.unwrap().unwrap();
   assert_eq!(
-    (read.id.as_str(), read.tenant.as_deref()),
-    ("gummies", Some("merchant-1"))
+    (read.id.as_str(), read.brand_id.as_deref()),
+    ("gummies", Some("brand-1"))
   );
   assert_eq!((read.revision, read.updated_at), (1, 1_700_000_000));
   assert_eq!(read.vectors.hashes, gummies.vectors.hashes);
@@ -106,7 +106,7 @@ async fn contract<S: VectorStore>(store: &S, other_layout: &S) {
   );
 
   // A second write to the same id replaces the first; the anchor is whatever the caller says it is.
-  let mut revised = record("gummies", Some("merchant-1"), [1.0, 0.3, 0.0, 0.0, 0.0, 0.0]);
+  let mut revised = record("gummies", Some("brand-1"), [1.0, 0.3, 0.0, 0.0, 0.0, 0.0]);
   revised.revision = 2;
   revised.anchor = gummies.vectors.composite.clone();
   // Quantities come back exactly as written: single values, ranges, whole numbers, fractions, and units the
@@ -140,16 +140,16 @@ async fn contract<S: VectorStore>(store: &S, other_layout: &S) {
     .put(&record(odd_id, None, [0.0, 0.0, 0.0, 1.0, 0.0, 0.0]))
     .await
     .unwrap();
-  assert_eq!(store.get(odd_id).await.unwrap().unwrap().tenant, None);
+  assert_eq!(store.get(odd_id).await.unwrap().unwrap().brand_id, None);
   assert!(store.delete(odd_id).await.unwrap());
 
   // Search: most similar first, on the current composite.
   store
-    .put(&record("chocolate", Some("merchant-1"), [0.8, 0.6, 0.0, 0.0, 0.0, 0.0]))
+    .put(&record("chocolate", Some("brand-1"), [0.8, 0.6, 0.0, 0.0, 0.0, 0.0]))
     .await
     .unwrap();
   store
-    .put(&record("vape", Some("merchant-2"), [0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    .put(&record("vape", Some("brand-2"), [0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
     .await
     .unwrap();
   let probe = unit([1.0, 0.3, 0.0, 0.0, 0.0, 0.0]);
@@ -158,14 +158,14 @@ async fn contract<S: VectorStore>(store: &S, other_layout: &S) {
   assert_eq!(ids, ["gummies", "chocolate", "vape"]);
   assert!((found[0].similarity - 1.0).abs() < 1e-4);
   assert!(found[2].similarity.abs() < 1e-4);
-  assert_eq!(found[1].tenant.as_deref(), Some("merchant-1"));
+  assert_eq!(found[1].brand_id.as_deref(), Some("brand-1"));
   let expected = cosine(&probe, &unit([0.8, 0.6, 0.0, 0.0, 0.0, 0.0])).unwrap();
   assert!(
     (found[1].similarity - expected).abs() < 1e-4,
     "the score is plain cosine similarity"
   );
 
-  // Limit, tenant filter, self-exclusion, and minimum similarity each narrow the result.
+  // Limit, brand filter, self-exclusion, and minimum similarity each narrow the result.
   let limited = store
     .search(SearchQuery {
       limit: 1,
@@ -187,7 +187,7 @@ async fn contract<S: VectorStore>(store: &S, other_layout: &S) {
 
   let theirs = store
     .search(SearchQuery {
-      tenant: Some("merchant-2"),
+      brand_id: Some("brand-2"),
       ..query(&probe)
     })
     .await
@@ -199,7 +199,7 @@ async fn contract<S: VectorStore>(store: &S, other_layout: &S) {
   assert!(
     store
       .search(SearchQuery {
-        tenant: Some("nobody"),
+        brand_id: Some("nobody"),
         ..query(&probe)
       })
       .await
@@ -233,7 +233,7 @@ async fn contract<S: VectorStore>(store: &S, other_layout: &S) {
 
   // A search with vectors is the same search: the same results in the same order under every filter, each with
   // the record's current vectors and quantities as `get` returns them.
-  let mut weighed = record("chocolate", Some("merchant-1"), [0.8, 0.6, 0.0, 0.0, 0.0, 0.0]);
+  let mut weighed = record("chocolate", Some("brand-1"), [0.8, 0.6, 0.0, 0.0, 0.0, 0.0]);
   weighed.quantities = quantities(&[("weight", Quantity::single(3.5, "g"))]);
   store.put(&weighed).await.unwrap();
   let variants = [
@@ -247,11 +247,11 @@ async fn contract<S: VectorStore>(store: &S, other_layout: &S) {
       ..query(&probe)
     },
     SearchQuery {
-      tenant: Some("merchant-2"),
+      brand_id: Some("brand-2"),
       ..query(&probe)
     },
     SearchQuery {
-      tenant: Some("nobody"),
+      brand_id: Some("nobody"),
       ..query(&probe)
     },
     SearchQuery {
@@ -269,8 +269,8 @@ async fn contract<S: VectorStore>(store: &S, other_layout: &S) {
     assert_eq!(plain.len(), with_vectors.len(), "{variant:?}");
     for (neighbor, found) in plain.iter().zip(&with_vectors) {
       assert_eq!(
-        (&neighbor.id, &neighbor.tenant),
-        (&found.neighbor.id, &found.neighbor.tenant)
+        (&neighbor.id, &neighbor.brand_id),
+        (&found.neighbor.id, &found.neighbor.brand_id)
       );
       assert!((neighbor.similarity - found.neighbor.similarity).abs() < 1e-6);
       let stored = store.get(&neighbor.id).await.unwrap().unwrap();
@@ -334,7 +334,7 @@ async fn contract<S: VectorStore>(store: &S, other_layout: &S) {
 
 /// The record `id` as one of several writers would write it: told apart by the fingerprint it carries.
 fn written_by(writer: &str, id: &str, revision: u64, updated_at: u64) -> StoredRecord {
-  let mut record = record(id, Some("merchant-1"), [1.0, 0.2, 0.0, 0.0, 0.0, 0.0]);
+  let mut record = record(id, Some("brand-1"), [1.0, 0.2, 0.0, 0.0, 0.0, 0.0]);
   record.vectors.hashes = BTreeMap::from([("name".to_owned(), format!("written-by-{writer}"))]);
   record.revision = revision;
   record.updated_at = updated_at;
@@ -401,7 +401,7 @@ async fn conditional<S: VectorStore>(store: &S, other_layout: &S) {
   assert_eq!(read.version(), second.version());
   assert_eq!(writer_of(store, "gummies").await.as_deref(), Some("second"));
   // Everything a plain write stores, a conditional one stores.
-  assert_eq!(read.tenant.as_deref(), Some("merchant-1"));
+  assert_eq!(read.brand_id.as_deref(), Some("brand-1"));
   assert_same_direction(&read.vectors.composite, &second.vectors.composite);
   assert_same_direction(&read.anchor, &second.anchor);
   // The write that won is what the next one names.
@@ -701,14 +701,14 @@ async fn reconnecting_to_an_existing_collection_sees_the_same_records() {
   let settings = qdrant_settings(unique_collection("reconnect"));
   let first = QdrantStore::connect(&settings, LAYOUT, DIM).await.unwrap();
   first
-    .put(&record("gummies", Some("merchant-1"), [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    .put(&record("gummies", Some("brand-1"), [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
     .await
     .unwrap();
 
   let second = QdrantStore::connect(&settings, LAYOUT, DIM).await.unwrap();
   let read = second.get("gummies").await;
   first.delete_collection().await.unwrap();
-  assert_eq!(read.unwrap().unwrap().tenant.as_deref(), Some("merchant-1"));
+  assert_eq!(read.unwrap().unwrap().brand_id.as_deref(), Some("brand-1"));
 }
 
 /// The names of the collection's payload indexes, read straight from Qdrant.
@@ -745,7 +745,7 @@ async fn a_collection_that_lost_its_payload_indexes_gets_them_back_on_connect() 
   let repaired = indexed_fields(&settings).await;
   store.delete_collection().await.unwrap();
 
-  assert_eq!(created, ["layout", "tenant"]);
+  assert_eq!(created, ["brand_id", "layout"]);
   assert!(stripped.is_empty(), "{stripped:?}");
   assert_eq!(repaired, created);
 }
@@ -758,7 +758,7 @@ async fn a_point_written_before_quantities_existed_reads_back_with_none() {
 
   let settings = qdrant_settings(unique_collection("legacy"));
   let store = QdrantStore::connect(&settings, LAYOUT, DIM).await.unwrap();
-  let mut measured = record("gummies", Some("merchant-1"), [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+  let mut measured = record("gummies", Some("brand-1"), [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
   measured.quantities = quantities(&[("weight_per_item", Quantity::single(3.5, "g"))]);
   measured.anchor_quantities = measured.quantities.clone();
   store.put(&measured).await.unwrap();
@@ -791,8 +791,8 @@ async fn a_point_written_before_quantities_existed_reads_back_with_none() {
   let read = read.unwrap().unwrap();
   assert!(read.quantities.is_empty() && read.anchor_quantities.is_empty());
   assert_eq!(
-    (read.tenant.as_deref(), read.revision),
-    (Some("merchant-1"), 1),
+    (read.brand_id.as_deref(), read.revision),
+    (Some("brand-1"), 1),
     "and the rest of the record is intact"
   );
 }

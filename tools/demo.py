@@ -5,9 +5,9 @@
 """A walk through the service for an audience, against a running server.
 
 It makes a synthetic catalog (every brand and product here is invented, and the same seed makes the same catalog),
-loads it over the `Import` stream, and then sends real requests about it: an ordinary edit, a listing recycled for
+loads it over the `Import` stream, and then sends real requests about it: an ordinary edit, a product recycled for
 another product, a product moved toward another in small steps, a quantity that changes beside unchanged text, a
-request from the wrong tenant, a retailer's listing matched to the catalog, and a neighbor search. Each step prints
+request from the wrong brand, a retailer's menu item matched to the catalog, and a neighbor search. Each step prints
 what was sent, what the server answered, and how long the call took. Nothing is asserted: what is printed is what
 came back.
 
@@ -45,7 +45,7 @@ PROTO_FILE = "recordsimilarity/v1/similarity.proto"
 
 # --- the catalog ---------------------------------------------------------------------------------------------------
 
-# Invented brands. Each makes a few kinds of product, so that a tenant's catalog looks like a brand's.
+# Invented brands. Each makes a few kinds of product, so that each one has a catalog of its own.
 BRANDS = [
   ("Sunny Orchard", ["gummies", "chocolate", "seltzer"]),
   ("Tidewater Extracts", ["cartridge", "concentrate"]),
@@ -297,7 +297,7 @@ def demo_id(number: int) -> str:
   return f"demo-{number:04}"
 
 
-def tenant_of(brand: int) -> str:
+def brand_id_of(brand: int) -> str:
   return f"brand-{brand + 1:02}"
 
 
@@ -305,7 +305,7 @@ def product(number: int, brand: int, fields: dict, quantities: dict) -> dict:
   name, _ = BRANDS[brand]
   return {
     "id": demo_id(number),
-    "tenant": tenant_of(brand),
+    "brand_id": brand_id_of(brand),
     "fields": {**fields, "brand": name},
     "quantities": quantities,
   }
@@ -315,22 +315,23 @@ def catalog(count: int, seed: int) -> list[dict]:
   """`count` products, no two of one brand with the same name. The same seed gives the same catalog."""
   rng = random.Random(seed)
   products = [product(index + 1, brand, fields, quantities) for index, (brand, fields, quantities) in enumerate(HEROES)]
-  taken = {(item["tenant"], item["fields"]["name"]) for item in products}
+  taken = {(item["brand_id"], item["fields"]["name"]) for item in products}
   attempts = 0
   while len(products) < count and attempts < count * 200:
     attempts += 1
     brand = rng.randrange(len(BRANDS))
     fields, quantities = KINDS[rng.choice(BRANDS[brand][1])](rng)
     item = product(len(products) + 1, brand, fields, quantities)
-    if (item["tenant"], fields["name"]) not in taken:
-      taken.add((item["tenant"], fields["name"]))
+    if (item["brand_id"], fields["name"]) not in taken:
+      taken.add((item["brand_id"], fields["name"]))
       products.append(item)
   return products[:count]
 
 
 def export_line(item: dict) -> str:
   """One line of the export format `record-similarity import` and `just client import` read."""
-  return json.dumps({"id": item["id"], "tenant": item["tenant"], "record": {**item["fields"], **item["quantities"]}})
+  record = {**item["fields"], **item["quantities"]}
+  return json.dumps({"id": item["id"], "brand_id": item["brand_id"], "record": record})
 
 
 # --- talking to the server -----------------------------------------------------------------------------------------
@@ -391,7 +392,7 @@ class Demo:
   def record(self, item: dict, identified: bool = True):
     quantities = {name: self.quantity(value) for name, value in item["quantities"].items()}
     if identified:
-      return self.pb.Record(id=item["id"], tenant=item["tenant"], fields=item["fields"], quantities=quantities)
+      return self.pb.Record(id=item["id"], brand_id=item["brand_id"], fields=item["fields"], quantities=quantities)
     return self.pb.Record(fields=item["fields"], quantities=quantities)
 
   # -- printing --
@@ -467,12 +468,12 @@ class Demo:
       print(f"   field     {field.name:<16}weight {field.weight:g}{floor}")
     print(f"   quantity  {', '.join(quantity.name for quantity in response.quantities)}")
 
-  def forget(self, record_id: str, tenant: str) -> bool:
+  def forget(self, record_id: str, brand_id: str) -> bool:
     """Delete one product. An earlier run with another seed stored the same id under another brand, and a delete
-    has to name the tenant a record was stored under, so the other brands are tried when the first is refused."""
-    for candidate in [tenant, *(tenant_of(brand) for brand in range(len(BRANDS)))]:
+    has to name the brand a record was stored under, so the other brands are tried when the first is refused."""
+    for candidate in [brand_id, *(brand_id_of(brand) for brand in range(len(BRANDS)))]:
       try:
-        return self.stub.Delete(self.pb.DeleteRequest(id=record_id, tenant=candidate)).deleted
+        return self.stub.Delete(self.pb.DeleteRequest(id=record_id, brand_id=candidate)).deleted
       except grpc.RpcError as error:
         if error.code() != grpc.StatusCode.FAILED_PRECONDITION:
           raise
@@ -484,8 +485,8 @@ class Demo:
     removed, missing, number = 0, 0, 0
     while number < len(self.products) or missing < 100:
       number += 1
-      tenant = self.products[number - 1]["tenant"] if number <= len(self.products) else tenant_of(0)
-      if self.forget(demo_id(number), tenant):
+      brand_id = self.products[number - 1]["brand_id"] if number <= len(self.products) else brand_id_of(0)
+      if self.forget(demo_id(number), brand_id):
         removed, missing = removed + 1, 0
       else:
         missing += 1
@@ -543,9 +544,9 @@ class Demo:
       "quantities": {"weight_per_item": {"value": 80, "unit": "g"}, "thc_per_item": {"value": 200, "unit": "mg"}},
     }
     self.step(
-      "A recycled listing",
+      "A recycled product",
       f"{was['id']} is a vape cartridge with a history. The same id now arrives describing another product,",
-      "which is how a listing's reviews and ranking get carried over to something else.",
+      "which is how a product's reviews and ranking get carried over to something else.",
     )
     self.sent("a different product under the old id", now, was)
     self.evaluate(now, self.pb.WRITE_MODE_ENFORCE)
@@ -581,13 +582,13 @@ class Demo:
     self.sent("the same text with ten times the THC", now, was)
     self.evaluate(now, self.pb.WRITE_MODE_DRY_RUN)
 
-  def wrong_tenant(self) -> None:
+  def wrong_brand(self) -> None:
     was = self.products[4]
-    other = next(item["tenant"] for item in self.products if item["tenant"] != was["tenant"])
-    now = {**edited(was, name="Sea Salt Dark Chocolate Bar 100mg (new recipe)"), "tenant": other}
+    other = next(item["brand_id"] for item in self.products if item["brand_id"] != was["brand_id"])
+    now = {**edited(was, name="Sea Salt Dark Chocolate Bar 100mg (new recipe)"), "brand_id": other}
     self.step(
       "An edit from the wrong brand",
-      f"{was['id']} belongs to {was['tenant']}. An edit for it arrives naming {other}.",
+      f"{was['id']} belongs to {was['brand_id']}. An edit for it arrives naming {other}.",
     )
     self.sent(f"an edit as {other}", now, was)
     try:
@@ -597,17 +598,17 @@ class Demo:
       print(f"   refused   {self.paint.bad(error.code().name)}: {error.details()}")
 
   def match(self) -> None:
-    listing = {"name": "Blueberry Gummies 10pk 100mg", "brand": "Sunny Orchard", "category": "Edibles"}
+    menu_item = {"name": "Blueberry Gummies 10pk 100mg", "brand": "Sunny Orchard", "category": "Edibles"}
     self.step(
-      "A retailer's listing, matched to the catalog",
+      "A retailer's menu item, matched to the catalog",
       "A menu item typed by a store, with no id: which stored product is it? Match reads and never writes.",
       "The server keeps no product text, so the names on the right are this script's own copy.",
     )
-    print(f"   {self.paint.dim('send')}      a listing")
-    for name, value in listing.items():
+    print(f"   {self.paint.dim('send')}      a menu item")
+    for name, value in menu_item.items():
       print(field_line(name, value))
     response, elapsed = self.timed(
-      self.stub.Match, self.pb.MatchRequest(listing=self.pb.Record(fields=listing), limit=5)
+      self.stub.Match, self.pb.MatchRequest(menu_item=self.pb.Record(fields=menu_item), limit=5)
     )
     print(f"   answered  {len(response.candidates)} candidates, best first   {self.took(elapsed)}")
     for candidate in response.candidates:
@@ -729,7 +730,7 @@ def main() -> int:
     demo.describe()
     demo.load(
       "Loading a catalog",
-      f"{len(products)} synthetic products from {len({item['tenant'] for item in products})} brands, sent over one "
+      f"{len(products)} synthetic products from {len({item['brand_id'] for item in products})} brands, sent over one "
       "Import stream.",
       "The server turns each product's fields into vectors and stores those: it keeps no product text.",
     )
@@ -741,7 +742,7 @@ def main() -> int:
     demo.recycled()
     demo.small_steps()
     demo.quantity_change()
-    demo.wrong_tenant()
+    demo.wrong_brand()
     demo.match()
     demo.neighbors()
     demo.summary()

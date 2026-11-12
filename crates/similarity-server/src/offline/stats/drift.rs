@@ -258,22 +258,22 @@ pub fn drift_range(run: &DriftRun, part: Label) -> Option<DriftRange> {
   })
 }
 
-/// A share of some histories, with the interval that resampling their owners gives.
+/// A share of some histories, with the interval that resampling their brands gives.
 fn rate(histories: &[&Replayed], is_error: impl Fn(&Replayed) -> bool, seed: u64) -> Rate {
   let errors = histories.iter().filter(|replayed| is_error(replayed)).count();
   let mut clusters: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
   let mut every_one_owned = true;
   for replayed in histories {
-    let Some(owner) = replayed.history.owner.as_deref() else {
+    let Some(brand_id) = replayed.history.brand_id.as_deref() else {
       every_one_owned = false;
       continue;
     };
-    let cluster = clusters.entry(owner).or_default();
+    let cluster = clusters.entry(brand_id).or_default();
     cluster.0 = cluster.0.saturating_add(usize::from(is_error(replayed)));
     cluster.1 = cluster.1.saturating_add(1);
   }
-  // Histories of one owner are not independent, so the owners are what is resampled (D17). Without an owner on
-  // every history, or with only one owner, there is nothing to resample.
+  // Histories of one brand are not independent, so the brands are what is resampled (D17). Without an brand on
+  // every history, or with only one brand, there is nothing to resample.
   let interval: Option<Interval> = (every_one_owned && clusters.len() > 1)
     .then(|| bootstrap(&clusters.into_values().collect::<Vec<_>>(), seed))
     .flatten();
@@ -532,22 +532,22 @@ mod tests {
     replayed(&[
       line(
         "steady-1",
-        r#""owner": "b1", "label": "edit", "#,
+        r#""brand_id": "b1", "label": "edit", "#,
         &steady("indica flower"),
       ),
       line(
         "steady-2",
-        r#""owner": "b2", "label": "edit", "#,
+        r#""brand_id": "b2", "label": "edit", "#,
         &steady("indica flower small"),
       ),
       line(
         "walk",
-        r#""owner": "b3", "label": "recycle", "recycled_at": 2, "#,
+        r#""brand_id": "b3", "label": "recycle", "recycled_at": 2, "#,
         &walk(),
       ),
       line(
         "jump",
-        r#""owner": "b3", "label": "recycle", "recycled_at": 1, "#,
+        r#""brand_id": "b3", "label": "recycle", "recycled_at": 1, "#,
         &[
           ("blueberry gummies", None, Some(40.0)),
           ("sativa vape cartridge", None, Some(40.0)),
@@ -665,7 +665,7 @@ mod tests {
     let blocked = blocked(&run, 0);
     assert_eq!((blocked.by_policy.errors, blocked.by_policy.of), (0, 2));
     assert_eq!(blocked.by_policy.rate, Some(0.0));
-    assert!(blocked.by_policy.interval.is_some(), "two owners can be resampled");
+    assert!(blocked.by_policy.interval.is_some(), "two brands can be resampled");
     assert_eq!((blocked.by_pair_rules.errors, blocked.by_drift_alone.errors), (0, 0));
 
     let caught = recycles(&run, &policy());
@@ -762,7 +762,7 @@ mod tests {
   /// configured policy rejects a step the pair rules reject, and nothing else, unless `drift_below` is given.
   fn made(
     id: &str,
-    owner: Option<&str>,
+    brand_id: Option<&str>,
     label: &str,
     recycled_at: Option<usize>,
     steps: &[(f32, bool)],
@@ -780,7 +780,7 @@ mod tests {
     Replayed {
       history: History {
         id: id.to_owned(),
-        owner: owner.map(str::to_owned),
+        brand_id: brand_id.map(str::to_owned),
         label: match label {
           "edit" => Some(Label::Edit),
           "recycle" => Some(Label::Recycle),
@@ -899,12 +899,12 @@ mod tests {
   }
 
   #[test]
-  fn a_share_is_errors_over_histories_and_its_interval_needs_every_history_to_name_one_of_several_owners() {
-    let blocked_run = |owners: [Option<&str>; 3]| {
+  fn a_share_is_errors_over_histories_and_its_interval_needs_every_history_to_name_one_of_several_brands() {
+    let blocked_run = |brands: [Option<&str>; 3]| {
       run_of(vec![
-        made("a", owners[0], "edit", None, &[(0.75, false)], None),
-        made("b", owners[1], "edit", None, &[(0.75, false)], None),
-        made("c", owners[2], "edit", None, &[(0.75, true)], None),
+        made("a", brands[0], "edit", None, &[(0.75, false)], None),
+        made("b", brands[1], "edit", None, &[(0.75, false)], None),
+        made("c", brands[2], "edit", None, &[(0.75, true)], None),
       ])
     };
     let owned = blocked(&blocked_run([Some("b1"), Some("b2"), Some("b3")]), 0);
@@ -916,14 +916,14 @@ mod tests {
       "{interval:?}"
     );
 
-    // One history without an owner, and there is nothing sound to resample.
+    // One history without an brand, and there is nothing sound to resample.
     assert_eq!(
       blocked(&blocked_run([Some("b1"), Some("b2"), None]), 0)
         .by_policy
         .interval,
       None
     );
-    // One owner for all of them, likewise.
+    // One brand for all of them, likewise.
     assert_eq!(
       blocked(&blocked_run([Some("b1"), Some("b1"), Some("b1")]), 0)
         .by_policy

@@ -69,9 +69,9 @@ enum Command {
   /// Replay whole edit histories and report how far products drift, to choose `anchor_threshold`.
   CalibrateDrift(CalibrateDriftArgs),
   /// Say what a shadowed server wrote: how often its candidate policy disagreed with the live one, in which
-  /// direction, for which tenants, and why. Reads the server's stdout; no model, no store.
+  /// direction, for which brands, and why. Reads the server's stdout; no model, no store.
   ShadowReport(ShadowReportArgs),
-  /// Score catalog groups (a product and the listings known to describe it) as `Match` would, to see how often
+  /// Score catalog groups (a product and the menu items known to describe it) as `Match` would, to see how often
   /// the right product comes first and where `matching.threshold` belongs.
   CalibrateMatch(CalibrateMatchArgs),
   /// Judge one recorded calibration under every combination of a grid of weights, floors, and limits. No model.
@@ -94,7 +94,7 @@ struct LoadArgs {
   #[arg(long, short, default_value = "config.toml")]
   config: PathBuf,
   /// Drive a server that is already running, at this URL (`http://host:port`), instead of starting one in this
-  /// process on an in-memory store. Its records are written under the tenant `load-test` and deleted afterwards.
+  /// process on an in-memory store. Its records are written under the brand `load-test` and deleted afterwards.
   #[arg(long)]
   server: Option<String>,
   /// How many callers at once: each level is run in turn, over records of its own.
@@ -116,24 +116,24 @@ struct LoadArgs {
 
 #[derive(Debug, Subcommand)]
 enum PairsCommand {
-  /// Give a share of one split's owners a split of their own, for choosing a model without using the holdout.
+  /// Give a share of one split's brands a split of their own, for choosing a model without using the holdout.
   Carve(CarveArgs),
 }
 
 #[derive(Debug, Args)]
 struct CarveArgs {
-  /// The pairs file, in the full format (each pair with `split` and `owner`). The result is written to stdout.
+  /// The pairs file, in the full format (each pair with `split` and `brand_id`). The result is written to stdout.
   pairs: PathBuf,
-  /// The split to take owners from.
+  /// The split to take brands from.
   #[arg(long, default_value = "calibrate")]
   from: String,
   /// The split to give them.
   #[arg(long, default_value = "validation")]
   into: String,
-  /// The share of the owners to move, between 0 and 1.
+  /// The share of the brands to move, between 0 and 1.
   #[arg(long)]
   fraction: f64,
-  /// Decides, with each owner's name, which owners move. The same salt always moves the same owners.
+  /// Decides, with each brand's name, which brands move. The same salt always moves the same brands.
   #[arg(long, default_value = "validation")]
   salt: String,
 }
@@ -305,7 +305,7 @@ struct CalibrateArgs {
   /// Labeled pairs, one JSON object per line: {"label": "edit" | "recycle", "note": ..., "before": {...}, "after": {...}}.
   pairs: PathBuf,
   /// Read the full format (`pairs.full.jsonl`): extra keys are allowed, each record is reduced to what the schema
-  /// defines, and `pair_id`, `owner`, `split`, and `variant_change` are used in the report.
+  /// defines, and `pair_id`, `brand_id`, `split`, and `variant_change` are used in the report.
   #[arg(long)]
   full: bool,
   /// With --full, score only the pairs of this split (for example `holdout`).
@@ -367,7 +367,7 @@ struct CalibrateDriftArgs {
   #[arg(long, short, default_value = "config.toml")]
   config: PathBuf,
   /// Edit histories, one JSON object per line: {"product": ..., "label": "edit" | "recycle", "versions": [{"fields":
-  /// {...}}, ...]}, with `owner`, `recycled_at`, `original`, and `truncated` where they are known.
+  /// {...}}, ...]}, with `brand_id`, `recycled_at`, `original`, and `truncated` where they are known.
   histories: PathBuf,
   /// Leave out labeled histories whose `label_confidence` is below this: high, medium, or low.
   #[arg(long, default_value = "medium")]
@@ -385,8 +385,8 @@ struct ImportArgs {
   /// The configuration file (for the model, schema, and collection to import into).
   #[arg(long, short, default_value = "config.toml")]
   config: PathBuf,
-  /// The export, one JSON object per line: {"id": ..., "tenant": ..., "record": {...}, "anchor": {...}}. `tenant`
-  /// and `anchor` (the record as it was first created) are optional.
+  /// The export, one JSON object per line: `{"id": ..., "brand_id": ..., "record": {...}, "anchor": {...}}`.
+  /// `brand_id` and `anchor` (the record as it was first created) are optional.
   export: PathBuf,
   /// How many records are embedded and written at a time.
   #[arg(long, default_value_t = 64)]
@@ -920,7 +920,7 @@ impl CalibrateArgs {
   }
 }
 
-/// How long a run took, for a listing: `41.2s`, `12m05s`, `1h02m`.
+/// How long a run took, for a list: `41.2s`, `12m05s`, `1h02m`.
 fn duration(seconds: f64) -> String {
   if seconds < 60.0 {
     return format!("{seconds:.1}s");
@@ -986,7 +986,7 @@ struct ShadowReportArgs {
   /// and labeled.
   #[arg(long)]
   ids: Option<PathBuf>,
-  /// How many tenants to list.
+  /// How many brands to list.
   #[arg(long, default_value_t = 10)]
   top: usize,
   /// Write the report as NDJSON events on stdout, for tools, in place of the text.
@@ -1023,14 +1023,14 @@ struct CalibrateMatchArgs {
   /// The configuration file (for the model, the schema, and `[matching]`).
   #[arg(long, short, default_value = "config.toml")]
   config: PathBuf,
-  /// Catalog groups, one JSON object per line: {"group": ..., "owner": ..., "split": ..., "catalog": {...},
-  /// "listings": [{...}, ...]}. Every group's product is in the index.
+  /// Catalog groups, one JSON object per line: `{"group": ..., "brand_id": ..., "split": ..., "catalog": {...},
+  /// "menu_items": [{...}, ...]}`. Every group's product is in the index.
   groups: PathBuf,
-  /// A catalog export, in the format `import` reads: its records join the index as products with no listings,
-  /// so that a listing has more to be confused with.
+  /// A catalog export, in the format `import` reads: its records join the index as products with no menu items,
+  /// so that a menu item has more to be confused with.
   #[arg(long)]
   catalog: Option<PathBuf>,
-  /// Score only the listings of groups in this split. Every product stays in the index.
+  /// Score only the menu items of groups in this split. Every product stays in the index.
   #[arg(long)]
   split: Option<String>,
   /// How many candidates a served ranking returns: the `limit` a caller of `Match` would ask for.
@@ -1137,12 +1137,12 @@ impl CarveArgs {
     tracing::info!(
       from = self.from.as_str(),
       into = self.into.as_str(),
-      owners = carved.owners,
-      owners_moved = carved.owners_moved,
+      brands = carved.brands,
+      brands_moved = carved.brands_moved,
       pairs_moved = carved.pairs_moved,
       edits_moved = carved.edits_moved,
       recycles_moved = carved.recycles_moved,
-      without_owner = carved.without_owner,
+      without_brand = carved.without_brand,
       "carved"
     );
     if carved.edits_moved == 0 || carved.recycles_moved == 0 {

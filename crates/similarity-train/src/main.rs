@@ -1,4 +1,4 @@
-//! `record-similarity-train`: fine-tunes the embedding model on labeled listing data.
+//! `record-similarity-train`: fine-tunes the embedding model on labeled menu item data.
 //!
 //! Reads a sentence-transformers model directory, trains it on labeled before/after pairs and/or catalog groups,
 //! and writes a new model directory that the server loads like any other. See "Fine-tuning the model" in the
@@ -50,7 +50,7 @@ enum DeviceChoice {
   Cuda,
 }
 
-/// Fine-tune the record-similarity embedding model on labeled listing data.
+/// Fine-tune the record-similarity embedding model on labeled menu item data.
 #[derive(Debug, Parser)]
 #[command(name = "record-similarity-train", version, about)]
 #[expect(clippy::struct_excessive_bools, reason = "each one is a switch on the command line")]
@@ -72,7 +72,7 @@ struct Cli {
   #[arg(long)]
   pairs: Option<PathBuf>,
 
-  /// Listings grouped by catalog product, JSONL (`catalog-groups.jsonl`)
+  /// Menu items grouped by catalog product, JSONL (`catalog-groups.jsonl`)
   #[arg(long)]
   catalog_groups: Option<PathBuf>,
 
@@ -152,7 +152,7 @@ struct Cli {
   #[arg(long, default_value_t = similarity_train::loss::DEFAULT_MARGIN)]
   margin: f64,
 
-  /// How sharply the catalog-group loss tells a listing's own catalog entry from the others in its batch
+  /// How sharply the catalog-group loss tells a menu item's own catalog entry from the others in its batch
   #[arg(long, default_value_t = similarity_train::loss::DEFAULT_SCALE)]
   scale: f64,
 
@@ -452,7 +452,7 @@ struct LabeledPairs {
   held_out: Vec<PairExample>,
   /// Never trained on, and used to choose among checkpoints.
   validation: Vec<PairExample>,
-  /// The owners of the last two: the brands the model is measured on.
+  /// The brands of the last two: the brands the model is measured on.
   measured_on: BTreeSet<String>,
 }
 
@@ -751,7 +751,7 @@ impl Cli {
     }
   }
 
-  /// The training pairs, the held-out pairs, and the validation pairs of `--pairs`, and the owners of the last
+  /// The training pairs, the held-out pairs, and the validation pairs of `--pairs`, and the brands of the last
   /// two: the brands the model is measured on.
   fn pairs(&self) -> anyhow::Result<LabeledPairs> {
     let Some(path) = &self.pairs else {
@@ -765,7 +765,7 @@ impl Cli {
     } else {
       data::pair_examples(&jsonl, path, &self.fields, Split::HeldOut(&self.validation_split))?
     };
-    let measured_on = data::owners_in(&jsonl, path, &[&self.holdout_split, &self.validation_split])?;
+    let measured_on = data::brands_in(&jsonl, path, &[&self.holdout_split, &self.validation_split])?;
     tracing::info!(
       file = %path.display(),
       examples = training.examples.len(),
@@ -800,7 +800,7 @@ impl Cli {
           file = %path.display(),
           examples = groups.examples.len(),
           excluded_groups = groups.excluded_groups,
-          groups_without_owner = groups.groups_without_owner,
+          groups_without_brand = groups.groups_without_brand,
           "catalog groups"
         );
         groups.examples
@@ -1261,7 +1261,7 @@ mod tests {
       }],
       groups: vec![GroupExample {
         catalog: "vape cartridge".to_owned(),
-        listing: "sativa vape cartridge".to_owned(),
+        menu_item: "sativa vape cartridge".to_owned(),
       }],
     }
   }
@@ -1941,7 +1941,7 @@ mod tests {
     let pairs = dir.path().join("pairs.splits.jsonl");
     let line = |split: &str, label: &str, before: &str, after: &str| {
       format!(
-        r#"{{"label": "{label}", "split": "{split}", "owner": "brand-{split}", "before": {{"name": "{before}"}}, "after": {{"name": "{after}"}}}}"#
+        r#"{{"label": "{label}", "split": "{split}", "brand_id": "brand-{split}", "before": {{"name": "{before}"}}, "after": {{"name": "{after}"}}}}"#
       )
     };
     let text = [

@@ -583,7 +583,7 @@ proptest! {
   }
 }
 
-/// A catalog for matching: the weights of two to four fields, a listing, and some stored records, each a value
+/// A catalog for matching: the weights of two to four fields, a menu item, and some stored records, each a value
 /// or none for every field, with at least one value.
 type Catalog = (Vec<f32>, Vec<Option<Vec<f32>>>, Vec<Vec<Option<Vec<f32>>>>);
 
@@ -637,15 +637,15 @@ proptest! {
   /// Why a match is scored again after the search (D5, D32): the cosine of two composites is the weighted mean
   /// over the fields both have, times a factor that depends only on which fields each side filled in.
   #[test]
-  fn the_search_score_is_the_match_score_scaled_by_the_field_overlap((weights, listing, records) in catalog()) {
+  fn the_search_score_is_the_match_score_scaled_by_the_field_overlap((weights, menu_item, records) in catalog()) {
     let schema = weighted_schema(&weights);
-    let listing_vectors = stored(&schema, &listing, "listing");
+    let menu_item_vectors = stored(&schema, &menu_item, "menu_item");
     let none = Quantities::new();
     for (index, record) in records.iter().enumerate() {
       let vectors = stored(&schema, record, &format!("record{index}"));
-      let search = f64::from(cosine(&listing_vectors.composite, &vectors.composite).unwrap());
-      let candidate = Candidate { id: "r", tenant: None, search_similarity: 0.0, vectors: &vectors, quantities: &none };
-      let ranked = matching::rank(&schema, DIM, &listing_vectors, &none, [candidate], 1).unwrap();
+      let search = f64::from(cosine(&menu_item_vectors.composite, &vectors.composite).unwrap());
+      let candidate = Candidate { id: "r", brand_id: None, search_similarity: 0.0, vectors: &vectors, quantities: &none };
+      let ranked = matching::rank(&schema, DIM, &menu_item_vectors, &none, [candidate], 1).unwrap();
       let exact = f64::from(ranked[0].comparison.similarity);
 
       let weight_of = |blocks: &[Option<Vec<f32>>], other: &[Option<Vec<f32>>]| -> f64 {
@@ -656,12 +656,12 @@ proptest! {
           .map(|(weight, _)| f64::from(*weight))
           .sum()
       };
-      let (both, of_listing, of_record) = (
-        weight_of(&listing, record),
-        weight_of(&listing, &listing),
+      let (both, of_menu_item, of_record) = (
+        weight_of(&menu_item, record),
+        weight_of(&menu_item, &menu_item),
         weight_of(record, record),
       );
-      let factor = both / (of_listing * of_record).sqrt();
+      let factor = both / (of_menu_item * of_record).sqrt();
       prop_assert!((search - exact * factor).abs() < 1e-4, "search {search}, exact {exact}, factor {factor}");
       prop_assert!(factor <= 1.0 + 1e-9);
       prop_assert!(ranked[0].comparison.fields.iter().all(|field| !field.below_floor));
@@ -669,14 +669,14 @@ proptest! {
   }
 
   /// The ranking is the plain weighted mean over shared fields, best first, whatever order the candidates came
-  /// in; a limit keeps the front of it; and a listing every one of whose values a record holds scores one.
+  /// in; a limit keeps the front of it; and a menu item every one of whose values a record holds scores one.
   #[test]
   fn a_ranking_is_the_exact_order_whatever_order_the_candidates_came_in(
-    (weights, listing, records) in catalog(),
+    (weights, menu_item, records) in catalog(),
     limit in 0_usize..7,
   ) {
     let schema = weighted_schema(&weights);
-    let listing_vectors = stored(&schema, &listing, "listing");
+    let menu_item_vectors = stored(&schema, &menu_item, "menu_item");
     let none = Quantities::new();
     let ids: Vec<String> = (0..records.len()).map(|index| format!("r{index}")).collect();
     let vectors: Vec<RecordVectors> = records
@@ -687,20 +687,20 @@ proptest! {
     let candidates = || {
       ids.iter().zip(&vectors).map(|(id, vectors)| Candidate {
         id,
-        tenant: None,
+        brand_id: None,
         search_similarity: 0.0,
         vectors,
         quantities: &none,
       })
     };
-    let all = matching::rank(&schema, DIM, &listing_vectors, &none, candidates(), usize::MAX).unwrap();
+    let all = matching::rank(&schema, DIM, &menu_item_vectors, &none, candidates(), usize::MAX).unwrap();
     prop_assert_eq!(all.len(), records.len());
 
     // Each score is the mean computed the plain way.
     for ranked in &all {
       let index: usize = ranked.id[1..].parse().unwrap();
       let (mut weighted, mut total) = (0.0_f64, 0.0_f64);
-      for (weight, (ours, theirs)) in weights.iter().zip(listing.iter().zip(&records[index])) {
+      for (weight, (ours, theirs)) in weights.iter().zip(menu_item.iter().zip(&records[index])) {
         if let (Some(ours), Some(theirs)) = (ours, theirs) {
           weighted += f64::from(*weight) * f64::from(cosine(theirs, ours).unwrap());
           total += f64::from(*weight);
@@ -715,20 +715,20 @@ proptest! {
       prop_assert!(first > second || (first == second && pair[0].id < pair[1].id));
     }
     // The same from any order, and a limit keeps the front.
-    let reversed = matching::rank(&schema, DIM, &listing_vectors, &none, candidates().rev(), usize::MAX).unwrap();
+    let reversed = matching::rank(&schema, DIM, &menu_item_vectors, &none, candidates().rev(), usize::MAX).unwrap();
     prop_assert_eq!(&reversed, &all);
-    let limited = matching::rank(&schema, DIM, &listing_vectors, &none, candidates(), limit).unwrap();
+    let limited = matching::rank(&schema, DIM, &menu_item_vectors, &none, candidates(), limit).unwrap();
     prop_assert_eq!(&limited[..], &all[..limit.min(all.len())]);
 
-    // A record that holds every value the listing has, and more, is a perfect match for it.
-    let superset: Vec<Option<Vec<f32>>> = listing
+    // A record that holds every value the menu item has, and more, is a perfect match for it.
+    let superset: Vec<Option<Vec<f32>>> = menu_item
       .iter()
       .zip(&records[0])
       .map(|(ours, theirs)| ours.clone().or_else(|| theirs.clone()))
       .collect();
     let superset = stored(&schema, &superset, "superset");
-    let own = Candidate { id: "own", tenant: None, search_similarity: 0.0, vectors: &superset, quantities: &none };
-    let ranked = matching::rank(&schema, DIM, &listing_vectors, &none, [own], 1).unwrap();
+    let own = Candidate { id: "own", brand_id: None, search_similarity: 0.0, vectors: &superset, quantities: &none };
+    let ranked = matching::rank(&schema, DIM, &menu_item_vectors, &none, [own], 1).unwrap();
     prop_assert!((ranked[0].comparison.similarity - 1.0).abs() < 1e-5);
   }
 }

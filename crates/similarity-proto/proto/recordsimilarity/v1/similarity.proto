@@ -20,7 +20,7 @@ service RecordSimilarity {
   //   retry with the original content still compares against the original.
   //
   // Errors: `INVALID_ARGUMENT` for a record that does not fit the configured schema (an unknown field or quantity,
-  // a quantity that is not a usable measurement) or a `mode` this server does not know, `FAILED_PRECONDITION` if the stored baseline belongs to a tenant the request does not name or was
+  // a quantity that is not a usable measurement) or a `mode` this server does not know, `FAILED_PRECONDITION` if the stored baseline belongs to a brand the request does not name or was
   // written under a different model or schema layout, `RESOURCE_EXHAUSTED` if the embedding queue is full,
   // `UNAVAILABLE` if the vector store cannot be reached, `ABORTED` if another writer changed the record every
   // time this request had judged it and gone to write.
@@ -41,10 +41,10 @@ service RecordSimilarity {
 
   // Forgets a record. The next `Evaluate` for its id starts a new baseline.
   //
-  // The tenant the request has to name is the tenant of the record as it is when it is deleted. Two requests to
+  // The brand the request has to name is the brand of the record as it is when it is deleted. Two requests to
   // delete one record that reach two servers at the same moment may both be answered `deleted: true`.
   //
-  // Errors: `FAILED_PRECONDITION` if the record is stored under a tenant the request does not name, `ABORTED`
+  // Errors: `FAILED_PRECONDITION` if the record is stored under a brand the request does not name, `ABORTED`
   // as for `Evaluate`.
   rpc Delete(DeleteRequest) returns (DeleteResponse);
 
@@ -67,14 +67,14 @@ service RecordSimilarity {
   // Errors on the call itself are the transport's. Everything about a record is in its answer.
   rpc Import(stream ImportRequest) returns (stream ImportResponse);
 
-  // Finds the stored records a listing from elsewhere describes (a retailer's menu item, say), best first, and
-  // says whether the best is the same product. Read-only: nothing is stored or changed.
+  // Finds the stored records a menu item describes (an entry on a retailer's menu, which names no stored record
+  // itself), best first, and says whether the best is the same product. Read-only: nothing is stored or changed.
   //
-  // Unlike `FindSimilar`, each candidate is scored exactly over the fields both it and the listing have, so a
-  // listing with only a name is scored on its name whatever else a stored record has filled in. Quantities are
+  // Unlike `FindSimilar`, each candidate is scored exactly over the fields both it and the menu item have, so a
+  // menu item with only a name is scored on its name whatever else a stored record has filled in. Quantities are
   // compared and reported for each candidate and never move a similarity or the decision.
   //
-  // Errors: `INVALID_ARGUMENT` for a listing that does not fit the schema, that carries an `id` or a `tenant`,
+  // Errors: `INVALID_ARGUMENT` for a menu item that does not fit the schema, that carries an `id` or a `brand_id`,
   // for a `limit` above 100, or for a `threshold` outside [-1, 1]; `RESOURCE_EXHAUSTED` and `UNAVAILABLE` as for
   // `Evaluate`.
   rpc Match(MatchRequest) returns (MatchResponse);
@@ -102,16 +102,21 @@ message Quantity {
 
 // A record to embed.
 message Record {
+  // What a field of this message was called before 2026-11-12. The numbers did not change, so a client built
+  // before then still sends what it sent; the names are kept from being given to anything else.
+  reserved "tenant";
+
   // The caller's identifier for the record. Opaque to this service; any non-empty string.
   optional string id = 1;
 
-  // The owner of the record (a merchant, an account). Stored with the record and usable as a search filter.
+  // The key of the brand that owns the record. Stored with the record and usable as a search filter. It is an
+  // identifier, compared exactly and never embedded: the brand's name, as text, is the `brand` field in `fields`.
   //
-  // Once a record is stored under a tenant, every later `Evaluate` or `Delete` for its id must name that same
-  // tenant; one that names another tenant, or none, is refused. A record stored without a tenant takes the tenant
-  // of the first revision that names one. This catches a caller applying one merchant's edit to another merchant's
+  // Once a record is stored under a brand, every later `Evaluate` or `Delete` for its id must name that same
+  // brand; one that names another brand, or none, is refused. A record stored without a brand takes the brand
+  // of the first revision that names one. This catches a caller applying one brand's edit to another brand's
   // record. It is a consistency check and not access control: this service does not authenticate its callers.
-  optional string tenant = 2;
+  optional string brand_id = 2;
 
   // Field name to text. Names must be ones the server's schema defines (see `Describe`). A missing field and a
   // blank one are the same thing: no value.
@@ -130,7 +135,7 @@ enum WriteMode {
   // Store the record if it is new or accepted; leave the baseline alone if it is rejected.
   WRITE_MODE_ENFORCE = 1;
 
-  // Never write. Use this to preview a verdict, for example while a merchant is still typing.
+  // Never write. Use this to preview a verdict, for example while someone is still typing.
   WRITE_MODE_DRY_RUN = 2;
 
   // Always store, whatever the verdict, and make this revision the new anchor for drift detection. This is the
@@ -362,6 +367,8 @@ message EvaluateResponse {
 }
 
 message FindSimilarRequest {
+  reserved "tenant";
+
   oneof query {
     // Search around a stored record. `NOT_FOUND` if there is none.
     string id = 1;
@@ -374,17 +381,19 @@ message FindSimilarRequest {
   // How many neighbors to return. Defaults to 10; at most 100.
   uint32 limit = 3;
 
-  // Only return records of this tenant.
-  optional string tenant = 4;
+  // Only return records of this brand.
+  optional string brand_id = 4;
 
   // Only return records at least this similar. Cosine scale, [-1, 1].
   optional float min_similarity = 5;
 }
 
 message Neighbor {
+  reserved "tenant";
+
   string id = 1;
 
-  optional string tenant = 2;
+  optional string brand_id = 2;
 
   float similarity = 3;
 }
@@ -394,10 +403,12 @@ message FindSimilarResponse {
 }
 
 message DeleteRequest {
+  reserved "tenant";
+
   string id = 1;
 
-  // The record's tenant. Required if the record is stored under one.
-  optional string tenant = 2;
+  // The record's brand. Required if the record is stored under one.
+  optional string brand_id = 2;
 }
 
 message DeleteResponse {
@@ -440,7 +451,7 @@ message Original {
 }
 
 message ImportRequest {
-  // The record as it is now. Its `id` is required. `tenant` is stored with it, as for `Evaluate`.
+  // The record as it is now. Its `id` is required. `brand_id` is stored with it, as for `Evaluate`.
   Record record = 1;
 
   // The record as it was first created, if that is still known. Drift is then measured from this version and not
@@ -472,7 +483,7 @@ message ImportResponse {
   ImportOutcome outcome = 3;
 
   // For `IMPORT_OUTCOME_FAILED`: the gRPC status code the same record would have got from `Evaluate` (3
-  // `INVALID_ARGUMENT`, 9 `FAILED_PRECONDITION` for a record stored under another tenant, 8 `RESOURCE_EXHAUSTED`,
+  // `INVALID_ARGUMENT`, 9 `FAILED_PRECONDITION` for a record stored under another brand, 8 `RESOURCE_EXHAUSTED`,
   // 10 `ABORTED`, 14 `UNAVAILABLE`). Zero otherwise.
   uint32 status_code = 4;
 
@@ -481,17 +492,19 @@ message ImportResponse {
 }
 
 message MatchRequest {
-  // The listing, under the field and quantity names the server's schema defines (see `Describe`). Map the
-  // listing's own fields onto these names and leave out one with no counterpart. `id` and `tenant` must be
-  // absent: a listing's id and its seller belong to another system.
-  Record listing = 1;
+  reserved "listing", "tenant";
+
+  // The menu item, under the field and quantity names the server's schema defines (see `Describe`). Map the
+  // menu item's own fields onto these names and leave out one with no counterpart. `id` and `brand_id` must be
+  // absent: a menu item's id and its seller belong to another system.
+  Record menu_item = 1;
 
   // How many candidates to return. Defaults to 5; at most 100.
   uint32 limit = 2;
 
-  // Only consider records of this tenant (the brand, when the caller knows it). Without it every tenant's
-  // records are candidates.
-  optional string tenant = 3;
+  // Only consider records of this brand, when the caller knows which brand the menu item is of. Without it
+  // every brand's records are candidates.
+  optional string brand_id = 3;
 
   // Holds the best candidate to this in place of the server's match threshold. Cosine scale, [-1, 1].
   optional float threshold = 4;
@@ -513,19 +526,21 @@ enum MatchDecision {
 }
 
 message MatchCandidate {
+  reserved "tenant";
+
   string id = 1;
 
-  optional string tenant = 2;
+  optional string brand_id = 2;
 
-  // The weighted mean of the per-field similarities over the fields both the stored record and the listing have:
+  // The weighted mean of the per-field similarities over the fields both the stored record and the menu item have:
   // what the decision is made on. `0` if they share no field.
   float similarity = 3;
 
   // The score the search found this candidate by: what `FindSimilar` would report for it.
   float search_similarity = 4;
 
-  // Read with the stored record as the baseline and the listing as the record: `FIELD_CHANGE_ADDED` is a field
-  // only the listing has and `FIELD_CHANGE_REMOVED` one only the stored record has, neither of which is scored.
+  // Read with the stored record as the baseline and the menu item as the record: `FIELD_CHANGE_ADDED` is a field
+  // only the menu item has and `FIELD_CHANGE_REMOVED` one only the stored record has, neither of which is scored.
   // Never `FIELD_CHANGE_RESTORED`, and `below_floor` is never set: a floor is a rule for revisions.
   repeated FieldScore fields = 5;
 

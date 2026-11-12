@@ -70,7 +70,7 @@ fn emit_pairs(calibration: &Calibration) {
       pair_id,
       label = pair.label_text.as_str(),
       split = pair.split.as_deref(),
-      owner = pair.owner.as_deref(),
+      brand_id = pair.brand_id.as_deref(),
       variant_change = pair.variant_change.as_deref(),
       label_source = pair.label_source.as_deref(),
       label_confidence = pair.label_confidence.as_deref(),
@@ -277,7 +277,7 @@ pub fn emit(offline: &Offline, policy: &Policy, calibration: &Calibration, seed:
     false_accept_rate,
     false_accept_low,
     false_accept_high,
-    owners = rates.owners,
+    brands = rates.brands,
     auc = stats::area_under_curve(calibration).map(|area| (area * 1e6).round() / 1e6),
     skipped_split = input.skipped_split,
     skipped_confidence = input.skipped_confidence,
@@ -469,7 +469,7 @@ fn collected_pair(event: &Event<'_>) -> anyhow::Result<Collected> {
       label_text,
       note: event.text("note")?.unwrap_or_default(),
       split: event.text("split")?,
-      owner: event.text("owner")?,
+      brand_id: event.text("brand_id")?,
       variant_change: event.text("variant_change")?,
       label_source: event.text("label_source")?,
       label_confidence: event.text("label_confidence")?,
@@ -688,12 +688,12 @@ mod tests {
 
   // Words the tiny tokenizer knows, so that different texts are different token sequences.
   const PAIRS: &str = concat!(
-    r#"{"pair_id": "p1", "label": "edit", "owner": "b1", "split": "calibrate", "variant_change": null, "#,
+    r#"{"pair_id": "p1", "label": "edit", "brand_id": "b1", "split": "calibrate", "variant_change": null, "#,
     r#""label_source": "moderator", "label_confidence": "high", "note": "same gummies", "strain": "x", "#,
     r#""before": {"name": "blueberry gummies", "category": "edibles > gummies", "weight": {"value": 1, "unit": "g"}}, "#,
     r#""after": {"name": "blueberry gummies", "category": "edibles > gummies", "weight": {"value": 1000, "unit": "mg"}}}"#,
     "\n",
-    r#"{"pair_id": "p2", "label": "recycle", "owner": "b2", "split": "calibrate", "variant_change": "size", "#,
+    r#"{"pair_id": "p2", "label": "recycle", "brand_id": "b2", "split": "calibrate", "variant_change": "size", "#,
     r#""before": {"name": "blueberry gummies", "category": "edibles", "weight": {"value": 1, "unit": "g"}, "strain": "x"}, "#,
     r#""after": {"name": "vape cartridge resin", "category": "flower", "weight": {"value": 8, "unit": "g"}}}"#,
     "\n",
@@ -768,7 +768,7 @@ mod tests {
       ),
       (&Value::from(3), &Value::from(1), &Value::from(1), &Value::from(1))
     );
-    assert_eq!(summary["owners"], 2);
+    assert_eq!(summary["brands"], 2);
   }
 
   #[test]
@@ -779,7 +779,7 @@ mod tests {
 
     let edit = find("p1");
     assert_eq!(
-      (&edit["label"], &edit["owner"], &edit["split"], &edit["category"]),
+      (&edit["label"], &edit["brand_id"], &edit["split"], &edit["category"]),
       (
         &Value::from("edit"),
         &Value::from("b1"),
@@ -806,7 +806,7 @@ mod tests {
       (&unsure["label"], &unsure["wrong"]),
       (&Value::from("unsure"), &Value::from(false))
     );
-    assert!(unsure.get("owner").is_none());
+    assert!(unsure.get("brand_id").is_none());
 
     let quantity = |id: &str| {
       *named(&events, "pair_quantity")
@@ -885,8 +885,8 @@ mod tests {
         ("variant_change", "size"),
         ("category", "edibles"),
         ("label_source", "moderator"),
-        ("owner", "b1"),
-        ("owner", "b2")
+        ("brand_id", "b1"),
+        ("brand_id", "b2")
       ]
     );
 
@@ -1038,13 +1038,13 @@ mod tests {
       assert_eq!(
         (
           read.pair.label,
-          &read.pair.owner,
+          &read.pair.brand_id,
           &read.pair.split,
           &read.pair.variant_change
         ),
         (
           original.pair.label,
-          &original.pair.owner,
+          &original.pair.brand_id,
           &original.pair.split,
           &original.pair.variant_change
         )

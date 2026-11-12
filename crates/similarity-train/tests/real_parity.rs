@@ -44,7 +44,7 @@ struct Pair {
 #[derive(Deserialize)]
 struct Group {
   catalog: String,
-  listing: String,
+  menu_item: String,
 }
 
 #[derive(Deserialize)]
@@ -127,7 +127,7 @@ fn burn_reproduces_pytorch_training_step_for_step() {
     .iter()
     .map(|group| GroupExample {
       catalog: group.catalog.clone(),
-      listing: group.listing.clone(),
+      menu_item: group.menu_item.clone(),
     })
     .collect();
 

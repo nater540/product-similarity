@@ -1,5 +1,5 @@
 # Labeled before/after pairs for `record-similarity calibrate`. Synthetic examples written for this repository,
-# NOT real merchant data: replace them with labeled edits from production before trusting a threshold.
+# NOT real product data: replace them with labeled edits from production before trusting a threshold.
 # One JSON object per line: {"label": "edit" | "recycle", "note": ..., "before": {...}, "after": {...}}
 # In a record, a string is a text field and an object is a quantity: {"value": 3.5, "unit": "g"} or
 # {"min": 18, "max": 22, "unit": "%"}. Some pairs carry quantities, enough to exercise that part of the report

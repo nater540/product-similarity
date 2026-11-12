@@ -45,7 +45,7 @@ anchor, and can be run again at any time: the second run creates what is missing
   a record may have.** Send me that output.
 - **How the application that will call the service builds a product's record**, if that integration exists
   already: which column becomes which field, how the category text is put together, what it sends as the
-  product's id and as its tenant. **The import has to build every record exactly the same way.** If the import
+  product's id and as its brand. **The import has to build every record exactly the same way.** If the import
   writes `Edibles > Gummies` and the application later sends `Gummies, Edibles`, every product looks edited the
   first time it is saved. If the integration does not exist yet, tell me, and use the mapping below; whoever
   builds it must then follow the same mapping.
@@ -64,16 +64,16 @@ If reaching something needs access you do not have, stop and tell me. Do not wor
 One JSON object per line, one line per product, in a new directory outside any git repository:
 
 ```json
-{"id": "8841207", "tenant": "5512", "record": {"name": "Blueberry Gummies 100mg", "category": "Edibles > Gummies", "brand": "Sunny Orchard", "description": "Ten vegan gummies...", "weight_per_item": {"value": 40, "unit": "g"}, "thc_per_item": {"min": 100, "max": 100, "unit": "mg"}}, "anchor": {"name": "Blueberry Gummies", "category": "Edibles > Gummies", "brand": "Sunny Orchard"}}
+{"id": "8841207", "brand_id": "5512", "record": {"name": "Blueberry Gummies 100mg", "category": "Edibles > Gummies", "brand": "Sunny Orchard", "description": "Ten vegan gummies...", "weight_per_item": {"value": 40, "unit": "g"}, "thc_per_item": {"min": 100, "max": 100, "unit": "mg"}}, "anchor": {"name": "Blueberry Gummies", "category": "Edibles > Gummies", "brand": "Sunny Orchard"}}
 ```
 
 Exactly these four keys; any other top-level key is refused, so that a misspelled one is noticed.
 
 - **`id` is the product's real id, as a string, exactly as the application will send it** when it asks about an
   edit. Not a pseudonym, not a hash. If the application will send `"8841207"`, the import sends `"8841207"`.
-- **`tenant` is the key of the brand that owns the product, as a string.** Once a product is stored under a
-  tenant, every later request about it must name the same tenant, or it is refused. So this too has to be
-  exactly what the application will send. If the application will send no tenant, leave the key out for every
+- **`brand_id` is the key of the brand that owns the product, as a string.** Once a product is stored under a
+  brand, every later request about it must name the same brand, or it is refused. So this too has to be
+  exactly what the application will send. If the application will send no brand, leave the key out for every
   product. Ask me which it is; do not guess, because it cannot be changed by importing again.
 - **`record` is the product as it is now.** `anchor`, optional, is the product as it was first created.
   Both use only the field and quantity names `describe` printed. With the shipped configuration those are:
@@ -127,7 +127,7 @@ Take about a hundred products from several brands and load only those (below). T
 service about the product as it is now, without storing anything:
 
 ```sh
-just client --server http://HOST:PORT evaluate 8841207 product.json --tenant 5512 --dry-run
+just client --server http://HOST:PORT evaluate 8841207 product.json --brand-id 5512 --dry-run
 ```
 
 where `product.json` is that product's `record` object, built the way the application builds it (through the
@@ -148,7 +148,7 @@ quantity  weight_per_item     x1.00  Unchanged (g to g)
 Every field and every quantity `Unchanged`, overall 1.000, revision 1. **Anything else means the import and the
 application build the record differently**, and has to be understood before the rest is loaded: a field that
 shows `Modified`, a quantity that shows `Added`, `Removed`, or `Incomparable`, or an error saying the record
-`belongs to tenant ...`. The `drift` line is the one that may be below 1.000, for a product loaded with an
+`belongs to brand_id ...`. The `drift` line is the one that may be below 1.000, for a product loaded with an
 `anchor`: it is how far the product has already moved from its first version.
 
 ## Load the catalog
@@ -188,7 +188,7 @@ is not an export line at all (a misspelled top-level key) stops the client befor
 client can make the same call (`Import(stream ImportRequest) returns (stream ImportResponse)`, in
 `similarity.proto`).
 
-- **A stream shares the server's one model with everyone else.** While it runs, a merchant's save waits behind
+- **A stream shares the server's one model with everyone else.** While it runs, a save by anyone else waits behind
   it. On a 12-core development machine a stream created about 400 products a second, and an ordinary edit took a
   median of 18 ms beside it where it takes 2 ms alone. Those are that machine's numbers; time the first thousand
   here and tell me what you see. If the service is already taking edits, load outside editing hours, or ask me

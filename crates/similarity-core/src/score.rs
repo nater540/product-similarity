@@ -1,7 +1,7 @@
 //! Comparing a proposed revision of a record against what is stored, and deciding whether to accept it.
 //!
-//! The question this module answers is "is this still the same record?". A merchant rewording a description or
-//! adding a potency to a name is an edit; a merchant turning a blueberry gummy into a vape cartridge under the same
+//! The question this module answers is "is this still the same record?". A brand rewording a description or
+//! adding a potency to a name is an edit; a brand turning a blueberry gummy into a vape cartridge under the same
 //! id is a different record wearing the old one's history. Three checks, each of which can reject on its own:
 //!
 //! 1. **Overall similarity**: the weighted mean of per-field cosines against the current baseline.

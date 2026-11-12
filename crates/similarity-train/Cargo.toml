@@ -1,6 +1,6 @@
 [package]
 name = "similarity-train"
-description = "Fine-tunes the record-similarity embedding model on labeled listing data, in Burn."
+description = "Fine-tunes the record-similarity embedding model on labeled product data, in Burn."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

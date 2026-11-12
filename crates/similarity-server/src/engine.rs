@@ -33,7 +33,7 @@ use crate::worker::{EmbedError, TextEmbedder};
 /// text fields that is about one forward pass of the default model.
 pub const DEFAULT_IMPORT_BATCH: usize = 8;
 
-/// How many candidates `match_listing` returns when the caller does not say.
+/// How many candidates `match_menu_item` returns when the caller does not say.
 pub const DEFAULT_MATCHES: usize = 5;
 /// The most records one match fetches to score, whatever the limit and the over-fetch come to.
 pub const MAX_MATCH_FETCH: usize = 1000;
@@ -60,7 +60,7 @@ pub enum EngineError {
   /// The record asked for does not exist.
   #[error("{0}")]
   NotFound(String),
-  /// The request is fine but the stored state forbids it (another tenant's record, another model's vectors).
+  /// The request is fine but the stored state forbids it (another brand's record, another model's vectors).
   #[error("{0}")]
   FailedPrecondition(String),
   /// Another writer kept changing the record while this request was being judged, so nothing was written.
@@ -112,8 +112,8 @@ impl From<EmbedError> for EngineError {
 pub struct RecordInput {
   /// The caller's identifier, if the record has one yet.
   pub id: Option<String>,
-  /// The record's owner.
-  pub tenant: Option<String>,
+  /// The key of the brand that owns the record.
+  pub brand_id: Option<String>,
   /// Field name and text pairs.
   pub fields: Vec<(String, String)>,
   /// Quantity name and value pairs.
@@ -213,7 +213,7 @@ pub struct ImportInput {
   pub anchor: Option<Original>,
 }
 
-/// An earlier version of a record: fields and quantities, with no id or tenant of its own.
+/// An earlier version of a record: fields and quantities, with no id or brand of its own.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Original {
   /// Field name and text pairs.
@@ -247,13 +247,13 @@ pub struct FindSimilarInput {
   pub query: SimilarTo,
   /// How many neighbors to return; zero means [`DEFAULT_NEIGHBORS`].
   pub limit: usize,
-  /// Only return this tenant's records.
-  pub tenant: Option<String>,
+  /// Only return this brand's records.
+  pub brand_id: Option<String>,
   /// Only return records at least this similar.
   pub min_similarity: Option<f32>,
 }
 
-/// How a listing is matched (see [`Engine::match_listing`]).
+/// How a menu item is matched (see [`Engine::match_menu_item`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Matching {
   /// The similarity the best candidate has to reach to be called a match. `None`: candidates are ranked and
@@ -272,15 +272,15 @@ impl Default for Matching {
   }
 }
 
-/// A request to match a listing.
+/// A request to match a menu item.
 #[derive(Debug, Clone, Default)]
 pub struct MatchInput {
-  /// The listing, under the schema's field and quantity names. It must carry no id and no tenant.
-  pub listing: RecordInput,
+  /// The menu item, under the schema's field and quantity names. It must carry no id and no brand.
+  pub menu_item: RecordInput,
   /// How many candidates to return; zero means [`DEFAULT_MATCHES`].
   pub limit: usize,
-  /// Only consider records of this tenant.
-  pub tenant: Option<String>,
+  /// Only consider records of this brand.
+  pub brand_id: Option<String>,
   /// Holds the best candidate to this in place of the configured threshold.
   pub threshold: Option<f32>,
 }
@@ -311,7 +311,7 @@ pub struct Description {
   pub schema: Schema,
   /// The thresholds.
   pub policy: Policy,
-  /// How listings are matched.
+  /// How menu items are matched.
   pub matching: Matching,
 }
 
@@ -327,7 +327,7 @@ pub fn store_layout(schema: &Schema, embedder: &impl TextEmbedder) -> (String, u
 #[derive(Debug)]
 struct Revision {
   id: String,
-  tenant: Option<String>,
+  brand_id: Option<String>,
   vectors: RecordVectors,
   quantities: Quantities,
 }
@@ -336,7 +336,7 @@ struct Revision {
 #[derive(Debug)]
 struct PreparedImport {
   id: String,
-  tenant: Option<String>,
+  brand_id: Option<String>,
   record: PreparedRecord,
   anchor: Option<PreparedRecord>,
 }
@@ -357,8 +357,8 @@ pub trait Observer: fmt::Debug + Send + Sync + 'static {
 pub struct Observation<'a> {
   /// The record's id.
   pub id: &'a str,
-  /// The tenant the request named, if it named one.
-  pub tenant: Option<&'a str>,
+  /// The brand the request named, if it named one.
+  pub brand_id: Option<&'a str>,
   /// What the request asked to be done with the verdict.
   pub mode: WriteMode,
   /// The threshold the request asked to be judged at in place of the configured one, if it did.
@@ -411,21 +411,21 @@ fn required_text(what: &str, value: Option<String>) -> Result<Option<String>, En
   }
 }
 
-/// Refuses a request that does not name the tenant `stored` belongs to.
+/// Refuses a request that does not name the brand `stored` belongs to.
 ///
-/// Naming no tenant is refused like naming the wrong one: a check that a caller can skip by leaving a field out
+/// Naming no brand is refused like naming the wrong one: a check that a caller can skip by leaving a field out
 /// would not catch the mistake it exists for, a code path that lost track of whose record it is editing. A record
-/// stored without a tenant accepts any request, which is how it gains one.
-fn same_tenant(stored: &StoredRecord, given: Option<&str>) -> Result<(), EngineError> {
-  match (stored.tenant.as_deref(), given) {
+/// stored without a brand accepts any request, which is how it gains one.
+fn same_brand(stored: &StoredRecord, given: Option<&str>) -> Result<(), EngineError> {
+  match (stored.brand_id.as_deref(), given) {
     (None, _) => Ok(()),
-    (Some(owner), Some(given)) if owner == given => Ok(()),
-    (Some(owner), Some(given)) => Err(EngineError::FailedPrecondition(format!(
-      "record `{}` belongs to tenant `{owner}`, not `{given}`",
+    (Some(brand), Some(given)) if brand == given => Ok(()),
+    (Some(brand), Some(given)) => Err(EngineError::FailedPrecondition(format!(
+      "record `{}` belongs to brand `{brand}`, not `{given}`",
       stored.id
     ))),
-    (Some(owner), None) => Err(EngineError::FailedPrecondition(format!(
-      "record `{}` belongs to tenant `{owner}`, and the request names no tenant",
+    (Some(brand), None) => Err(EngineError::FailedPrecondition(format!(
+      "record `{}` belongs to brand `{brand}`, and the request names no brand",
       stored.id
     ))),
   }
@@ -473,7 +473,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     self.import_batch
   }
 
-  /// The same engine, matching listings by `matching` from now on.
+  /// The same engine, matching menu items by `matching` from now on.
   #[must_use]
   pub fn with_matching(mut self, matching: Matching) -> Self {
     self.matching = matching;
@@ -557,7 +557,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       None => self.policy,
     };
     let id = required_text("record.id", input.record.id.clone())?;
-    let tenant = required_text("record.tenant", input.record.tenant.clone())?;
+    let brand_id = required_text("record.brand_id", input.record.brand_id.clone())?;
     let prepared = self.prepare(&input.record)?;
 
     let Some(id) = id else {
@@ -573,7 +573,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     let _serialized = self.lock_for(&id)?.lock().await;
     let asked = (input.mode, input.threshold);
     for _ in 0..WRITE_ATTEMPTS {
-      let attempt = self.attempt(&id, tenant.as_deref(), &prepared, asked, &policy);
+      let attempt = self.attempt(&id, brand_id.as_deref(), &prepared, asked, &policy);
       if let Some(output) = attempt.await? {
         return Ok(output);
       }
@@ -587,21 +587,21 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
   async fn attempt(
     &self,
     id: &str,
-    tenant: Option<&str>,
+    brand_id: Option<&str>,
     prepared: &PreparedRecord,
     asked: (WriteMode, Option<f32>),
     policy: &Policy,
   ) -> Result<Option<EvaluateOutput>, EngineError> {
     let baseline = self.store.get(id).await?;
     if let Some(stored) = &baseline {
-      same_tenant(stored, tenant)?;
+      same_brand(stored, brand_id)?;
     }
     let vectors = self
       .embed(prepared, baseline.as_ref().map(|record| &record.vectors))
       .await?;
     let revision = Revision {
       id: id.to_owned(),
-      tenant: tenant.map(str::to_owned),
+      brand_id: brand_id.map(str::to_owned),
       vectors,
       quantities: prepared.quantities().clone(),
     };
@@ -622,7 +622,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     let (mode, threshold) = asked;
     let Revision {
       id,
-      tenant,
+      brand_id,
       vectors: candidate,
       quantities,
     } = first;
@@ -630,7 +630,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     if stored {
       let record = StoredRecord {
         id: id.clone(),
-        tenant: tenant.clone(),
+        brand_id: brand_id.clone(),
         anchor: candidate.composite.clone(),
         vectors: candidate.clone(),
         // A new record is its own point of reference, for quantities as for text.
@@ -646,7 +646,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     if let Some(observer) = &self.observer {
       observer.observe(&Observation {
         id: &id,
-        tenant: tenant.as_deref(),
+        brand_id: brand_id.as_deref(),
         mode,
         threshold,
         policy,
@@ -676,7 +676,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     let (mode, threshold) = asked;
     let Revision {
       id,
-      tenant,
+      brand_id,
       vectors: candidate,
       quantities,
     } = candidate;
@@ -705,7 +705,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     let identical = evaluation.comparison.fields.iter().all(unchanged)
       && candidate.hashes == baseline.vectors.hashes
       && evaluation.quantities.iter().all(same_amount)
-      && tenant == baseline.tenant;
+      && brand_id == baseline.brand_id;
     let write = match mode {
       WriteMode::DryRun => false,
       WriteMode::Enforce => accepted && !identical,
@@ -731,7 +731,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       };
       let record = StoredRecord {
         id: id.clone(),
-        tenant: tenant.clone(),
+        brand_id: brand_id.clone(),
         anchor,
         vectors: candidate.clone(),
         quantities: quantities.clone(),
@@ -756,7 +756,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     if let Some(observer) = &self.observer {
       observer.observe(&Observation {
         id: &id,
-        tenant: tenant.as_deref(),
+        brand_id: brand_id.as_deref(),
         mode,
         threshold,
         policy,
@@ -799,7 +799,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
   /// That is what lets a re-index keep a record's drift history.
   ///
   /// Returns one outcome per input, in order. A record that cannot be imported (it does not fit the schema, or
-  /// its id is stored under a tenant it does not name) fails by itself and stops nothing else.
+  /// its id is stored under a brand it does not name) fails by itself and stops nothing else.
   ///
   /// # Errors
   ///
@@ -877,12 +877,12 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     Ok(outcomes)
   }
 
-  /// Whether a record to be imported is stored already, under a tenant the import may name.
+  /// Whether a record to be imported is stored already, under a brand the import may name.
   async fn stored_already(&self, prepared: &PreparedImport) -> Result<bool, EngineError> {
     match self.store.get(&prepared.id).await? {
       Some(stored) => {
-        // Naming another tenant is the mistake the tenant rule exists for, here as anywhere (D14).
-        same_tenant(&stored, prepared.tenant.as_deref())?;
+        // Naming another brand is the mistake the brand rule exists for, here as anywhere (D14).
+        same_brand(&stored, prepared.brand_id.as_deref())?;
         Ok(true)
       }
       None => Ok(false),
@@ -895,14 +895,14 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
         "`record.id` is required: a record without an id cannot be stored".to_owned(),
       ));
     };
-    let tenant = required_text("record.tenant", input.record.tenant.clone())?;
+    let brand_id = required_text("record.brand_id", input.record.brand_id.clone())?;
     let record = self.prepare(&input.record)?;
     let anchor = input
       .anchor
       .map(|original| {
         self.prepare(&RecordInput {
           id: None,
-          tenant: None,
+          brand_id: None,
           fields: original.fields,
           quantities: original.quantities,
         })
@@ -917,7 +917,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       })?;
     Ok(PreparedImport {
       id,
-      tenant,
+      brand_id,
       record,
       anchor,
     })
@@ -951,7 +951,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     };
     let record = StoredRecord {
       id: prepared.id,
-      tenant: prepared.tenant,
+      brand_id: prepared.brand_id,
       vectors,
       anchor,
       quantities,
@@ -963,8 +963,8 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     let _serialized = self.lock_for(&record.id)?.lock().await;
     for _ in 0..WRITE_ATTEMPTS {
       if let Some(stored) = self.store.get(&record.id).await? {
-        // Naming another tenant is the mistake the tenant rule exists for, here as anywhere (D14).
-        same_tenant(&stored, record.tenant.as_deref())?;
+        // Naming another brand is the mistake the brand rule exists for, here as anywhere (D14).
+        same_brand(&stored, record.brand_id.as_deref())?;
         return Ok(Imported::Skipped);
       }
       // "Only creates" is the store's to keep, not this process's lock: a record another replica, or the import
@@ -998,7 +998,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
         "`min_similarity` is {minimum}, outside the cosine range [-1, 1]"
       )));
     }
-    let tenant = required_text("tenant", input.tenant)?;
+    let brand_id = required_text("brand_id", input.brand_id)?;
 
     let (vector, exclude_id) = match input.query {
       SimilarTo::Id(id) => {
@@ -1020,18 +1020,18 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     let query = SearchQuery {
       vector: &vector,
       limit,
-      tenant: tenant.as_deref(),
+      brand_id: brand_id.as_deref(),
       exclude_id: exclude_id.as_deref(),
       min_similarity: input.min_similarity,
     };
     Ok(self.store.search(query).await?)
   }
 
-  /// Finds the stored records `input.listing` describes, best first, and decides whether the best is a match.
+  /// Finds the stored records `input.menu_item` describes, best first, and decides whether the best is a match.
   ///
-  /// The listing is embedded under the schema like any record and searched for like any record, among every
-  /// tenant's records unless `input.tenant` narrows it. Then each of the records the search returned is scored
-  /// exactly over the fields it shares with the listing ([`matching::rank`]), which is what the search score
+  /// The menu item is embedded under the schema like any record and searched for like any record, among every
+  /// brand's records unless `input.brand_id` narrows it. Then each of the records the search returned is scored
+  /// exactly over the fields it shares with the menu item ([`matching::rank`]), which is what the search score
   /// cannot do, and the best is held to the threshold if there is one. More records are fetched than are
   /// returned ([`Matching::overfetch`]), because the search order is not the exact order.
   ///
@@ -1039,13 +1039,13 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
   ///
   /// # Errors
   ///
-  /// [`EngineError::InvalidArgument`] for a listing that does not fit the schema or carries an id or a tenant,
+  /// [`EngineError::InvalidArgument`] for a menu item that does not fit the schema or carries an id or a brand,
   /// a limit above [`MAX_NEIGHBORS`], or a threshold outside the cosine range; otherwise as [`Self::evaluate`].
-  pub async fn match_listing(&self, input: MatchInput) -> Result<MatchOutput, EngineError> {
-    if input.listing.id.is_some() || input.listing.tenant.is_some() {
+  pub async fn match_menu_item(&self, input: MatchInput) -> Result<MatchOutput, EngineError> {
+    if input.menu_item.id.is_some() || input.menu_item.brand_id.is_some() {
       return Err(EngineError::InvalidArgument(
-        "a listing carries no `id` and no `tenant`: both belong to the system the listing came from. To match \
-         within one tenant, name it in the request's `tenant`"
+        "a menu item carries no `id` and no `brand_id`: both belong to the system the menu item came from. To match \
+         within one brand, name it in the request's `brand_id`"
           .to_owned(),
       ));
     }
@@ -1066,16 +1066,16 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
         "`threshold` is {threshold}, outside the cosine range [-1, 1]"
       )));
     }
-    let tenant = required_text("tenant", input.tenant)?;
-    let prepared = self.prepare(&input.listing)?;
-    let listing = self.embed(&prepared, None).await?;
+    let brand_id = required_text("brand_id", input.brand_id)?;
+    let prepared = self.prepare(&input.menu_item)?;
+    let menu_item = self.embed(&prepared, None).await?;
 
     let found = self
       .store
       .search_vectors(SearchQuery {
-        vector: &listing.composite,
+        vector: &menu_item.composite,
         limit: limit.saturating_mul(self.matching.overfetch).min(MAX_MATCH_FETCH),
-        tenant: tenant.as_deref(),
+        brand_id: brand_id.as_deref(),
         exclude_id: None,
         min_similarity: None,
       })
@@ -1083,11 +1083,11 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     let candidates = matching::rank(
       &self.schema,
       self.embedder.dimension(),
-      &listing,
+      &menu_item,
       prepared.quantities(),
       found.iter().map(|found| Candidate {
         id: &found.neighbor.id,
-        tenant: found.neighbor.tenant.as_deref(),
+        brand_id: found.neighbor.brand_id.as_deref(),
         search_similarity: found.neighbor.similarity,
         vectors: &found.vectors,
         quantities: &found.quantities,
@@ -1107,19 +1107,19 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
   /// # Errors
   ///
   /// See [`EngineError`].
-  pub async fn delete(&self, id: String, tenant: Option<String>) -> Result<bool, EngineError> {
+  pub async fn delete(&self, id: String, brand_id: Option<String>) -> Result<bool, EngineError> {
     let Some(id) = required_text("id", Some(id))? else {
       return Err(EngineError::InvalidArgument("`id` is required".to_owned()));
     };
-    let tenant = required_text("tenant", tenant)?;
+    let brand_id = required_text("brand_id", brand_id)?;
     let _serialized = self.lock_for(&id)?.lock().await;
     for _ in 0..WRITE_ATTEMPTS {
       let Some(stored) = self.store.get(&id).await? else {
         return Ok(false);
       };
-      same_tenant(&stored, tenant.as_deref())?;
-      // The record that is deleted is the one whose tenant was just checked. One that another writer has since
-      // replaced, and may have given a tenant, is looked at again.
+      same_brand(&stored, brand_id.as_deref())?;
+      // The record that is deleted is the one whose brand was just checked. One that another writer has since
+      // replaced, and may have given a brand, is looked at again.
       if self.store.delete_if(&id, stored.version()).await? {
         return Ok(true);
       }
@@ -1310,7 +1310,7 @@ mod tests {
   fn record(id: Option<&str>, fields: &[(&str, &str)]) -> RecordInput {
     RecordInput {
       id: id.map(str::to_owned),
-      tenant: None,
+      brand_id: None,
       fields: fields
         .iter()
         .map(|(name, text)| ((*name).to_owned(), (*text).to_owned()))
@@ -1346,11 +1346,22 @@ mod tests {
     engine.store.get(id).await.unwrap()
   }
 
-  /// A store whose reads give way to other tasks, as a round trip to a real store does.
-  struct Slow(MemoryStore);
+  /// A store whose reads give way to other tasks, as a round trip to a real store does, and are counted.
+  struct Slow(MemoryStore, std::sync::atomic::AtomicUsize);
+
+  impl Slow {
+    fn over(store: MemoryStore) -> Self {
+      Self(store, std::sync::atomic::AtomicUsize::new(0))
+    }
+
+    fn reads(&self) -> usize {
+      self.1.load(std::sync::atomic::Ordering::Relaxed)
+    }
+  }
 
   impl VectorStore for Slow {
     async fn get(&self, id: &str) -> Result<Option<StoredRecord>, StoreError> {
+      self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
       let found = self.0.get(id).await;
       tokio::task::yield_now().await;
       found
@@ -1388,24 +1399,24 @@ mod tests {
   ];
   /// Closer to nothing but the search: one field, so its composite is all name.
   const WRONG: [(&str, &str); 1] = [("name", "blueberry gummies 10pk tin")];
-  const LISTING: [(&str, &str); 1] = [("name", "blueberry gummies 100mg 10pk")];
+  const MENU_ITEM: [(&str, &str); 1] = [("name", "blueberry gummies 100mg 10pk")];
 
-  fn listing(fields: &[(&str, &str)]) -> MatchInput {
+  fn menu_item(fields: &[(&str, &str)]) -> MatchInput {
     MatchInput {
-      listing: record(None, fields),
+      menu_item: record(None, fields),
       ..MatchInput::default()
     }
   }
 
   async fn catalog(matching: Matching) -> TestEngine {
     let engine = engine().with_matching(matching);
-    for (id, tenant, fields) in [
+    for (id, brand_id, fields) in [
       ("right", "brand-1", RIGHT.as_slice()),
       ("wrong", "brand-2", WRONG.as_slice()),
       ("vape", "brand-2", VAPE.as_slice()),
     ] {
       let mut input = evaluate_input(Some(id), fields);
-      input.record.tenant = Some(tenant.to_owned());
+      input.record.brand_id = Some(brand_id.to_owned());
       engine.evaluate(input).await.unwrap();
     }
     engine
@@ -1415,23 +1426,23 @@ mod tests {
   /// record that also has only a name ahead of the right product, which has every field filled in; scored over
   /// the field both sides have, the right product is first.
   #[tokio::test]
-  async fn a_name_only_listing_finds_its_product_ahead_of_a_wrong_one_the_search_prefers() {
+  async fn a_name_only_menu_item_finds_its_product_ahead_of_a_wrong_one_the_search_prefers() {
     let engine = catalog(Matching::default()).await;
     let searched = engine
       .find_similar(FindSimilarInput {
-        query: SimilarTo::Record(record(None, &LISTING)),
+        query: SimilarTo::Record(record(None, &MENU_ITEM)),
         limit: 3,
-        tenant: None,
+        brand_id: None,
         min_similarity: None,
       })
       .await
       .unwrap();
     assert_eq!(
       searched[0].id, "wrong",
-      "the search prefers the record with as few fields as the listing"
+      "the search prefers the record with as few fields as the menu item"
     );
 
-    let output = engine.match_listing(listing(&LISTING)).await.unwrap();
+    let output = engine.match_menu_item(menu_item(&MENU_ITEM)).await.unwrap();
     let ids: Vec<&str> = output
       .candidates
       .iter()
@@ -1444,7 +1455,7 @@ mod tests {
     );
 
     let best = &output.candidates[0];
-    assert_eq!(best.tenant.as_deref(), Some("brand-1"));
+    assert_eq!(best.brand_id.as_deref(), Some("brand-1"));
     let name = best
       .comparison
       .fields
@@ -1489,9 +1500,9 @@ mod tests {
     .await;
     let one = MatchInput {
       limit: 1,
-      ..listing(&LISTING)
+      ..menu_item(&MENU_ITEM)
     };
-    let output = narrow.match_listing(one.clone()).await.unwrap();
+    let output = narrow.match_menu_item(one.clone()).await.unwrap();
     assert_eq!((output.candidates[0].id.as_str(), output.fetched), ("wrong", 1));
 
     let wide = catalog(Matching {
@@ -1499,7 +1510,7 @@ mod tests {
       overfetch: 2,
     })
     .await;
-    let output = wide.match_listing(one).await.unwrap();
+    let output = wide.match_menu_item(one).await.unwrap();
     assert_eq!(
       (
         output.candidates[0].id.as_str(),
@@ -1510,25 +1521,25 @@ mod tests {
     );
 
     // Zero means five, and the fetch is the limit times the over-fetch, as far as there are records.
-    let output = wide.match_listing(listing(&LISTING)).await.unwrap();
+    let output = wide.match_menu_item(menu_item(&MENU_ITEM)).await.unwrap();
     assert_eq!((output.candidates.len(), output.fetched), (3, 3));
   }
 
   #[tokio::test]
   async fn the_best_candidate_is_held_to_the_configured_threshold_or_to_the_requests() {
     let plain = catalog(Matching::default()).await;
-    let score = plain.match_listing(listing(&LISTING)).await.unwrap().candidates[0]
+    let score = plain.match_menu_item(menu_item(&MENU_ITEM)).await.unwrap().candidates[0]
       .comparison
       .similarity;
     let with = |threshold: Option<f32>| MatchInput {
       threshold,
-      ..listing(&LISTING)
+      ..menu_item(&MENU_ITEM)
     };
     assert_eq!(
-      plain.match_listing(with(Some(score))).await.unwrap().decision,
+      plain.match_menu_item(with(Some(score))).await.unwrap().decision,
       Decision::Matched
     );
-    let above = plain.match_listing(with(Some(score.next_up()))).await.unwrap();
+    let above = plain.match_menu_item(with(Some(score.next_up()))).await.unwrap();
     assert_eq!(
       (above.decision, above.threshold),
       (Decision::NoMatch, Some(score.next_up()))
@@ -1544,75 +1555,75 @@ mod tests {
       overfetch: 5,
     })
     .await;
-    let output = configured.match_listing(with(None)).await.unwrap();
+    let output = configured.match_menu_item(with(None)).await.unwrap();
     assert_eq!((output.decision, output.threshold), (Decision::NoMatch, Some(0.99)));
-    let output = configured.match_listing(with(Some(0.5))).await.unwrap();
+    let output = configured.match_menu_item(with(Some(0.5))).await.unwrap();
     assert_eq!((output.decision, output.threshold), (Decision::Matched, Some(0.5)));
     assert_eq!(configured.describe().matching.threshold, Some(0.99));
 
     for outside in [1.5, -1.5, f32::NAN] {
-      let error = plain.match_listing(with(Some(outside))).await.unwrap_err();
+      let error = plain.match_menu_item(with(Some(outside))).await.unwrap_err();
       assert!(matches!(error, EngineError::InvalidArgument(_)), "{error:?}");
     }
   }
 
   #[tokio::test]
-  async fn a_match_can_be_limited_to_one_tenant() {
+  async fn a_match_can_be_limited_to_one_brand() {
     let engine = catalog(Matching::default()).await;
-    let within = |tenant: &str| MatchInput {
-      tenant: Some(tenant.to_owned()),
-      ..listing(&LISTING)
+    let within = |brand_id: &str| MatchInput {
+      brand_id: Some(brand_id.to_owned()),
+      ..menu_item(&MENU_ITEM)
     };
     let ids =
       |output: MatchOutput| -> Vec<String> { output.candidates.into_iter().map(|candidate| candidate.id).collect() };
-    assert_eq!(ids(engine.match_listing(within("brand-1")).await.unwrap()), ["right"]);
+    assert_eq!(ids(engine.match_menu_item(within("brand-1")).await.unwrap()), ["right"]);
     assert_eq!(
-      ids(engine.match_listing(within("brand-2")).await.unwrap()),
+      ids(engine.match_menu_item(within("brand-2")).await.unwrap()),
       ["wrong", "vape"]
     );
-    let nobody = engine.match_listing(within("brand-3")).await.unwrap();
+    let nobody = engine.match_menu_item(within("brand-3")).await.unwrap();
     assert_eq!(
       (nobody.candidates.len(), nobody.fetched, nobody.decision),
       (0, 0, Decision::NotJudged)
     );
     assert!(
-      engine.match_listing(within("  ")).await.is_err(),
-      "a blank tenant is not no tenant"
+      engine.match_menu_item(within("  ")).await.is_err(),
+      "a blank brand is not no brand"
     );
   }
 
-  /// A listing's id and its seller are another system's. Taking them would invite a caller to confuse the
+  /// A menu item's id and its seller are another system's. Taking them would invite a caller to confuse the
   /// retailer with the brand whose records are being searched.
   #[tokio::test]
-  async fn a_listing_that_does_not_fit_is_refused() {
+  async fn a_menu_item_that_does_not_fit_is_refused() {
     let engine = catalog(Matching::default()).await;
     let refused = |input: MatchInput| {
       let engine = &engine;
       async move {
-        let error = engine.match_listing(input).await.unwrap_err();
+        let error = engine.match_menu_item(input).await.unwrap_err();
         assert!(matches!(error, EngineError::InvalidArgument(_)), "{error:?}");
         error.to_string()
       }
     };
-    let mut with_id = listing(&LISTING);
-    with_id.listing.id = Some("menu-item-7".to_owned());
-    assert!(refused(with_id).await.contains("no `id` and no `tenant`"));
-    let mut with_tenant = listing(&LISTING);
-    with_tenant.listing.tenant = Some("retailer-1".to_owned());
-    refused(with_tenant).await;
+    let mut with_id = menu_item(&MENU_ITEM);
+    with_id.menu_item.id = Some("menu-item-7".to_owned());
+    assert!(refused(with_id).await.contains("no `id` and no `brand_id`"));
+    let mut with_brand = menu_item(&MENU_ITEM);
+    with_brand.menu_item.brand_id = Some("retailer-1".to_owned());
+    refused(with_brand).await;
 
-    refused(listing(&[("name", "x"), ("strain", "indica")])).await;
-    refused(listing(&[("category", "edibles")])).await;
+    refused(menu_item(&[("name", "x"), ("strain", "indica")])).await;
+    refused(menu_item(&[("category", "edibles")])).await;
     refused(MatchInput {
       limit: MAX_NEIGHBORS + 1,
-      ..listing(&LISTING)
+      ..menu_item(&MENU_ITEM)
     })
     .await;
     let at_most = MatchInput {
       limit: MAX_NEIGHBORS,
-      ..listing(&LISTING)
+      ..menu_item(&MENU_ITEM)
     };
-    assert_eq!(engine.match_listing(at_most).await.unwrap().candidates.len(), 3);
+    assert_eq!(engine.match_menu_item(at_most).await.unwrap().candidates.len(), 3);
   }
 
   #[tokio::test]
@@ -1621,7 +1632,7 @@ mod tests {
       threshold: Some(0.5),
       overfetch: 5,
     });
-    let output = engine.match_listing(listing(&LISTING)).await.unwrap();
+    let output = engine.match_menu_item(menu_item(&MENU_ITEM)).await.unwrap();
     assert_eq!(
       (output.candidates.len(), output.decision, output.fetched),
       (0, Decision::NoMatch, 0)
@@ -1641,8 +1652,8 @@ mod tests {
     for id in ["right", "wrong", "vape"] {
       before.push(stored(&engine, id).await);
     }
-    for input in [listing(&LISTING), listing(&RIGHT), listing(&VAPE)] {
-      let output = engine.match_listing(input).await.unwrap();
+    for input in [menu_item(&MENU_ITEM), menu_item(&RIGHT), menu_item(&VAPE)] {
+      let output = engine.match_menu_item(input).await.unwrap();
       assert_eq!(output.decision, Decision::Matched);
     }
     let mut after = Vec::new();
@@ -1652,7 +1663,7 @@ mod tests {
     assert_eq!(before, after);
 
     // The product's own text finds the product, unchanged in every field.
-    let own = engine.match_listing(listing(&RIGHT)).await.unwrap();
+    let own = engine.match_menu_item(menu_item(&RIGHT)).await.unwrap();
     assert_eq!(own.candidates[0].id, "right");
     assert_eq!(own.candidates[0].comparison.similarity, 1.0);
     assert!(
@@ -1670,15 +1681,15 @@ mod tests {
     let engine = engine_over(measured_schema((Some(1.5), true)), Policy::new(0.75, None).unwrap());
     engine.evaluate(measured(&[("weight", grams(1.0))])).await.unwrap();
     let ask = |quantities: Vec<(String, Quantity)>| MatchInput {
-      listing: RecordInput {
+      menu_item: RecordInput {
         quantities,
         ..record(None, &GUMMIES)
       },
       ..MatchInput::default()
     };
-    let plain = engine.match_listing(ask(Vec::new())).await.unwrap();
+    let plain = engine.match_menu_item(ask(Vec::new())).await.unwrap();
     let tenfold = engine
-      .match_listing(ask(vec![("weight".to_owned(), grams(10.0))]))
+      .match_menu_item(ask(vec![("weight".to_owned(), grams(10.0))]))
       .await
       .unwrap();
     assert_eq!(tenfold.candidates[0].comparison, plain.candidates[0].comparison);
@@ -1690,7 +1701,7 @@ mod tests {
     );
 
     let unknown = engine
-      .match_listing(ask(vec![("potency".to_owned(), grams(1.0))]))
+      .match_menu_item(ask(vec![("potency".to_owned(), grams(1.0))]))
       .await;
     assert!(matches!(unknown, Err(EngineError::InvalidArgument(_))));
   }
@@ -1699,7 +1710,7 @@ mod tests {
   #[derive(Debug, Clone, PartialEq)]
   struct Told {
     id: String,
-    tenant: Option<String>,
+    brand_id: Option<String>,
     mode: WriteMode,
     threshold: Option<f32>,
     judged_at: f32,
@@ -1722,7 +1733,7 @@ mod tests {
     fn observe(&self, observation: &Observation<'_>) {
       self.0.lock().unwrap().push(Told {
         id: observation.id.to_owned(),
-        tenant: observation.tenant.map(str::to_owned),
+        brand_id: observation.brand_id.map(str::to_owned),
         mode: observation.mode,
         threshold: observation.threshold,
         judged_at: observation.policy.threshold,
@@ -1753,7 +1764,7 @@ mod tests {
     let (engine, recorder) = observed();
     let weighed = |fields: &[(&str, &str)], mode: WriteMode, threshold: Option<f32>| EvaluateInput {
       record: RecordInput {
-        tenant: Some("brand-1".to_owned()),
+        brand_id: Some("brand-1".to_owned()),
         quantities: vec![("weight".to_owned(), grams(3.5))],
         ..record(Some("p1"), fields)
       },
@@ -1785,7 +1796,7 @@ mod tests {
     let weight: Quantities = [("weight".to_owned(), grams(3.5))].into_iter().collect();
     let told = |mode, threshold: Option<f32>, stored, revision, judged| Told {
       id: "p1".to_owned(),
-      tenant: Some("brand-1".to_owned()),
+      brand_id: Some("brand-1".to_owned()),
       mode,
       threshold,
       judged_at: threshold.unwrap_or(0.75),
@@ -1818,9 +1829,9 @@ mod tests {
       .unwrap();
     let last = recorder.told().pop().unwrap();
     assert_eq!(
-      (last.id.as_str(), last.tenant, last.stored, last.revision, last.judged),
+      (last.id.as_str(), last.brand_id, last.stored, last.revision, last.judged),
       ("p2", None, false, 0, None),
-      "and a request that names no tenant is observed with none"
+      "and a request that names no brand is observed with none"
     );
   }
 
@@ -1917,7 +1928,7 @@ mod tests {
     let (layout, dimension) = store_layout(&schema(), &embedder);
     let recorder = Arc::new(Recorder::default());
     let engine = Engine::new(
-      Slow(MemoryStore::new(layout, dimension)),
+      Slow::over(MemoryStore::new(layout, dimension)),
       embedder,
       schema(),
       Policy::new(0.0, None).unwrap(),
@@ -1947,13 +1958,15 @@ mod tests {
   }
 
   /// A verdict is a read, a judgment, and a write. Two requests for one id that interleave would both read "no
-  /// such record" and both create it, and the second would never be judged against the first: a recycle through
-  /// the gap between two requests. Each id is therefore handled by one request at a time.
+  /// such record", and the second must still be judged against the first: a recycle must not get through the gap
+  /// between two requests. The store's conditional write sees to that wherever the two requests are (D35). Within
+  /// one process the lock sees to more: each id is handled by one request at a time, so neither request ever
+  /// finds the record changed under it and has to read and judge twice.
   #[tokio::test]
   async fn two_requests_for_one_record_are_judged_one_after_the_other() {
     let embedder = WordBagEmbedder::new("word-bag-v1");
     let (layout, dimension) = store_layout(&schema(), &embedder);
-    let store = Slow(MemoryStore::new(layout, dimension));
+    let store = Slow::over(MemoryStore::new(layout, dimension));
     let engine = Engine::new(store, embedder, schema(), Policy::new(0.75, None).unwrap());
 
     let (first, second) = tokio::join!(
@@ -1974,6 +1987,11 @@ mod tests {
       engine.store.0.get("p1").await.unwrap().unwrap().revision,
       1,
       "the rejected one wrote nothing"
+    );
+    assert_eq!(
+      engine.store.reads(),
+      2,
+      "each read the record once: neither lost a race"
     );
 
     // Requests for different ids do not wait on each other, and both get their answer.
@@ -2021,7 +2039,7 @@ mod tests {
     FindSimilarInput {
       query: SimilarTo::Record(record(None, fields)),
       limit: 0,
-      tenant: None,
+      brand_id: None,
       min_similarity: None,
     }
   }
@@ -2030,7 +2048,7 @@ mod tests {
     FindSimilarInput {
       query: SimilarTo::Id(id.to_owned()),
       limit: 0,
-      tenant: None,
+      brand_id: None,
       min_similarity: None,
     }
   }
@@ -2314,66 +2332,63 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn a_record_can_gain_a_tenant_and_from_then_on_every_request_must_name_it() {
+  async fn a_record_can_gain_a_brand_and_from_then_on_every_request_must_name_it() {
     let engine = engine();
-    let with_tenant = |tenant: Option<&str>, fields: &[(&str, &str)]| EvaluateInput {
+    let with_brand = |brand_id: Option<&str>, fields: &[(&str, &str)]| EvaluateInput {
       record: RecordInput {
-        tenant: tenant.map(str::to_owned),
+        brand_id: brand_id.map(str::to_owned),
         ..record(Some("p1"), fields)
       },
       ..EvaluateInput::default()
     };
 
-    engine.evaluate(with_tenant(None, &GUMMIES)).await.unwrap();
-    let adopted = engine
-      .evaluate(with_tenant(Some("merchant-1"), &GUMMIES))
-      .await
-      .unwrap();
-    assert!(adopted.stored, "gaining a tenant is a change worth writing");
+    engine.evaluate(with_brand(None, &GUMMIES)).await.unwrap();
+    let adopted = engine.evaluate(with_brand(Some("brand-1"), &GUMMIES)).await.unwrap();
+    assert!(adopted.stored, "gaining a brand is a change worth writing");
     assert_eq!(
-      stored(&engine, "p1").await.unwrap().tenant.as_deref(),
-      Some("merchant-1")
+      stored(&engine, "p1").await.unwrap().brand_id.as_deref(),
+      Some("brand-1")
     );
 
-    let stolen = engine.evaluate(with_tenant(Some("merchant-2"), &GUMMIES)).await;
-    assert!(matches!(stolen, Err(EngineError::FailedPrecondition(message)) if message.contains("merchant-1")));
+    let stolen = engine.evaluate(with_brand(Some("brand-2"), &GUMMIES)).await;
+    assert!(matches!(stolen, Err(EngineError::FailedPrecondition(message)) if message.contains("brand-1")));
 
-    // Leaving the tenant out is not a way around the check, in any mode.
+    // Leaving the brand out is not a way around the check, in any mode.
     let before = stored(&engine, "p1").await.unwrap();
     for mode in [WriteMode::Enforce, WriteMode::DryRun, WriteMode::Force] {
       let unnamed = EvaluateInput {
         mode,
-        ..with_tenant(None, &VAPE)
+        ..with_brand(None, &VAPE)
       };
       let refused = engine.evaluate(unnamed).await;
       assert!(
-        matches!(&refused, Err(EngineError::FailedPrecondition(message)) if message.contains("names no tenant")),
+        matches!(&refused, Err(EngineError::FailedPrecondition(message)) if message.contains("names no brand")),
         "{mode:?}: {refused:?}"
       );
     }
     assert_eq!(stored(&engine, "p1").await.unwrap(), before);
 
-    let owner = engine
-      .evaluate(with_tenant(Some("merchant-1"), &GUMMIES_EDITED))
+    let by_its_brand = engine
+      .evaluate(with_brand(Some("brand-1"), &GUMMIES_EDITED))
       .await
       .unwrap();
-    assert_eq!(owner.verdict, Verdict::Accepted);
+    assert_eq!(by_its_brand.verdict, Verdict::Accepted);
   }
 
   #[tokio::test]
-  async fn deleting_a_record_that_has_a_tenant_takes_that_tenant() {
+  async fn deleting_a_record_that_has_a_brand_takes_that_brand() {
     let engine = engine();
     let owned = EvaluateInput {
       record: RecordInput {
-        tenant: Some("merchant-1".to_owned()),
+        brand_id: Some("brand-1".to_owned()),
         ..record(Some("p1"), &GUMMIES)
       },
       ..EvaluateInput::default()
     };
     engine.evaluate(owned).await.unwrap();
 
-    for tenant in [None, Some("merchant-2".to_owned())] {
-      let refused = engine.delete("p1".to_owned(), tenant).await;
+    for brand_id in [None, Some("brand-2".to_owned())] {
+      let refused = engine.delete("p1".to_owned(), brand_id).await;
       assert!(
         matches!(refused, Err(EngineError::FailedPrecondition(_))),
         "{refused:?}"
@@ -2382,7 +2397,7 @@ mod tests {
     assert!(stored(&engine, "p1").await.is_some());
     assert!(
       engine
-        .delete("p1".to_owned(), Some("merchant-1".to_owned()))
+        .delete("p1".to_owned(), Some("brand-1".to_owned()))
         .await
         .unwrap()
     );
@@ -2953,9 +2968,9 @@ mod tests {
   #[tokio::test]
   async fn a_record_that_cannot_be_imported_fails_alone() {
     let engine = measuring_engine();
-    let owned = |id: &str, tenant: &str, fields: &[(&str, &str)]| ImportInput {
+    let owned = |id: &str, brand_id: &str, fields: &[(&str, &str)]| ImportInput {
       record: RecordInput {
-        tenant: Some(tenant.to_owned()),
+        brand_id: Some(brand_id.to_owned()),
         ..record(Some(id), fields)
       },
       anchor: None,
@@ -3009,11 +3024,11 @@ mod tests {
       assert_eq!(stored(&engine, id).await, None, "{id}");
     }
     assert_eq!(
-      stored(&engine, "taken").await.unwrap().tenant.as_deref(),
+      stored(&engine, "taken").await.unwrap().brand_id.as_deref(),
       Some("brand-1")
     );
     assert_eq!(
-      stored(&engine, "good").await.unwrap().tenant.as_deref(),
+      stored(&engine, "good").await.unwrap().brand_id.as_deref(),
       Some("brand-1")
     );
     assert_eq!(
@@ -3101,7 +3116,7 @@ mod tests {
       evaluate_input(Some("  "), &GUMMIES),
       EvaluateInput {
         record: RecordInput {
-          tenant: Some(String::new()),
+          brand_id: Some(String::new()),
           ..record(Some("p1"), &GUMMIES)
         },
         ..EvaluateInput::default()
@@ -3158,6 +3173,46 @@ mod tests {
       );
       assert_eq!(stored(&engine, "p1").await, None);
     }
+  }
+
+  /// What the per-record lock is for, now that the store refuses a write over a record that changed (D35).
+  /// Without it, requests for one record in one process would all read it, one would write, and the rest would
+  /// lose, read again, and judge again, some of them until they gave up. With it, every one of them reads once
+  /// and writes once, in turn.
+  #[tokio::test]
+  async fn requests_for_one_record_in_one_process_take_turns_and_none_of_them_loses_a_race() {
+    let embedder = WordBagEmbedder::new("word-bag-v1");
+    let (layout, dimension) = store_layout(&schema(), &embedder);
+    let engine = Arc::new(Engine::new(
+      Slow::over(MemoryStore::new(layout, dimension)),
+      embedder,
+      schema(),
+      Policy::new(0.75, None).unwrap(),
+    ));
+    engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
+    let before = engine.store.reads();
+
+    // Every one of these writes, whatever it is judged against.
+    let tasks: Vec<_> = (0..32)
+      .map(|turn| {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move {
+          let fields = if turn % 2 == 0 { &VAPE } else { &GUMMIES };
+          engine
+            .evaluate(EvaluateInput {
+              mode: WriteMode::Force,
+              ..evaluate_input(Some("p1"), fields)
+            })
+            .await
+        })
+      })
+      .collect();
+    for task in tasks {
+      let output = task.await.unwrap().expect("nobody gave up");
+      assert!(output.stored);
+    }
+    assert_eq!(engine.store.0.get("p1").await.unwrap().unwrap().revision, 33);
+    assert_eq!(engine.store.reads() - before, 32, "one read for each request");
   }
 
   #[tokio::test]
@@ -3353,10 +3408,10 @@ mod tests {
       (Verdict::Accepted, false, 1)
     );
 
-    // A record of another tenant that turned up in between is another tenant's record.
-    let branded = |tenant: &str| EvaluateInput {
+    // A record of another brand that turned up in between is another brand's record.
+    let branded = |brand_id: &str| EvaluateInput {
       record: RecordInput {
-        tenant: Some(tenant.to_owned()),
+        brand_id: Some(brand_id.to_owned()),
         ..record(Some("p3"), &GUMMIES)
       },
       ..EvaluateInput::default()
@@ -3389,14 +3444,14 @@ mod tests {
     );
     assert_eq!(here.store.reads(), 3);
 
-    // Created under a tenant the import does not name, it is refused like any import of that id.
+    // Created under a brand the import does not name, it is refused like any import of that id.
     here.store.after_read(
       1,
       rival(
         &there,
         EvaluateInput {
           record: RecordInput {
-            tenant: Some("brand-1".to_owned()),
+            brand_id: Some("brand-1".to_owned()),
             ..record(Some("p2"), &GUMMIES)
           },
           ..EvaluateInput::default()
@@ -3410,20 +3465,20 @@ mod tests {
     );
   }
 
-  /// The tenant a delete has to name is the tenant of the record that is deleted (D14), not of a version of it
+  /// The brand a delete has to name is the brand of the record that is deleted (D14), not of a version of it
   /// that was read a moment earlier.
   #[tokio::test]
   async fn a_delete_is_held_to_the_record_as_it_is_when_it_is_deleted() {
     let (here, there) = replicas();
     there.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
-    // The record gains a tenant while a delete that names none is on its way.
+    // The record gains a brand while a delete that names none is on its way.
     here.store.after_read(
       0,
       rival(
         &there,
         EvaluateInput {
           record: RecordInput {
-            tenant: Some("brand-1".to_owned()),
+            brand_id: Some("brand-1".to_owned()),
             ..record(Some("p1"), &GUMMIES)
           },
           ..EvaluateInput::default()
@@ -3436,12 +3491,12 @@ mod tests {
       "{refused}"
     );
     let kept = here.store.shared().get("p1").await.unwrap().unwrap();
-    assert_eq!((kept.revision, kept.tenant.as_deref()), (2, Some("brand-1")));
+    assert_eq!((kept.revision, kept.brand_id.as_deref()), (2, Some("brand-1")));
 
     // A record that was only edited in between is still the caller's to delete, and is deleted as it is now.
     let edit = EvaluateInput {
       record: RecordInput {
-        tenant: Some("brand-1".to_owned()),
+        brand_id: Some("brand-1".to_owned()),
         ..record(Some("p1"), &GUMMIES_EDITED)
       },
       ..EvaluateInput::default()
@@ -3621,19 +3676,19 @@ mod tests {
 
   async fn seeded() -> TestEngine {
     let engine = engine();
-    let seed = |id: &str, tenant: &str, fields: &[(&str, &str)]| EvaluateInput {
+    let seed = |id: &str, brand_id: &str, fields: &[(&str, &str)]| EvaluateInput {
       record: RecordInput {
-        tenant: Some(tenant.to_owned()),
+        brand_id: Some(brand_id.to_owned()),
         ..record(Some(id), fields)
       },
       ..EvaluateInput::default()
     };
-    engine.evaluate(seed("gummies", "merchant-1", &GUMMIES)).await.unwrap();
+    engine.evaluate(seed("gummies", "brand-1", &GUMMIES)).await.unwrap();
     engine
-      .evaluate(seed("gummies-100", "merchant-2", &GUMMIES_EDITED))
+      .evaluate(seed("gummies-100", "brand-2", &GUMMIES_EDITED))
       .await
       .unwrap();
-    engine.evaluate(seed("vape", "merchant-1", &VAPE)).await.unwrap();
+    engine.evaluate(seed("vape", "brand-1", &VAPE)).await.unwrap();
     engine
   }
 
@@ -3650,7 +3705,7 @@ mod tests {
       neighbors[0].similarity > 0.75 && neighbors[1].similarity < 0.3,
       "{neighbors:?}"
     );
-    assert_eq!(neighbors[0].tenant.as_deref(), Some("merchant-2"));
+    assert_eq!(neighbors[0].brand_id.as_deref(), Some("brand-2"));
   }
 
   #[tokio::test]
@@ -3660,7 +3715,7 @@ mod tests {
     let preview = EvaluateInput {
       mode: WriteMode::DryRun,
       record: RecordInput {
-        tenant: Some("merchant-1".to_owned()),
+        brand_id: Some("brand-1".to_owned()),
         ..record(Some("gummies"), &GUMMIES_EDITED)
       },
       ..EvaluateInput::default()
@@ -3687,11 +3742,11 @@ mod tests {
     let engine = seeded().await;
     let around_gummies = || similar_to_id("gummies");
 
-    let tenant = FindSimilarInput {
-      tenant: Some("merchant-1".to_owned()),
+    let brand_id = FindSimilarInput {
+      brand_id: Some("brand-1".to_owned()),
       ..around_gummies()
     };
-    assert_eq!(ids(&engine.find_similar(tenant).await.unwrap()), ["vape"]);
+    assert_eq!(ids(&engine.find_similar(brand_id).await.unwrap()), ["vape"]);
 
     let close = FindSimilarInput {
       min_similarity: Some(0.5),
@@ -3749,12 +3804,12 @@ mod tests {
   #[tokio::test]
   async fn a_deleted_record_starts_over() {
     let engine = seeded().await;
-    let owner = || Some("merchant-1".to_owned());
-    assert!(engine.delete("gummies".to_owned(), owner()).await.unwrap());
-    assert!(!engine.delete("gummies".to_owned(), owner()).await.unwrap());
+    let brand = || Some("brand-1".to_owned());
+    assert!(engine.delete("gummies".to_owned(), brand()).await.unwrap());
+    assert!(!engine.delete("gummies".to_owned(), brand()).await.unwrap());
     assert!(
       !engine.delete("gummies".to_owned(), None).await.unwrap(),
-      "nothing stored, nothing to check a tenant against"
+      "nothing stored, nothing to check a brand against"
     );
     assert!(matches!(
       engine.delete(String::new(), None).await,

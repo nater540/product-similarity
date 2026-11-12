@@ -1,12 +1,12 @@
 # record-similarity
 
 A gRPC server (tonic) that decides whether an edit to a record is still the same record, to catch "recycled"
-marketplace listings. Each revision is embedded field by field with a small BERT-class sentence encoder (defined
+marketplace products. Each revision is embedded field by field with a small BERT-class sentence encoder (defined
 and trained in [Burn](https://burn.dev), run by ONNX Runtime), compared with the stored baseline, and accepted or
 rejected against calibrated thresholds. A record's quantities (weight, volume, potency) are compared as numbers
 beside that, never embedded. Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D35) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D36) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -67,7 +67,7 @@ changing a design. Infer conventions from the existing code first.
 - `crates/similarity-proto`: the `.proto` (the source of truth for the API, and where its docs live) and generated
   code.
 - `crates/similarity-core`: encoder, strict weight loading and saving, tokenization, composite vectors, quantities,
-  scoring, policy, and scoring a listing against stored records (`matching`). Synchronous, no I/O beyond reading and writing a model directory, no network code ever (D11).
+  scoring, policy, and scoring a menu item against stored records (`matching`). Synchronous, no I/O beyond reading and writing a model directory, no network code ever (D11).
 - `crates/similarity-store`: the `VectorStore` trait, `MemoryStore`, `QdrantStore`.
 - `crates/similarity-runs`: the local record of runs (D23): the manifest, starting and ending a run, reading runs
   back. It records and lists; it decides nothing.
@@ -94,6 +94,13 @@ changing a design. Infer conventions from the existing code first.
   holds; it may only give the anchor the first value of a field it has never had (D8). Fields present on one side
   only stay out of the score, except a `Restored` field, which is scored against the anchor. Do not "simplify"
   that away: it is what stops a field being swapped by blanking it and filling it in again.
+- **The words are the user's company's** (D36). A record's brand is its `brand_id` (never `tenant`, never
+  `owner`): the key of the brand that owns it, in the API, the store, the files, and the events. `brand` alone is
+  the scored text field that holds the brand's name. What `Match` is given is a *menu item* (`menu_item`,
+  `menu_items` in group files), never a "listing": where the owner works, a listing is a dispensary. A product
+  entry is a product or a record. The old names are refused wherever they could be read without an error and
+  mean nothing (a tolerant file format, a stored point), and reserved in the `.proto`. "The owner" in these
+  documents is the person who owns the project, and is not a name for anything in the data.
 - **Every write the engine makes is conditional on what it read** (D35). `Engine` never calls `VectorStore::put`
   or `delete`: it calls `put_if` with the version it judged against (or `Expected::Absent` for a record it found
   missing) and `delete_if`, and when one comes back `false` it has written nothing and reads and judges again,
@@ -131,7 +138,7 @@ changing a design. Infer conventions from the existing code first.
   trades a stream's speed against how long every other request waits; the README's table was measured with
   `just load`. Do not make the stream wait for a batch to fill, and do not buffer more than one batch on either
   side of the loop in `import_stream.rs`: back-pressure on the sender is the transport's job.
-- **A tenant, once stored, must be named by every later request for that id**, including `Delete` (D14).
+- **A brand, once stored, must be named by every later request for that id**, including `Delete` (D14).
 - **What a supported model directory is lives in one place**, `similarity_core::model::Pipeline`. The loader and
   `model fetch` both use it; never parse `modules.json` anywhere else.
 - **Burn 0.22 is not the Burn in older tutorials**: models are not generic over a backend, a runtime `Device`
@@ -169,8 +176,8 @@ changing a design. Infer conventions from the existing code first.
   policy: after the first rejection the baseline stops moving and the rest of the history is fiction.
   `anchor_threshold = 0.85` in `config.example.toml` is a starting point, not a measurement; do not replace it
   with a number from `data/drift.sample.jsonl`, which is synthetic.
-- **A match is a read, scored exactly** (D32). `Match` never writes, a listing is mapped onto the product schema
-  and never gets a layout of its own, and a listing that carries an `id` or a `tenant` is refused. The engine and
+- **A match is a read, scored exactly** (D32). `Match` never writes, a menu item is mapped onto the product schema
+  and never gets a layout of its own, and a menu item that carries an `id` or a `brand_id` is refused. The engine and
   `calibrate-match` both rank with `similarity_core::matching::rank`: do not score a match anywhere else, do not
   apply a floor or a quantity limit to one, and do not let a quantity move a match score or decision (D16).
   `matching.threshold` is a measurement and `config.example.toml` ships none; `matching.overfetch` is a cost that
@@ -188,7 +195,7 @@ changing a design. Infer conventions from the existing code first.
   request through `Observer`, after the outcome is final and anything it writes is written. Never give `observe`
   a return value, a way to fail the request, or anything to wait on, and never let a shadow judge with
   `Evaluation::rejudge` (the similarity to the anchor has to be computed under its own weights). The `shadow*`
-  event names are an interface like the calibration ones, and a line carries an id, a tenant, scores, and codes:
+  event names are an interface like the calibration ones, and a line carries an id, a brand, scores, and codes:
   never a record's text. `config.example.toml` ships no shadow and no number for one. A shadow measures
   agreement, not quality: do not add anything that ranks or adopts a candidate by its disagreements.
   `shadow-report` takes totals from the `shadow_summary` lines and everything else from the `shadow` lines, and
@@ -201,7 +208,7 @@ changing a design. Infer conventions from the existing code first.
   split (`record-similarity pairs carve` makes one), and the holdout is measured once, for what was chosen. Do
   not add a code path, a recipe, or a sentence in the README that picks anything by its holdout numbers. Models
   are compared by AUC (`similarity_core::separation`), never by errors at a configured threshold, which belongs
-  to the model it was measured on. Catalog groups of an owner in the validation or holdout split are not trained
+  to the model it was measured on. Catalog groups of a brand in the validation or holdout split are not trained
   on.
 - **A report computes nothing** (D28). `runs compare` and `runs report` lay out numbers from `runs::training`
   (a training run's events) and `offline::stats` (a calibration). Put a new number in one of those, never in

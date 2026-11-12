@@ -5,9 +5,9 @@
 //! - **Labeled pairs** (`pairs.full.jsonl` or `pairs.jsonl`): the before and after of one edit, labeled `edit` or
 //!   `recycle`. Each field whose text changed contributes one [`PairExample`]: the two texts should embed close
 //!   together for an edit and far apart for a recycle.
-//! - **Catalog groups** (`catalog-groups.jsonl`): merchant listings linked to the same catalog product. Each listing
-//!   contributes one [`GroupExample`] per field: its text should embed closer to its own catalog entry than to any
-//!   other catalog entry in the batch.
+//! - **Catalog groups** (`catalog-groups.jsonl`): retailers' menu items linked to the same catalog product. Each
+//!   menu item contributes one [`GroupExample`] per field: its text should embed closer to its own catalog entry
+//!   than to any other catalog entry in the batch.
 //!
 //! Everything here is plain data and deterministic given a seed; no tensors are involved.
 
@@ -29,17 +29,17 @@ pub struct PairExample {
   pub before: String,
   /// The field's text after the edit.
   pub after: String,
-  /// `true` for an ordinary edit, `false` for a recycled listing.
+  /// `true` for an ordinary edit, `false` for a recycled product.
   pub same: bool,
 }
 
-/// One field of a catalog product and of a merchant listing linked to it.
+/// One field of a catalog product and of a retailer's menu item linked to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupExample {
   /// The catalog entry's text.
   pub catalog: String,
-  /// The merchant listing's text for the same field.
-  pub listing: String,
+  /// The menu item's text for the same field.
+  pub menu_item: String,
 }
 
 /// What a pairs file yielded, and what was left out of it.
@@ -59,33 +59,55 @@ impl PairExamples {
     self.examples.iter().filter(|example| example.same).count()
   }
 
-  /// How many examples come from recycled listings.
+  /// How many examples come from recycled products.
   pub fn recycles(&self) -> usize {
     self.examples.len().saturating_sub(self.edits())
   }
+}
+
+/// Refuses `owner`, the name `brand_id` had in these files until 2026-11-12. Unknown keys are ignored here, so a
+/// file from before would otherwise be read as one whose lines have no brand, and the brands held back for
+/// measuring would be trained on.
+fn owner_is_now_brand_id<'de, D: serde::Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+  Err(serde::de::Error::custom(
+    "the key `owner` is now `brand_id`: rename it in the file",
+  ))
+}
+
+/// The same for `listings`, which is `menu_items` now.
+fn listings_are_now_menu_items<'de, D: serde::Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+  Err(serde::de::Error::custom(
+    "the key `listings` is now `menu_items`: rename it in the file",
+  ))
 }
 
 // Unknown keys are ignored on purpose: `pairs.full.jsonl` carries a dozen bookkeeping keys per line, and extra
 // fields per record, that only matter to whoever assembled it.
 #[derive(Deserialize)]
 struct PairLine {
+  #[serde(default, rename = "owner", deserialize_with = "owner_is_now_brand_id")]
+  _owner: (),
   label: String,
   #[serde(default)]
   split: Option<String>,
   #[serde(default)]
-  owner: Option<String>,
+  brand_id: Option<String>,
   before: BTreeMap<String, Value>,
   after: BTreeMap<String, Value>,
 }
 
 #[derive(Deserialize)]
 struct GroupLine {
+  #[serde(default, rename = "owner", deserialize_with = "owner_is_now_brand_id")]
+  _owner: (),
+  #[serde(default, rename = "listings", deserialize_with = "listings_are_now_menu_items")]
+  _listings: (),
   #[serde(default)]
-  owner: Option<String>,
+  brand_id: Option<String>,
   #[serde(default)]
   split: Option<String>,
   catalog: BTreeMap<String, Value>,
-  listings: Vec<BTreeMap<String, Value>>,
+  menu_items: Vec<BTreeMap<String, Value>>,
 }
 
 /// A field's text in the form the server embeds it: whitespace collapsed, `None` if absent, blank, or not a string.
@@ -180,7 +202,7 @@ pub fn pair_examples(jsonl: &str, origin: &Path, fields: &[String], split: Split
   Ok(found)
 }
 
-/// The owners of every pair assigned to one of `splits`.
+/// The brands of every pair assigned to one of `splits`.
 ///
 /// These are the brands a model is to be measured on, so nothing of theirs may be trained on: not their pairs,
 /// which the split already keeps out, and not their catalog groups, which have no split of their own.
@@ -188,12 +210,12 @@ pub fn pair_examples(jsonl: &str, origin: &Path, fields: &[String], split: Split
 /// # Errors
 ///
 /// Returns [`TrainError::Data`] naming the line if a line is not a JSON object with `label`, `before`, and `after`.
-pub fn owners_in(jsonl: &str, origin: &Path, splits: &[&str]) -> Result<BTreeSet<String>> {
+pub fn brands_in(jsonl: &str, origin: &Path, splits: &[&str]) -> Result<BTreeSet<String>> {
   Ok(
     parse_lines::<PairLine>(jsonl, origin)?
       .into_iter()
       .filter(|line| line.split.as_deref().is_some_and(|split| splits.contains(&split)))
-      .filter_map(|line| line.owner)
+      .filter_map(|line| line.brand_id)
       .collect(),
   )
 }
@@ -203,24 +225,24 @@ pub fn owners_in(jsonl: &str, origin: &Path, splits: &[&str]) -> Result<BTreeSet
 pub struct GroupExamples {
   /// The usable examples.
   pub examples: Vec<GroupExample>,
-  /// Groups left out because their owner is one a model is measured on, or because they are themselves in a
+  /// Groups left out because their brand is one a model is measured on, or because they are themselves in a
   /// split that is.
   pub excluded_groups: usize,
-  /// Groups that name no owner. They are trained on, since there is nothing to check them against.
-  pub groups_without_owner: usize,
+  /// Groups that name no brand. They are trained on, since there is nothing to check them against.
+  pub groups_without_brand: usize,
 }
 
-/// Turns catalog groups into per-field (catalog text, listing text) examples.
+/// Turns catalog groups into per-field (catalog text, menu item text) examples.
 ///
-/// A listing whose text is identical to the catalog's is left out: it is already at similarity 1. A group whose
-/// `owner` is in `exclude` is left out whole: a brand whose pairs are held back for measuring must not be learned
+/// A menu item whose text is identical to the catalog's is left out: it is already at similarity 1. A group whose
+/// `brand_id` is in `exclude` is left out whole: a brand whose pairs are held back for measuring must not be learned
 /// from through its catalog either, or the measurement is of something the model has seen. So is a group whose
 /// own `split` is one of `held_out`: those are the groups a match threshold is measured on (`calibrate-match`).
 /// A group with no `split` is training data, as a pair with none is.
 ///
 /// # Errors
 ///
-/// Returns [`TrainError::Data`] naming the line if a line is not a JSON object with `catalog` and `listings`.
+/// Returns [`TrainError::Data`] naming the line if a line is not a JSON object with `catalog` and `menu_items`.
 pub fn group_examples(
   jsonl: &str,
   origin: &Path,
@@ -234,26 +256,26 @@ pub fn group_examples(
       found.excluded_groups = found.excluded_groups.saturating_add(1);
       continue;
     }
-    match &line.owner {
-      Some(owner) if exclude.contains(owner) => {
+    match &line.brand_id {
+      Some(brand_id) if exclude.contains(brand_id) => {
         found.excluded_groups = found.excluded_groups.saturating_add(1);
         continue;
       }
       Some(_) => {}
-      None => found.groups_without_owner = found.groups_without_owner.saturating_add(1),
+      None => found.groups_without_brand = found.groups_without_brand.saturating_add(1),
     }
     let examples = &mut found.examples;
     for field in fields {
       let Some(catalog) = field_text(&line.catalog, field) else {
         continue;
       };
-      for listing in &line.listings {
-        if let Some(listing) = field_text(listing, field)
-          && listing != catalog
+      for menu_item in &line.menu_items {
+        if let Some(menu_item) = field_text(menu_item, field)
+          && menu_item != catalog
         {
           examples.push(GroupExample {
             catalog: catalog.clone(),
-            listing,
+            menu_item,
           });
         }
       }
@@ -288,7 +310,7 @@ impl Batch {
 /// Splits `order` into batches of at most `batch_size` in which no text appears twice.
 ///
 /// `texts` gives the two texts of each example. The ranking loss treats every other example in the batch as a
-/// negative, so a batch holding the same catalog entry twice would be told that two listings of one product must
+/// negative, so a batch holding the same catalog entry twice would be told that two menu items of one product must
 /// embed apart, which is exactly the opposite of what the data says. An example that collides with one already in
 /// the batch is deferred to a later batch rather than dropped, so every example is used exactly once per pass.
 fn batches_without_duplicates(texts: &[(&str, &str)], order: Vec<usize>, batch_size: usize) -> Vec<Vec<usize>> {
@@ -327,14 +349,14 @@ fn batches_without_duplicates(texts: &[(&str, &str)], order: Vec<usize>, batch_s
 /// rather than all of one and then all of the other.
 ///
 /// Only catalog groups are kept free of repeated texts. The contrastive loss scores each pair on its own, so a
-/// text appearing in two pairs of a batch is harmless, and labeled pairs repeat texts by nature (the same listing
+/// text appearing in two pairs of a batch is harmless, and labeled pairs repeat texts by nature (the same menu item
 /// as the "before" of an edit and of a recycle).
 ///
 /// A catalog batch that would hold a single example is left out of the pass. With nothing to rank it against, its
 /// loss and gradient are exactly zero, so it teaches nothing; but an optimizer step on it would still move the
 /// weights along whatever momentum the earlier steps left, and would use up a step of the learning-rate schedule.
-/// Such batches appear when one catalog entry has far more listings than the rest. The order is reshuffled every
-/// pass, so over several passes different listings of that entry are the ones left out.
+/// Such batches appear when one catalog entry has far more menu items than the rest. The order is reshuffled every
+/// pass, so over several passes different menu items of that entry are the ones left out.
 pub fn epoch(pairs: &[PairExample], groups: &[GroupExample], batch_size: usize, rng: &mut Rng) -> Vec<Batch> {
   let mut shuffled = |count: usize| {
     let mut order: Vec<usize> = (0..count).collect();
@@ -346,7 +368,7 @@ pub fn epoch(pairs: &[PairExample], groups: &[GroupExample], batch_size: usize, 
 
   let group_texts: Vec<(&str, &str)> = groups
     .iter()
-    .map(|example| (example.catalog.as_str(), example.listing.as_str()))
+    .map(|example| (example.catalog.as_str(), example.menu_item.as_str()))
     .collect();
 
   let mut batches: Vec<Batch> = pair_order
@@ -457,7 +479,7 @@ mod tests {
 
     let groups = concat!(
       r#"{"catalog": {"name": "Blue Dream", "weight_per_item": {"value": 3.5, "unit": "g"}}, "#,
-      r#""listings": [{"name": "Blue Dream Eighth", "weight_per_item": {"value": 0.125, "unit": "oz"}}]}"#
+      r#""menu_items": [{"name": "Blue Dream Eighth", "weight_per_item": {"value": 0.125, "unit": "oz"}}]}"#
     );
     let found = group_examples(
       groups,
@@ -469,7 +491,7 @@ mod tests {
     .unwrap()
     .examples;
     assert_eq!(found.len(), 1);
-    assert_eq!(found[0].listing, "Blue Dream Eighth");
+    assert_eq!(found[0].menu_item, "Blue Dream Eighth");
   }
 
   #[test]
@@ -502,10 +524,10 @@ mod tests {
   }
 
   #[test]
-  fn each_listing_of_a_catalog_group_pairs_with_the_catalog_entry() {
+  fn each_menu_item_of_a_catalog_group_pairs_with_the_catalog_entry() {
     let jsonl = concat!(
       r#"{"group": "g1", "catalog": {"name": "Wyld Blueberry Gummies"}, "#,
-      r#""listings": [{"name": "WYLD blueberry"}, {"name": "Wyld Blueberry Gummies"}, {"brand": "Wyld"}]}"#
+      r#""menu_items": [{"name": "WYLD blueberry"}, {"name": "Wyld Blueberry Gummies"}, {"brand": "Wyld"}]}"#
     );
     let examples = group_examples(
       jsonl,
@@ -516,12 +538,12 @@ mod tests {
     )
     .unwrap()
     .examples;
-    // The second listing is identical to the catalog entry and the third has no name.
+    // The second menu item is identical to the catalog entry and the third has no name.
     assert_eq!(
       examples,
       [GroupExample {
         catalog: "Wyld Blueberry Gummies".to_owned(),
-        listing: "WYLD blueberry".to_owned()
+        menu_item: "WYLD blueberry".to_owned()
       }]
     );
   }
@@ -542,7 +564,7 @@ mod tests {
 
   #[test]
   fn no_batch_holds_the_same_text_twice_and_every_example_is_used_once() {
-    // Three listings of one catalog entry, two of another: the ranking loss must never see two in one batch.
+    // Three menu items of one catalog entry, two of another: the ranking loss must never see two in one batch.
     let texts = [
       ("a", "a1"),
       ("a", "a2"),
@@ -566,7 +588,7 @@ mod tests {
         );
       }
     }
-    // Example 5 shares a listing text with example 0, so it waits for the second batch, where it fits.
+    // Example 5 shares a menu item text with example 0, so it waits for the second batch, where it fits.
     assert_eq!(batches, [vec![0, 3], vec![1, 4, 5], vec![2]]);
   }
 
@@ -582,7 +604,7 @@ mod tests {
     let groups: Vec<GroupExample> = (0..7)
       .map(|index| GroupExample {
         catalog: format!("catalog {index}"),
-        listing: format!("listing {index}"),
+        menu_item: format!("menu item {index}"),
       })
       .collect();
 
@@ -607,18 +629,18 @@ mod tests {
   fn pairs_that_share_a_text_still_fill_a_batch_but_catalog_examples_do_not() {
     let pairs: Vec<PairExample> = (0..4)
       .map(|index| PairExample {
-        before: "the same listing".to_owned(),
+        before: "the same menu item".to_owned(),
         after: format!("after {index}"),
         same: true,
       })
       .collect();
     assert_eq!(epoch(&pairs, &[], 4, &mut Rng::new(3)).len(), 1);
 
-    // Two listings each of two catalog entries: a batch can hold one listing of each entry, never two of one.
+    // Two menu items each of two catalog entries: a batch can hold one menu item of each entry, never two of one.
     let groups: Vec<GroupExample> = (0..4)
       .map(|index| GroupExample {
         catalog: format!("catalog entry {}", index % 2),
-        listing: format!("listing {index}"),
+        menu_item: format!("menu item {index}"),
       })
       .collect();
     let batches = epoch(&[], &groups, 4, &mut Rng::new(3));
@@ -627,7 +649,7 @@ mod tests {
 
   #[test]
   fn a_catalog_example_with_nothing_to_rank_against_is_left_out_of_the_pass() {
-    // Five listings of one entry and one of another: only one batch can hold two examples.
+    // Five menu items of one entry and one of another: only one batch can hold two examples.
     let groups: Vec<GroupExample> = (0..6)
       .map(|index| GroupExample {
         catalog: if index == 0 {
@@ -636,7 +658,7 @@ mod tests {
           "the common entry"
         }
         .to_owned(),
-        listing: format!("listing {index}"),
+        menu_item: format!("menu item {index}"),
       })
       .collect();
     let batches = epoch(&[], &groups, 4, &mut Rng::new(3));
@@ -651,27 +673,55 @@ mod tests {
     assert!(epoch(&[], &[], 8, &mut Rng::new(0)).is_empty());
   }
 
+  /// The names these files had until 2026-11-12 are refused, not ignored. Ignored, a brand's `owner` would leave
+  /// its lines with no brand, and a brand held back for measuring would be trained on.
+  #[test]
+  fn the_names_from_before_are_refused_in_pairs_and_in_groups() {
+    let origin = Path::new("old.jsonl");
+    let pair =
+      r#"{"label": "edit", "split": "holdout", "owner": "brand-1", "before": {"name": "a"}, "after": {"name": "b"}}"#;
+    let error = brands_in(pair, origin, &["holdout"]).unwrap_err().to_string();
+    assert!(error.contains("`owner` is now `brand_id`"), "{error}");
+
+    let fields = ["name".to_owned()];
+    for (group, expected) in [
+      (
+        r#"{"owner": "brand-1", "catalog": {"name": "gummies"}, "menu_items": [{"name": "gummies 100mg"}]}"#,
+        "`owner` is now `brand_id`",
+      ),
+      (
+        r#"{"brand_id": "brand-1", "catalog": {"name": "gummies"}, "listings": [{"name": "gummies 100mg"}]}"#,
+        "`listings` is now `menu_items`",
+      ),
+    ] {
+      let error = group_examples(group, origin, &fields, &BTreeSet::new(), &[])
+        .unwrap_err()
+        .to_string();
+      assert!(error.contains(expected), "{error}");
+    }
+  }
+
   /// A brand held back for measuring must not be learned from through its catalog either.
   #[test]
-  fn catalog_groups_of_an_owner_that_is_measured_on_are_left_out_whole() {
+  fn catalog_groups_of_a_brand_that_is_measured_on_are_left_out_whole() {
     let pairs = concat!(
-      r#"{"label": "edit", "split": "calibrate", "owner": "brand-1", "before": {"name": "a"}, "after": {"name": "b"}}"#,
+      r#"{"label": "edit", "split": "calibrate", "brand_id": "brand-1", "before": {"name": "a"}, "after": {"name": "b"}}"#,
       "\n",
-      r#"{"label": "edit", "split": "validation", "owner": "brand-2", "before": {"name": "a"}, "after": {"name": "b"}}"#,
+      r#"{"label": "edit", "split": "validation", "brand_id": "brand-2", "before": {"name": "a"}, "after": {"name": "b"}}"#,
       "\n",
-      r#"{"label": "recycle", "split": "holdout", "owner": "brand-3", "before": {"name": "a"}, "after": {"name": "b"}}"#,
+      r#"{"label": "recycle", "split": "holdout", "brand_id": "brand-3", "before": {"name": "a"}, "after": {"name": "b"}}"#,
       "\n",
       r#"{"label": "edit", "split": "holdout", "before": {"name": "a"}, "after": {"name": "b"}}"#,
     );
-    let measured_on = owners_in(pairs, Path::new("pairs.jsonl"), &["validation", "holdout"]).unwrap();
+    let measured_on = brands_in(pairs, Path::new("pairs.jsonl"), &["validation", "holdout"]).unwrap();
     assert_eq!(
       measured_on.iter().map(String::as_str).collect::<Vec<_>>(),
       ["brand-2", "brand-3"]
     );
 
-    let group = |owner: Option<&str>, name: &str| {
-      let owner = owner.map_or_else(String::new, |owner| format!(r#""owner": "{owner}", "#));
-      format!(r#"{{{owner}"catalog": {{"name": "{name}"}}, "listings": [{{"name": "{name} 100mg"}}]}}"#)
+    let group = |brand_id: Option<&str>, name: &str| {
+      let brand_id = brand_id.map_or_else(String::new, |brand_id| format!(r#""brand_id": "{brand_id}", "#));
+      format!(r#"{{{brand_id}"catalog": {{"name": "{name}"}}, "menu_items": [{{"name": "{name} 100mg"}}]}}"#)
     };
     let groups = [
       group(Some("brand-1"), "gummies"),
@@ -690,7 +740,7 @@ mod tests {
     .unwrap();
     let kept: Vec<&str> = found.examples.iter().map(|example| example.catalog.as_str()).collect();
     assert_eq!(kept, ["gummies", "tincture"]);
-    assert_eq!((found.excluded_groups, found.groups_without_owner), (2, 1));
+    assert_eq!((found.excluded_groups, found.groups_without_brand), (2, 1));
   }
 
   /// A group can say which split it is in itself. The held-out ones are what a match threshold is measured on
@@ -700,7 +750,7 @@ mod tests {
     let group = |split: Option<&str>, name: &str| {
       let split = split.map_or_else(String::new, |split| format!(r#""split": "{split}", "#));
       format!(
-        r#"{{{split}"owner": "brand-9", "catalog": {{"name": "{name}"}}, "listings": [{{"name": "{name} 10pk"}}]}}"#
+        r#"{{{split}"brand_id": "brand-9", "catalog": {{"name": "{name}"}}, "menu_items": [{{"name": "{name} 10pk"}}]}}"#
       )
     };
     let groups = [
@@ -720,7 +770,7 @@ mod tests {
     .unwrap();
     let kept: Vec<&str> = found.examples.iter().map(|example| example.catalog.as_str()).collect();
     assert_eq!(kept, ["gummies", "tincture"]);
-    assert_eq!((found.excluded_groups, found.groups_without_owner), (2, 0));
+    assert_eq!((found.excluded_groups, found.groups_without_brand), (2, 0));
 
     let all = group_examples(
       &groups,

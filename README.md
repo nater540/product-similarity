@@ -2,7 +2,7 @@
 
 A gRPC service that answers one question about an edit to a record: **is this still the same record?**
 
-Marketplace listings get "recycled": a merchant takes an existing product, say a blueberry gummy, and edits it into
+Marketplace products get "recycled": a brand takes an existing product, say a blueberry gummy, and edits it into
 an entirely different one, keeping the id and everything attached to it (reviews, rankings, history). This service
 embeds each revision of a record field by field with a small sentence-embedding model, compares it with the
 stored version, and accepts or rejects the change. The model is defined, loaded, and fine-tuned in Rust with
@@ -143,9 +143,9 @@ Check that it works, from another terminal:
 
 ```sh
 just client describe
-just client evaluate sku-1 data/examples/gummies.json --tenant merchant-1
-just client evaluate sku-1 data/examples/gummies-edited.json --tenant merchant-1
-just client evaluate sku-1 data/examples/vape.json --tenant merchant-1
+just client evaluate sku-1 data/examples/gummies.json --brand-id brand-1
+just client evaluate sku-1 data/examples/gummies-edited.json --brand-id brand-1
+just client evaluate sku-1 data/examples/vape.json --brand-id brand-1
 just client similar sku-1
 ```
 
@@ -183,12 +183,12 @@ starts. The steps, in order:
 2. 300 products from 12 brands, created over one `Import` stream.
 3. The same load again: nothing is created and nothing is touched.
 4. An ordinary edit, as a dry run and then enforced: accepted.
-5. A listing recycled for a different product: rejected, and the stored product shown to be as it was.
+5. A product recycled for a different one: rejected, and the stored product shown to be as it was.
 6. The same kind of swap made in five small edits. Four are accepted. The fifth changes one word, scores 0.941
    against the stored product, and is rejected for how far the product has moved from where it started.
 7. The same text with ten times the THC: the quantity is reported beside text that scores 1.000.
-8. An edit that names another brand's tenant: refused.
-9. A retailer's listing with no id, matched to the catalog.
+8. An edit that names another brand: refused.
+9. A retailer's menu item with no id, matched to the catalog.
 10. The nearest neighbors of a stored product.
 
 Two of them, from a run against the server above on the laptop that [Performance](#performance) describes:
@@ -250,7 +250,7 @@ The binary is `record-similarity` (`target/release/record-similarity` after `jus
 | `record-similarity calibrate-sweep SELECT.ndjson --grid GRID.toml [--config config.toml] [--evaluate OTHER.ndjson]` | Judges one recorded calibration under a grid of weights, floors, and limits. See [Trying many configurations at once](#trying-many-configurations-at-once). |
 | `record-similarity runs list [--runs DIR] [--kind KIND] [--limit N]` | Lists what was recorded: every calibration and every training run. See [Recorded runs](#recorded-runs). |
 | `record-similarity runs compare A B`, `runs report A [B ...] [--out report.html]` | Compares two recorded runs as text, or writes an HTML page for up to six. See [Recorded runs](#recorded-runs). |
-| `record-similarity pairs carve PAIRS.jsonl --fraction F [--from S] [--into S] [--salt TEXT]` | Gives a share of one split's owners a split of their own. See [Choose a model, then measure it once](#3-choose-a-model-then-measure-it-once). |
+| `record-similarity pairs carve PAIRS.jsonl --fraction F [--from S] [--into S] [--salt TEXT]` | Gives a share of one split's brands a split of their own. See [Choose a model, then measure it once](#3-choose-a-model-then-measure-it-once). |
 | `record-similarity load [--config config.toml] [--server URL] [--concurrency 1,4,16] [--records N]` | Measures latency and throughput through the API with synthetic records. See [Under concurrent callers](#under-concurrent-callers). |
 
 Environment variables:
@@ -298,13 +298,13 @@ The API is defined, with full documentation of every field, in
 | RPC | What it does |
 |---|---|
 | `Evaluate` | Embeds a record. With an `id`, compares it with the stored baseline, returns a verdict with per-field detail, and stores it if allowed. |
-| `FindSimilar` | Returns the stored records most similar to a stored id or to an ad hoc record, optionally within one tenant. |
+| `FindSimilar` | Returns the stored records most similar to a stored id or to an ad hoc record, optionally within one brand. |
 | `Import` | Streaming. Creates every record of a stream that is not stored yet and answers each one; a record that is stored is left exactly alone. |
-| `Match` | Returns the stored records a listing from elsewhere describes, best first, each scored over the fields both sides have, and says whether the best is a match. Stores nothing. |
+| `Match` | Returns the stored records a menu item from elsewhere describes, best first, each scored over the fields both sides have, and says whether the best is a match. Stores nothing. |
 | `Delete` | Forgets a record. |
 | `Describe` | Reports the model fingerprint, schema, and thresholds in force. |
 
-A record is an optional `id`, an optional `tenant`, a map of field name to text, and a map of quantity name to
+A record is an optional `id`, an optional `brand_id`, a map of field name to text, and a map of quantity name to
 quantity. The names must be ones the server's schema defines; `Describe` lists both kinds.
 
 **Quantities.** A quantity is `{min, max, unit}`. A single value is sent with `min` equal to `max`, and so is a
@@ -314,11 +314,11 @@ range of which only one end is known. `unit` is free text: mass (`mcg`, `mg`, `g
 finite, not negative, and `min` not above `max`. A quantity is never sent as text in `fields`, and a quantity the
 record does not have is left out. [Mapping your records](#mapping-your-records) shows where each column goes.
 
-**Tenants.** Once a record is stored under a tenant, every later `Evaluate` or `Delete` for its id must name the
-same tenant. A request naming another tenant, or none, gets `FAILED_PRECONDITION`. A record stored without a
-tenant takes the tenant of the first revision that names one. This catches a caller applying one merchant's edit
-to another merchant's record. It is a consistency check, not access control: the server does not authenticate
-its callers. If you use tenants at all, send one with every request.
+**Brands.** Once a record is stored under a brand, every later `Evaluate` or `Delete` for its id must name the
+same brand. A request naming another brand, or none, gets `FAILED_PRECONDITION`. A record stored without a
+brand takes the brand of the first revision that names one. This catches a caller applying one brand's edit
+to another brand's record. It is a consistency check, not access control: the server does not authenticate
+its callers. If you use brands at all, send one with every request.
 
 ### With the bundled client
 
@@ -327,11 +327,11 @@ The quickest way to poke a server. It is also a small, complete example of a Rus
 
 ```sh
 just client describe
-just client evaluate <id> <fields.json> [--tenant T] [--dry-run | --force]
+just client evaluate <id> <fields.json> [--brand-id T] [--dry-run | --force]
 just client similar <id> [--limit N]
 just client import <export.jsonl>
-just client match <listing.json> [--tenant T] [--limit N] [--threshold S]
-just client delete <id> [--tenant T]
+just client match <menu-item.json> [--brand-id T] [--limit N] [--threshold S]
+just client delete <id> [--brand-id T]
 just client --server http://other-host:50051 describe
 ```
 
@@ -366,7 +366,7 @@ Create a record (the first `Evaluate` for an id stores it as the baseline):
 grpcurl -plaintext -d '{
   "record": {
     "id": "sku-1",
-    "tenant": "merchant-1",
+    "brand_id": "brand-1",
     "fields": {
       "name": "Blueberry Gummies 100mg",
       "category": "Edibles > Gummies",
@@ -396,7 +396,7 @@ Preview what would happen to an edit, without storing anything:
 grpcurl -plaintext -d '{
   "record": {
     "id": "sku-1",
-    "tenant": "merchant-1",
+    "brand_id": "brand-1",
     "fields": {
       "name": "Sour Diesel Vape Cartridge 1g",
       "category": "Vape Pens > Cartridges",
@@ -452,28 +452,28 @@ Other requests:
 
 ```sh
 # Store a change regardless of the verdict (a reviewer approved it). Also resets the drift anchor.
-grpcurl -plaintext -d '{"record": {"id": "sku-1", "tenant": "merchant-1", "fields": {"name": "OG Kush Pre-Roll 1g"}}, "mode": "WRITE_MODE_FORCE"}' \
+grpcurl -plaintext -d '{"record": {"id": "sku-1", "brand_id": "brand-1", "fields": {"name": "OG Kush Pre-Roll 1g"}}, "mode": "WRITE_MODE_FORCE"}' \
   localhost:50051 recordsimilarity.v1.RecordSimilarity/Evaluate
 
 # Embed only: no id, nothing compared or stored. `return_vector` returns the vector.
 grpcurl -plaintext -d '{"record": {"fields": {"name": "Blueberry Gummies"}}, "return_vector": true}' \
   localhost:50051 recordsimilarity.v1.RecordSimilarity/Evaluate
 
-# The stored records most similar to a stored one, within one tenant.
-grpcurl -plaintext -d '{"id": "sku-1", "limit": 5, "tenant": "merchant-1"}' \
+# The stored records most similar to a stored one, within one brand.
+grpcurl -plaintext -d '{"id": "sku-1", "limit": 5, "brand_id": "brand-1"}' \
   localhost:50051 recordsimilarity.v1.RecordSimilarity/FindSimilar
 
 # The stored records most similar to text that is not stored.
 grpcurl -plaintext -d '{"record": {"fields": {"name": "blueberry gummy 100 mg"}}, "limit": 3, "min_similarity": 0.5}' \
   localhost:50051 recordsimilarity.v1.RecordSimilarity/FindSimilar
 
-# Which stored records a listing from elsewhere describes. The listing goes under `listing`, where the calls
-# above have `record`, and carries no `id` and no `tenant`. A client that drops keys it does not know sends an
-# empty request for any other shape, and is answered "`listing` is required".
-grpcurl -plaintext -d '{"listing": {"fields": {"name": "Blueberry Indica Gummies 100mg (10pk)"}}, "limit": 1}' \
+# Which stored records a menu item from elsewhere describes. The menu item goes under `menu_item`, where the calls
+# above have `record`, and carries no `id` and no `brand_id`. A client that drops keys it does not know sends an
+# empty request for any other shape, and is answered "`menu_item` is required".
+grpcurl -plaintext -d '{"menu_item": {"fields": {"name": "Blueberry Indica Gummies 100mg (10pk)"}}, "limit": 1}' \
   localhost:50051 recordsimilarity.v1.RecordSimilarity/Match
 
-grpcurl -plaintext -d '{"id": "sku-1", "tenant": "merchant-1"}' localhost:50051 recordsimilarity.v1.RecordSimilarity/Delete
+grpcurl -plaintext -d '{"id": "sku-1", "brand_id": "brand-1"}' localhost:50051 recordsimilarity.v1.RecordSimilarity/Delete
 
 # Health, as a load balancer would ask.
 grpcurl -plaintext -d '{"service": "recordsimilarity.v1.RecordSimilarity"}' localhost:50051 grpc.health.v1.Health/Check
@@ -493,7 +493,7 @@ let mut client = RecordSimilarityClient::connect("http://127.0.0.1:50051").await
 let request = pb::EvaluateRequest {
   record: Some(pb::Record {
     id: Some("sku-1".to_owned()),
-    tenant: Some("merchant-1".to_owned()),
+    brand_id: Some("brand-1".to_owned()),
     fields: [("name".to_owned(), "Blueberry Gummies 100mg".to_owned())].into(),
     quantities: [(
       "weight_per_item".to_owned(),
@@ -534,7 +534,7 @@ from recordsimilarity.v1 import similarity_pb2 as pb, similarity_pb2_grpc as rpc
 client = rpc.RecordSimilarityStub(grpc.insecure_channel("127.0.0.1:50051"))
 record = pb.Record(
     id="sku-1",
-    tenant="merchant-1",
+    brand_id="brand-1",
     fields={"name": "Blueberry Gummies 100mg"},
     quantities={"weight_per_item": pb.Quantity(min=80, max=80, unit="g")},
 )
@@ -625,7 +625,7 @@ record: an accepted one is stored and counts as a revision.
 |---|---|---|
 | `INVALID_ARGUMENT` | The record does not fit the schema (unknown field or quantity, missing required field, blank id, a quantity that is negative, not finite, has `min` above `max`, or has no unit), a parameter is out of range, or `mode` is a value this server does not know. | Fix the request. Retrying will not help. |
 | `NOT_FOUND` | `FindSimilar` by an id that is not stored. | |
-| `FAILED_PRECONDITION` | The stored record belongs to a tenant the request does not name (it names another, or none), or was written under a different model or field set. | Send the record's tenant, or see [Re-indexing](#re-indexing). |
+| `FAILED_PRECONDITION` | The stored record belongs to a brand the request does not name (it names another, or none), or was written under a different model or field set. | Send the record's brand, or see [Re-indexing](#re-indexing). |
 | `RESOURCE_EXHAUSTED` | The embedding queue is full. | Retry with backoff. |
 | `ABORTED` | Another writer changed the record each of the four times this request had judged it and gone to write. That takes another server working on the same record at the same instant, four times running. | Send the request again as it is. |
 | `UNAVAILABLE` | Qdrant cannot be reached. | Retry with backoff. |
@@ -645,7 +645,7 @@ after, and what never to do.
 
 **At edit time.**
 
-1. While the merchant is editing, optionally call `Evaluate` with `WRITE_MODE_DRY_RUN` to warn them early.
+1. While someone is editing, optionally call `Evaluate` with `WRITE_MODE_DRY_RUN` to warn them early.
 2. When they save, call `Evaluate` in the default mode. On `ACCEPTED` or `CREATED`, save the edit; the service has
    already stored the new baseline.
 3. On `REJECTED`, do not save. Show the `reasons`, or route the edit to a human reviewer.
@@ -665,7 +665,7 @@ brand's product record, with the example configuration:
 
 | On the record | In the request | Notes |
 |---|---|---|
-| Brand foreign key | `tenant`, as a string | The tenant is the brand that owns the product. A product moving to another brand is then refused by the tenant check. |
+| Brand foreign key | `brand_id`, as a string | The brand that owns the product. A product moving to another brand is then refused by the brand check. |
 | Brand name, looked up from the key | `fields["brand"]` | The same for every product of a brand, so it rarely moves a score. |
 | Root and sub category, through the join | `fields["category"]`, for example `Edibles > Gummies` | See the two rules below. |
 | `name`, `description` | `fields["name"]`, `fields["description"]` | Sent as stored. Do not trim or clean them; the service normalizes whitespace itself. |
@@ -693,13 +693,13 @@ Rules for the caller:
 ### Creating records over a stream
 
 `Import` creates records that are not stored yet, as many as the caller sends, over one call: new products from
-a nightly sync, a merchant's whole catalog on the day it is onboarded, or everything, for a caller that cannot
+a nightly sync, a brand's whole catalog on the day it is onboarded, or everything, for a caller that cannot
 run the `import` command beside Qdrant. The caller streams records and gets one answer for each, in order.
 
 ```json
-{"id": "sku-1", "tenant": "merchant-1", "record": {"name": "Blueberry Gummies 100mg", "category": "Edibles > Gummies", "weight_per_item": {"value": 40, "unit": "g"}}}
-{"id": "sku-2", "tenant": "merchant-1", "record": {"name": "Peach Gummies 100mg", "category": "Edibles > Gummies"}, "anchor": {"name": "Peach Gummies"}}
-{"id": "sku-3", "tenant": "merchant-2", "record": {"name": "Sour Diesel Vape Cartridge 1g", "strain": "sativa"}}
+{"id": "sku-1", "brand_id": "brand-1", "record": {"name": "Blueberry Gummies 100mg", "category": "Edibles > Gummies", "weight_per_item": {"value": 40, "unit": "g"}}}
+{"id": "sku-2", "brand_id": "brand-1", "record": {"name": "Peach Gummies 100mg", "category": "Edibles > Gummies"}, "anchor": {"name": "Peach Gummies"}}
+{"id": "sku-3", "brand_id": "brand-2", "record": {"name": "Sour Diesel Vape Cartridge 1g", "strain": "sativa"}}
 ```
 
 ```text
@@ -729,7 +729,7 @@ the call is `Import(stream ImportRequest) returns (stream ImportResponse)`.)
   today's new products is sent whole, and only the new ones reach the model.
 - **One record failing does not end the stream.** It is answered `FAILED`, with the status code the same record
   would have got from `Evaluate` (`INVALID_ARGUMENT`, or `FAILED_PRECONDITION` for an id stored under another
-  tenant) and the reason, and the next record is taken. The tenant rule holds as everywhere.
+  brand) and the reason, and the next record is taken. The brand rule holds as everywhere.
 - **`anchor` is the record as it was first created**, if you still have that. Drift is then measured from it and
   not from the record as it is today, exactly as for the `import` command.
 - **Answers come in batches.** The server takes whatever has arrived, up to `server.import_batch_records` (8),
@@ -746,24 +746,24 @@ the call is `Import(stream ImportRequest) returns (stream ImportResponse)`.)
   | 2 | 285 | 1.6 ms | 7.4 ms | 10.7 ms |
   | 1 | 220 | 1.6 ms | 5.5 ms | 8.7 ms |
 
-  A merchant's save takes 18 ms instead of 2 ms while a bulk load is running at the default. Nothing was refused
-  in any of these runs. If that is too slow for your callers, lower the setting, or load catalogs when merchants
-  are not editing. A stream that only trickles (a few new products a minute) makes batches of one and costs what
+  Someone else's save takes 18 ms instead of 2 ms while a bulk load is running at the default. Nothing was refused
+  in any of these runs. If that is too slow for your callers, lower the setting, or load catalogs when nobody
+  is editing. A stream that only trickles (a few new products a minute) makes batches of one and costs what
   the same number of `Evaluate` calls would.
 - **A busy model slows a stream; it does not fail it.** When the queue in front of the model is full the stream
   waits and offers its batch again, reading nothing more meanwhile, which holds the sender back. Only after ten
   seconds without room are that batch's records answered `RESOURCE_EXHAUSTED`, and the stream goes on.
 - **A caller that disconnects loses nothing.** What was imported stays imported, and the rest was never taken.
 
-### Matching a listing to a stored record
+### Matching a menu item to a stored record
 
 `Match` answers a second question with the same model and the same stored catalog: not "is this edit still the
-same product?" but "which stored product is this listing a listing of?". A retailer's menu item, say, in the
-retailer's words and often with nothing but a name.
+same product?" but "which stored product is this menu item for?". A menu item is an entry on a retailer's menu,
+in the retailer's words and often with nothing but a name.
 
 ```text
-$ just client evaluate sku-1 data/examples/gummies.json --tenant merchant-1
-$ just client evaluate sku-2 data/examples/vape.json --tenant merchant-2
+$ just client evaluate sku-1 data/examples/gummies.json --brand-id brand-1
+$ just client evaluate sku-2 data/examples/vape.json --brand-id brand-2
 
 $ cat data/examples/menu-item.json
 {
@@ -773,42 +773,42 @@ $ cat data/examples/menu-item.json
 
 $ just client match data/examples/menu-item.json
 decision  NotJudged: the server has no match threshold
-1         0.940  sku-1  merchant-1  (the search scored it 0.595)
+1         0.940  sku-1  brand-1  (the search scored it 0.595)
   field     brand               -  only the stored record has it
   field     category            -  only the stored record has it
   field     description         -  only the stored record has it
   field     name            0.940
   quantity  thc_per_item            -  only the stored record has it
-  quantity  weight_per_item     x1.00  Unchanged (g in the record, g in the listing)
-2         0.501  sku-2  merchant-2  (the search scored it 0.317)
+  quantity  weight_per_item     x1.00  Unchanged (g in the record, g in the menu item)
+2         0.501  sku-2  brand-2  (the search scored it 0.317)
   field     brand               -  only the stored record has it
   field     category            -  only the stored record has it
   field     description         -  only the stored record has it
   field     name            0.501
   quantity  thc_per_item            -  only the stored record has it
-  quantity  weight_per_item    x40.00  Modified (g in the record, g in the listing)
+  quantity  weight_per_item    x40.00  Modified (g in the record, g in the menu item)
 ```
 
-- **Each candidate is scored over the fields both sides have.** The listing has only a name, so each candidate's
+- **Each candidate is scored over the fields both sides have.** The menu item has only a name, so each candidate's
   similarity is its name's. A search cannot do that: it compares whole stored vectors, in which a field one side
   lacks counts against the pair, and the gummies it found at 0.595 are a 0.940 match. So `Match` searches, fetches
   more records than it will return (`matching.overfetch` for each one), scores those exactly, and orders them by
   that score. `search_similarity` is returned beside it, and is what `FindSimilar` would report.
-- **Map the listing onto the schema's names.** A listing has no schema of its own: its fields go under `name`,
+- **Map the menu item onto the schema's names.** A menu item has no schema of its own: its fields go under `name`,
   `category`, and the rest, as a product's do ([Mapping your records](#mapping-your-records)), and a field with
-  no counterpart is left out. A listing carries no `id` and no `tenant`; both belong to the system it came from,
+  no counterpart is left out. A menu item carries no `id` and no `brand_id`; both belong to the system it came from,
   and a request that sends either is refused.
-- **Every tenant's records are candidates, unless the request names one.** A caller that knows the brand passes
-  its key as `tenant`. A caller that knows only the brand's name puts it in the `brand` field, where it is scored
+- **Every brand's records are candidates, unless the request names one.** A caller that knows the brand passes
+  its key as `brand_id`. A caller that knows only the brand's name puts it in the `brand` field, where it is scored
   like any other field.
 - **The decision is about the best candidate alone,** and only where there is a threshold: `MATCHED` at or above
   it, `NO_MATCH` below it or with no candidates, `NOT_JUDGED` when the server has none and the request gave none
   (`--threshold`, or `threshold` in the request). The example configuration has none, because a match threshold
   is a measurement and nobody has made it.
 - **Quantities are reported for each candidate and decide nothing.** They are compared with the stored record's
-  value as the one before and the listing's as the one after, and do not move a similarity or the decision.
-  Whether a 3.5 g listing can be a listing of a 1 g product is a question about your catalog.
-- **Nothing is written.** A match stores no listing and changes no record, floors and limits do not apply to it,
+  value as the one before and the menu item's as the one after, and do not move a similarity or the decision.
+  Whether a 3.5 g menu item can be an entry for a 1 g product is a question about your catalog.
+- **Nothing is written.** A match stores no menu item and changes no record, floors and limits do not apply to it,
   and it never appears in a record's history.
 
 ## How a verdict is reached
@@ -877,7 +877,7 @@ client reads: a string is a text field, an object is a quantity. There are two f
 - **Full** (`--full`), for a data export: the `pairs.full.jsonl` that
   [`docs/data-request-prompt.md`](docs/data-request-prompt.md) asks for. Extra keys are allowed. Each record is
   reduced to what the schema defines, and what that leaves out is counted by key in the report, so a misspelled
-  key shows up as a number and not as a quietly weaker score. `pair_id`, `owner`, `split`, `variant_change`,
+  key shows up as a number and not as a quietly weaker score. `pair_id`, `brand_id`, `split`, `variant_change`,
   `label_source`, and `label_confidence` are used when present. A pair with any label other than `edit` or
   `recycle` (an `unsure`) is scored and listed, and counted nowhere.
 
@@ -954,7 +954,7 @@ Reading it:
 - **`to or from zero`** deserves a look before any factor limit is set, because such a change is beyond every
   limit. In the sample it is an edit: a CBD content that went from 0 to 0.1%.
 - **The slices** show where the errors are. `by category` is always there. With `--full` the pairs are also
-  sliced by `variant_change`, `label_source`, and `owner` (the ten largest, to show one brand dominating).
+  sliced by `variant_change`, `label_source`, and `brand_id` (the ten largest, to show one brand dominating).
 - **`to accept at most N% of recycles`** is the trade the overall threshold makes: the lowest threshold that lets
   through no more than that share of recycles, and the share of edits it rejects. It looks at the overall score
   only, without floors or quantity limits. A line is left out when it allows no more recycles than the one before
@@ -982,7 +982,7 @@ exactly as before.
 
 ### A data export, with intervals
 
-`data/calibration.sample.full.jsonl` is the same sample in the full format, with invented owners, splits, and
+`data/calibration.sample.full.jsonl` is the same sample in the full format, with invented brands, splits, and
 label sources, three `unsure` variant changes, and a `strain` key the schema does not define. Its report has more
 in it (shortened here):
 
@@ -1001,12 +1001,12 @@ count                         0         1                 0                 0
 flavor                        0         1                 0                 0
 strain                        0         4                 0                 0
 ...
-by owner (largest)        edits  recycles  wrongly rejected  wrongly accepted
+by brand (largest)        edits  recycles  wrongly rejected  wrongly accepted
 brand-1                      13         6                 0                 0
 brand-2                       4         4                 0                 0
 ...
 configured policy (threshold 0.900 plus field floors and any quantity limits): 0 edit(s) wrongly rejected, 0 recycle(s) wrongly accepted, of 45 pairs
-false-reject rate 0.0% (0.0% to 0.0%), false-accept rate 0.0% (0.0% to 0.0%) (95% intervals from resampling 7 owners)
+false-reject rate 0.0% (0.0% to 0.0%), false-accept rate 0.0% (0.0% to 0.0%) (95% intervals from resampling 7 brands)
 best overall threshold for this data: 0.895 (margin 0.046; 0 edit(s) rejected, 0 recycle(s) accepted)
 an edit scores above a recycle in 100.0% of pairings (AUC 1.0000): the number to compare two models by, since it needs no threshold
 to accept at most 1.0% of recycles on the overall score alone: threshold 0.895, rejecting 0.0% (0.0% to 0.0%) of edits
@@ -1016,10 +1016,10 @@ record keys that were not compared: strain (29, not in the schema)
 left out: 0 pair(s) of another split, 1 labeled pair(s) below the confidence asked for
 ```
 
-- **The intervals** are the middle 95% of each rate when the **owners** are resampled, 1,000 times, with all
+- **The intervals** are the middle 95% of each rate when the **brands** are resampled, 1,000 times, with all
   their pairs. Pairs from one brand are not independent of each other, so resampling pairs would make the
   intervals too narrow, and narrower the more one brand contributed. They need every labeled pair to name an
-  owner and at least two owners, which is why the strict format has none. Zero errors give a zero-width
+  brand and at least two brands, which is why the strict format has none. Zero errors give a zero-width
   interval, which says nothing about the pairs that were not sampled: with 45 pairs, treat it as no evidence.
 - **The `unsure` pairs** are the ones to look at by hand. Here all three same-brand variant changes score above
   the threshold and would be accepted, which is the case the data request calls the hardest.
@@ -1048,7 +1048,7 @@ The events are flat: a pair is one `pair` line and then one line per field, quan
 its `pair_id`. One recycle from the sample, with the envelope fields removed:
 
 ```json
-{"message":"pair","pair_id":"p030","label":"recycle","split":"calibrate","owner":"brand-1","variant_change":"flavor","label_source":"moderator_revert","label_confidence":"high","category":"Edibles","note":"gummies become a different candy, same category and brand","similarity":0.808716,"accepted":false,"wrong":false,"measure_changed":false}
+{"message":"pair","pair_id":"p030","label":"recycle","split":"calibrate","brand_id":"brand-1","variant_change":"flavor","label_source":"moderator_revert","label_confidence":"high","category":"Edibles","note":"gummies become a different candy, same category and brand","similarity":0.808716,"accepted":false,"wrong":false,"measure_changed":false}
 {"message":"pair_field","pair_id":"p030","field":"name","change":"modified","similarity":0.65489,"weight":4.0,"below_floor":true}
 {"message":"pair_quantity","pair_id":"p030","quantity":"thc_per_item","change":"modified","factor":2.0,"zero_crossing":false,"incomparable":false,"previous_unit":"mg","unit":"mg","beyond_limit":false}
 {"message":"pair_reason","pair_id":"p030","code":"field_below_floor","field":"name","value":0.65489,"limit":0.8}
@@ -1057,7 +1057,7 @@ its `pair_id`. One recycle from the sample, with the envelope fields removed:
 | `message` | One per | Fields |
 |---|---|---|
 | `calibration` | run, first | `fingerprint`, `dimension`, `max_tokens`, `threshold`, `anchor_threshold`, `reject_on_measure_change`, `pairs_sha256`, `pairs`, `split`, `min_confidence`, `seed` |
-| `pair` | pair | `pair_id`, `label`, `split`, `owner`, `variant_change`, `label_source`, `label_confidence`, `category`, `note`, `similarity`, `accepted`, `wrong`, `measure_changed`, `anchored`, `anchor_similarity` |
+| `pair` | pair | `pair_id`, `label`, `split`, `brand_id`, `variant_change`, `label_source`, `label_confidence`, `category`, `note`, `similarity`, `accepted`, `wrong`, `measure_changed`, `anchored`, `anchor_similarity` |
 | `pair_field` | pair and field | `pair_id`, `field`, `change`, `similarity`, `weight`, `below_floor` |
 | `pair_quantity` | pair and quantity | `pair_id`, `quantity`, `change`, `factor`, `zero_crossing`, `incomparable`, `previous_unit`, `unit`, `beyond_limit` |
 | `pair_reason` | pair and reason for rejecting it | `pair_id`, `code`, `field`, `value`, `limit` |
@@ -1068,7 +1068,7 @@ its `pair_id`. One recycle from the sample, with the envelope fields removed:
 | `slice` | attribute and value | `by`, `value`, `edits`, `recycles`, `false_rejects`, `false_accepts`, `edits_low`, `edits_high`, `recycles_low`, `recycles_high` |
 | `operating_point` | target | `false_accept_target`, `threshold`, `false_accept_rate`, `false_reject_rate`, `false_reject_low`, `false_reject_high` |
 | `ignored_key` | key and reason | `key`, `reason`, `count` |
-| `summary` | run, last | `pairs`, `edits`, `recycles`, `unlabeled`, both error counts and rates with `_low` and `_high`, `owners`, `skipped_split`, `skipped_confidence` |
+| `summary` | run, last | `pairs`, `edits`, `recycles`, `unlabeled`, both error counts and rates with `_low` and `_high`, `brands`, `skipped_split`, `skipped_confidence` |
 
 A value that does not apply is left out, never `null`. The reason codes are `below_threshold`,
 `field_below_floor`, `anchor_drift`, `quantity_beyond_factor`, `quantity_incomparable`, and `measure_changed`,
@@ -1136,17 +1136,17 @@ training step is a flag, and every run is [recorded](#recorded-runs)), then `run
 
 ### A match threshold
 
-`matching.threshold` is what [`Match`](#matching-a-listing-to-a-stored-record) holds its best candidate to, and
-it is read from catalog groups: a stored product and the listings known to describe it.
+`matching.threshold` is what [`Match`](#matching-a-menu-item-to-a-stored-record) holds its best candidate to, and
+it is read from catalog groups: a stored product and the menu items known to describe it.
 
 ```json
-{"group": "g-1", "owner": "brand-5", "split": "holdout",
+{"group": "g-1", "brand_id": "brand-5", "split": "holdout",
  "catalog": {"name": "Lemon Tree Pre-Roll 1g", "category": "Pre-Rolls", "weight_per_item": {"value": 1, "unit": "g"}},
- "listings": [{"name": "Tall Grass Lemon Tree Pre-Roll 1g"}, {"name": "Lemon Tree Preroll 1g - Tall Grass"}]}
+ "menu_items": [{"name": "Tall Grass Lemon Tree Pre-Roll 1g"}, {"name": "Lemon Tree Preroll 1g - Tall Grass"}]}
 ```
 
-`calibrate-match` puts every product in an index, scores every listing against every product the way `Match`
-would, and reports how often a listing's own product comes first and where a threshold could go:
+`calibrate-match` puts every product in an index, scores every menu item against every product the way `Match`
+would, and reports how often a menu item's own product comes first and where a threshold could go:
 
 ```sh
 just calibrate-match data/catalog-groups.sample.jsonl config.example.toml --split holdout
@@ -1154,14 +1154,14 @@ just calibrate-match data/catalog-groups.sample.jsonl config.example.toml --spli
 
 ```text
 model     f46e48ee0ea2dd02-d256-t256 (256 dimensions per field, up to 256 tokens)
-listings  20 of the `holdout` split, scored against 21 products (0 from the catalog export)
+menu items  20 of the `holdout` split, scored against 21 products (0 from the catalog export)
 served    the first 20 candidates, from the 100 the search returns (5 for each)
 
 rank    own best other  margin  group                            best other
-   1  0.942      0.839  +0.103  g-preroll-lemon-tree-1g          g-preroll-lemon-tree-5-pack (same owner)
-   1  0.939      0.882  +0.057  g-preroll-lemon-tree-1g          g-preroll-lemon-tree-5-pack (same owner)
-   1  0.931      0.876  +0.055  g-preroll-lemon-tree-5-pack      g-preroll-lemon-tree-1g (same owner)
-   2  0.885      0.900  -0.015  g-preroll-lemon-tree-5-pack      g-preroll-lemon-tree-1g (same owner)
+   1  0.942      0.839  +0.103  g-preroll-lemon-tree-1g          g-preroll-lemon-tree-5-pack (same brand)
+   1  0.939      0.882  +0.057  g-preroll-lemon-tree-1g          g-preroll-lemon-tree-5-pack (same brand)
+   1  0.931      0.876  +0.055  g-preroll-lemon-tree-5-pack      g-preroll-lemon-tree-1g (same brand)
+   2  0.885      0.900  -0.015  g-preroll-lemon-tree-5-pack      g-preroll-lemon-tree-1g (same brand)
    ...
 
 ranking
@@ -1171,60 +1171,60 @@ ranking
   mean reciprocal rank       0.975
   first, scoring every product 19 of 20  95.0% (87.5% to 100.0%)
   served ranking differs from that 0 of 20  0.0% (0.0% to 0.0%)  (what an over-fetch of 5 loses)
-  intervals are the middle 95% over resamples of 2 owners
+  intervals are the middle 95% over resamples of 2 brands
 
 scores
   own product        0.836 to 0.963 (20)
   best other product 0.637 to 0.917 (20)
-  best other is a product of the same owner 17 of 20  85.0% (83.3% to 87.5%)
+  best other is a product of the same brand 17 of 20  85.0% (83.3% to 87.5%)
   own above best other, over all pairings (AUC) 0.870
 
 threshold
   best separates the two at 0.850 (margin 0.003): 2 own below it, 5 best other at or above it
-  to match a listing whose product is absent at most 1% of the time: 0.919, where 0.0% (0.0% to 0.0%) would be, and 65.0% (50.0% to 75.0%) of listings score their own product below it
-  to match a listing whose product is absent at most 5% of the time: 0.916, where 5.0% (0.0% to 8.3%) would be, and 60.0% (37.5% to 75.0%) of listings score their own product below it
+  to match a menu item whose product is absent at most 1% of the time: 0.919, where 0.0% (0.0% to 0.0%) would be, and 65.0% (50.0% to 75.0%) of menu items score their own product below it
+  to match a menu item whose product is absent at most 5% of the time: 0.916, where 5.0% (0.0% to 8.3%) would be, and 60.0% (37.5% to 75.0%) of menu items score their own product below it
   configured: none (`matching.threshold`), so `Match` ranks and decides nothing
 
-quantity           compared   same incomparable listing only product only
+quantity           compared   same incomparable menu item only product only
 thc_per_item              2      2            0            0            6
 volume_per_item           1      0            0            0            1
 weight_per_item           5      5            0            0            7
 
-left out: 33 listings of other splits
+left out: 33 menu items of other splits
 ```
 
-(Twenty synthetic listings of two invented brands. The report shows what to look at; no threshold may be read
+(Twenty synthetic menu items of two invented brands. The report shows what to look at; no threshold may be read
 from it.)
 
-- **Two scores for each listing.** `own` is what its own product scores. `best other` is the best product that is
-  not its own, and it stands in for a listing whose product is not in the catalog at all: that is what such a
-  listing would be matched to. The groups cannot show that case directly, since every listing in them has a
+- **Two scores for each menu item.** `own` is what its own product scores. `best other` is the best product that is
+  not its own, and it stands in for a menu item whose product is not in the catalog at all: that is what such a
+  menu item would be matched to. The groups cannot show that case directly, since every menu item in them has a
   product. A match threshold belongs at or below the first population and above the second.
 - **The hard case is a sibling.** A five-pack of a pre-roll scores 0.900 against the single, above its own 0.885,
-  and the two capsule products are within 0.05 of each other. Where the best other belongs to the same owner
-  (17 of 20 here), no threshold separates them: the listing has to say what differs, and the name has to count.
+  and the two capsule products are within 0.05 of each other. Where the best other belongs to the same brand
+  (17 of 20 here), no threshold separates them: the menu item has to say what differs, and the name has to count.
   That is what `margin` is reported for, and it is the case fine-tuning on catalog groups trains.
-- **A threshold trades two errors.** Every operating point says both: how often a listing with no product would
-  be matched anyway, and how many listings score their own product below the line and go unmatched. On these
-  listings the two populations overlap, so keeping the first to 1% leaves 65% unmatched.
-- **`--split` selects listings, never products.** A listing is scored against everything it could be confused
+- **A threshold trades two errors.** Every operating point says both: how often a menu item with no product would
+  be matched anyway, and how many menu items score their own product below the line and go unmatched. On these
+  menu items the two populations overlap, so keeping the first to 1% leaves 65% unmatched.
+- **`--split` selects menu items, never products.** A menu item is scored against everything it could be confused
   with, so every group's product is in the index whatever its split. `--catalog export.jsonl` adds the records of
-  an [import](#importing-a-catalog) export as products with no listings, for an index the size of the real one.
+  an [import](#importing-a-catalog) export as products with no menu items, for an index the size of the real one.
 - **The over-fetch is measured here.** The served ranking scores only what a search returns, `matching.overfetch`
-  records for each candidate. The report says how many listings got another ranking than scoring every product
+  records for each candidate. The report says how many menu items got another ranking than scoring every product
   would give them. With 21 products and 100 fetched, none can; on a real catalog this is the line that says
   whether 5 is enough.
-- **Quantities are counted, not used.** For each quantity: how often the listing and its own product both have a
+- **Quantities are counted, not used.** For each quantity: how often the menu item and its own product both have a
   value, how often those agree, and how often only one side has one. Whether a size that differs should stop a
   match is a decision about the catalog, and this is the evidence for it.
 - `--depth` is the `limit` a caller would ask for (20). `--ndjson` writes the calibration as `match_calibration`,
-  `match_listing`, `match_field`, `match_quantity`, and `match_summary` lines, joined on `listing_id`, with no
-  listing's text. With `matching.threshold` set, the report and the events also say what that threshold does:
-  listings whose own product is below it, listings whose best other reaches it, and listings matched to the
+  `match_menu_item`, `match_field`, `match_quantity`, and `match_summary` lines, joined on `menu_item_id`, with no
+  menu item's text. With `matching.threshold` set, the report and the events also say what that threshold does:
+  menu items whose own product is below it, menu items whose best other reaches it, and menu items matched to the
   wrong product.
 
 Measure it on groups the model was not trained on. The trainer leaves out a group whose `split` is the holdout
-or the validation split, and a group whose owner has pairs in either.
+or the validation split, and a group whose brand has pairs in either.
 
 ### The drift threshold
 
@@ -1233,7 +1233,7 @@ was. A before/after pair cannot say where it belongs: that is a question about a
 from edit histories, every version of a product in order:
 
 ```json
-{"product": "h7", "owner": "brand-4", "label": "recycle", "recycled_at": 2, "versions": [{"at": "2026-01-01T09:00:00Z", "fields": {"name": "Blueberry Gummies 100mg"}}, {"fields": {"name": "Blueberry Gummies 100mg (Indica)"}}, {"fields": {"name": "Sour Diesel Live Resin Cartridge 1g"}}]}
+{"product": "h7", "brand_id": "brand-4", "label": "recycle", "recycled_at": 2, "versions": [{"at": "2026-01-01T09:00:00Z", "fields": {"name": "Blueberry Gummies 100mg"}}, {"fields": {"name": "Blueberry Gummies 100mg (Indica)"}}, {"fields": {"name": "Sour Diesel Live Resin Cartridge 1g"}}]}
 ```
 
 `label` is `edit` for a product that stayed itself and `recycle` for one that became another; any other label is
@@ -1288,7 +1288,7 @@ Reading it:
   recycle is below every legitimate history, there is nothing to suggest, and the report says what the threshold
   must stay under.
 - **`legitimate histories blocked`** is what the configured policy costs: products that stayed themselves and
-  were rejected at some step, with a 95% interval from resampling owners. `by the drift check alone` is how many
+  were rejected at some step, with a 95% interval from resampling brands. `by the drift check alone` is how many
   of those the drift check is to blame for.
 - **`recycles first rejected`** says when: at the version that was no longer the product, later (recycled
   versions were accepted first), before it (a legitimate version was the one refused), or never.
@@ -1347,7 +1347,7 @@ its margin                     0.046   0.072
 slices whose errors changed
 category Flower: wrongly rejected 0 -> 1, wrongly accepted 0 -> 0
 label source identifiers_unchanged: wrongly rejected 0 -> 1, wrongly accepted 0 -> 0
-owner brand-2: wrongly rejected 0 -> 1, wrongly accepted 0 -> 0
+brand id brand-2: wrongly rejected 0 -> 1, wrongly accepted 0 -> 0
 ```
 
 Reading it: every pair whose verdict changed is listed, the largest change in score first, and named for what it
@@ -1440,11 +1440,11 @@ Two kinds of signal, either or both. The formats are the ones `docs/data-request
   carry a `split` key, `calibrate` is trained on (`--split` changes that), `holdout` is only ever measured
   (`--holdout-split`), and `validation` is what checkpoints are compared on (`--validation-split`; see
   [step 3](#3-choose-a-model-then-measure-it-once)). Pairs with no `split` are all trained on.
-- **Catalog groups** (`--catalog-groups`): listings from different merchants linked to the same catalog product.
+- **Catalog groups** (`--catalog-groups`): menu items from different retailers linked to the same catalog product.
   These are naturally occurring paraphrases and usually the larger, cleaner source.
 
   ```json
-  {"group": "g1", "catalog": {"name": "Blueberry Gummies 100mg"}, "listings": [{"name": "WYLD Blueberry 100mg (10pk)"}]}
+  {"group": "g1", "catalog": {"name": "Blueberry Gummies 100mg"}, "menu_items": [{"name": "WYLD Blueberry 100mg (10pk)"}]}
   ```
 
 By default only `name` and `description` are learned from (`--fields`). Categorical fields are left out because the
@@ -1485,7 +1485,7 @@ just release-train metal        # or: just release-train cuda
 | `--learning-rate` | `2e-5` | The peak, after a warm-up over the first 10% of steps. Lower it if the model gets worse on pairs held back from training. |
 | `--warmup-ratio` | `0.1` | The share of all steps spent warming the learning rate up to its peak. |
 | `--margin` | `0.5` | How far apart, in cosine distance, the two texts of a recycled pair are pushed before the loss stops caring. |
-| `--scale` | `20` | How sharply the catalog-group loss tells a listing's own catalog entry from the others in its batch. |
+| `--scale` | `20` | How sharply the catalog-group loss tells a menu item's own catalog entry from the others in its batch. |
 | `--max-tokens` | `256` | Match `model.max_tokens` in the server config. |
 | `--device` | `cpu` | `cpu`, `metal`, or `cuda`. The GPU ones need a binary built with that feature. |
 | `--seed` | `0` | Fixes the batch order and dropout. |
@@ -1503,10 +1503,10 @@ What it does:
 
 - **Labeled pairs** are trained with a contrastive loss: an edit's two texts are pulled together, a recycle's are
   pushed apart until they clear a margin.
-- **Catalog groups** are trained with a ranking loss: each catalog entry must pick out its own listing from the
-  others in the batch. No batch holds the same text twice, so two listings of one product are never used as
-  negatives for each other. A listing left with nothing to be ranked against sits that pass out (the log says
-  how many), which happens when one catalog entry has far more listings than the rest.
+- **Catalog groups** are trained with a ranking loss: each catalog entry must pick out its own menu item from the
+  others in the batch. No batch holds the same text twice, so two menu items of one product are never used as
+  negatives for each other. A menu item left with nothing to be ranked against sits that pass out (the log says
+  how many), which happens when one catalog entry has far more menu items than the rest.
 - **Both losses are applied at every width in `--dims`**, so the model stays usable when truncated.
 - The optimizer is AdamW with a linear warm-up and decay, and the encoder's own dropout (10%) is active. Dropout
   exists only inside the training pass; the server's forward pass has none to forget to turn off.
@@ -1611,10 +1611,10 @@ answer only one of the two. Give the choosing a split of its own:
 record-similarity pairs carve pairs.full.jsonl --fraction 0.15 > pairs.carved.jsonl
 ```
 
-That moves a share of the `calibrate` owners to a new `validation` split. Whole owners move, never single pairs,
-and which ones is decided by a hash of the owner's name and `--salt`, so the same command always moves the same
-owners. Pick the share so that the new split has enough of both labels to tell models apart; the command logs
-how many edits and recycles it moved, and warns if either is none. Catalog groups whose `owner` is in the
+That moves a share of the `calibrate` brands to a new `validation` split. Whole brands move, never single pairs,
+and which ones is decided by a hash of the brand's id and `--salt`, so the same command always moves the same
+brands. Pick the share so that the new split has enough of both labels to tell models apart; the command logs
+how many edits and recycles it moved, and warns if either is none. Catalog groups whose `brand_id` is in the
 validation or holdout split are left out of training too, so that a brand held back for measuring is not learned
 from by another route, and so is a group that carries one of those splits itself
 ([A match threshold](#a-match-threshold) is measured on those).
@@ -1882,7 +1882,7 @@ fingerprint it scored with), and its first input.
 - **`--runs DIR`** (or `RECORD_SIMILARITY_RUNS`) puts the records somewhere else, and **`--no-run`** records
   nothing. If the directory cannot be written, the command stops before doing any work and says so.
 - **Runs stay where they were made.** `runs/` is ignored by git and left out of the container image. A run on
-  real data names its files and holds pair ids and owner pseudonyms in its events; `run.json` also has the host
+  real data names its files and holds pair ids and brand pseudonyms in its events; `run.json` also has the host
   name, the working directory, and the command line.
 
 Only `calibrate` and the trainer are recorded. `serve`, `import`, `compare`, and `calibrate-diff` are not.
@@ -2033,10 +2033,10 @@ just import export.jsonl config.toml             # import into the collection th
 ```
 
 The export is one JSON object per line. `record` is the record as it is now, in the shape every other tool reads
-(a string is a text field, an object is a quantity). `tenant` and `anchor` are optional:
+(a string is a text field, an object is a quantity). `brand_id` and `anchor` are optional:
 
 ```json
-{"id": "sku-1", "tenant": "brand-7", "record": {"name": "Blueberry Gummies 100mg - Indica", "category": "Edibles > Gummies", "weight_per_item": {"value": 40, "unit": "g"}}, "anchor": {"name": "Blueberry Gummies 100mg", "category": "Edibles > Gummies"}}
+{"id": "sku-1", "brand_id": "brand-7", "record": {"name": "Blueberry Gummies 100mg - Indica", "category": "Edibles > Gummies", "weight_per_item": {"value": 40, "unit": "g"}}, "anchor": {"name": "Blueberry Gummies 100mg", "category": "Edibles > Gummies"}}
 ```
 
 What it does, and what it will not do:
@@ -2074,7 +2074,7 @@ created as. Asked about its current content, the server answers that nothing has
 that the record has already moved from where it started:
 
 ```text
-$ just client evaluate p026 p026.json --tenant brand-1 --dry-run
+$ just client evaluate p026 p026.json --brand-id brand-1 --dry-run
 verdict   Accepted (stored: false, revision 1)
 overall   1.000 against a threshold of 0.900
 drift     0.963 similarity to the original record
@@ -2143,7 +2143,7 @@ A category that counts half as much lets a product move between categories: the 
 what the live policy refused. Whether that is a fault of the candidate or of the live policy, the shadow cannot
 say.
 
-`shadow-report` reads the file and says what is in it. Here after a few more requests, from two tenants:
+`shadow-report` reads the file and says what is in it. Here after a few more requests, from two brands:
 
 ```sh
 just shadow-report shadow.ndjson --ids to-label.jsonl
@@ -2161,9 +2161,9 @@ live rejected, the candidate would have accepted
   scored 0.860 to 0.879 by the live weights and 0.918 to 0.942 by the candidate's
        2  below_threshold
 
-tenant                          lines only candidate rejects    only live rejects
-merchant-1                          1                      0                    1
-merchant-2                          1                      0                    1
+brand                           lines only candidate rejects    only live rejects
+brand-1                             1                      0                    1
+brand-2                             1                      0                    1
 
 A disagreement says the two policies differ on a revision, not which is right. Label the revisions (`--ids`), and judge the candidate with `calibrate`.
 ```
@@ -2171,13 +2171,13 @@ A disagreement says the two policies differ on a revision, not which is right. L
 `to-label.jsonl` is the list to take to your own database, one line for each revision disagreed on:
 
 ```json
-{"key":"1794454332-2","id":"sku-1","tenant":"merchant-1","live_verdict":"rejected","shadow_verdict":"accepted","live_similarity":0.878707,"shadow_similarity":0.942242}
-{"key":"1794454332-4","id":"sku-3","tenant":"merchant-2","live_verdict":"rejected","shadow_verdict":"accepted","live_similarity":0.860299,"shadow_similarity":0.917739}
+{"key":"1794454332-2","id":"sku-1","brand_id":"brand-1","live_verdict":"rejected","shadow_verdict":"accepted","live_similarity":0.878707,"shadow_similarity":0.942242}
+{"key":"1794454332-4","id":"sku-3","brand_id":"brand-2","live_verdict":"rejected","shadow_verdict":"accepted","live_similarity":0.860299,"shadow_similarity":0.917739}
 ```
 
 The totals come from the server's `shadow_summary` lines, the last of each run added up, so a file that several
-restarts wrote into is counted whole. Which tenants and which reasons come from the `shadow` lines. An interval
-(resampled by tenant, since one brand's edits are not independent of each other) needs a line for every judged
+restarts wrote into is counted whole. Which brands and which reasons come from the `shadow` lines. An interval
+(resampled by brand, since one brand's edits are not independent of each other) needs a line for every judged
 revision, which is what `events = "all"` writes. `--shadow NAME` picks one candidate out of a file that holds
 several, and `--ndjson` writes the report as `shadow_report*` lines.
 
@@ -2202,8 +2202,8 @@ several, and `--ndjson` writes the report as `shadow_report*` lines.
   scores what it agrees on. `shadow_summary` every `summary_every_s` seconds and once more as the server stops:
   the counts since it started. `run`, on these lines, is the second that run of the server began. `created` records had nothing to be judged against; `judged` is `agreed` plus
   the two kinds of disagreement; `failed` should stay zero.
-- **No record text is written.** A line names a record by its id and by the tenant the request named, which is
-  what lets disagreements be counted by brand. The requests above named none, so their lines have no `tenant`.
+- **No record text is written.** A line names a record by its id and by the brand the request named, which is
+  what lets disagreements be counted by brand. The requests above named none, so their lines have no `brand_id`.
 - **It costs one more comparison of vectors already in memory**: no model and no store. Its lines are written
   the way log lines are, so stdout has to be read by something, as stderr already has to be. Against
   this server with `just load ... --server`, one caller, 300 records: edits took a median of 5.63 ms with no
@@ -2332,7 +2332,7 @@ stream. The table leaves out two of the resave rows. One line:
 ```
 
 `--server http://host:port` drives a server that is already running, instead of starting one. Its records are
-written under the tenant `load-test` and deleted afterwards, and the worker's side (`batches`, `texts_per_batch`,
+written under the brand `load-test` and deleted afterwards, and the worker's side (`batches`, `texts_per_batch`,
 `model_busy`, `queue_wait_ms`) is left out, since a client cannot see it. No record text is in any result.
 
 In service, every `evaluate`, `find_similar`, `match`, and `delete` log line carries `elapsed_ms`: the time from
@@ -2449,8 +2449,8 @@ just mutants --list        # what would be tested, without building anything
 just mutants-train -j 3    # the trainer's checkpoint rules, a set of its own; four minutes
 ```
 
-The last full run tested 681 mutants in 27 minutes at three jobs: 571 were caught, 110 did not compile, and
-none survived; the trainer's set is 58 more, 39 caught and 19 that did not compile.
+The last full run tested 689 mutants in 28 minutes at three jobs: 575 were caught, 113 did not compile, and 1
+survived, which then got a test; the trainer's set is 58 more, 39 caught and 19 that did not compile.
 It is not part of `just ci`. Run it after changing the scoring, the quantity comparison, the engine's write
 path, the calibration statistics, the match ranking, or the promotion gate.
 
@@ -2480,12 +2480,12 @@ data/
   calibration.sample.jsonl        synthetic labeled pairs, in the strict format
   calibration.sample.full.jsonl   the same pairs in the full format a data export uses
   drift.sample.jsonl              synthetic edit histories, for `calibrate-drift`
-  catalog-groups.sample.jsonl     synthetic products with listings of them, for `calibrate-match`
+  catalog-groups.sample.jsonl     synthetic products with menu items of them, for `calibrate-match`
   regression.jsonl                curated hard cases, synthetic, whose verdicts are pinned
   regression.snapshot.ndjson      what the pinned model and the example config make of them
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D35)
+  decisions.md               why things are the way they are (D1 to D36)
   data-request-prompt.md     a brief for collecting labeled production data
   import-prompt.md           a brief for loading the real catalog into a running service
   feature-suggestions.md     features that could be added, built and not, the last twelve about production
@@ -2523,6 +2523,9 @@ what that field says.
 | `... already exists and is not empty` (fine-tuning) | `--out` names a directory that holds something. Choose a new one; a model directory is never overwritten. |
 | `... already holds a checkpoint for step N, which this run would write again` | The checkpoint directory has checkpoints from an earlier run of the same name. Resume from the latest with `--resume`, or delete them, or give another `--checkpoint-dir`. |
 | `checkpoint ...: belongs to a run with different options` (or `different training data`) | `--resume` was given with other options or data than the run was started with. Repeat the original command, changing only `--base` to `--resume`. |
+| ``the key `owner` is now `brand_id` ``, or ``the key `listings` is now `menu_items` `` | A pairs, history, or group file from before 2026-11-12, when a record's brand was its `owner` and a menu item was a `listing`. Rename the key in the file. An import export with `tenant` is refused as an unknown field for the same reason: it is `brand_id`. |
+| ``it was stored when a record's brand was kept under `tenant` `` | The Qdrant collection was written before that rename. Use a new `qdrant.collection` and import the catalog again: read as they are, the old points would belong to no brand. |
+| `` `menu_item` is required `` from `Match` | The request has no `menu_item`. The record to match goes under that key (it was `listing` before 2026-11-12), not under `record`, and a client that drops keys it does not know sends an empty request for any other shape. |
 | `INVALID_ARGUMENT: invalid record: unknown field ...` | The request used a field name the schema does not define. `Describe` lists the valid ones. |
 | `INVALID_ARGUMENT: invalid record: unknown quantity ...` | The request used a quantity the schema does not define. Add a `[quantities.<name>]` table to the config, or drop it from the request. |
 | `` invalid record: `...` is a quantity, not a text field `` | A quantity was sent as text in `fields`. Send it in `quantities`, as a number with a unit. |

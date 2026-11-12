@@ -44,9 +44,9 @@ enum Command {
     id: String,
     /// The JSON file holding the record's fields.
     fields: PathBuf,
-    /// The record's tenant.
+    /// The record's brand.
     #[arg(long)]
-    tenant: Option<String>,
+    brand_id: Option<String>,
     /// Report the verdict without storing anything.
     #[arg(long, conflicts_with = "force")]
     dry_run: bool,
@@ -65,17 +65,17 @@ enum Command {
   /// Create every record of an export that is not stored yet, over one streaming call. What is stored is left
   /// alone.
   Import {
-    /// The export: one JSON object per line, `{"id": ..., "tenant": ..., "record": {...}, "anchor": {...}}`, the
+    /// The export: one JSON object per line, `{"id": ..., "brand_id": ..., "record": {...}, "anchor": {...}}`, the
     /// format `record-similarity import` reads.
     export: PathBuf,
   },
-  /// Find the stored records a listing from elsewhere describes, best first, and whether the best is a match.
+  /// Find the stored records a menu item from elsewhere describes, best first, and whether the best is a match.
   Match {
-    /// The JSON file holding the listing, under the server's field and quantity names.
-    listing: PathBuf,
-    /// Only consider records of this tenant.
+    /// The JSON file holding the menu item, under the server's field and quantity names.
+    menu_item: PathBuf,
+    /// Only consider records of this brand.
     #[arg(long)]
-    tenant: Option<String>,
+    brand_id: Option<String>,
     /// How many candidates to list.
     #[arg(long, default_value_t = 5)]
     limit: u32,
@@ -87,9 +87,9 @@ enum Command {
   Delete {
     /// The record's id.
     id: String,
-    /// The record's tenant; required if it was stored under one.
+    /// The record's brand; required if it was stored under one.
     #[arg(long)]
-    tenant: Option<String>,
+    brand_id: Option<String>,
   },
 }
 
@@ -209,11 +209,11 @@ fn print_description(description: pb::DescribeResponse) {
   }
   match description.match_threshold {
     Some(threshold) => println!(
-      "matching  a listing matches at {threshold:.2}; {} records are scored for each one returned",
+      "matching  a menu item matches at {threshold:.2}; {} records are scored for each one returned",
       description.match_overfetch
     ),
     None => println!(
-      "matching  no threshold: listings are ranked, not judged; {} records are scored for each one returned",
+      "matching  no threshold: menu items are ranked, not judged; {} records are scored for each one returned",
       description.match_overfetch
     ),
   }
@@ -230,16 +230,16 @@ fn print_match(response: &pb::MatchResponse) {
       rank,
       candidate.similarity,
       candidate.id,
-      candidate.tenant.as_deref().unwrap_or("-"),
+      candidate.brand_id.as_deref().unwrap_or("-"),
       candidate.search_similarity
     );
     for field in &candidate.fields {
       let similarity = field
         .similarity
         .map_or_else(|| "-".to_owned(), |value| format!("{value:.3}"));
-      // Read with the stored record as the baseline: `Added` is a field only the listing has.
+      // Read with the stored record as the baseline: `Added` is a field only the menu item has.
       let side = match field.change() {
-        pb::FieldChange::Added => "  only the listing has it",
+        pb::FieldChange::Added => "  only the menu item has it",
         pb::FieldChange::Removed => "  only the stored record has it",
         _ => "",
       };
@@ -251,12 +251,12 @@ fn print_match(response: &pb::MatchResponse) {
         None => "-".to_owned(),
       };
       let unit = |unit: &Option<String>| unit.clone().unwrap_or_else(|| "-".to_owned());
-      // The same reading: the stored record's value is the one before, the listing's the one after.
+      // The same reading: the stored record's value is the one before, the menu item's the one after.
       let what = match quantity.change() {
-        pb::QuantityChange::Added => "only the listing has it".to_owned(),
+        pb::QuantityChange::Added => "only the menu item has it".to_owned(),
         pb::QuantityChange::Removed => "only the stored record has it".to_owned(),
         change => format!(
-          "{change:?} ({} in the record, {} in the listing)",
+          "{change:?} ({} in the record, {} in the menu item)",
           unit(&quantity.previous_unit),
           unit(&quantity.unit)
         ),
@@ -293,7 +293,7 @@ fn read_export(path: &Path) -> anyhow::Result<Vec<pb::ImportRequest>> {
     requests.push(pb::ImportRequest {
       record: Some(pb::Record {
         id: Some(parsed.id),
-        tenant: parsed.tenant,
+        brand_id: parsed.brand_id,
         fields: parsed.record.texts.into_iter().collect(),
         quantities: quantities(parsed.record.quantities),
       }),
@@ -307,13 +307,13 @@ fn read_export(path: &Path) -> anyhow::Result<Vec<pb::ImportRequest>> {
 }
 
 /// Reads a record file and turns it into the request message.
-fn read_record(path: &Path, id: Option<String>, tenant: Option<String>) -> anyhow::Result<pb::Record> {
+fn read_record(path: &Path, id: Option<String>, brand_id: Option<String>) -> anyhow::Result<pb::Record> {
   let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
   let record: RecordFields = serde_json::from_str(&text)
     .context("expected a JSON object of text fields and quantities ({\"value\": 3.5, \"unit\": \"g\"})")?;
   Ok(pb::Record {
     id,
-    tenant,
+    brand_id,
     fields: record.texts.into_iter().collect(),
     quantities: quantities(record.quantities),
   })
@@ -333,7 +333,7 @@ async fn main() -> anyhow::Result<()> {
     Command::Evaluate {
       id,
       fields,
-      tenant,
+      brand_id,
       dry_run,
       force,
     } => {
@@ -343,7 +343,7 @@ async fn main() -> anyhow::Result<()> {
         _ => pb::WriteMode::Enforce,
       };
       let request = pb::EvaluateRequest {
-        record: Some(read_record(&fields, Some(id), tenant)?),
+        record: Some(read_record(&fields, Some(id), brand_id)?),
         mode: mode.into(),
         ..pb::EvaluateRequest::default()
       };
@@ -360,7 +360,7 @@ async fn main() -> anyhow::Result<()> {
           "{:.3}  {}  {}",
           neighbor.similarity,
           neighbor.id,
-          neighbor.tenant.unwrap_or_default()
+          neighbor.brand_id.unwrap_or_default()
         );
       }
     }
@@ -392,22 +392,22 @@ async fn main() -> anyhow::Result<()> {
       println!("failed    {failed}");
     }
     Command::Match {
-      listing,
-      tenant,
+      menu_item,
+      brand_id,
       limit,
       threshold,
     } => {
       let request = pb::MatchRequest {
-        // A listing carries no id and no tenant of its own; the tenant here narrows the search.
-        listing: Some(read_record(&listing, None, None)?),
+        // A menu item carries no id and no brand of its own; the brand here narrows the search.
+        menu_item: Some(read_record(&menu_item, None, None)?),
         limit,
-        tenant,
+        brand_id,
         threshold,
       };
       print_match(&client.r#match(request).await?.into_inner());
     }
-    Command::Delete { id, tenant } => {
-      let request = pb::DeleteRequest { id, tenant };
+    Command::Delete { id, brand_id } => {
+      let request = pb::DeleteRequest { id, brand_id };
       let deleted = client.delete(request).await?.into_inner().deleted;
       println!("{}", if deleted { "deleted" } else { "nothing to delete" });
     }

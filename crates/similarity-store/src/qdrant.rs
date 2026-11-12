@@ -5,7 +5,7 @@
 //! - `current`: the composite of the accepted baseline. HNSW-indexed; this is what searches match.
 //! - `anchor`: the composite of the record as first stored. Only ever read back by id, so it has no HNSW graph
 //!   (`m = 0`) and lives on disk, costing no memory.
-//! - payload: the caller's id, the tenant, the layout id, the per-field text fingerprints, a revision counter, a
+//! - payload: the caller's id, the brand, the layout id, the per-field text fingerprints, a revision counter, a
 //!   timestamp, and the record's quantities (current and original). Quantities are compared as numbers and are in
 //!   no vector, which is why a point written before they existed needs no migration: it reads back with none.
 //!
@@ -41,7 +41,7 @@ use crate::{Expected, Found, Neighbor, Result, SearchQuery, StoreError, StoredRe
 
 const CURRENT: &str = "current";
 const ANCHOR: &str = "anchor";
-const TENANT_KEY: &str = "tenant";
+const BRAND_ID_KEY: &str = "brand_id";
 const LAYOUT_KEY: &str = "layout";
 // The two payload keys a conditional write filters on. They are the names `PointPayload` serializes under.
 const REVISION_KEY: &str = "revision";
@@ -67,7 +67,7 @@ pub struct QdrantSettings {
 struct PointPayload {
   record_id: String,
   #[serde(default, skip_serializing_if = "Option::is_none")]
-  tenant: Option<String>,
+  brand_id: Option<String>,
   layout: String,
   #[serde(default)]
   hashes: BTreeMap<String, String>,
@@ -218,13 +218,13 @@ impl QdrantStore {
   /// between the two steps (or lost a creation race) without indexes for good, with nothing ever noticing: filters
   /// still work unindexed, only slowly.
   ///
-  /// On a new collection this happens before any point is written, so the HNSW graph is built tenant-aware from
-  /// the start.
+  /// On a new collection this happens before any point is written, so the HNSW graph is built with the brand as
+  /// its partition from the start (`is_tenant` is Qdrant's name for a key a collection is partitioned by).
   async fn ensure_indexes(&self) -> Result<()> {
     self
       .client
       .create_field_index(
-        CreateFieldIndexCollectionBuilder::new(self.collection.as_str(), TENANT_KEY, FieldType::Keyword)
+        CreateFieldIndexCollectionBuilder::new(self.collection.as_str(), BRAND_ID_KEY, FieldType::Keyword)
           .field_index_params(KeywordIndexParamsBuilder::default().is_tenant(true))
           .wait(true),
       )
@@ -334,7 +334,7 @@ impl QdrantStore {
 
     let payload = serde_json::to_value(PointPayload {
       record_id: record.id.clone(),
-      tenant: record.tenant.clone(),
+      brand_id: record.brand_id.clone(),
       layout: self.layout.clone(),
       hashes: record.vectors.hashes.clone(),
       revision: record.revision,
@@ -395,8 +395,8 @@ impl QdrantStore {
     }
 
     let mut must = vec![Condition::matches(LAYOUT_KEY, self.layout.clone())];
-    if let Some(tenant) = query.tenant {
-      must.push(Condition::matches(TENANT_KEY, tenant.to_owned()));
+    if let Some(brand_id) = query.brand_id {
+      must.push(Condition::matches(BRAND_ID_KEY, brand_id.to_owned()));
     }
     let mut filter = Filter::must(must);
     if let Some(excluded) = query.exclude_id {
@@ -417,6 +417,16 @@ impl QdrantStore {
 }
 
 fn decode_payload(id: &str, payload: HashMap<String, Value>) -> Result<PointPayload> {
+  // A point from before 2026-11-12 keeps its brand under `tenant`. Read as it is, it would be a record that
+  // belongs to nobody, and the rule that a request must name a record's brand would let anyone through.
+  if payload.contains_key("tenant") {
+    return Err(StoreError::Corrupt {
+      id: id.to_owned(),
+      reason: "it was stored when a record's brand was kept under `tenant`, which is `brand_id` now; import the \
+               collection again"
+        .to_owned(),
+    });
+  }
   Payload::from(payload)
     .deserialize()
     .map_err(|source| StoreError::Corrupt {
@@ -460,7 +470,7 @@ impl VectorStore for QdrantStore {
     let named = |name: &str| self.dense(id, vectors.as_ref(), name);
     Ok(Some(StoredRecord {
       id: payload.record_id,
-      tenant: payload.tenant,
+      brand_id: payload.brand_id,
       vectors: RecordVectors {
         composite: named(CURRENT)?,
         hashes: payload.hashes,
@@ -578,7 +588,7 @@ impl VectorStore for QdrantStore {
         let payload = decode_payload("<search result>", point.payload)?;
         Ok(Neighbor {
           id: payload.record_id,
-          tenant: payload.tenant,
+          brand_id: payload.brand_id,
           similarity: point.score,
         })
       })
@@ -608,7 +618,7 @@ impl VectorStore for QdrantStore {
         Ok(Found {
           neighbor: Neighbor {
             id: payload.record_id,
-            tenant: payload.tenant,
+            brand_id: payload.brand_id,
             similarity: point.score,
           },
           vectors: RecordVectors {
@@ -643,7 +653,7 @@ mod tests {
   fn a_payload_round_trips_through_qdrant_values() {
     let payload = PointPayload {
       record_id: "product-42".to_owned(),
-      tenant: Some("merchant-7".to_owned()),
+      brand_id: Some("brand-7".to_owned()),
       layout: "abc-d256-t256|category,name".to_owned(),
       hashes: BTreeMap::from([("name".to_owned(), "00ff".to_owned())]),
       revision: 3,
@@ -665,7 +675,7 @@ mod tests {
     let decoded = decode_payload("product-42", encoded.into()).unwrap();
     assert_eq!(decoded.write.as_deref(), Some("00000000deadbeef"));
     assert_eq!(decoded.record_id, "product-42");
-    assert_eq!(decoded.tenant.as_deref(), Some("merchant-7"));
+    assert_eq!(decoded.brand_id.as_deref(), Some("brand-7"));
     assert_eq!(decoded.hashes["name"], "00ff");
     assert_eq!((decoded.revision, decoded.updated_at), (3, 1_700_000_000));
     assert_eq!(decoded.quantities, payload.quantities);
@@ -698,16 +708,29 @@ mod tests {
   }
 
   #[test]
-  fn a_payload_without_a_tenant_decodes_to_none() {
+  fn a_payload_without_a_brand_decodes_to_none() {
     let encoded = Payload::try_from(serde_json::json!({ "record_id": "p", "layout": "l" })).unwrap();
     let decoded = decode_payload("p", encoded.into()).unwrap();
-    assert_eq!(decoded.tenant, None);
+    assert_eq!(decoded.brand_id, None);
     assert!(decoded.hashes.is_empty());
+  }
+
+  /// A point from before the brand's key was renamed still says `tenant`. Decoded as it is, it would be a record
+  /// that belongs to nobody, which every request may touch.
+  #[test]
+  fn a_point_that_keeps_its_brand_under_the_name_from_before_is_refused() {
+    let old = serde_json::json!({ "record_id": "p", "layout": "l", "tenant": "brand-7", "revision": 1 });
+    let error = decode_payload("p", Payload::try_from(old).unwrap().into()).unwrap_err();
+    assert!(
+      matches!(&error, StoreError::Corrupt { id, reason }
+        if id == "p" && reason.contains("`brand_id`") && reason.contains("import")),
+      "{error}"
+    );
   }
 
   #[test]
   fn a_payload_missing_its_identity_is_corrupt() {
-    let encoded = Payload::try_from(serde_json::json!({ "tenant": "merchant-7" })).unwrap();
+    let encoded = Payload::try_from(serde_json::json!({ "brand_id": "brand-7" })).unwrap();
     assert!(matches!(
       decode_payload("p", encoded.into()),
       Err(StoreError::Corrupt { .. })
@@ -718,7 +741,7 @@ mod tests {
   fn a_plain_write_carries_no_mark_and_a_point_without_one_decodes() {
     let payload = PointPayload {
       record_id: "p".to_owned(),
-      tenant: None,
+      brand_id: None,
       layout: "l".to_owned(),
       hashes: BTreeMap::new(),
       revision: 1,

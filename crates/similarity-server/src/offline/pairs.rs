@@ -3,7 +3,7 @@
 //! - The **strict** format is four keys per line (`label`, `note`, `before`, `after`) and refuses anything else. It
 //!   is what a person writes by hand, and a typo in it should be an error.
 //! - The **full** format is what `docs/data-request-prompt.md` asks a data export to produce (`pairs.full.jsonl`):
-//!   the same pair with its bookkeeping (`pair_id`, `owner`, `split`, `variant_change`, how it was labeled) and
+//!   the same pair with its bookkeeping (`pair_id`, `brand_id`, `split`, `variant_change`, how it was labeled) and
 //!   with every field the source had, most of which the schema does not define. It is read leniently, and what is
 //!   left out is counted rather than passed over in silence.
 //!
@@ -92,8 +92,8 @@ pub struct Pair {
   pub note: String,
   /// Which part of the data the pair belongs to (`calibrate`, `holdout`).
   pub split: Option<String>,
-  /// Who owns the record, as a pseudonym. Pairs from one owner are not independent of each other.
-  pub owner: Option<String>,
+  /// Who owns the record, as a pseudonym. Pairs from one brand are not independent of each other.
+  pub brand_id: Option<String>,
   /// The kind of same-brand variant change this is (`flavor`, `size`, ...), if it is one.
   pub variant_change: Option<String>,
   /// The evidence the label rests on.
@@ -231,7 +231,7 @@ pub fn parse_pairs(jsonl: &str) -> anyhow::Result<Pairs> {
       label_text: parsed.label.as_str().to_owned(),
       note: parsed.note,
       split: None,
-      owner: None,
+      brand_id: None,
       variant_change: None,
       label_source: None,
       label_confidence: None,
@@ -251,10 +251,28 @@ pub fn parse_pairs(jsonl: &str) -> anyhow::Result<Pairs> {
   })
 }
 
+/// Refuses `owner`, the name `brand_id` had in these files until 2026-11-12. The full formats ignore keys they do
+/// not know, so a file from before would otherwise be read as one whose pairs have no brand: no error, and every
+/// split by brand and every interval over brands quietly gone.
+pub(crate) fn owner_is_now_brand_id<'de, D: serde::Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+  Err(serde::de::Error::custom(
+    "the key `owner` is now `brand_id`: rename it in the file",
+  ))
+}
+
+/// The same for `listings`, which is `menu_items` now.
+pub(crate) fn listings_are_now_menu_items<'de, D: serde::Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+  Err(serde::de::Error::custom(
+    "the key `listings` is now `menu_items`: rename it in the file",
+  ))
+}
+
 // Unknown keys are ignored on purpose: the full format carries bookkeeping that only matters to whoever
 // assembled it, and more of it will be added over time.
 #[derive(Deserialize)]
 struct FullLine {
+  #[serde(default, rename = "owner", deserialize_with = "owner_is_now_brand_id")]
+  _owner: (),
   #[serde(default)]
   pair_id: Option<String>,
   label: String,
@@ -263,7 +281,7 @@ struct FullLine {
   #[serde(default)]
   split: Option<String>,
   #[serde(default)]
-  owner: Option<String>,
+  brand_id: Option<String>,
   #[serde(default)]
   variant_change: Option<String>,
   #[serde(default)]
@@ -382,7 +400,7 @@ pub fn parse_full_pairs(jsonl: &str, schema: &Schema, selection: Selection<'_>) 
       label_text: parsed.label,
       note: parsed.note.unwrap_or_default(),
       split: parsed.split,
-      owner: parsed.owner,
+      brand_id: parsed.brand_id,
       variant_change: parsed.variant_change,
       label_source: parsed.label_source,
       label_confidence: parsed.label_confidence,
@@ -503,7 +521,7 @@ mod tests {
   }
 
   const FULL: &str = concat!(
-    r#"{"pair_id": "p1", "product": "x", "owner": "brand-1", "edited_at": "2026-03-14T17:02:11Z", "#,
+    r#"{"pair_id": "p1", "product": "x", "brand_id": "brand-1", "edited_at": "2026-03-14T17:02:11Z", "#,
     r#""label": "recycle", "label_source": "moderator_revert", "label_confidence": "high", "#,
     r#""variant_change": null, "split": "calibrate", "note": "gummies became a vape", "#,
     r#""before": {"name": "Gummies", "category": "Edibles > Gummies", "strain": "n/a", "strain_id": 7, "#,
@@ -523,7 +541,7 @@ mod tests {
       (pair.label, pair.label_text.as_str()),
       (Some(Label::Recycle), "recycle")
     );
-    assert_eq!(pair.owner.as_deref(), Some("brand-1"));
+    assert_eq!(pair.brand_id.as_deref(), Some("brand-1"));
     assert_eq!(pair.split.as_deref(), Some("calibrate"));
     assert_eq!(pair.variant_change, None, "a null is no value");
     assert_eq!(pair.label_source.as_deref(), Some("moderator_revert"));
@@ -716,7 +734,7 @@ mod tests {
         label_text: String::new(),
         note: String::new(),
         split: None,
-        owner: None,
+        brand_id: None,
         variant_change: None,
         label_source: None,
         label_confidence: None,
@@ -729,5 +747,17 @@ mod tests {
     assert_eq!(pair(Some("Tinctures")).category(), Some("Tinctures"));
     assert_eq!(pair(Some("  ")).category(), None);
     assert_eq!(pair(None).category(), None);
+  }
+
+  /// The full format ignores keys it does not know, and until 2026-11-12 a pair's brand was its `owner`.
+  #[test]
+  fn a_full_file_under_the_name_from_before_is_refused_not_read_without_its_brands() {
+    let old = FULL.replace("\"brand_id\":", "\"owner\":");
+    assert_ne!(old, FULL);
+    let error = format!("{:#}", parse_full_pairs(&old, &schema(), everything()).unwrap_err());
+    assert!(
+      error.contains("line") && error.contains("`owner` is now `brand_id`"),
+      "{error}"
+    );
   }
 }

@@ -3,9 +3,9 @@
 //! Everything here is derived from a [`Calibration`] and nothing else, so the text report and the event stream
 //! state the same numbers. Only pairs labeled `edit` or `recycle` take part, unless a function says otherwise.
 //!
-//! The intervals deserve a word. Pairs from one owner are written by the same people about the same product line
+//! The intervals deserve a word. Pairs from one brand are written by the same people about the same product line
 //! and are not independent of each other, so an interval that resampled pairs would be too narrow, and would get
-//! narrower the more one brand contributed. The bootstrap here resamples **owners**, with all their pairs, which is
+//! narrower the more one brand contributed. The bootstrap here resamples **brands**, with all their pairs, which is
 //! why it needs every pair to name one and reports no interval otherwise.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,14 +20,14 @@ pub mod shadow;
 use super::calibrate::{Calibration, ScoredPair};
 use super::pairs::Label;
 
-/// How many times the owners are resampled for an interval.
+/// How many times the brands are resampled for an interval.
 pub const RESAMPLES: usize = 1000;
 
 /// The false-accept rates an operating point is reported for, in percent.
 const TARGET_PERCENTS: [usize; 3] = [1, 2, 5];
 
-/// How many owners the per-owner slice lists: the largest contributors, which is what it is there to show.
-const OWNERS_SHOWN: usize = 10;
+/// How many brands the per-brand slice lists: the largest contributors, which is what it is there to show.
+const BRANDS_SHOWN: usize = 10;
 
 /// A count as a float. Counts here are numbers of pairs, far below where the conversion would lose anything.
 fn number(count: usize) -> f64 {
@@ -268,7 +268,7 @@ pub fn quantity_suggestions(calibration: &Calibration) -> Vec<QuantitySuggestion
 /// The labeled pairs that share one value of some attribute, summarized.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Slice {
-  /// The attribute: `variant_change`, `category`, `label_source`, or `owner`.
+  /// The attribute: `variant_change`, `category`, `label_source`, or `brand_id`.
   pub by: &'static str,
   /// The value the pairs share.
   pub value: String,
@@ -307,10 +307,10 @@ fn slice_of(by: &'static str, value: &str, pairs: &[&ScoredPair]) -> Slice {
   }
 }
 
-/// The labeled pairs sliced by variant change, top-level category, label source, and owner.
+/// The labeled pairs sliced by variant change, top-level category, label source, and brand.
 ///
 /// A pair without a value for an attribute is in none of that attribute's slices. Slices are in name order within
-/// an attribute, except `owner`, which lists only the largest contributors, largest first: it exists to show one
+/// an attribute, except `brand_id`, which lists only the largest contributors, largest first: it exists to show one
 /// brand dominating the data.
 pub fn slices(calibration: &Calibration) -> Vec<Slice> {
   type Key = for<'a> fn(&'a ScoredPair) -> Option<&'a str>;
@@ -318,7 +318,7 @@ pub fn slices(calibration: &Calibration) -> Vec<Slice> {
     ("variant_change", |scored| scored.pair.variant_change.as_deref()),
     ("category", |scored| scored.pair.category()),
     ("label_source", |scored| scored.pair.label_source.as_deref()),
-    ("owner", |scored| scored.pair.owner.as_deref()),
+    ("brand_id", |scored| scored.pair.brand_id.as_deref()),
   ];
 
   let mut slices = Vec::new();
@@ -330,18 +330,18 @@ pub fn slices(calibration: &Calibration) -> Vec<Slice> {
       }
     }
     let mut of_attribute: Vec<Slice> = groups.iter().map(|(value, pairs)| slice_of(by, value, pairs)).collect();
-    if by == "owner" {
+    if by == "brand_id" {
       let size = |slice: &Slice| slice.edits.saturating_add(slice.recycles);
-      // Stable, so owners of equal size stay in name order.
+      // Stable, so brands of equal size stay in name order.
       of_attribute.sort_by_key(|slice| std::cmp::Reverse(size(slice)));
-      of_attribute.truncate(OWNERS_SHOWN);
+      of_attribute.truncate(BRANDS_SHOWN);
     }
     slices.extend(of_attribute);
   }
   slices
 }
 
-/// The middle 95% of a rate across resamples of the owners.
+/// The middle 95% of a rate across resamples of the brands.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Interval {
   /// The 2.5th percentile.
@@ -359,24 +359,24 @@ pub struct Rate {
   pub of: usize,
   /// `errors / of`, or `None` when there were no chances.
   pub rate: Option<f64>,
-  /// How much that rate moves when the owners are resampled. `None` when the pairs do not all name an owner, or
+  /// How much that rate moves when the brands are resampled. `None` when the pairs do not all name an brand, or
   /// name only one.
   pub interval: Option<Interval>,
 }
 
-/// The labeled pairs grouped by owner, or `None` if they cannot be resampled by owner: some pair names none, or
+/// The labeled pairs grouped by brand, or `None` if they cannot be resampled by brand: some pair names none, or
 /// they all name the same one.
-fn owners(calibration: &Calibration) -> Option<Vec<Vec<&ScoredPair>>> {
+fn brands(calibration: &Calibration) -> Option<Vec<Vec<&ScoredPair>>> {
   let mut groups: BTreeMap<&str, Vec<&ScoredPair>> = BTreeMap::new();
   for scored in calibration.pairs.iter().filter(|scored| scored.pair.label.is_some()) {
-    groups.entry(scored.pair.owner.as_deref()?).or_default().push(scored);
+    groups.entry(scored.pair.brand_id.as_deref()?).or_default().push(scored);
   }
   (groups.len() > 1).then(|| groups.into_values().collect())
 }
 
-/// Resamples owners with replacement and returns the middle 95% of `errors / chances` across the resamples.
+/// Resamples brands with replacement and returns the middle 95% of `errors / chances` across the resamples.
 ///
-/// `clusters` holds one `(errors, chances)` per owner. A resample with no chances at all has no rate and is left
+/// `clusters` holds one `(errors, chances)` per brand. A resample with no chances at all has no rate and is left
 /// out; if every one is, there is no interval.
 fn bootstrap(clusters: &[(usize, usize)], seed: u64) -> Option<Interval> {
   let mut rng = Rng::new(seed);
@@ -404,7 +404,7 @@ fn bootstrap(clusters: &[(usize, usize)], seed: u64) -> Option<Interval> {
   })
 }
 
-/// A rate over the pairs of `label`, where `is_error` says which of them count, with its interval if the owners
+/// A rate over the pairs of `label`, where `is_error` says which of them count, with its interval if the brands
 /// allow one.
 fn rate_of(
   calibration: &Calibration,
@@ -423,11 +423,11 @@ fn rate_of(
   };
   let (errors, of) = count(&mut calibration.labeled(label));
   let interval = clusters.and_then(|clusters| {
-    let per_owner: Vec<(usize, usize)> = clusters
+    let per_brand: Vec<(usize, usize)> = clusters
       .iter()
       .map(|pairs| count(&mut pairs.iter().copied().filter(|scored| scored.pair.label == Some(label))))
       .collect();
-    bootstrap(&per_owner, seed)
+    bootstrap(&per_brand, seed)
   });
   Rate {
     errors,
@@ -444,19 +444,19 @@ pub struct ErrorRates {
   pub false_reject: Rate,
   /// Recycles accepted, out of all recycles.
   pub false_accept: Rate,
-  /// How many owners the intervals were resampled from, when there are intervals.
-  pub owners: Option<usize>,
+  /// How many brands the intervals were resampled from, when there are intervals.
+  pub brands: Option<usize>,
 }
 
 /// The configured policy's two error rates. `seed` fixes the resampling, so the same pairs and the same seed give
 /// the same intervals.
 pub fn error_rates(calibration: &Calibration, seed: u64) -> ErrorRates {
-  let clusters = owners(calibration);
+  let clusters = brands(calibration);
   let wrong = |scored: &ScoredPair| scored.wrong();
   ErrorRates {
     false_reject: rate_of(calibration, clusters.as_deref(), Label::Edit, wrong, seed),
     false_accept: rate_of(calibration, clusters.as_deref(), Label::Recycle, wrong, seed),
-    owners: clusters.as_ref().map(Vec::len),
+    brands: clusters.as_ref().map(Vec::len),
   }
 }
 
@@ -491,7 +491,7 @@ pub fn operating_points(calibration: &Calibration, seed: u64) -> Vec<OperatingPo
   sorted.sort_by(f32::total_cmp);
   sorted.dedup();
   let cuts: Vec<f32> = super::calibrate::cuts(&sorted).map(|(cut, _)| cut).collect();
-  let clusters = owners(calibration);
+  let clusters = brands(calibration);
 
   let mut points = Vec::new();
   let mut previous = None;
@@ -785,14 +785,15 @@ mod tests {
 
   #[test]
   fn slices_count_each_attribute_separately_and_their_counts_add_up() {
-    let pair = |label: Label, similarity: f32, accepted: bool, owner: &str, variant: Option<&str>, category: &str| {
-      scored_as(label, similarity, accepted, |pair| {
-        pair.owner = Some(owner.to_owned());
-        pair.variant_change = variant.map(str::to_owned);
-        pair.label_source = Some("moderator".to_owned());
-        pair.before.texts.insert("category".to_owned(), category.to_owned());
-      })
-    };
+    let pair =
+      |label: Label, similarity: f32, accepted: bool, brand_id: &str, variant: Option<&str>, category: &str| {
+        scored_as(label, similarity, accepted, |pair| {
+          pair.brand_id = Some(brand_id.to_owned());
+          pair.variant_change = variant.map(str::to_owned);
+          pair.label_source = Some("moderator".to_owned());
+          pair.before.texts.insert("category".to_owned(), category.to_owned());
+        })
+      };
     let calibration = summarized(vec![
       pair(Label::Edit, 0.95, true, "b1", None, "Edibles > Gummies"),
       pair(Label::Edit, 0.70, false, "b1", Some("flavor"), "Edibles > Chocolates"),
@@ -824,16 +825,16 @@ mod tests {
     assert_eq!(find("category", "Flower").recycles, 2);
     assert_eq!(find("label_source", "moderator").edits, 2);
 
-    // Owners are listed largest first.
-    let owners: Vec<&str> = slices
+    // Brands are listed largest first.
+    let brands: Vec<&str> = slices
       .iter()
-      .filter(|slice| slice.by == "owner")
+      .filter(|slice| slice.by == "brand_id")
       .map(|slice| slice.value.as_str())
       .collect();
-    assert_eq!(owners, ["b1", "b2"]);
+    assert_eq!(brands, ["b1", "b2"]);
 
-    // Every pair has a category and an owner here, so those attributes' slices cover the whole.
-    for by in ["category", "owner", "label_source"] {
+    // Every pair has a category and an brand here, so those attributes' slices cover the whole.
+    for by in ["category", "brand_id", "label_source"] {
       let total: usize = slices
         .iter()
         .filter(|slice| slice.by == by)
@@ -851,27 +852,27 @@ mod tests {
   }
 
   #[test]
-  fn only_the_ten_largest_owners_are_listed() {
+  fn only_the_ten_largest_brands_are_listed() {
     let mut pairs = Vec::new();
-    for owner in 0..12 {
-      for _ in 0..=owner {
-        pairs.push(owned(Label::Edit, 0.9, true, &format!("b{owner:02}")));
+    for brand_id in 0..12 {
+      for _ in 0..=brand_id {
+        pairs.push(owned(Label::Edit, 0.9, true, &format!("b{brand_id:02}")));
       }
     }
     let slices = slices(&summarized(pairs));
-    let owners: Vec<(&str, usize)> = slices
+    let brands: Vec<(&str, usize)> = slices
       .iter()
-      .filter(|slice| slice.by == "owner")
+      .filter(|slice| slice.by == "brand_id")
       .map(|slice| (slice.value.as_str(), slice.edits))
       .collect();
-    assert_eq!(owners.len(), 10);
-    assert_eq!(owners[0], ("b11", 12));
-    assert_eq!(owners[9], ("b02", 3));
+    assert_eq!(brands.len(), 10);
+    assert_eq!(brands[0], ("b11", 12));
+    assert_eq!(brands[9], ("b02", 3));
   }
 
-  fn owned(label: Label, similarity: f32, accepted: bool, owner: &str) -> ScoredPair {
+  fn owned(label: Label, similarity: f32, accepted: bool, brand_id: &str) -> ScoredPair {
     scored_as(label, similarity, accepted, |pair| {
-      pair.owner = Some(owner.to_owned());
+      pair.brand_id = Some(brand_id.to_owned());
     })
   }
 
@@ -890,9 +891,9 @@ mod tests {
     assert!((rates.false_reject.rate.unwrap() - 0.25).abs() < 1e-12);
     assert!((rates.false_accept.rate.unwrap() - 0.5).abs() < 1e-12);
     assert_eq!(
-      (rates.false_reject.interval, rates.owners),
+      (rates.false_reject.interval, rates.brands),
       (None, None),
-      "no owners, no interval"
+      "no brands, no interval"
     );
 
     let no_recycles = error_rates(&summarized(vec![scored(Label::Edit, 0.9, true)]), 0);
@@ -900,7 +901,7 @@ mod tests {
   }
 
   #[test]
-  fn an_interval_comes_from_resampling_owners_and_is_fixed_by_the_seed() {
+  fn an_interval_comes_from_resampling_brands_and_is_fixed_by_the_seed() {
     // Brand b1 gets everything right; brand b2 gets half its edits wrong; b3 has one wrong edit.
     let mut pairs = Vec::new();
     for _ in 0..10 {
@@ -914,7 +915,7 @@ mod tests {
     let calibration = summarized(pairs);
 
     let rates = error_rates(&calibration, 0);
-    assert_eq!(rates.owners, Some(3));
+    assert_eq!(rates.brands, Some(3));
     let rate = rates.false_reject.rate.unwrap();
     assert!((rate - 6.0 / 21.0).abs() < 1e-12);
     let interval = rates.false_reject.interval.unwrap();
@@ -938,7 +939,7 @@ mod tests {
   }
 
   #[test]
-  fn one_owner_or_a_pair_without_one_means_no_interval() {
+  fn one_brand_or_a_pair_without_one_means_no_interval() {
     let one = summarized(vec![
       owned(Label::Edit, 0.9, true, "b1"),
       owned(Label::Recycle, 0.2, false, "b1"),
@@ -950,9 +951,9 @@ mod tests {
       owned(Label::Edit, 0.9, true, "b2"),
       scored(Label::Recycle, 0.2, false),
     ]);
-    assert_eq!(error_rates(&partly, 0).owners, None);
+    assert_eq!(error_rates(&partly, 0).brands, None);
 
-    // An unlabeled pair without an owner is not in the way: it is not resampled.
+    // An unlabeled pair without an brand is not in the way: it is not resampled.
     let unsure = scored_as(Label::Edit, 0.5, true, |pair| {
       pair.label = None;
       pair.label_text = "unsure".to_owned();
@@ -962,7 +963,7 @@ mod tests {
       owned(Label::Recycle, 0.2, false, "b2"),
       unsure,
     ]);
-    assert_eq!(error_rates(&with_unsure, 0).owners, Some(2));
+    assert_eq!(error_rates(&with_unsure, 0).brands, Some(2));
     assert_eq!(
       error_rates(&with_unsure, 0).false_reject.of,
       1,

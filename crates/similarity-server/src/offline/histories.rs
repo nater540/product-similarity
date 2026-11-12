@@ -6,7 +6,7 @@
 //! One JSON object per line:
 //!
 //! ```json
-//! {"product": "h7", "owner": "b12", "label": "recycle", "recycled_at": 3,
+//! {"product": "h7", "brand_id": "b12", "label": "recycle", "recycled_at": 3,
 //!  "versions": [{"at": "2025-11-02T09:00:00Z", "fields": {"name": "Blueberry Gummies"}}, ...]}
 //! ```
 //!
@@ -41,8 +41,8 @@ pub struct Version {
 pub struct History {
   /// What identifies the history: the product, as a pseudonym.
   pub id: String,
-  /// Who owns the product, as a pseudonym. Histories of one owner are not independent of each other.
-  pub owner: Option<String>,
+  /// Who owns the product, as a pseudonym. Histories of one brand are not independent of each other.
+  pub brand_id: Option<String>,
   /// `Edit` for a product that stayed itself throughout, `Recycle` for one that became another. `None` for any
   /// other label: such a history is replayed and shown, and never counted.
   pub label: Option<Label>,
@@ -86,7 +86,7 @@ struct VersionLine {
 struct Line {
   product: String,
   #[serde(default)]
-  owner: Option<String>,
+  brand_id: Option<String>,
   label: String,
   #[serde(default)]
   recycled_at: Option<usize>,
@@ -179,7 +179,7 @@ pub fn parse_histories(jsonl: &str, schema: &Schema, min_confidence: Option<Conf
     }
     histories.push(History {
       id: parsed.product,
-      owner: parsed.owner,
+      brand_id: parsed.brand_id,
       label,
       label_text: parsed.label,
       label_source: parsed.label_source,
@@ -235,7 +235,7 @@ mod tests {
       "# synthetic".to_owned(),
       String::new(),
       concat!(
-        r#"{"product": "h1", "owner": "b1", "label": "recycle", "recycled_at": 2, "label_source": "moderator", "#,
+        r#"{"product": "h1", "brand_id": "b1", "label": "recycle", "recycled_at": 2, "label_source": "moderator", "#,
         r#""label_confidence": "high", "original": {"name": "gummies", "sku": "x"}, "#,
         r#""versions": [{"fields": {"name": "gummies 100mg", "weight": {"value": 40, "unit": "g"}, "strain": "s"}}, "#,
         r#"{"at": "2026-02-01T00:00:00Z", "fields": {"name": "gummies 200mg", "weight": "heavy"}}, "#,
@@ -248,7 +248,7 @@ mod tests {
     let parsed = parse_histories(&text, &schema(), None).unwrap();
     assert_eq!(parsed.histories.len(), 2);
     let first = &parsed.histories[0];
-    assert_eq!((first.id.as_str(), first.owner.as_deref()), ("h1", Some("b1")));
+    assert_eq!((first.id.as_str(), first.brand_id.as_deref()), ("h1", Some("b1")));
     assert_eq!((first.label, first.recycled_at), (Some(Label::Recycle), Some(2)));
     assert_eq!(first.label_confidence, Some(Confidence::High));
     assert_eq!(first.original.as_ref().unwrap().texts["name"], "gummies");

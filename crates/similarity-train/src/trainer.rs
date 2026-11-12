@@ -426,7 +426,7 @@ impl Session {
       }
       TextBatch::Groups(examples) => (
         examples.iter().map(|example| example.catalog.as_str()).collect(),
-        examples.iter().map(|example| example.listing.as_str()).collect(),
+        examples.iter().map(|example| example.menu_item.as_str()).collect(),
         Objective::Ranking { scale: self.scale },
       ),
     };
@@ -644,9 +644,9 @@ mod tests {
       ("resin", "indica resin mg"),
     ]
     .into_iter()
-    .map(|(catalog, listing)| GroupExample {
+    .map(|(catalog, menu_item)| GroupExample {
       catalog: catalog.to_owned(),
-      listing: listing.to_owned(),
+      menu_item: menu_item.to_owned(),
     })
     .collect()
   }
@@ -702,7 +702,7 @@ mod tests {
   }
 
   #[test]
-  fn training_on_catalog_groups_teaches_each_entry_to_pick_out_its_own_listing() {
+  fn training_on_catalog_groups_teaches_each_entry_to_pick_out_its_own_menu_item() {
     let Fixture {
       encoder,
       tokenizer,
@@ -1322,7 +1322,7 @@ mod tests {
       device,
       _dir,
     } = fixture();
-    // Three listings of a single catalog entry: no batch can hold two of them.
+    // Three menu items of a single catalog entry: no batch can hold two of them.
     let examples = Examples {
       pairs: Vec::new(),
       groups: [
@@ -1331,9 +1331,9 @@ mod tests {
         "gummies blueberry indica",
       ]
       .into_iter()
-      .map(|listing| GroupExample {
+      .map(|menu_item| GroupExample {
         catalog: "blueberry gummies".to_owned(),
-        listing: listing.to_owned(),
+        menu_item: menu_item.to_owned(),
       })
       .collect(),
     };

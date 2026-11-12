@@ -177,7 +177,7 @@ fn render_slices(calibration: &Calibration, out: &mut String) {
     ("variant_change", "by variant change"),
     ("category", "by category"),
     ("label_source", "by label source"),
-    ("owner", "by owner (largest)"),
+    ("brand_id", "by brand (largest)"),
   ] {
     let mut of_attribute = slices.iter().filter(|slice| slice.by == by).peekable();
     if of_attribute.peek().is_none() {
@@ -215,15 +215,15 @@ pub(crate) fn describe_rate(rate: &Rate) -> String {
   }
 }
 
-/// Appends the two error rates with their intervals, when the pairs name enough owners to resample.
+/// Appends the two error rates with their intervals, when the pairs name enough brands to resample.
 fn render_error_rates(calibration: &Calibration, seed: u64, out: &mut String) {
   let rates = stats::error_rates(calibration, seed);
-  let Some(owners) = rates.owners else {
+  let Some(brands) = rates.brands else {
     return;
   };
   let _ = writeln!(
     out,
-    "false-reject rate {}, false-accept rate {} (95% intervals from resampling {owners} owners)",
+    "false-reject rate {}, false-accept rate {} (95% intervals from resampling {brands} brands)",
     describe_rate(&rates.false_reject),
     describe_rate(&rates.false_accept)
   );
@@ -599,9 +599,9 @@ mod tests {
 
   #[test]
   fn slices_rates_and_what_was_left_out_are_reported_when_the_pairs_carry_them() {
-    let pair = |label: Label, similarity: f32, accepted: bool, owner: &str, variant: Option<&str>| {
+    let pair = |label: Label, similarity: f32, accepted: bool, brand_id: &str, variant: Option<&str>| {
       scored_as(label, similarity, accepted, |pair| {
-        pair.owner = Some(owner.to_owned());
+        pair.brand_id = Some(brand_id.to_owned());
         pair.variant_change = variant.map(str::to_owned);
         pair
           .before
@@ -642,7 +642,7 @@ mod tests {
     assert!(!report.contains("by label source"), "no pair has one: {report}");
 
     assert!(
-      report.contains("false-reject rate 50.0% (0.0% to 100.0%), false-accept rate 50.0% (0.0% to 100.0%) (95% intervals from resampling 2 owners)"),
+      report.contains("false-reject rate 50.0% (0.0% to 100.0%), false-accept rate 50.0% (0.0% to 100.0%) (95% intervals from resampling 2 brands)"),
       "{report}"
     );
     assert!(

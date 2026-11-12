@@ -115,7 +115,7 @@ fn quantities(record: &RecordFields) -> Vec<(String, Quantity)> {
 fn record_input(history: &History, record: &RecordFields) -> RecordInput {
   RecordInput {
     id: Some(history.id.clone()),
-    tenant: history.owner.clone(),
+    brand_id: history.brand_id.clone(),
     fields: texts(record),
     quantities: quantities(record),
   }
@@ -327,7 +327,7 @@ mod tests {
   fn every_version_is_measured_against_the_one_before_it_and_against_the_anchor() {
     let run = replayed(&[line(
       "walk",
-      r#""owner": "b1", "label": "recycle", "recycled_at": 2, "#,
+      r#""brand_id": "b1", "label": "recycle", "recycled_at": 2, "#,
       &WALK,
     )]);
     let [history] = run.histories.as_slice() else {
@@ -506,7 +506,7 @@ mod tests {
             .evaluate(EvaluateInput {
               record: RecordInput {
                 id: Some(history.id.clone()),
-                tenant: None,
+                brand_id: None,
                 fields: texts(&version.fields),
                 quantities: quantities(&version.fields),
               },

@@ -33,8 +33,8 @@ use tonic::transport::Channel;
 
 use crate::worker::WorkerSnapshot;
 
-/// The tenant every record of a load test belongs to, so that nothing it writes can be taken for a real record.
-pub const TENANT: &str = "load-test";
+/// The brand every record of a load test belongs to, so that nothing it writes can be taken for a real record.
+pub const BRAND_ID: &str = "load-test";
 
 /// How long a caller waits before sending again a request the server refused as overloaded. A setting of this
 /// tool, not a policy: a real caller's retry is its own business.
@@ -152,7 +152,7 @@ pub fn catalog(
     };
     let mut record = pb::Record {
       id: Some(format!("{prefix}-{index}")),
-      tenant: Some(TENANT.to_owned()),
+      brand_id: Some(BRAND_ID.to_owned()),
       ..pb::Record::default()
     };
     let mut put = |name: &str, text: String| {
@@ -567,7 +567,7 @@ async fn delete(client: &mut Client, records: Vec<pb::Record>) {
   for record in records {
     let request = pb::DeleteRequest {
       id: record.id.unwrap_or_default(),
-      tenant: record.tenant,
+      brand_id: record.brand_id,
     };
     let _ = client.delete(request).await;
   }
@@ -664,7 +664,7 @@ mod tests {
     ids.dedup();
     assert_eq!(ids.len(), 50, "every record has its own id");
     for record in &records {
-      assert_eq!(record.tenant.as_deref(), Some(TENANT));
+      assert_eq!(record.brand_id.as_deref(), Some(BRAND_ID));
       let mut names: Vec<&str> = record.fields.keys().map(String::as_str).collect();
       names.sort_unstable();
       assert_eq!(
@@ -835,7 +835,7 @@ mod tests {
       .find_similar(pb::FindSimilarRequest {
         query: Some(pb::find_similar_request::Query::Record(like_any_of_them)),
         limit: 10,
-        tenant: Some(TENANT.to_owned()),
+        brand_id: Some(BRAND_ID.to_owned()),
         ..pb::FindSimilarRequest::default()
       })
       .await

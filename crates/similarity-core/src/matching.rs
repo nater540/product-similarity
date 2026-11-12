@@ -1,13 +1,13 @@
-//! Matching a listing from elsewhere to the stored record it describes.
+//! Matching a menu item from elsewhere to the stored record it describes.
 //!
-//! A revision is compared with one stored record, the one that shares its id. A listing (a retailer's menu item,
-//! say) names no stored record: the question is *which* one it describes, if any. A search around the listing's
-//! composite finds candidates, and this module scores them.
+//! A revision is compared with one stored record, the one that shares its id. A menu item (an entry on a
+//! retailer's menu) names no stored record: the question is *which* one it describes, if any. A search around
+//! the menu item's composite finds candidates, and this module scores them.
 //!
 //! **The search score is skewed and the score here is not.** The cosine of two composites is the weighted mean of
 //! the per-field similarities over the fields both sides have, multiplied by a factor that depends only on which
-//! fields each side filled in: `W(both) / sqrt(W(listing) * W(record))`, with `W` the sum of the weights of a set
-//! of fields. A listing with only a name is therefore ranked below its true strength against a record with every
+//! fields each side filled in: `W(both) / sqrt(W(menu_item) * W(record))`, with `W` the sum of the weights of a set
+//! of fields. A menu item with only a name is therefore ranked below its true strength against a record with every
 //! field filled, and the more fields the record has, the further below. [`rank`] scores each candidate with
 //! [`score::compare`], which reports a field only one side has and leaves it out of the mean, so the factor is
 //! gone. The search only has to bring the right record into the candidates; how many to fetch for that is a cost
@@ -15,7 +15,7 @@
 //!
 //! **A match is a reading, not a revision.** Field floors, the anchor, and quantity limits are rules about what an
 //! edit may do to a record, and none applies. A candidate is compared with the stored record as the baseline and
-//! the listing as the candidate, without an anchor, and no field is ever reported below a floor. Quantities are
+//! the menu item as the candidate, without an anchor, and no field is ever reported below a floor. Quantities are
 //! compared and reported the same way round and never enter the score or the decision (D16).
 
 use crate::error::Result;
@@ -29,8 +29,8 @@ use crate::score::{self, Comparison};
 pub struct Candidate<'a> {
   /// The record's id.
   pub id: &'a str,
-  /// The record's owner, if it has one.
-  pub tenant: Option<&'a str>,
+  /// The key of the brand that owns the record, if it has one.
+  pub brand_id: Option<&'a str>,
   /// The composite cosine the search ranked it by.
   pub search_similarity: f32,
   /// The record's current vectors.
@@ -39,18 +39,18 @@ pub struct Candidate<'a> {
   pub quantities: &'a Quantities,
 }
 
-/// A candidate, scored exactly against the listing.
+/// A candidate, scored exactly against the menu item.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ranked {
   /// The record's id.
   pub id: String,
-  /// The record's owner, if it has one.
-  pub tenant: Option<String>,
+  /// The key of the brand that owns the record, if it has one.
+  pub brand_id: Option<String>,
   /// The composite cosine the search ranked it by.
   pub search_similarity: f32,
-  /// The comparison with the stored record as the baseline and the listing as the candidate, weighed under the
+  /// The comparison with the stored record as the baseline and the menu item as the candidate, weighed under the
   /// schema. [`Comparison::similarity`] is the match score: the weighted mean over the fields both sides have. A
-  /// field only the listing has is `Added`, one only the record has is `Removed`; neither is scored, and no field
+  /// field only the menu item has is `Added`, one only the record has is `Removed`; neither is scored, and no field
   /// is ever below a floor.
   pub comparison: Comparison,
   /// The quantities, compared the same way round. Reported, and consulted by nothing.
@@ -68,7 +68,7 @@ pub enum Decision {
   NoMatch,
 }
 
-/// Scores every candidate against the listing, puts the best first, and keeps `limit`.
+/// Scores every candidate against the menu item, puts the best first, and keeps `limit`.
 ///
 /// The order is by match score, highest first. Equal scores are ordered by id, so that the result does not
 /// depend on the order the candidates came in.
@@ -79,25 +79,25 @@ pub enum Decision {
 pub fn rank<'a>(
   schema: &Schema,
   dimension: usize,
-  listing: &RecordVectors,
-  listing_quantities: &Quantities,
+  menu_item: &RecordVectors,
+  menu_item_quantities: &Quantities,
   candidates: impl IntoIterator<Item = Candidate<'a>>,
   limit: usize,
 ) -> Result<Vec<Ranked>> {
   let nothing = Quantities::new();
   let mut ranked = Vec::new();
   for candidate in candidates {
-    let mut comparison = score::compare(schema, dimension, candidate.vectors, None, listing)?;
-    // A floor is a rule about what an edit may do to a field. A listing is not an edit.
+    let mut comparison = score::compare(schema, dimension, candidate.vectors, None, menu_item)?;
+    // A floor is a rule about what an edit may do to a field. A menu item is not an edit.
     for field in &mut comparison.fields {
       field.below_floor = false;
     }
     ranked.push(Ranked {
       id: candidate.id.to_owned(),
-      tenant: candidate.tenant.map(str::to_owned),
+      brand_id: candidate.brand_id.map(str::to_owned),
       search_similarity: candidate.search_similarity,
       comparison,
-      quantities: score::compare_quantities(schema, candidate.quantities, &nothing, listing_quantities),
+      quantities: score::compare_quantities(schema, candidate.quantities, &nothing, menu_item_quantities),
     });
   }
   ranked.sort_by(|a, b| {
@@ -192,19 +192,19 @@ mod tests {
   fn candidate<'a>(id: &'a str, vectors: &'a RecordVectors, quantities: &'a Quantities) -> Candidate<'a> {
     Candidate {
       id,
-      tenant: None,
+      brand_id: None,
       search_similarity: 0.0,
       vectors,
       quantities,
     }
   }
 
-  fn ranked(listing: &RecordVectors, products: &[(&str, &RecordVectors)], limit: usize) -> Vec<Ranked> {
+  fn ranked(menu_item: &RecordVectors, products: &[(&str, &RecordVectors)], limit: usize) -> Vec<Ranked> {
     let none = Quantities::new();
     rank(
       &schema(),
       DIM,
-      listing,
+      menu_item,
       &none,
       products.iter().map(|(id, vectors)| candidate(id, vectors, &none)),
       limit,
@@ -212,22 +212,22 @@ mod tests {
     .unwrap()
   }
 
-  /// The case the module exists for. A menu item has a name and nothing else; the product it is a listing of has
+  /// The case the module exists for. A menu item has a name and nothing else; the product it is a menu item for has
   /// every field. The search would score the pair at the name's similarity times `4 / sqrt(4 * 7)`; the match
   /// score is the name's similarity.
   #[test]
-  fn a_name_only_listing_is_scored_on_its_name_against_a_fully_filled_product() {
-    let listing = record(&[("name", 10.0, "wyld blueberry 10pk")]);
+  fn a_name_only_menu_item_is_scored_on_its_name_against_a_fully_filled_product() {
+    let menu_item = record(&[("name", 10.0, "wyld blueberry 10pk")]);
     let product = record(&[
       ("name", 0.0, "blueberry gummies"),
       ("description", 80.0, "ten vegan gummies"),
       ("category", 120.0, "edibles"),
     ]);
-    let result = ranked(&listing, &[("p1", &product)], 5);
+    let result = ranked(&menu_item, &[("p1", &product)], 5);
     let name = 10.0_f32.to_radians().cos();
     assert!((result[0].comparison.similarity - name).abs() < 1e-6);
 
-    let search = cosine(&listing.composite, &product.composite).unwrap();
+    let search = cosine(&menu_item.composite, &product.composite).unwrap();
     assert!((search - name * 4.0 / 28.0_f32.sqrt()).abs() < 1e-6, "{search}");
     assert!(
       search < 0.76 && name > 0.98,
@@ -237,9 +237,9 @@ mod tests {
 
   #[test]
   fn a_field_only_one_side_has_is_reported_and_left_out_of_the_score() {
-    let listing = record(&[("name", 0.0, "a"), ("category", 60.0, "listing's own")]);
+    let menu_item = record(&[("name", 0.0, "a"), ("category", 60.0, "menu item's own")]);
     let product = record(&[("name", 0.0, "b"), ("description", 90.0, "c")]);
-    let result = ranked(&listing, &[("p1", &product)], 5);
+    let result = ranked(&menu_item, &[("p1", &product)], 5);
     let fields: Vec<_> = result[0]
       .comparison
       .fields
@@ -263,9 +263,9 @@ mod tests {
 
   #[test]
   fn identical_text_is_unchanged_at_exactly_one() {
-    let listing = record(&[("name", 0.0, "same text")]);
+    let menu_item = record(&[("name", 0.0, "same text")]);
     let product = record(&[("name", 0.0, "same text"), ("category", 30.0, "edibles")]);
-    let result = ranked(&listing, &[("p1", &product)], 5);
+    let result = ranked(&menu_item, &[("p1", &product)], 5);
     let fields = &result[0].comparison.fields;
     let name = fields.iter().find(|field| field.field == "name").unwrap();
     assert_eq!((name.change, name.similarity), (FieldChange::Unchanged, Some(1.0)));
@@ -276,33 +276,33 @@ mod tests {
   /// because the right one has more fields filled in.
   #[test]
   fn candidates_are_ordered_by_match_score_not_by_search_score() {
-    let listing = record(&[("name", 0.0, "listing")]);
+    let menu_item = record(&[("name", 0.0, "menu_item")]);
     let right = record(&[
       ("name", 5.0, "right"),
       ("description", 90.0, "d"),
       ("category", 90.0, "c"),
     ]);
     let wrong = record(&[("name", 30.0, "wrong")]);
-    let search = |product: &RecordVectors| cosine(&listing.composite, &product.composite).unwrap();
+    let search = |product: &RecordVectors| cosine(&menu_item.composite, &product.composite).unwrap();
     assert!(search(&wrong) > search(&right), "the search prefers the wrong one");
 
     let none = Quantities::new();
     let candidates = [
       Candidate {
         search_similarity: search(&wrong),
-        tenant: Some("brand-2"),
+        brand_id: Some("brand-2"),
         ..candidate("wrong", &wrong, &none)
       },
       Candidate {
         search_similarity: search(&right),
-        tenant: Some("brand-1"),
+        brand_id: Some("brand-1"),
         ..candidate("right", &right, &none)
       },
     ];
-    let result = rank(&schema(), DIM, &listing, &none, candidates, 5).unwrap();
+    let result = rank(&schema(), DIM, &menu_item, &none, candidates, 5).unwrap();
     let order: Vec<_> = result
       .iter()
-      .map(|ranked| (ranked.id.as_str(), ranked.tenant.as_deref()))
+      .map(|ranked| (ranked.id.as_str(), ranked.brand_id.as_deref()))
       .collect();
     assert_eq!(order, [("right", Some("brand-1")), ("wrong", Some("brand-2"))]);
     assert_eq!(
@@ -315,31 +315,35 @@ mod tests {
 
   #[test]
   fn equal_scores_are_ordered_by_id_and_the_limit_keeps_the_best() {
-    let listing = record(&[("name", 0.0, "listing")]);
+    let menu_item = record(&[("name", 0.0, "menu_item")]);
     let near = record(&[("name", 10.0, "near")]);
     let far = record(&[("name", 50.0, "far")]);
-    let result = ranked(&listing, &[("z", &near), ("far", &far), ("a", &near), ("m", &near)], 10);
+    let result = ranked(
+      &menu_item,
+      &[("z", &near), ("far", &far), ("a", &near), ("m", &near)],
+      10,
+    );
     let ids: Vec<&str> = result.iter().map(|ranked| ranked.id.as_str()).collect();
     assert_eq!(ids, ["a", "m", "z", "far"]);
-    let kept = ranked(&listing, &[("far", &far), ("z", &near), ("a", &near)], 2);
+    let kept = ranked(&menu_item, &[("far", &far), ("z", &near), ("a", &near)], 2);
     let ids: Vec<&str> = kept.iter().map(|ranked| ranked.id.as_str()).collect();
     assert_eq!(ids, ["a", "z"]);
-    assert!(ranked(&listing, &[("a", &near)], 0).is_empty());
+    assert!(ranked(&menu_item, &[("a", &near)], 0).is_empty());
   }
 
-  /// A floor is a rule for revisions. The schema here has one on the name that this listing would be far below.
+  /// A floor is a rule for revisions. The schema here has one on the name that this menu item would be far below.
   #[test]
   fn a_match_never_reports_a_field_below_a_floor() {
-    let listing = record(&[("name", 60.0, "listing")]);
+    let menu_item = record(&[("name", 60.0, "menu_item")]);
     let product = record(&[("name", 0.0, "product")]);
-    let result = ranked(&listing, &[("p1", &product)], 5);
+    let result = ranked(&menu_item, &[("p1", &product)], 5);
     assert!(result[0].comparison.similarity < 0.99);
     assert!(result[0].comparison.fields.iter().all(|field| !field.below_floor));
   }
 
   #[test]
   fn quantities_are_reported_per_candidate_and_move_no_score() {
-    let listing = record(&[("name", 10.0, "listing")]);
+    let menu_item = record(&[("name", 10.0, "menu_item")]);
     let product = record(&[("name", 0.0, "product")]);
     let grams = |value: f64| -> Quantities {
       [("weight".to_owned(), Quantity::single(value, "g"))]
@@ -347,12 +351,12 @@ mod tests {
         .collect()
     };
     let (one, ten, none) = (grams(1.0), grams(10.0), Quantities::new());
-    let score = |listing_quantities: &Quantities, product_quantities: &Quantities| {
+    let score = |menu_item_quantities: &Quantities, product_quantities: &Quantities| {
       rank(
         &schema(),
         DIM,
-        &listing,
-        listing_quantities,
+        &menu_item,
+        menu_item_quantities,
         [candidate("p1", &product, product_quantities)],
         5,
       )
@@ -371,16 +375,16 @@ mod tests {
     );
     assert!(!weight.beyond_limit, "a limit is a rule for revisions too");
 
-    // Read with the stored record as the baseline: a quantity only the listing has was added.
+    // Read with the stored record as the baseline: a quantity only the menu item has was added.
     assert_eq!(score(&one, &none).quantities[0].change, QuantityChange::Added);
     assert_eq!(score(&none, &one).quantities[0].change, QuantityChange::Removed);
   }
 
   #[test]
   fn the_best_candidate_matches_at_the_threshold_and_not_below_it() {
-    let listing = record(&[("name", 0.0, "listing")]);
+    let menu_item = record(&[("name", 0.0, "menu_item")]);
     let product = record(&[("name", 20.0, "product")]);
-    let result = ranked(&listing, &[("p1", &product)], 5);
+    let result = ranked(&menu_item, &[("p1", &product)], 5);
     let score = result[0].comparison.similarity;
     assert_eq!(decide(None, &result), Decision::NotJudged, "no threshold, no judgment");
     assert_eq!(
@@ -402,10 +406,10 @@ mod tests {
   /// Only the best candidate is judged: a second one above the threshold does not make a match of a first below.
   #[test]
   fn the_decision_is_about_the_first_candidate_alone() {
-    let listing = record(&[("name", 0.0, "listing")]);
+    let menu_item = record(&[("name", 0.0, "menu_item")]);
     let near = record(&[("name", 10.0, "near")]);
     let far = record(&[("name", 60.0, "far")]);
-    let mut result = ranked(&listing, &[("near", &near), ("far", &far)], 5);
+    let mut result = ranked(&menu_item, &[("near", &near), ("far", &far)], 5);
     assert_eq!(decide(Some(0.9), &result), Decision::Matched);
     result.reverse();
     assert_eq!(decide(Some(0.9), &result), Decision::NoMatch);
@@ -413,12 +417,12 @@ mod tests {
 
   #[test]
   fn a_candidate_of_another_layout_is_an_error() {
-    let listing = record(&[("name", 0.0, "listing")]);
+    let menu_item = record(&[("name", 0.0, "menu_item")]);
     let other = RecordVectors {
       composite: vec![1.0, 0.0],
       hashes: BTreeMap::new(),
     };
     let none = Quantities::new();
-    assert!(rank(&schema(), DIM, &listing, &none, [candidate("p1", &other, &none)], 5).is_err());
+    assert!(rank(&schema(), DIM, &menu_item, &none, [candidate("p1", &other, &none)], 5).is_err());
   }
 }

@@ -32,7 +32,7 @@ it can still be written and tested here on synthetic data.
 The serving path and the training math are solid. The gaps are in what surrounds them:
 
 - **No machine-readable record of an evaluation.** `calibrate` prints a text report, and its strict four-key input
-  format drops the `pair_id`, `owner`, `variant_change`, and `split` that the data request collects.
+  format drops the `pair_id`, `brand_id`, `variant_change`, and `split` that the data request collects.
 - **No lineage.** A fine-tuned model directory does not say which base model, data, or options produced it. Only
   checkpoints carry a state file, and that holds the options and a data fingerprint but not the base model.
 - **Nothing compares two runs,** whether two trainings or two calibrations.
@@ -78,7 +78,7 @@ and because each would put a Python service in the loop.
 | 24 | Audit of the store against the catalog | Production | M | An export |
 | 25 | Anchor backup and restore | Production | M | No |
 | 26 | Operational metrics | Production | M | No |
-| 27 | Fair admission between tenants | Production | M | No |
+| 27 | Fair admission between brands | Production | M | No |
 | 28 | A batch call | Production | M | No |
 | 29 | Policy reload, and a configuration digest | Production | S to M | No |
 | 30 | Who forced or deleted, and why | Production | S | No |
@@ -146,7 +146,7 @@ dependency, used by both binaries. `runs/` joins `.gitignore`.
 
 **Built** (D24). What came out differently: results are not written into a checkpoint (D18) but emitted as
 events; checkpoints are compared by AUC and not at the configured thresholds, which belong to the base model;
-the validation split is carved by whole owners with `pairs carve`; and catalog groups of measured owners are
+the validation split is carved by whole brands with `pairs carve`; and catalog groups of measured brands are
 left out of training. A resumed run does not re-score its predecessor's checkpoints.
 
 **What.** The trainer measures separation on an evaluation split at each checkpoint, not only at the start and
@@ -258,7 +258,7 @@ suggested from the largest factor among edits, not from a gap between the two la
   `quantity_range`, `suggestion`, and `summary`.
 - `--full` reads `pairs.full.jsonl` directly, with `--split` and `--min-confidence` filters, in place of the `jq`
   projection the README describes.
-- The report gains slices: by `variant_change`, by top-level category, by `label_source`, and by owner.
+- The report gains slices: by `variant_change`, by top-level category, by `label_source`, and by brand.
 - It adds brand-clustered bootstrap intervals on the false-reject and false-accept rates, and an operating-point
   table (false-reject rate at 1%, 2%, and 5% false-accept rate).
 - It shows the score distribution of `unsure` pairs, scored but not counted as errors.
@@ -334,13 +334,13 @@ download per pinned revision to CI, which the current workflow avoids on purpose
 **What.**
 
 1. A richer `evaluate` log event. It carries `id`, `verdict`, `similarity`, `anchor_similarity`, `stored`, and
-   `revision` today. Add the tenant, mode, model fingerprint, per-field similarity and change, reason codes, and
+   `revision` today. Add the brand, mode, model fingerprint, per-field similarity and change, reason codes, and
    the time spent embedding and in Qdrant.
 2. An optional Prometheus endpoint (`server.metrics_listen`): verdict counters by mode, per-field similarity
    histograms, queue depth, batch size, `RESOURCE_EXHAUSTED` count, latency.
 3. `record-similarity drift --logs prod.ndjson --reference calibration.ndjson`: compares weekly per-field
    distributions with the previous window and with calibration (population stability index and a KS statistic),
-   and reports rejection-rate trends by tenant.
+   and reports rejection-rate trends by brand.
 
 **Why here.** The rollout plan in the README is to run in `DRY_RUN` and log the responses. The current log line
 cannot show which field caused a rejection or which brand is behind most of them, so the logs are not yet the
@@ -411,7 +411,7 @@ were in the build, which is fixed.
 - **Engine state machine.** Random sequences of `Evaluate` (every mode), `Delete`, and `FindSimilar` run against
   a simple reference model, on the in-memory store and the bag-of-words embedder. Invariants: a rejected or
   `DRY_RUN` revision never changes stored state (D7); an ordinary accepted write never replaces an anchor value
-  (D8); `FORCE` resets the anchor; the tenant rules hold (D14).
+  (D8); `FORCE` resets the anchor; the brand rules hold (D14).
 - **Threshold suggestion.** `suggest_threshold` equals a brute-force optimum.
 - **Normalization.** Whitespace normalization is idempotent and the text hash is stable under it.
 - **Batching (D9).** Embedding a text alone and inside a merged, length-bucketed batch agree within tolerance.
@@ -486,7 +486,7 @@ trait did not have to grow. The streaming `Import` RPC was not built.
 **What.** `record-similarity reindex --config new.toml export.jsonl` writes straight to a new collection
 through the store, bypassing the gRPC queue. It embeds in full batches, resumes by skipping ids already stored
 under the target layout, and reports progress as NDJSON. Each input line is
-`{id, tenant, fields, anchor_fields?}`. When the caller still has a record's original version, `anchor_fields`
+`{id, brand_id, fields, anchor_fields?}`. When the caller still has a record's original version, `anchor_fields`
 is embedded as the anchor, so a re-index no longer resets drift detection. A client-streaming `Import` RPC could
 offer the same thing remotely.
 
@@ -502,7 +502,7 @@ engine entry point that respects D8: it sets an anchor only when creating a reco
 
 ### 17. Reviewer feedback capture
 
-**What.** A `RecordFeedback` RPC: the caller sends the id, tenant, the before and after fields, and the
+**What.** A `RecordFeedback` RPC: the caller sends the id, brand, the before and after fields, and the
 reviewer's decision with its source. The server checks that `before` matches the stored baseline's field hashes
 and emits a `feedback` result event in the `pairs.full.jsonl` shape, with `label_source: "reviewer"`.
 `record-similarity feedback export logs.ndjson` turns those events into a calibration and training file.
@@ -554,7 +554,7 @@ were left out: the server stores no text to diff against, and a neighbor cut-off
 `ANCHOR_DRIFT`, and the three quantity reasons that now exist, `QUANTITY_BEYOND_FACTOR`, `QUANTITY_INCOMPARABLE`,
 `MEASURE_CHANGED`), the field or quantity, the similarity or factor, and the limit, alongside the existing
 strings. Each modified field
-gets a word-level diff (`Blueberry` to `Peach`). On a rejection, optionally, a tenant-scoped neighbor search
+gets a word-level diff (`Blueberry` to `Peach`). On a rejection, optionally, a brand-scoped neighbor search
 with the new text: "the edited record now matches sku-77 at 0.97".
 
 **Why here.** The `Reason` enum exists in `score.rs` but reaches the API only as English sentences, so a UI or
@@ -569,13 +569,13 @@ flag, so the common path stays one lookup. The diff is plain string work.
 ### 20. Menu-item to brand-product matching
 
 **Built** (D32). What came out differently: there is no brand-name hint (the server stores no text; the brand's
-key goes in `tenant`, or its name in the `brand` field); the over-fetch is a setting that `calibrate-match`
-measures, not a fixed five; a listing has no field configuration of its own (that would be another layout);
-the threshold separates each listing's own product from the best other one, with intervals, and none is shipped;
+key goes in `brand_id`, or its name in the `brand` field); the over-fetch is a setting that `calibrate-match`
+measures, not a fixed five; a menu item has no field configuration of its own (that would be another layout);
+the threshold separates each menu item's own product from the best other one, with intervals, and none is shipped;
 and quantities are reported per candidate and used for nothing.
 
 **What.** A `Match` RPC. It takes a retailer menu item's fields (often only a name), searches brand products
-across tenants, optionally narrowed by a brand-name hint, over-fetches five times the wanted number of
+across brands, optionally narrowed by a brand-name hint, over-fetches five times the wanted number of
 candidates from Qdrant, and re-ranks them with the exact weighted score over the fields both sides have. It
 returns the top matches with per-field scores and a same-product decision. `calibrate-match
 catalog-groups.jsonl` measures recall and mean reciprocal rank and picks the match threshold.
@@ -657,7 +657,7 @@ it removes a limitation and costs one extra read on a write.
 
 **What.** `record-similarity audit export.jsonl`: reads an export of the caller's own database (the format
 `import` reads) and the collection, and reports ids the store lacks, ids the store has that the export does not,
-records whose text or quantities differ, and records stored under another tenant. No model: the store keeps a
+records whose text or quantities differ, and records stored under another brand. No model: the store keeps a
 fingerprint of every field's text, and the export's text can be fingerprinted the same way.
 
 **Why here.** The service's baseline and the caller's database have to agree, and today nothing can check that
@@ -681,7 +681,7 @@ snapshot covers this only for as long as the model does not change; a file keyed
 no longer applies.
 
 **Effort.** M (it shares the `scan` of 24). **Needs:** nothing. **Decide:** where such a file may be kept: it
-holds vectors and fingerprints, no text, and tenant ids.
+holds vectors and fingerprints, no text, and brand ids.
 
 ### 26. Operational metrics
 
@@ -695,20 +695,20 @@ feature 10: that is one line per request about *scores*, for judging thresholds,
 counters about the *process*, for paging someone.
 
 **Effort.** M. **Needs:** nothing. **Decide:** it opens a second port, and it overlaps a question deferred with
-feature 10 (whether to have a metrics endpoint at all). Tenants must not become label values.
+feature 10 (whether to have a metrics endpoint at all). Brands must not become label values.
 
-### 27. One tenant cannot starve the rest
+### 27. One brand cannot starve the rest
 
-**What.** Fair admission in front of the embedding queue: a cap on how much of the queue one tenant may hold, or
-round-robin between tenants when it is contended.
+**What.** Fair admission in front of the embedding queue: a cap on how much of the queue one brand may hold, or
+round-robin between brands when it is contended.
 
 **Why here.** There is one queue of `model.queue_depth` (256) for everyone, first come first served. One
-merchant's bulk edit, or one misbehaving integration retrying without backoff, fills it, and every other
-merchant's saves get `RESOURCE_EXHAUSTED`. The load test shows how little it takes: the queue is the only buffer
+brand's bulk edit, or one misbehaving integration retrying without backoff, fills it, and every other
+brand's saves get `RESOURCE_EXHAUSTED`. The load test shows how little it takes: the queue is the only buffer
 in front of one thread.
 
-**Effort.** M. **Needs:** `just load` extended with two tenants of unequal appetite. **Decide:** what a request
-without a tenant counts as.
+**Effort.** M. **Needs:** `just load` extended with two brands of unequal appetite. **Decide:** what a request
+without a brand counts as.
 
 ### 28. A batch call
 
@@ -723,7 +723,7 @@ passes on purpose.
 creates, and is not something an application can call.
 
 **Effort.** M. **Needs:** nothing. **Decide:** whether a batch is all `DRY_RUN` (a report) or may write; a
-batch that writes needs every per-record rule of `Evaluate`, including the tenant check.
+batch that writes needs every per-record rule of `Evaluate`, including the brand check.
 
 ### 29. Change a threshold without a restart, and know every replica agrees
 
@@ -749,14 +749,14 @@ says. Both are the ways around the service, and neither leaves any trace of who 
 deletes and re-creates to get an edit through is indistinguishable from normal traffic.
 
 **Effort.** S. **Needs:** nothing. **Decide:** this is personal data about staff in a log and in the store, so
-it is the owner's call, like the tenant was.
+it is the owner's call, like the brand was.
 
 ### 31. TLS and a caller identity
 
-**What.** TLS on the listener, and a caller identity (a client certificate or a token) that the tenant check can
+**What.** TLS on the listener, and a caller identity (a client certificate or a token) that the brand check can
 be tied to.
 
-**Why here.** The server speaks plaintext and trusts every caller; the tenant rule is a consistency check and
+**Why here.** The server speaks plaintext and trusts every caller; the brand rule is a consistency check and
 says so. Behind a mesh that is enough. Anywhere else, any client on the network can delete any record, or
 `FORCE` one.
 
@@ -798,7 +798,7 @@ part that puts them in order. It is also most of the model half of feature 18.
 4. **24 and 25, audit and anchor backup,** together: they share a scan of the store, and between them they are
    the answer to "what if the collection and the catalog disagree, or the collection is gone".
 
-Then 26 if a metrics endpoint is wanted, and 27 before the first large merchant integration. 28 to 31 wait on
+Then 26 if a metrics endpoint is wanted, and 27 before the first large integration. 28 to 31 wait on
 who the callers turn out to be; 32 waits for a model change.
 
 ## Things noticed along the way

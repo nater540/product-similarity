@@ -32,10 +32,10 @@ use similarity_store::{QdrantStore, VectorStore};
 use tokio::sync::oneshot;
 use tonic::transport::Channel;
 
-fn record(id: &str, tenant: &str, fields: &[(&str, &str)]) -> pb::Record {
+fn record(id: &str, brand_id: &str, fields: &[(&str, &str)]) -> pb::Record {
   pb::Record {
     id: Some(id.to_owned()),
-    tenant: Some(tenant.to_owned()),
+    brand_id: Some(brand_id.to_owned()),
     fields: fields
       .iter()
       .map(|(name, text)| ((*name).to_owned(), (*text).to_owned()))
@@ -45,7 +45,7 @@ fn record(id: &str, tenant: &str, fields: &[(&str, &str)]) -> pb::Record {
 }
 
 /// `record` with quantities, each a single value: `(name, value, unit)`.
-fn measured(id: &str, tenant: &str, fields: &[(&str, &str)], quantities: &[(&str, f64, &str)]) -> pb::Record {
+fn measured(id: &str, brand_id: &str, fields: &[(&str, &str)], quantities: &[(&str, f64, &str)]) -> pb::Record {
   pb::Record {
     quantities: quantities
       .iter()
@@ -58,7 +58,7 @@ fn measured(id: &str, tenant: &str, fields: &[(&str, &str)], quantities: &[(&str
         ((*name).to_owned(), quantity)
       })
       .collect(),
-    ..record(id, tenant, fields)
+    ..record(id, brand_id, fields)
   }
 }
 
@@ -182,7 +182,7 @@ async fn scenario(mut client: RecordSimilarityClient<Channel>) {
 
   // A new product becomes the baseline.
   let created = client
-    .evaluate(evaluate(record("sku-1", "merchant-1", &GUMMIES)))
+    .evaluate(evaluate(record("sku-1", "brand-1", &GUMMIES)))
     .await
     .unwrap()
     .into_inner();
@@ -193,7 +193,7 @@ async fn scenario(mut client: RecordSimilarityClient<Channel>) {
 
   // An ordinary edit (name suffix, reworded description) is accepted and stored.
   let edited = client
-    .evaluate(evaluate(record("sku-1", "merchant-1", &GUMMIES_EDITED)))
+    .evaluate(evaluate(record("sku-1", "brand-1", &GUMMIES_EDITED)))
     .await
     .unwrap()
     .into_inner();
@@ -213,7 +213,7 @@ async fn scenario(mut client: RecordSimilarityClient<Channel>) {
 
   // Turning the gummies into a vape cartridge is rejected, with reasons, and nothing is written.
   let recycled = client
-    .evaluate(evaluate(record("sku-1", "merchant-1", &VAPE)))
+    .evaluate(evaluate(record("sku-1", "brand-1", &VAPE)))
     .await
     .unwrap()
     .into_inner();
@@ -250,7 +250,7 @@ async fn scenario(mut client: RecordSimilarityClient<Channel>) {
     GUMMIES_EDITED[3],
   ];
   let sneaky = client
-    .evaluate(evaluate(record("sku-1", "merchant-1", &renamed)))
+    .evaluate(evaluate(record("sku-1", "brand-1", &renamed)))
     .await
     .unwrap()
     .into_inner();
@@ -264,7 +264,7 @@ async fn scenario(mut client: RecordSimilarityClient<Channel>) {
 
   // The stored baseline survived both attempts: re-submitting the accepted edit is a no-op at similarity 1.
   let again = client
-    .evaluate(evaluate(record("sku-1", "merchant-1", &GUMMIES_EDITED)))
+    .evaluate(evaluate(record("sku-1", "brand-1", &GUMMIES_EDITED)))
     .await
     .unwrap()
     .into_inner();
@@ -276,16 +276,16 @@ async fn scenario(mut client: RecordSimilarityClient<Channel>) {
 
   // Neighbor search ranks a sibling product above an unrelated one, on the same scale as the verdicts.
   client
-    .evaluate(evaluate(record("sku-2", "merchant-1", &RASPBERRY_GUMMIES)))
+    .evaluate(evaluate(record("sku-2", "brand-1", &RASPBERRY_GUMMIES)))
     .await
     .unwrap();
   client
-    .evaluate(evaluate(record("sku-3", "merchant-2", &VAPE)))
+    .evaluate(evaluate(record("sku-3", "brand-2", &VAPE)))
     .await
     .unwrap();
-  let around = |tenant: Option<&str>| pb::FindSimilarRequest {
+  let around = |brand_id: Option<&str>| pb::FindSimilarRequest {
     query: Some(pb::find_similar_request::Query::Id("sku-1".to_owned())),
-    tenant: tenant.map(str::to_owned),
+    brand_id: brand_id.map(str::to_owned),
     ..pb::FindSimilarRequest::default()
   };
   let neighbors = client.find_similar(around(None)).await.unwrap().into_inner().neighbors;
@@ -301,7 +301,7 @@ async fn scenario(mut client: RecordSimilarityClient<Channel>) {
   );
 
   let own = client
-    .find_similar(around(Some("merchant-1")))
+    .find_similar(around(Some("brand-1")))
     .await
     .unwrap()
     .into_inner()
@@ -315,7 +315,7 @@ async fn scenario(mut client: RecordSimilarityClient<Channel>) {
   let probe = pb::FindSimilarRequest {
     query: Some(pb::find_similar_request::Query::Record(pb::Record {
       id: None,
-      tenant: None,
+      brand_id: None,
       fields: HashMap::from([("name".to_owned(), "sour diesel 510 cart".to_owned())]),
       quantities: HashMap::new(),
     })),
@@ -327,28 +327,25 @@ async fn scenario(mut client: RecordSimilarityClient<Channel>) {
     "sku-3"
   );
 
-  // "Which stored product is this menu item a listing of?" The listing has a name and nothing else, in a
+  // "Which stored product is this menu item for?" The menu item has a name and nothing else, in a
   // retailer's words. The vape it describes has every field filled in, so the search scores it low; scored on
   // the name alone, which is all the two share, it is well ahead. The shipped configuration has no match
   // threshold, so the candidates are ranked and nothing is claimed.
-  let listing = pb::MatchRequest {
-    listing: Some(pb::Record {
+  let menu_item = pb::MatchRequest {
+    menu_item: Some(pb::Record {
       id: None,
-      tenant: None,
+      brand_id: None,
       fields: HashMap::from([("name".to_owned(), "sour diesel 510 cart".to_owned())]),
       quantities: HashMap::new(),
     }),
     ..pb::MatchRequest::default()
   };
-  let matched = client.r#match(listing.clone()).await.unwrap().into_inner();
+  let matched = client.r#match(menu_item.clone()).await.unwrap().into_inner();
   assert_eq!(matched.decision(), pb::MatchDecision::NotJudged);
   assert_eq!(matched.threshold, None);
   assert_eq!(matched.candidates.len(), 3, "{matched:?}");
   let best = &matched.candidates[0];
-  assert_eq!(
-    (best.id.as_str(), best.tenant.as_deref()),
-    ("sku-3", Some("merchant-2"))
-  );
+  assert_eq!((best.id.as_str(), best.brand_id.as_deref()), ("sku-3", Some("brand-2")));
   assert!(
     best.similarity > best.search_similarity + 0.1,
     "the match score is not the search score: {best:?}"
@@ -367,11 +364,11 @@ async fn scenario(mut client: RecordSimilarityClient<Channel>) {
       .iter()
       .all(|field| field.field == "name" || field.change() == pb::FieldChange::Removed)
   );
-  // Within the other merchant's records there is no vape to find, and a threshold says so.
+  // Within the other brand's records there is no vape to find, and a threshold says so.
   let elsewhere = pb::MatchRequest {
-    tenant: Some("merchant-1".to_owned()),
+    brand_id: Some("brand-1".to_owned()),
     threshold: Some(best.similarity),
-    ..listing
+    ..menu_item
   };
   let elsewhere = client.r#match(elsewhere).await.unwrap().into_inner();
   assert_eq!(elsewhere.decision(), pb::MatchDecision::NoMatch, "{elsewhere:?}");
@@ -380,7 +377,7 @@ async fn scenario(mut client: RecordSimilarityClient<Channel>) {
   // A reviewer can force the change through; after that the vape is the record.
   let force = pb::EvaluateRequest {
     mode: pb::WriteMode::Force.into(),
-    ..evaluate(record("sku-1", "merchant-1", &VAPE))
+    ..evaluate(record("sku-1", "brand-1", &VAPE))
   };
   let forced = client.evaluate(force).await.unwrap().into_inner();
   assert_eq!(
@@ -388,7 +385,7 @@ async fn scenario(mut client: RecordSimilarityClient<Channel>) {
     (pb::Verdict::Rejected, true, 3)
   );
   let settled = client
-    .evaluate(evaluate(record("sku-1", "merchant-1", &VAPE)))
+    .evaluate(evaluate(record("sku-1", "brand-1", &VAPE)))
     .await
     .unwrap()
     .into_inner();
@@ -402,7 +399,7 @@ async fn scenario(mut client: RecordSimilarityClient<Channel>) {
   // never reject: the same vape at half the size, with its potency rewritten in other units, is still accepted.
   let sized = [("weight_per_item", 1.0, "g"), ("thc_per_item", 850.0, "mg")];
   let first = client
-    .evaluate(evaluate(measured("sku-1", "merchant-1", &VAPE, &sized)))
+    .evaluate(evaluate(measured("sku-1", "brand-1", &VAPE, &sized)))
     .await
     .unwrap()
     .into_inner();
@@ -420,7 +417,7 @@ async fn scenario(mut client: RecordSimilarityClient<Channel>) {
 
   let resized = [("weight_per_item", 500.0, "mg"), ("thc_per_item", 0.85, "g")];
   let halved = client
-    .evaluate(evaluate(measured("sku-1", "merchant-1", &VAPE, &resized)))
+    .evaluate(evaluate(measured("sku-1", "brand-1", &VAPE, &resized)))
     .await
     .unwrap()
     .into_inner();
@@ -442,7 +439,7 @@ async fn scenario(mut client: RecordSimilarityClient<Channel>) {
 
   // What Qdrant holds is what was sent: sending it again changes nothing.
   let again = client
-    .evaluate(evaluate(measured("sku-1", "merchant-1", &VAPE, &resized)))
+    .evaluate(evaluate(measured("sku-1", "brand-1", &VAPE, &resized)))
     .await
     .unwrap()
     .into_inner();
@@ -454,7 +451,7 @@ async fn scenario(mut client: RecordSimilarityClient<Channel>) {
     client
       .delete(pb::DeleteRequest {
         id: "sku-1".to_owned(),
-        tenant: Some("merchant-1".to_owned()),
+        brand_id: Some("brand-1".to_owned()),
       })
       .await
       .unwrap()
@@ -462,7 +459,7 @@ async fn scenario(mut client: RecordSimilarityClient<Channel>) {
       .deleted
   );
   let reborn = client
-    .evaluate(evaluate(record("sku-1", "merchant-1", &GUMMIES)))
+    .evaluate(evaluate(record("sku-1", "brand-1", &GUMMIES)))
     .await
     .unwrap()
     .into_inner();
@@ -480,7 +477,7 @@ fn export_line(id: &str, name: &str, original_name: Option<&str>) -> String {
       "weight_per_item": {"value": weight, "unit": "g"},
     })
   };
-  let mut line = serde_json::json!({"id": id, "tenant": "brand-1", "record": record(name, 40.0)});
+  let mut line = serde_json::json!({"id": id, "brand_id": "brand-1", "record": record(name, 40.0)});
   if let Some(original) = original_name {
     line["anchor"] = record(original, 20.0);
   }
@@ -556,7 +553,7 @@ async fn a_catalog_is_imported_into_qdrant_with_its_original_versions_and_a_seco
 
     // What Qdrant holds: a plain record is its own anchor, and one with an original version is not.
     let plain = reader.get("sku-1").await.unwrap().unwrap();
-    assert_eq!((plain.revision, plain.tenant.as_deref()), (1, Some("brand-1")));
+    assert_eq!((plain.revision, plain.brand_id.as_deref()), (1, Some("brand-1")));
     assert!(similarity_core::vector::cosine(&plain.anchor, &plain.vectors.composite).unwrap() > 0.9999);
     let edited = reader.get("sku-2").await.unwrap().unwrap();
     let agreement = similarity_core::vector::cosine(&edited.anchor, &edited.vectors.composite).unwrap();
@@ -571,7 +568,7 @@ async fn a_catalog_is_imported_into_qdrant_with_its_original_versions_and_a_seco
     let preview = EvaluateInput {
       record: RecordInput {
         id: Some("sku-2".to_owned()),
-        tenant: Some("brand-1".to_owned()),
+        brand_id: Some("brand-1".to_owned()),
         fields: vec![
           ("name".to_owned(), "Blueberry Gummies 100mg (Indica)".to_owned()),
           ("category".to_owned(), GUMMIES[1].1.to_owned()),

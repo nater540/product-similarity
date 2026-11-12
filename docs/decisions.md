@@ -156,7 +156,7 @@ The honest assessment, since the question was asked:
 - **At tens of thousands of records, search does not need one either.** Brute force over 50,000 composites of 1024
   floats is about 50 million multiply-adds, on the order of 10 ms on one core. `MemoryStore` does exactly that.
 - **What Qdrant does provide** is everything operational: durable state shared by every server replica,
-  tenant-filtered search, snapshots, a dashboard for looking at what is stored, and headroom to millions of records
+  brand-filtered search, snapshots, a dashboard for looking at what is stored, and headroom to millions of records
   without redesign.
 - **What it was said to lack** was a compare-and-swap, and that was true of the Qdrant this was first written
   against. The one that is pinned now has a conditional upsert, and every write uses it (D35). A relational
@@ -169,7 +169,7 @@ the same job at this scale with one fewer service and with transactional writes.
 
 Layout in Qdrant: one collection, one point per record, two named vectors. `current` is HNSW-indexed and is what
 searches match. `anchor` (see D8) is only ever read by id, so its HNSW graph is disabled (`m = 0`) and it lives on
-disk. `tenant` has a tenant-aware keyword index. Point ids are the UUIDv5 of the record id.
+disk. `brand_id` has a brand-aware keyword index. Point ids are the UUIDv5 of the record id.
 
 The payload indexes are ensured on every connect, not only when the collection is created. Creating an index
 that exists costs nothing, and the alternative leaves a collection whose first start failed between the two steps
@@ -190,7 +190,7 @@ A rejected revision must leave the baseline alone. If it overwrote it, the recyc
 compared against their own first attempt and pass.
 
 Three write modes cover the workflows around that: `ENFORCE` (above), `DRY_RUN` (never write: preview a verdict
-while the merchant is still typing), and `FORCE` (always write: a human reviewer overrides the policy). A forced
+while someone is still typing), and `FORCE` (always write: a human reviewer overrides the policy). A forced
 write still reports the verdict the policy would have given.
 
 A `mode` value the server does not recognize is `INVALID_ARGUMENT`. Protobuf's convention is to read an unknown
@@ -369,17 +369,17 @@ resulting similarities. The CUDA feature compiles and has not been run.
 **What this does not show.** Everything above establishes that the trainer computes what the reference computes.
 Whether fine-tuning improves verdicts is a question for real labeled data and a held-out calibration.
 
-## D14. A tenant, once set, must be named
+## D14. A brand, once set, must be named
 
-A record may carry a tenant (the merchant it belongs to). It is stored with the record and filters searches. It
-is also checked: once a record has a tenant, an `Evaluate` or `Delete` for its id must name the same one. Naming
+A record may carry a `brand_id`: the key of the brand it belongs to. It is stored with the record and filters searches. It
+is also checked: once a record has a brand, an `Evaluate` or `Delete` for its id must name the same one. Naming
 another is refused, and so is naming none. The second half matters as much as the first: the mistake the check
 exists for is a caller that has lost track of whose record it is editing, and a check that can be skipped by
-leaving a field out does not catch that. A record stored without a tenant takes the first one a revision names,
-which is how a catalog indexed before tenants were in use gains them.
+leaving a field out does not catch that. A record stored without a brand takes the first one a revision names,
+which is how a catalog indexed before brands were in use gains them.
 
 This is a consistency check and not access control. The server does not authenticate anyone (see the README's
-limitations), so a caller that can reach it can always supply the right tenant.
+limitations), so a caller that can reach it can always supply the right brand.
 
 ## D15. Logs are NDJSON, and results are output
 
@@ -502,10 +502,10 @@ quotient overflows (`1e-300 g` against `1e300 g`). An infinite factor is not a J
 carrying it would hold `null`, and the run could not be read back. Such a change gets the largest finite number,
 which is beyond every limit, as it should be.
 
-## D17. A calibration is also data: flat events, intervals over owners
+## D17. A calibration is also data: flat events, intervals over brands
 
 `calibrate` printed a report for a person and nothing else, and read only a four-key format that drops everything
-a data export knows about a pair (its id, its owner, its split, whether it is a variant change). Real labeled
+a data export knows about a pair (its id, its brand, its split, whether it is a variant change). Real labeled
 pairs make three more things necessary: reading the export as it is, saying how sure an error rate is, and
 keeping a run in a form another run can be compared with.
 
@@ -531,11 +531,11 @@ what scoring afresh would.
 **One source for every number.** The text report and the events are both rendered from `offline::stats`. Two
 renderers that each computed their own ranges would drift apart, as the trainer's two log formats once did (D15).
 
-**Intervals resample owners, not pairs.** The two error rates and the operating points carry a 95% interval from
-1,000 seeded bootstrap resamples. What is resampled is the owner, with all of its pairs: edits by one brand are
+**Intervals resample brands, not pairs.** The two error rates and the operating points carry a 95% interval from
+1,000 seeded bootstrap resamples. What is resampled is the brand, with all of its pairs: edits by one brand are
 written by the same people about the same product line and are not independent, so resampling pairs would give an
 interval that is too narrow, and narrower the more one brand dominates. That needs every labeled pair to name an
-owner and at least two owners; otherwise no interval is printed, which is honest for a file that cannot support
+brand and at least two brands; otherwise no interval is printed, which is honest for a file that cannot support
 one. A rate with no errors has a zero-width interval. That is a limit of the method on small data and the README
 says so; it is not evidence of a zero rate.
 
@@ -631,7 +631,7 @@ evaluating afresh (D17); that a quantity's factor is the same in both directions
 rewriting both sides in another unit (D16); that judging quantities never touches the text verdict; and that a
 text embeds the same alone and in any batch (D9). In `similarity-server`: that the suggested threshold is what
 trying every cut finds, and a **state machine**: random sequences of `Evaluate` (every mode, valid and malformed,
-with and without tenants and quantities), `Delete`, and `FindSimilar`, with every rule of D7, D8, D14, and D16
+with and without brands and quantities), `Delete`, and `FindSimilar`, with every rule of D7, D8, D14, and D16
 checked after every request against what the store held before it.
 
 **It can fail.** Three deliberate breaks of the engine (writing a rejected revision, replacing the anchor's
@@ -667,7 +667,7 @@ to the model. Three choices in it:
 stored exactly as it is, down to its timestamp. An import that could update would be a way to replace a baseline
 and an anchor without a verdict, which is everything D7 and D8 exist to prevent; and "which records did the
 interrupted run get to?" would need an answer. Creating only, it is safe to run twice and is resumed by running
-it again, with no bookkeeping. The same request rule holds as anywhere else: an id stored under another tenant
+it again, with no bookkeeping. The same request rule holds as anywhere else: an id stored under another brand
 is an error for that record, not a skip (D14).
 
 **The original version, where the caller still has it, becomes the anchor.** A line may carry `anchor`: the
@@ -828,7 +828,7 @@ another run and must be accepted.
 After that, a note that cannot be written is a warning: the training matters more than the note about it.
 
 **The id is the time, the kind, and a name**, `20261111T201826Z-train-mdbr-leaf-mt-ft`, so that a directory
-listing is in order and needs no index. The name comes from a path the caller chose, so a property holds that an
+menu item is in order and needs no index. The name comes from a path the caller chose, so a property holds that an
 id is always a single safe path component.
 
 **What it does not do.** It records and lists. Comparing runs, drawing them, and deciding on them are features
@@ -845,21 +845,21 @@ chosen that way has been fitted to the holdout, and the error rates it reports a
 production will be. Two planners found this independently. The export has two splits, and one of them cannot
 both choose and judge.
 
-**A third split, carved from the first.** `pairs carve` moves a share of one split's owners (by default from
-`calibrate` to `validation`). Whole owners move, because pairs of one brand are not independent. Which owners is
-decided by a hash of the owner's name and a salt, with no randomness and no state: the same command moves the
-same owners, carving twice moves nothing more, and a larger share keeps every owner a smaller one moved. The
+**A third split, carved from the first.** `pairs carve` moves a share of one split's brands (by default from
+`calibrate` to `validation`). Whole brands move, because pairs of one brand are not independent. Which brands is
+decided by a hash of the brand's id and a salt, with no randomness and no state: the same command moves the
+same brands, carving twice moves nothing more, and a larger share keeps every brand a smaller one moved. The
 share has no default. It is not a threshold, but it is a judgment about how many labeled pairs a comparison
 needs, and that depends on the data.
 
 **Both binaries select by `split` alone.** The trainer trains on `calibrate`, compares on `validation`, and
 reports on `holdout`; `calibrate --split` reads any of them. The alternative was a fold computed in memory from
-an owner hash in each binary (which would allow k folds). One carved split was chosen because the two binaries
+a brand hash in each binary (which would allow k folds). One carved split was chosen because the two binaries
 then cannot disagree about which pairs are which, and a file is something a person can look at.
 
-**Catalog groups of measured owners are left out of training.** A catalog group has no split of its own. One
-whose owner is in the validation or holdout split is skipped, or the brand held back for measuring would be
-learned from by another route. A group that names no owner is kept and counted.
+**Catalog groups of measured brands are left out of training.** A catalog group has no split of its own. One
+whose brand is in the validation or holdout split is skipped, or the brand held back for measuring would be
+learned from by another route. A group that names no brand is kept and counted.
 
 **The trainer compares by AUC, not by errors at a threshold.** The area under the curve is how often an edit
 scores above a recycle: it depends only on order. "Errors at the configured threshold" was the obvious measure
@@ -922,6 +922,14 @@ and split they came from). Each got a test, and each mutation was then applied b
 
 After the streaming import and the ONNX engine, a run at `a7b67c3` tested 681 mutants in 27 minutes: 571 caught,
 110 that do not compile, none surviving.
+
+After conditional writes (D35), a run at `9756a57` tested 689 mutants in 28 minutes: 575 caught, 113 that do not
+compile, 1 surviving, and the survivor said something. With the per-record lock replaced by one that locks
+nothing, every test still passed: the store's condition now gives the right outcome whether or not requests take
+turns, so the test that used to catch a missing lock (thirty-two requests, one record created) no longer could.
+What the lock still does is keep a process from racing itself, and that is what its tests now state: two
+requests for one record each read it once, and thirty-two forced writes to one record all succeed with one read
+apiece. The mutation, applied by hand, fails both.
 
 **Why an allowlist of files.** The alternative, excluding what should not be mutated, grows a list of everything
 whose only tests need the model or Qdrant, and a new file is mutated by default whether or not its tests can run.
@@ -987,7 +995,7 @@ grow, is a different measurement and needs an open loop; the README warns agains
 
 **The store defaults to memory, and Qdrant is never the default.** A load test that wrote into the configured
 collection because nobody said otherwise would be a bad afternoon. Against a running server the records go under
-a tenant of their own and are deleted afterwards.
+a brand of their own and are deleted afterwards.
 
 **Request lines carry `elapsed_ms`,** and the `evaluate` line's similarities are rounded to six places as every
 other event's are (the last line that printed a 32-bit value's conversion noise).
@@ -1167,9 +1175,9 @@ candidate's configuration from the live one, which is how the names and `require
 `shadow_schema_field` and `shadow_schema_quantity` line per item, `shadow` and `shadow_reason` joined on `key`,
 `shadow_summary`. They go to stdout, which a serving process did not write to before; that is why nothing is
 written without a `[shadow]` table, and why the default is a line per disagreement and not per request. A
-`shadow` line carries scores, verdicts, and codes, and no text. It names the record by id and by the tenant the
-request named, as given: the owner decided on 2026-11-11 that a tenant is an identifier the server may write,
-which is also the answer the telemetry plan was waiting for. A request that names no tenant gets a line without
+`shadow` line carries scores, verdicts, and codes, and no text. It names the record by id and by the brand the
+request named, as given: the owner decided on 2026-11-11 that a brand is an identifier the server may write,
+which is also the answer the telemetry plan was waiting for. A request that names no brand gets a line without
 the key. Fields can be added later; none may be repurposed.
 
 **Agreement is not quality.** A disagreement says the policies differ, not which is right. The summary counts
@@ -1196,8 +1204,8 @@ would plug into, so building the policy half first cost it nothing.
 **`shadow-report` reads the file back.** Totals come from the summaries (each counts from its server's start,
 so the last of each run is taken and the runs are added up; `run` on the lines is what tells them apart), and
 everything about which revisions comes from the `shadow` lines. The two are never mixed: a rate is over what
-the summaries counted, and an interval, resampled by tenant, is given only when the file has a line for every
-judged revision (`events = "all"`), because only then is each tenant's share of the judged revisions known. The
+the summaries counted, and an interval, resampled by brand, is given only when the file has a line for every
+judged revision (`events = "all"`), because only then is each brand's share of the judged revisions known. The
 reasons listed for a disagreement are the ones the rejecting side gave. It writes the disagreements as a list
 to label and prints, last, that a disagreement is not a verdict on the candidate. Its numbers are in
 `offline::stats::shadow`, like every other report's (D17).
@@ -1269,31 +1277,31 @@ gate prints the name and records it. It cannot know what the operator then does.
 **Not built:** a minimum holdout size. The plan proposed warning below 40 recycles, a number nobody measured.
 The report prints each rate with its interval instead, which says the same thing without a constant.
 
-## D32. Matching a listing to a record is a read, scored exactly, with a threshold nobody has measured yet
+## D32. Matching a menu item to a record is a read, scored exactly, with a threshold nobody has measured yet
 
 The same model and the same stored catalog can answer a second question: not "is this edit still the same
-record?" but "which stored record is this listing a listing of?". A retailer's menu item, in the retailer's
-words, often with only a name. `FindSimilar` with an ad hoc record already half-answers it, and D5 says why only
+record?" but "which stored record is this menu item for?". A menu item is an entry on a retailer's menu, in the
+retailer's words, often with only a name. `FindSimilar` with an ad hoc record already half-answers it, and D5 says why only
 half.
 
-**The search score is the exact score times a factor, and the factor is known.** For a listing `Q` and a stored
+**The search score is the exact score times a factor, and the factor is known.** For a menu item `Q` and a stored
 record `C`, the cosine of the two composites is the weighted mean over the fields both have, multiplied by
 `W(Q∩C) / sqrt(W(Q) * W(C))`, `W` being the sum of the weights of a set of fields. The factor depends only on
-which fields each side filled in. A name-only listing against a record with all four example fields is scaled by
+which fields each side filled in. A name-only menu item against a record with all four example fields is scaled by
 `4 / sqrt(4 * 10) = 0.63`; against a record with only a name, not at all. So a search ranks the record that
-resembles the listing in *which fields it has* above the one that resembles it in *what they say*. A property
+resembles the menu item in *which fields it has* above the one that resembles it in *what they say*. A property
 holds the formula (`the_search_score_is_the_match_score_scaled_by_the_field_overlap`), and the README's example
 shows it on the real model: 0.940 exact, 0.595 in the search.
 
 **So a match searches, then scores what it found.** `matching::rank` in `similarity-core` scores each candidate
-with `score::compare`, stored record as baseline, listing as candidate, no anchor: a field only one side has is
+with `score::compare`, stored record as baseline, menu item as candidate, no anchor: a field only one side has is
 reported and left out. The engine and `calibrate-match` both call it, so the server and the measurement rank
 alike. A match is a reading, not a revision: no floor and no quantity limit applies, and none is ever reported.
 
 **The over-fetch is a cost, and it is measured.** Only what the search returns can be scored, so `Match`
 fetches `matching.overfetch` records for each candidate it returns, capped at 1,000. The suggestion said five.
 Five is a guess, kept as the default and not defended: `calibrate-match` scores every product exhaustively as
-well and reports how many listings got another ranking, which on a real catalog is what says whether five is
+well and reports how many menu items got another ranking, which on a real catalog is what says whether five is
 enough. `VectorStore::search_vectors` exists so that the re-rank is one round trip and not one `get` per
 candidate; both stores build both searches from one request, and the shared contract holds them to the same
 results in the same order.
@@ -1302,33 +1310,33 @@ results in the same order.
 returns ids. `Match` returns another score, per-field and per-quantity detail, and a decision. Changing what
 `FindSimilar` reports would silently change a documented number for its callers.
 
-**A listing is mapped onto the product schema and has no layout of its own.** Another set of fields is another
-layout (D12), and a listing under one could not be compared with a product at all. The caller maps the listing's
+**A menu item is mapped onto the product schema and has no layout of its own.** Another set of fields is another
+layout (D12), and a menu item under one could not be compared with a product at all. The caller maps the menu item's
 columns onto the schema's names, as it does for products, and leaves out what has no counterpart.
 
-**A listing carries no id and no tenant, and a request that sends either is refused.** Both belong to the system
-the listing came from. Accepting a tenant on the listing would invite a caller to pass the retailer where the
-brand is meant. The search is narrowed by the request's own `tenant`. Without one every tenant's records are
+**A menu item carries no id and no brand, and a request that sends either is refused.** Both belong to the system
+the menu item came from. Accepting a brand on the menu item would invite a caller to pass the retailer where the
+brand is meant. The search is narrowed by the request's own `brand_id`. Without one every brand's records are
 candidates: the owner's decision of 2026-11-11, and what `FindSimilar` has always done. As everywhere, the
-tenant is a consistency check and not access control (D14).
+brand is a consistency check and not access control (D14).
 
-**It never writes.** No listing is stored, no record changes, and D7, D8, and D20 are untouched by construction.
+**It never writes.** No menu item is stored, no record changes, and D7, D8, and D20 are untouched by construction.
 The property state machine sends `Match` requests among the others and checks the store is exactly what it was.
 
-**Quantities are reported and decide nothing** (D16). A 3.5 g listing of a 1 g product may be the same product
+**Quantities are reported and decide nothing** (D16). A 3.5 g menu item for a 1 g product may be the same product
 in one catalog and another product in the next. Each candidate's quantities are compared and returned, and
-`calibrate-match` counts how the listings' agree with their own products'. Whether one should stop a match waits
+`calibrate-match` counts how the menu items' agree with their own products'. Whether one should stop a match waits
 for the answer to that question about the real catalog. Containment (a batch's potency inside a product's range)
 would be the right comparison for some of them, and is not built.
 
-**The threshold separates two populations, and the second is a stand-in.** The first is what listings score
-against their own products. The second should be what a listing scores when its product is not in the catalog,
-which the groups cannot contain: every listing in them has a product. The best product that is *not* its own is
-exactly what such a listing would be matched to, so it stands in. These are the two populations a revision
+**The threshold separates two populations, and the second is a stand-in.** The first is what menu items score
+against their own products. The second should be what a menu item scores when its product is not in the catalog,
+which the groups cannot contain: every menu item in them has a product. The best product that is *not* its own is
+exactly what such a menu item would be matched to, so it stands in. These are the two populations a revision
 threshold separates (D17), in another guise, and `stats::matching::populations` writes them as the `edit` and
 `recycle` pairs of a `Calibration` so that the suggestion, the operating points, the AUC, and the
-owner-resampled intervals are the tested ones and not a second copy. What the stand-in cannot give is the base
-rate: how many real listings have no product. The data request now asks for it.
+brand-resampled intervals are the tested ones and not a second copy. What the stand-in cannot give is the base
+rate: how many real menu items have no product. The data request now asks for it.
 
 **No threshold is shipped.** `matching.threshold` is a measurement like any other (D3), nobody has made it, and
 without one `Match` ranks and says `NOT_JUDGED`. The sample groups are synthetic and no number may be read from
@@ -1336,12 +1344,12 @@ them. The decision is on the best candidate's score alone; `margin` is reported,
 the second can be judged later from the events without scoring anything again.
 
 **Held-out groups.** A group carries a `split`, and the trainer leaves out a group in the holdout or validation
-split as it leaves out a group whose owner has pairs there (D24): a match threshold measured on groups the model
-was trained on would flatter it. `--split` selects whose listings are scored and never which products are in the
-index, since a listing has to be found among everything it could be confused with.
+split as it leaves out a group whose brand has pairs there (D24): a match threshold measured on groups the model
+was trained on would flatter it. `--split` selects whose menu items are scored and never which products are in the
+index, since a menu item has to be found among everything it could be confused with.
 
 **Not built:** separate weights for matching (the `match_field` lines carry what would be needed to judge them
-without a model), a `calibrate-match` diff, storing listings, and any use of quantities in the ranking.
+without a model), a `calibrate-match` diff, storing menu items, and any use of quantities in the ranking.
 
 ## D33. New records can be streamed in; a stream only creates, and shares the model a batch at a time
 
@@ -1373,7 +1381,7 @@ whatever else has already arrived, up to `server.import_batch_records`, and neve
 own rule (D9), one level up. A trickle makes batches of one. What the setting trades was measured, not guessed.
 A batch is one job on the one embedding thread, and every other request waits for the job in front of it. At 8
 records (about one forward pass of four-field records) a stream runs at 81 records a second, the ceiling 64
-concurrent callers of `Evaluate` reach, and a merchant's edit beside it takes a median 86 ms instead of 6 ms.
+concurrent callers of `Evaluate` reach, and an edit by someone else beside it takes a median 86 ms instead of 6 ms.
 At 1 the stream runs at 48 a second and the edit takes 25 ms. The default is 8: a save of 86 ms is still a fast
 save, and a bulk load is the less frequent event. It is a setting because that is a judgment about someone
 else's callers. (Those figures are from when Burn ran the model. With ONNX Runtime, D34, the stream runs at 398
@@ -1396,7 +1404,7 @@ socket. `grpc.rs` converts and spawns. The engine is unchanged apart from the ea
 **Measured through `just load`,** which gained a `stream` phase so that the figure is produced like the others.
 The trade-off table in the README is `load --server` beside a stream that never ran dry.
 
-**Not built:** a streaming or batch `Evaluate`; per-tenant fairness between a stream and other callers (feature
+**Not built:** a streaming or batch `Evaluate`; per-brand fairness between a stream and other callers (feature
 27), which this makes more pressing; a final summary message on the stream (the caller counts its answers, and
 the server logs one `import` line).
 
@@ -1502,7 +1510,7 @@ find: nothing (`Expected::Absent`), or the version it read. It writes if that is
 did. `delete_if` is the same for a delete. The engine uses nothing else: a first version is written only if
 there is still no record, a revision only over the version it was judged against, a forced write the same (its
 revision number would otherwise be wrong), an import only if there is still no record, and a delete only of the
-record whose tenant was just checked.
+record whose brand was just checked.
 
 **A writer that lost has written nothing, and judges again.** It reads the record as it is now, embeds what
 differs from that, and judges and writes against that, up to four times (`WRITE_ATTEMPTS`). So a request that
@@ -1561,3 +1569,48 @@ writes unconditionally, so two replicas coordinate only once both are this versi
 **Not done:** a Postgres store, where the same contract is a version check in a transaction; an index on the
 two payload keys the condition reads, which a Qdrant run in strict mode may ask for before it accepts the
 filter.
+
+## D36. The words are the ones the owner's company uses
+
+The first version of this service was written in general terms: a record has a *tenant*, a labeled pair has an
+*owner*, and `Match` is given a *listing*. Where the owner works those are the wrong words. A record's tenant
+and a pair's owner are both the brand that owns the product. And a "listing" is a dispensary: it owns menus,
+which hold menu items, and a menu item is what `Match` is given. A reader there met "listing" in the API and
+thought of a store.
+
+**What they are now** (the owner's choices, 2026-11-12):
+
+| Was | Is | Where |
+|---|---|---|
+| `tenant` | `brand_id` | `Record`, every request and answer, the import export, the stored payload, the `shadow` events, `--brand-id` |
+| `owner` | `brand_id` | pair, history, and group files; the calibration and match events |
+| `listing`, `listings` | `menu_item`, `menu_items` | `MatchRequest`, group files, the `match_*` events |
+| `merchant-1` | `brand-1` | the examples |
+
+`brand_id` and not `brand`, because `brand` is taken: it is the text field that holds the brand's name, which is
+scored. The key is an identifier, compared exactly and never embedded. Renaming the text field instead would
+have changed the set of field names, and with it the layout id of everything stored (D12). In prose the key's
+owner is simply "the brand".
+
+Two words were offered and kept: `catalog`, for the stored product of a group, and "retailer", for whoever
+owns a menu.
+
+**Everywhere, with nothing read under the old names.** The alternative was to accept both, which leaves two
+spellings in every file format for good. Nothing was in production. So:
+
+- The `.proto` renames the fields and keeps their numbers, which is all a client built from the old file
+  depends on, and reserves the old names so that they are never given to something else.
+- A file format that refuses unknown keys refuses the old names by that rule (`tenant` in an import export).
+- A format that ignores unknown keys would have read an old file as one with no brands, without a word: pairs
+  that no longer split by brand, intervals over nothing, held-out brands trained on. Those formats refuse
+  `owner` and `listings` by name and say what each is called now.
+- A stored point that still has `tenant` is refused when it is read. Decoded as it is, it would be a record that
+  belongs to no brand, which any request may edit or delete (D14).
+
+**Event names moved too**, against the rule that they never do (D17, D30, D32): `tenant` and `owner` are
+`brand_id` in every event that carried one, `owners` is `brands`, `shadow_report_tenant` is
+`shadow_report_brand`, and `match_listing` is `match_menu_item`. The rule exists because other tools read these
+names, and no other tool reads them yet. This is the one time; the rule stands.
+
+**What was left alone.** The plans under `docs/plans/` are records of what was proposed and say so at the top.
+The curated cases and their pinned verdicts hold no brand and no menu item, and did not change.

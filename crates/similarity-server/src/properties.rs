@@ -1,7 +1,7 @@
 //! Properties of the service, checked on generated inputs.
 //!
 //! The engine's tests are scenarios someone thought of. This drives the engine with random sequences of requests
-//! (every write mode, with and without quantities and tenants, valid and not) and after every single request
+//! (every write mode, with and without quantities and brands, valid and not) and after every single request
 //! checks the rules the product stands on, whatever came before:
 //!
 //! - a rejected revision, a dry run, and a failed request leave the stored record exactly as it was (D7);
@@ -9,7 +9,7 @@
 //!   value of something it never had (D8, D16);
 //! - a forced write makes the record its own anchor;
 //! - the revision counter moves by exactly one, exactly when something was stored;
-//! - a record with a tenant is touched only by a request that names it (D14);
+//! - a record with a brand is touched only by a request that names it (D14);
 //! - an import creates a record or leaves it exactly alone, and what it creates has the original version, where
 //!   one was given, as its anchor;
 //! - nothing ever happens to a record other than the one a request is about;
@@ -55,7 +55,7 @@ fn cases() -> Config {
 
 /// The ids requests are about. Few, so that a sequence keeps coming back to the same records.
 const IDS: [&str; 2] = ["a", "b"];
-const TENANTS: [&str; 2] = ["brand-1", "brand-2"];
+const BRAND_IDS: [&str; 2] = ["brand-1", "brand-2"];
 /// Names that share words in a chain, so that some edits are small, some large, and some walk a record away.
 const NAMES: [&str; 7] = [
   "blueberry gummies vegan fruit chews",
@@ -74,7 +74,7 @@ const DESCRIPTIONS: [&str; 3] = ["ten vegan gummies with real fruit", "one gram 
 enum Request {
   Evaluate {
     id: Option<usize>,
-    tenant: Option<usize>,
+    brand_id: Option<usize>,
     name: usize,
     category: Option<usize>,
     description: Option<usize>,
@@ -85,12 +85,12 @@ enum Request {
   },
   Delete {
     id: usize,
-    tenant: Option<usize>,
+    brand_id: Option<usize>,
   },
   /// A bulk import of one record, with or without the version it was created as.
   Import {
     id: usize,
-    tenant: Option<usize>,
+    brand_id: Option<usize>,
     name: usize,
     category: Option<usize>,
     weight: Option<(f64, &'static str)>,
@@ -99,11 +99,11 @@ enum Request {
   Search {
     id: usize,
   },
-  /// A listing from elsewhere, to be matched against whatever is stored.
+  /// A menu item from elsewhere, to be matched against whatever is stored.
   Match {
     name: usize,
     category: Option<usize>,
-    tenant: Option<usize>,
+    brand_id: Option<usize>,
     threshold: Option<f32>,
   },
 }
@@ -119,7 +119,7 @@ fn request() -> impl Strategy<Value = Request> {
   let evaluate = (
     (
       proptest::option::weighted(0.9, 0..IDS.len()),
-      proptest::option::of(0..TENANTS.len()),
+      proptest::option::of(0..BRAND_IDS.len()),
       // Mostly real names; the blank one makes the request invalid.
       prop_oneof![9 => 0..NAMES.len() - 1, 1 => Just(NAMES.len() - 1)],
       proptest::option::of(0..CATEGORIES.len()),
@@ -137,9 +137,9 @@ fn request() -> impl Strategy<Value = Request> {
     ),
   )
     .prop_map(
-      |((id, tenant, name, category, description), (weight, thc, mode, threshold))| Request::Evaluate {
+      |((id, brand_id, name, category, description), (weight, thc, mode, threshold))| Request::Evaluate {
         id,
-        tenant,
+        brand_id,
         name,
         category,
         description,
@@ -149,21 +149,21 @@ fn request() -> impl Strategy<Value = Request> {
         threshold,
       },
     );
-  let delete =
-    (0..IDS.len(), proptest::option::of(0..TENANTS.len())).prop_map(|(id, tenant)| Request::Delete { id, tenant });
+  let delete = (0..IDS.len(), proptest::option::of(0..BRAND_IDS.len()))
+    .prop_map(|(id, brand_id)| Request::Delete { id, brand_id });
   let search = (0..IDS.len()).prop_map(|id| Request::Search { id });
   let name = || prop_oneof![9 => 0..NAMES.len() - 1, 1 => Just(NAMES.len() - 1)];
   let import = (
     0..IDS.len(),
-    proptest::option::of(0..TENANTS.len()),
+    proptest::option::of(0..BRAND_IDS.len()),
     name(),
     proptest::option::of(0..CATEGORIES.len()),
     proptest::option::of(quantity()),
     proptest::option::of((name(), proptest::option::of(quantity()))),
   )
-    .prop_map(|(id, tenant, name, category, weight, original)| Request::Import {
+    .prop_map(|(id, brand_id, name, category, weight, original)| Request::Import {
       id,
-      tenant,
+      brand_id,
       name,
       category,
       weight,
@@ -172,13 +172,13 @@ fn request() -> impl Strategy<Value = Request> {
   let matched = (
     prop_oneof![9 => 0..NAMES.len() - 1, 1 => Just(NAMES.len() - 1)],
     proptest::option::of(0..CATEGORIES.len()),
-    proptest::option::of(0..TENANTS.len()),
+    proptest::option::of(0..BRAND_IDS.len()),
     prop_oneof![2 => Just(None), 1 => Just(Some(0.5_f32)), 1 => Just(Some(7.0_f32))],
   )
-    .prop_map(|(name, category, tenant, threshold)| Request::Match {
+    .prop_map(|(name, category, brand_id, threshold)| Request::Match {
       name,
       category,
-      tenant,
+      brand_id,
       threshold,
     });
   prop_oneof![12 => evaluate, 2 => delete, 3 => import, 1 => search, 2 => matched]
@@ -294,7 +294,7 @@ fn check_anchor_kept(before: &StoredRecord, after: &StoredRecord) -> Result<(), 
 fn evaluate_input(request: &Request) -> Option<EvaluateInput> {
   let Request::Evaluate {
     id,
-    tenant,
+    brand_id,
     name,
     category,
     description,
@@ -315,7 +315,7 @@ fn evaluate_input(request: &Request) -> Option<EvaluateInput> {
   Some(EvaluateInput {
     record: RecordInput {
       id: id.map(|index| IDS[index].to_owned()),
-      tenant: tenant.map(|index| TENANTS[index].to_owned()),
+      brand_id: brand_id.map(|index| BRAND_IDS[index].to_owned()),
       fields,
       quantities,
     },
@@ -328,7 +328,7 @@ fn evaluate_input(request: &Request) -> Option<EvaluateInput> {
 fn import_input(request: &Request) -> Option<ImportInput> {
   let Request::Import {
     id,
-    tenant,
+    brand_id,
     name,
     category,
     weight,
@@ -348,7 +348,7 @@ fn import_input(request: &Request) -> Option<ImportInput> {
   Some(ImportInput {
     record: RecordInput {
       id: Some(IDS[id].to_owned()),
-      tenant: tenant.map(|index| TENANTS[index].to_owned()),
+      brand_id: brand_id.map(|index| BRAND_IDS[index].to_owned()),
       fields,
       quantities: weigh(weight),
     },
@@ -368,7 +368,7 @@ async fn step(engine: &TestEngine, request: &Request) -> Result<(), TestCaseErro
   match request.clone() {
     Request::Evaluate {
       id,
-      tenant,
+      brand_id,
       name,
       weight,
       thc,
@@ -376,7 +376,7 @@ async fn step(engine: &TestEngine, request: &Request) -> Result<(), TestCaseErro
       threshold,
       ..
     } => {
-      let tenant = tenant.map(|index| TENANTS[index].to_owned());
+      let brand_id = brand_id.map(|index| BRAND_IDS[index].to_owned());
       let input = evaluate_input(request).unwrap();
       let outcome = engine.evaluate(input).await;
       let after = stored(engine).await;
@@ -398,15 +398,15 @@ async fn step(engine: &TestEngine, request: &Request) -> Result<(), TestCaseErro
         None => (None, None),
       };
 
-      let owner = was.and_then(|record| record.tenant.as_ref());
-      let wrong_tenant = owner.is_some_and(|owner| Some(owner) != tenant.as_ref());
+      let brand = was.and_then(|record| record.brand_id.as_ref());
+      let wrong_brand = brand.is_some_and(|brand| Some(brand) != brand_id.as_ref());
       let output = match outcome {
         Err(error) => {
           prop_assert_eq!(was, is, "a failed request wrote something: {:?}", error);
           if is_invalid(name, weight, thc, threshold) {
             prop_assert!(matches!(error, EngineError::InvalidArgument(_)), "{:?}", error);
           } else {
-            prop_assert!(wrong_tenant, "an acceptable request was refused: {:?}", error);
+            prop_assert!(wrong_brand, "an acceptable request was refused: {:?}", error);
             prop_assert!(matches!(error, EngineError::FailedPrecondition(_)), "{:?}", error);
           }
           return Ok(());
@@ -418,8 +418,8 @@ async fn step(engine: &TestEngine, request: &Request) -> Result<(), TestCaseErro
         "a malformed request was served"
       );
       prop_assert!(
-        !wrong_tenant,
-        "D14: a record with a tenant was evaluated by a request that does not name it"
+        !wrong_brand,
+        "D14: a record with a brand was evaluated by a request that does not name it"
       );
       if let Some(similarity) = output.similarity {
         prop_assert!(similarity.is_finite() && (-1.0..=1.0).contains(&similarity));
@@ -489,7 +489,7 @@ async fn step(engine: &TestEngine, request: &Request) -> Result<(), TestCaseErro
         "one write, one revision"
       );
       prop_assert_eq!(output.revision, is.revision);
-      prop_assert_eq!(&is.tenant, &tenant);
+      prop_assert_eq!(&is.brand_id, &brand_id);
       match (was, mode) {
         // A new record and a forced one are their own point of reference.
         (None, _) | (Some(_), WriteMode::Force) => {
@@ -499,17 +499,17 @@ async fn step(engine: &TestEngine, request: &Request) -> Result<(), TestCaseErro
         (Some(was), _) => check_anchor_kept(was, is)?,
       }
     }
-    Request::Delete { id, tenant } => {
-      let tenant = tenant.map(|index| TENANTS[index].to_owned());
-      let outcome = engine.delete(IDS[id].to_owned(), tenant.clone()).await;
+    Request::Delete { id, brand_id } => {
+      let brand_id = brand_id.map(|index| BRAND_IDS[index].to_owned());
+      let outcome = engine.delete(IDS[id].to_owned(), brand_id.clone()).await;
       let after = stored(engine).await;
       for (index, (was, is)) in before.iter().zip(&after).enumerate() {
         if index != id {
           prop_assert_eq!(was, is);
         }
       }
-      let owner = before[id].as_ref().and_then(|record| record.tenant.as_ref());
-      if owner.is_some_and(|owner| Some(owner) != tenant.as_ref()) {
+      let brand = before[id].as_ref().and_then(|record| record.brand_id.as_ref());
+      if brand.is_some_and(|brand| Some(brand) != brand_id.as_ref()) {
         prop_assert!(
           matches!(outcome, Err(EngineError::FailedPrecondition(_))),
           "D14: {:?}",
@@ -523,13 +523,13 @@ async fn step(engine: &TestEngine, request: &Request) -> Result<(), TestCaseErro
     }
     Request::Import {
       id,
-      tenant,
+      brand_id,
       name,
       weight,
       original,
       ..
     } => {
-      let tenant = tenant.map(|index| TENANTS[index].to_owned());
+      let brand_id = brand_id.map(|index| BRAND_IDS[index].to_owned());
       let input = import_input(request).unwrap();
       let mut outcomes = sound_engine(engine.import(vec![input]).await)?;
       let outcome = outcomes
@@ -545,14 +545,14 @@ async fn step(engine: &TestEngine, request: &Request) -> Result<(), TestCaseErro
 
       let invalid = is_invalid(name, weight, None, None)
         || original.is_some_and(|(name, weight)| is_invalid(name, weight, None, None));
-      let owner = was.and_then(|record| record.tenant.as_ref());
+      let brand = was.and_then(|record| record.brand_id.as_ref());
       if invalid {
         prop_assert!(matches!(outcome, Err(EngineError::InvalidArgument(_))), "{:?}", outcome);
         prop_assert_eq!(was, is);
       } else if let Some(was) = was {
         // An import never updates. Not the record, not its anchor, not its timestamp.
         prop_assert_eq!(Some(was), is, "an import changed a record that was already stored");
-        if owner.is_some_and(|owner| Some(owner) != tenant.as_ref()) {
+        if brand.is_some_and(|brand| Some(brand) != brand_id.as_ref()) {
           prop_assert!(
             matches!(outcome, Err(EngineError::FailedPrecondition(_))),
             "D14: {:?}",
@@ -566,7 +566,7 @@ async fn step(engine: &TestEngine, request: &Request) -> Result<(), TestCaseErro
         let Some(is) = is else {
           return Err(TestCaseError::fail("created, and nothing is stored"));
         };
-        prop_assert_eq!((is.revision, &is.tenant), (1, &tenant));
+        prop_assert_eq!((is.revision, &is.brand_id), (1, &brand_id));
         let schema = schema();
         let anchor = sound(schema.blocks(WORD_BAG_DIMENSION, &is.anchor))?;
         let current = sound(schema.blocks(WORD_BAG_DIMENSION, &is.vectors.composite))?;
@@ -601,22 +601,22 @@ async fn step(engine: &TestEngine, request: &Request) -> Result<(), TestCaseErro
     Request::Match {
       name,
       category,
-      tenant,
+      brand_id,
       threshold,
     } => {
       let mut fields = vec![("name".to_owned(), NAMES[name].to_owned())];
       fields.extend(category.map(|index| ("category".to_owned(), CATEGORIES[index].to_owned())));
-      let tenant = tenant.map(|index| TENANTS[index].to_owned());
+      let brand_id = brand_id.map(|index| BRAND_IDS[index].to_owned());
       let outcome = engine
-        .match_listing(MatchInput {
-          listing: RecordInput {
+        .match_menu_item(MatchInput {
+          menu_item: RecordInput {
             id: None,
-            tenant: None,
+            brand_id: None,
             fields,
             quantities: Vec::new(),
           },
           limit: 0,
-          tenant: tenant.clone(),
+          brand_id: brand_id.clone(),
           threshold,
         })
         .await;
@@ -630,12 +630,12 @@ async fn step(engine: &TestEngine, request: &Request) -> Result<(), TestCaseErro
           error
         ),
         Ok(output) => {
-          prop_assert!(!invalid, "an unusable listing was matched");
+          prop_assert!(!invalid, "an unusable menu item was matched");
           // Every stored record the request may see is a candidate (there are fewer than the limit), best first.
           let visible = before
             .iter()
             .flatten()
-            .filter(|record| tenant.is_none() || record.tenant == tenant)
+            .filter(|record| brand_id.is_none() || record.brand_id == brand_id)
             .count();
           prop_assert_eq!(output.candidates.len(), visible);
           prop_assert_eq!(output.fetched, visible);
@@ -664,7 +664,7 @@ async fn step(engine: &TestEngine, request: &Request) -> Result<(), TestCaseErro
         .find_similar(FindSimilarInput {
           query: SimilarTo::Id(IDS[id].to_owned()),
           limit: 0,
-          tenant: None,
+          brand_id: None,
           min_similarity: None,
         })
         .await;
@@ -779,7 +779,7 @@ fn an_evaluation_judged_again_under_its_own_configuration_is_itself() {
     let record = |name: &str, weight: f64| EvaluateInput {
       record: RecordInput {
         id: Some("a".to_owned()),
-        tenant: None,
+        brand_id: None,
         fields: vec![("name".to_owned(), name.to_owned())],
         quantities: vec![("weight".to_owned(), Quantity::single(weight, "g"))],
       },
@@ -908,7 +908,7 @@ proptest! {
     };
     let input = |record: &RecordFields| RecordInput {
       id: Some("p".to_owned()),
-      tenant: None,
+      brand_id: None,
       fields: fields(record),
       quantities: quantities(record),
     };
@@ -1120,9 +1120,9 @@ async fn ask<S: VectorStore>(engine: &Engine<S, WordBagEmbedder>, request: &Requ
     return Answer::Imported(engine.import(vec![input]).await);
   }
   match request {
-    Request::Delete { id, tenant } => {
-      let tenant = tenant.map(|index| TENANTS[index].to_owned());
-      Answer::Deleted(engine.delete(IDS[*id].to_owned(), tenant).await)
+    Request::Delete { id, brand_id } => {
+      let brand_id = brand_id.map(|index| BRAND_IDS[index].to_owned());
+      Answer::Deleted(engine.delete(IDS[*id].to_owned(), brand_id).await)
     }
     _ => Answer::NotAsked,
   }

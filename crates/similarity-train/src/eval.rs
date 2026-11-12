@@ -46,7 +46,7 @@ pub struct Separation {
   pub width: usize,
   /// Examples from ordinary edits, if there are any.
   pub edits: Option<Spread>,
-  /// Examples from recycled listings, if there are any.
+  /// Examples from recycled products, if there are any.
   pub recycles: Option<Spread>,
   /// How often an edit scores above a recycle, a tie counting half: 1.0 is perfectly separated, 0.5 is not at
   /// all. It needs no threshold, which is what makes it fit for choosing between models. `None` unless both

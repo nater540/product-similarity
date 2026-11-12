@@ -73,8 +73,8 @@ pub enum StoreError {
 pub struct StoredRecord {
   /// The caller's identifier.
   pub id: String,
-  /// The record's owner, if it has one.
-  pub tenant: Option<String>,
+  /// The key of the brand that owns the record, if it has one. An identifier: the brand's name is a text field.
+  pub brand_id: Option<String>,
   /// The current baseline: what the next revision is compared against, and what searches match.
   pub vectors: RecordVectors,
   /// The composite of the record as first stored (or last force-written), for drift detection.
@@ -131,8 +131,8 @@ pub struct SearchQuery<'a> {
   pub vector: &'a [f32],
   /// The most neighbors to return.
   pub limit: usize,
-  /// Only match records of this tenant.
-  pub tenant: Option<&'a str>,
+  /// Only match records of this brand.
+  pub brand_id: Option<&'a str>,
   /// Never return the record with this id (typically the record being searched around).
   pub exclude_id: Option<&'a str>,
   /// Only return records with at least this cosine similarity.
@@ -144,8 +144,8 @@ pub struct SearchQuery<'a> {
 pub struct Neighbor {
   /// The matching record's id.
   pub id: String,
-  /// The matching record's owner.
-  pub tenant: Option<String>,
+  /// The key of the brand that owns the matching record.
+  pub brand_id: Option<String>,
   /// Cosine similarity between the query and the record's current composite.
   pub similarity: f32,
 }

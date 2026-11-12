@@ -61,7 +61,7 @@ impl From<EngineError> for Status {
 fn record_input(record: pb::Record) -> RecordInput {
   RecordInput {
     id: record.id,
-    tenant: record.tenant,
+    brand_id: record.brand_id,
     fields: record.fields.into_iter().collect(),
     // Passed on exactly as sent. Whether a quantity is a usable measurement is the engine's to decide.
     quantities: quantities(record.quantities),
@@ -287,7 +287,7 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
       .find_similar(FindSimilarInput {
         query,
         limit: usize::try_from(request.limit).unwrap_or(usize::MAX),
-        tenant: request.tenant,
+        brand_id: request.brand_id,
         min_similarity: request.min_similarity,
       })
       .await?;
@@ -302,7 +302,7 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
         .into_iter()
         .map(|neighbor| pb::Neighbor {
           id: neighbor.id,
-          tenant: neighbor.tenant,
+          brand_id: neighbor.brand_id,
           similarity: neighbor.similarity,
         })
         .collect(),
@@ -311,8 +311,8 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
 
   async fn delete(&self, request: Request<pb::DeleteRequest>) -> Result<Response<pb::DeleteResponse>, Status> {
     let started = Instant::now();
-    let pb::DeleteRequest { id, tenant } = request.into_inner();
-    let deleted = self.engine.delete(id.clone(), tenant).await?;
+    let pb::DeleteRequest { id, brand_id } = request.into_inner();
+    let deleted = self.engine.delete(id.clone(), brand_id).await?;
     tracing::info!(%id, deleted, elapsed_ms = milliseconds(started), "delete");
     Ok(Response::new(pb::DeleteResponse { deleted }))
   }
@@ -370,15 +370,15 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
   async fn r#match(&self, request: Request<pb::MatchRequest>) -> Result<Response<pb::MatchResponse>, Status> {
     let started = Instant::now();
     let request = request.into_inner();
-    let Some(listing) = request.listing else {
-      return Err(Status::invalid_argument("`listing` is required"));
+    let Some(menu_item) = request.menu_item else {
+      return Err(Status::invalid_argument("`menu_item` is required"));
     };
     let output = self
       .engine
-      .match_listing(MatchInput {
-        listing: record_input(listing),
+      .match_menu_item(MatchInput {
+        menu_item: record_input(menu_item),
         limit: usize::try_from(request.limit).unwrap_or(usize::MAX),
-        tenant: request.tenant,
+        brand_id: request.brand_id,
         threshold: request.threshold,
       })
       .await?;
@@ -400,7 +400,7 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
         .into_iter()
         .map(|candidate| pb::MatchCandidate {
           id: candidate.id,
-          tenant: candidate.tenant,
+          brand_id: candidate.brand_id,
           similarity: candidate.comparison.similarity,
           search_similarity: candidate.search_similarity,
           fields: candidate.comparison.fields.into_iter().map(field_score).collect(),
