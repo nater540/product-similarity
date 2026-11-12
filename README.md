@@ -2281,8 +2281,8 @@ engine = "onnx"
 - **It is C++, not Rust.** The `ort` crate is a binding to Microsoft's runtime. `just release-onnx` downloads a
   prebuilt static library for the target at build time (from the crate author's distribution, pinned by the
   crate's exact version) and links it in: the binary grows from 13 MB to 31 MB and needs nothing installed
-  beside it. The default build has none of this. Whether a production build should take that prebuilt library,
-  or link one you built or obtained yourselves, is worth deciding before it ships.
+  beside it. The default build has none of this. The prebuilt library is the choice for now; linking one you
+  built or obtained yourselves instead is a change of the crate's features, not of code (D34).
 - **The vectors are the same.** On the default model the two engines differ by at most two ten-millionths in any
   component of a unit vector, far below what a 32-bit cosine resolves. So the fingerprint is the same, a
   collection written under one engine is read under the other, the thresholds do not move, and two replicas may

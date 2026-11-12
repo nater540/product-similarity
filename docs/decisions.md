@@ -1434,11 +1434,12 @@ the best tool, not for everything. `tools/export_onnx.py` exports the sentence-t
 not including, normalization, checks the result against PyTorch on batches of other shapes than it was traced
 with, and writes the file by rename. Nothing at run time needs Python.
 
-**Where the C++ comes from is not settled.** The `ort` crate's `download-binaries` feature fetches a prebuilt
-static library at build time from the crate author's distribution. That is convenient and it is a third party's
-binary inside the server. The crate is pinned to an exact version, and the alternative (`load-dynamic`, with a
-runtime library the organization builds or takes from Microsoft's releases) is a change of features, not of
-code. It is the owner's decision before this engine serves production traffic.
+**Where the C++ comes from: the prebuilt download, for now.** The `ort` crate's `download-binaries` feature
+fetches a prebuilt static library at build time from the crate author's distribution. That is convenient and it
+is a third party's binary inside the server. The owner chose to keep it for now (2026-11-12). The crate is
+pinned to an exact version, and the alternative (`load-dynamic`, with a runtime library the organization builds
+or takes from Microsoft's releases) is a change of features, not of code, so the choice can be taken again
+without touching the engine.
 
 **What each platform needed.** On macOS the prebuilt library has Objective-C that calls into the compiler's
 runtime library, which Rust does not link unless told (`.cargo/config.toml`); and ONNX Runtime hands graphs to
