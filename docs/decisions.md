@@ -905,6 +905,11 @@ letting the engine's scenarios vouch for the core's arithmetic, and much faster.
 After a test for each, 400 mutants: 333 caught, 67 that do not compile, none surviving, in 14 minutes at three
 jobs on a 12-core machine.
 
+The set grows with the code. With the drift statistics, the histogram, and the engine's observer in it, a run
+at `7b14697` tested 517 mutants in 18 minutes: 434 caught, 83 that do not compile, none surviving. The run
+before it had left three alive, in the histogram's range checks and in what counts as a recycle caught by drift
+alone, and each got a test.
+
 **Why an allowlist of files.** The alternative, excluding what should not be mutated, grows a list of everything
 whose only tests need the model or Qdrant, and a new file is mutated by default whether or not its tests can run.
 The eight files are where a mutant that survives means a wrong verdict.

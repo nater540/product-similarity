@@ -1924,9 +1924,9 @@ just mutants --list        # what would be tested, without building anything
 just mutants-train -j 3    # the trainer's checkpoint rules, a set of its own; four minutes
 ```
 
-The last full run tested 400 mutants in 14 minutes at three jobs: 333 were caught, 67 did not compile, and none
-survived; the trainer's set is 58 more, 39 caught and 19 that did not compile. It is not part of `just ci`. Run it after changing the scoring, the quantity comparison, the engine's
-write path, or the calibration statistics.
+The last full run tested 517 mutants in 18 minutes at three jobs: 434 were caught, 83 did not compile, and none
+survived; the trainer's set is 58 more, 39 caught and 19 that did not compile. It is not part of `just ci`. Run
+it after changing the scoring, the quantity comparison, the engine's write path, or the calibration statistics.
 
 - **A survivor is answered with a test,** an example that states the boundary as a sentence, or a property if
   the rule holds for every input. It is excluded in `.cargo/mutants.toml` only when the change cannot alter any
