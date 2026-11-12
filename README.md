@@ -1742,7 +1742,8 @@ sku-1	rejected	accepted	0.878707	0.942242
   the counts since it started. `created` records had nothing to be judged against; `judged` is `agreed` plus
   the two kinds of disagreement; `failed` should stay zero.
 - **No record text is written, and no tenant.** A line names a record by its id, as the request log does.
-- **It costs one more comparison of vectors already in memory**: no model, no store, nothing waited for. Against
+- **It costs one more comparison of vectors already in memory**: no model and no store. Its lines are written
+  the way log lines are, so stdout has to be read by something, as stderr already has to be. Against
   this server with `just load ... --server`, one caller, 300 records: edits took a median of 5.63 ms with no
   shadow, 5.63 ms with this one, and 5.69 ms with `events = "all"`; resaves, which never reach the model,
   0.10 ms, 0.11 ms, and 0.11 ms. One run each, so differences of that size are noise. (`load` without

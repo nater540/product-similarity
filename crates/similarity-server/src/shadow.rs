@@ -8,8 +8,8 @@
 //!
 //! **A shadow decides nothing.** It is told about a request after the live outcome is final and returns nothing,
 //! so it cannot change a verdict, a response, or a write, whatever it concludes and even if it fails. What it
-//! costs the live path is one more weighted comparison of vectors that are already in memory: no model, no store,
-//! nothing awaited.
+//! costs the live path is one more weighted comparison of vectors that are already in memory, and a line written
+//! as a log line is where there is one to write: no model, no store, nothing awaited.
 //!
 //! **A shadow measures agreement, not quality.** A disagreement says the two policies differ on a request, not
 //! which of them is right; only a label can say that. The ids it lists are for labeling, and the labeled pairs

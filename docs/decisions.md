@@ -1159,7 +1159,10 @@ go through `calibrate`, where a gate exists (`calibrate-diff --fail-on`).
 **What it costs was measured, not argued.** One weighted comparison of vectors in memory per judged revision,
 and three small clones per stored write so that the engine can still show the observer what it stored. Under
 `load --server` on the development machine the medians with and without a shadow were within noise of each
-other (README).
+other (README). One cost is not a number: a line is written under the record's lock by a blocking write, exactly
+as the request log line is written to stderr. A stdout that nothing reads would stall a server with a shadow
+the way a stderr that nothing reads stalls any server. Moving the write off the request is the model shadow's
+queue, and is not worth having for a line per disagreement.
 
 **A candidate model is not shadowed.** `docs/plans/18-shadow-evaluation.md` designs it: a second model, a second
 collection, writes mirrored from the live decision, a lossy ordered queue, an import into the shadow collection,
