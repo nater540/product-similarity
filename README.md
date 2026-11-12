@@ -484,9 +484,12 @@ In JSON, enum values are written by name (`"WRITE_MODE_DRY_RUN"`), 64-bit intege
 
 ### With Bruno
 
-`bruno/` is a [Bruno](https://www.usebruno.com) collection with a request for every call: open the folder as a
-collection and pick the `local` environment, which points at `grpc://127.0.0.1:50051`. The requests read the
-API from the repository's `.proto` (the collection names it by a relative path), so they stay in step with it.
+`bruno/` is a [Bruno](https://www.usebruno.com) collection with a request for every call. In Bruno, choose
+**Open collection** and select the `bruno` folder itself, then pick the `local` environment, which points at
+`grpc://127.0.0.1:50051`. (**Import collection** is the wrong door: it wants one exported file, and answers
+"Unsupported collection format" for any file of this folder.) The requests read the API from the repository's
+`.proto`, which the collection names by a relative path: they stay in step with it, and the folder has to stay
+where it is in the checkout.
 
 They are numbered in an order that works on an empty server (`just serve-in-memory config.toml`): `Describe`,
 an `Import` stream that creates two records and has a third refused, the five kinds of `Evaluate`, two searches,
