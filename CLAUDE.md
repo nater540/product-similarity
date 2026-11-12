@@ -218,7 +218,8 @@ changing a design. Infer conventions from the existing code first.
 - Slow tests: `just test-parity`, `just test-snapshot`, `just test-qdrant`, `just test-real`; `just snapshot` rewrites
   the pinned verdicts
 - The ONNX engine: `just export-onnx <model-dir>` (needs `uv`), `just release-onnx`, `just test-onnx`,
-  `just throughput <model-dir> onnx`
+  `just throughput <model-dir> onnx`; in a container, `just image <tag> onnx` (Debian 13: the prebuilt runtime
+  does not link on Debian 12)
 - Mutation testing (needs `cargo install cargo-mutants`): `just mutants -j 3`, `just mutants-diff`,
   `just mutants-train`
 - Run: `just serve` (needs Qdrant) or `just serve-in-memory`; then `just client describe`

@@ -2264,8 +2264,9 @@ model.
 ### The ONNX engine
 
 The forward pass is nearly all of what a request costs, and Burn's CPU backend is not the fastest way to run it.
-The server can run the same model through [ONNX Runtime](https://onnxruntime.ai) instead, which on this machine
-is four to five times faster (the tables above). It is off unless you turn it on, in three steps:
+The server can run the same model through [ONNX Runtime](https://onnxruntime.ai) instead: four to five times
+faster on macOS (the tables above), and about twice as fast in a Linux container (below). It is off unless you
+turn it on, in three steps:
 
 ```sh
 just export-onnx models/mdbr-leaf-mt     # writes models/mdbr-leaf-mt/onnx/model.onnx (needs uv; PyTorch does the export)
@@ -2296,8 +2297,24 @@ engine = "onnx"
   and still runs in Burn.
 - **On macOS it runs on the CPU**, not through CoreML, which ONNX Runtime would otherwise pick and which is slower
   for a model this size. `device = "metal"` applies to Burn only.
-- **Not measured yet: Linux.** Everything above is one Apple-silicon machine. The ratio between the engines will
-  differ on the hardware you serve on; run `just throughput` both ways there before sizing anything.
+- **In a container.** `just image record-similarity:onnx onnx` builds the image with the engine linked in. The
+  image is Debian 13 for both variants: the prebuilt ONNX Runtime library is compiled against the C++ standard
+  library of GCC 13 and does not link on Debian 12. It still needs a model directory with `onnx/model.onnx` in
+  it (the image bakes in the fetched model, which has none): mount one, or copy an exported directory in.
+- **On Linux the gain is smaller.** `load` inside that container (Linux on arm64, 12 cores, the same laptop,
+  300 records per level):
+
+  | Callers | Phase | Burn: requests per second, median | ONNX Runtime: requests per second, median |
+  |---|---|---|---|
+  | 1 | create | 47, 21.3 ms | 98, 10.4 ms |
+  | 1 | edit | 164, 6.1 ms | 285, 3.5 ms |
+  | 16 | create | 71, 223.5 ms | 170, 92.8 ms |
+  | 16 | edit | 346, 45.9 ms | 822, 19.3 ms |
+  | 1 | stream | 71 | 170 |
+
+  Burn runs about as it does on macOS. ONNX Runtime is 1.7 to 2.4 times faster than Burn here, where on macOS
+  it is 4 to 5: its macOS build has more behind it on that hardware. **Not measured: x86-64**, which is likely
+  what you serve on and may differ again. Run `load` under both engines there before sizing anything.
 
 ## Development
 

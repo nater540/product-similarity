@@ -1,7 +1,13 @@
 # syntax=docker/dockerfile:1
 
 # ---- build -------------------------------------------------------------------------------------------------------
-FROM rust:1.96-bookworm AS build
+# Debian 13 for both stages. The default build would run on Debian 12 as well; the ONNX build
+# (`--build-arg FEATURES=onnx`) would not link there, because the prebuilt ONNX Runtime library is compiled against
+# the C++ standard library of GCC 13 and Debian 12 has GCC 12's. One base for both keeps the two images alike.
+ARG BUILD_IMAGE=rust:1.96-trixie
+ARG RUNTIME_IMAGE=debian:trixie-slim
+
+FROM ${BUILD_IMAGE} AS build
 
 # `protoc` compiles the gRPC definitions (crates/similarity-proto/build.rs).
 RUN apt-get update \
@@ -14,10 +20,14 @@ COPY . .
 # `docker build --build-arg RECORD_SIMILARITY_COMMIT=$(git rev-parse --short=12 HEAD) .`, which is what `just image`
 # does. It ends up in the `provenance.json` of the model fetched below.
 ARG RECORD_SIMILARITY_COMMIT=unknown
+# Cargo features of the server, empty for the default build. `--build-arg FEATURES=onnx` links ONNX Runtime in,
+# for `engine = "onnx"`; the model directory then also needs `onnx/model.onnx` (`just export-onnx`), which this
+# image does not make.
+ARG FEATURES=""
 ENV RECORD_SIMILARITY_COMMIT=${RECORD_SIMILARITY_COMMIT}
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p similarity-server \
+    cargo build --release --locked -p similarity-server ${FEATURES:+--features ${FEATURES}} \
   && cp target/release/record-similarity /usr/local/bin/record-similarity
 
 # The model is baked into the image, checksum-verified at build time, so that a running container never needs the
@@ -25,7 +35,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 RUN record-similarity model fetch --dir /opt/models/mdbr-leaf-mt
 
 # ---- runtime -----------------------------------------------------------------------------------------------------
-FROM debian:bookworm-slim
+FROM ${RUNTIME_IMAGE}
 
 # Root certificates, for TLS to a managed Qdrant.
 RUN apt-get update \

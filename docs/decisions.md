@@ -1440,16 +1440,23 @@ binary inside the server. The crate is pinned to an exact version, and the alter
 runtime library the organization builds or takes from Microsoft's releases) is a change of features, not of
 code. It is the owner's decision before this engine serves production traffic.
 
-**Two things the platform needed.** On macOS the prebuilt library has Objective-C that calls into the compiler's
+**What each platform needed.** On macOS the prebuilt library has Objective-C that calls into the compiler's
 runtime library, which Rust does not link unless told (`.cargo/config.toml`); and ONNX Runtime hands graphs to
-CoreML by default there, which was slower and failed on a batch, so the session is told to prefer the CPU.
-Neither applies to Linux, where none of this has been run yet.
+CoreML by default there, which was slower and failed on a batch, so the session is told to prefer the CPU. On
+Linux neither applies, and something else does: the prebuilt library is compiled against the C++ standard
+library of GCC 13, so it does not link on Debian 12 (the first container build failed on exactly that). The
+image moved to Debian 13 for both variants, which the owner accepted for production on 2026-11-12, so that the
+two images differ in one build argument and nothing else.
 
-**Measured.** `just throughput`: a four-field record in 4.2 ms against 20.2 ms. `just load`, through gRPC: one
-edit in 1.6 ms against 5.6 ms, and a ceiling of about 2,400 edits a second against 470, with the queue, the
-batching, and the single embedding thread unchanged. An `Import` stream runs at 404 records a second against 80.
+**Measured.** On macOS, `just throughput`: a four-field record in 4.2 ms against 20.2 ms. `just load`, through
+gRPC: one edit in 1.6 ms against 5.6 ms, and a ceiling of about 2,400 edits a second against 470, with the
+queue, the batching, and the single embedding thread unchanged. An `Import` stream runs at 404 records a second
+against 80. **In a Linux container on the same machine the gain is 1.7 to 2.4 times, not 4 to 5:** one edit in
+3.5 ms against 6.1 ms, 822 edits a second at 16 callers against 346. Burn is about as fast there as on macOS;
+ONNX Runtime's macOS build is the one that does better on that hardware. The engine is worth having at twice
+the speed, and the first figure should not be quoted for a Linux deployment.
 
-**Not done:** a Linux build and measurement; several embedding threads (ONNX Runtime may make one thread per
-core a better design than one thread across cores, and that is unmeasured); the container image, which still
-builds the default engine.
+**Not done:** x86-64, which is unmeasured and is probably what production runs on; several embedding threads
+(ONNX Runtime may make one thread per core a better design than one thread across cores); an image that has an
+exported model in it (the image bakes in the fetched model, which has no graph).
 

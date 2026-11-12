@@ -36,8 +36,8 @@ release-train backend="":
     cargo build --release -p similarity-train {{ if backend == "" { "" } else { "--features " + backend } }}
 
 # Container image with the model baked in
-image tag="record-similarity:dev":
-    docker build --build-arg RECORD_SIMILARITY_COMMIT="$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)" -t {{ tag }} .
+image tag="record-similarity:dev" features="":
+    docker build --build-arg RECORD_SIMILARITY_COMMIT="$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)" --build-arg FEATURES={{ features }} -t {{ tag }} .
 
 # --- test and lint ----------------------------------------------------------
 
