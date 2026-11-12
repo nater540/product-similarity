@@ -1,7 +1,9 @@
 # Feature suggestions
 
-Twenty features that could be added to this project, with what each is, why it matters here, how it would fit the
-code, and what it would cost. **Features 1, 2, 3, 5, 7, 8, 9, 11, 12, 13, 15, 16, and 19 are built** (D17 to D28, and the README); the rest are not. They were proposed in November 2026 from a read of the
+Features that could be added to this project, with what each is, why it matters here, how it would fit the
+code, and what it would cost. **Of the first twenty, all are built or half built (6 and 18) except 10, 14, and
+17, which the owner deferred on 2026-11-11.** Features 21 to 32 (section E) are about running the service in
+production and are proposals only: none is built. They were proposed in November 2026 from a read of the
 repository as it stood then (`README.md`, `docs/decisions.md`, and the crates); check a suggestion against the
 code before starting on it, since the code will have moved. It has moved once already: records now carry
 quantities, compared as numbers (D16), and the features that touch a verdict or a report say below what that
@@ -21,6 +23,7 @@ it can still be written and tested here on synthetic data.
 - [B. Regression reporting](#b-regression-reporting)
 - [C. Testing depth](#c-testing-depth)
 - [D. Serving, operations, and product](#d-serving-operations-and-product)
+- [E. Running it in production](#e-running-it-in-production)
 - [What to build first](#what-to-build-first)
 - [Things noticed along the way](#things-noticed-along-the-way)
 
@@ -69,6 +72,18 @@ and because each would put a Python service in the loop.
 | 18 | Shadow evaluation of a candidate model | Serving | L | Real traffic |
 | 19 | Structured reason codes and explanations | Serving | M | No |
 | 20 | Menu-item to brand-product matching | Serving | L | Yes |
+| 21 | Readiness that tells the truth, and a drain on shutdown | Production | S | No |
+| 22 | Deadlines honored, writes that survive a cancelled request | Production | M | No |
+| 23 | Conditional writes across replicas | Production | M | No |
+| 24 | Audit of the store against the catalog | Production | M | An export |
+| 25 | Anchor backup and restore | Production | M | No |
+| 26 | Operational metrics | Production | M | No |
+| 27 | Fair admission between tenants | Production | M | No |
+| 28 | A batch call | Production | M | No |
+| 29 | Policy reload, and a configuration digest | Production | S to M | No |
+| 30 | Who forced or deleted, and why | Production | S | No |
+| 31 | TLS and a caller identity | Production | M | No |
+| 32 | Model cutover without stopping | Production | L | A candidate model |
 
 ## A. Experiment tracking, lineage, and a model registry
 
@@ -575,6 +590,182 @@ probably wants its own field configuration, since menu items do not have the sam
 
 **Effort.** L. **Needs real data:** yes (catalog groups).
 
+## E. Running it in production
+
+Proposed on 2026-11-11, after features 1 to 20 were built or deferred, from a read of how the server behaves when
+things around it go wrong: its health service, its shutdown, what a cancelled request leaves behind, what it does
+when Qdrant is slow or gone, and what it cannot recover if the collection is lost. Each says what was checked in
+the code, because a suggestion about production is only worth as much as the fault it names is real.
+
+### 21. Readiness that tells the truth, and a drain on shutdown
+
+**What.** Two health services instead of one answer. *Live*: the process is up. *Ready*: the model has answered
+a warm-up pass, the embedding thread is alive, and Qdrant answered a cheap call within the last few seconds. On
+`SIGTERM`: report not ready first, wait for the load balancer to notice, finish what is in flight up to a
+deadline, then exit.
+
+**Why here.** `serve` calls `set_serving` once, before the first request, and never again
+(`crates/similarity-server/src/lib.rs`). A replica whose Qdrant is unreachable keeps reporting `SERVING` and
+answers every request `UNAVAILABLE`; a readiness probe sends it traffic anyway. Shutdown is graceful but has no
+deadline and does not leave the load balancer's rotation first, so the last requests of a rolling deploy race
+the listener closing.
+
+**Effort.** S. **Needs:** nothing. **Decide:** how stale a Qdrant check may be, and the drain deadline.
+
+### 22. Deadlines that are honored, and writes that survive a cancelled request
+
+**What.** Three changes on one theme. (a) The embedding worker skips a job whose caller is gone. (b) A request
+whose deadline cannot be met in the queue is refused at once (`DEADLINE_EXCEEDED`), not embedded late. (c) The
+judge-and-write section of `Evaluate` runs to completion even when the request is cancelled, and what happened is
+logged with the id, so that a cancelled request is never half applied without a trace.
+
+**Why here.** Checked in the sources: tonic applies the client's `grpc-timeout` to every handler and drops the
+handler when it expires or the client disconnects. `Job` in `worker.rs` holds a reply channel and the worker never
+asks whether it is closed, so under overload the one embedding thread spends its time on answers nobody is
+waiting for, which is exactly when it can least afford to. And a handler dropped while `store.put` is in flight
+leaves the write's outcome unknown: the baseline may have moved for a caller that was told nothing. The README
+tells the caller to keep its database and the service in step; this is the case where the caller cannot know it
+has to.
+
+**Effort.** M. **Needs:** nothing; `just load` can show (a) and (b) under overload. **Decide:** whether a write
+whose caller is gone should be completed or abandoned. Completing it is the safer default: a retry of the same
+content is then answered "unchanged".
+
+### 23. Conditional writes: two replicas cannot both accept against one baseline
+
+**What.** Make the store's write conditional on the revision that was judged: update only if the stored record
+is still at revision N, create only if nothing is stored. On a miss, read again and judge again.
+
+**Why here.** This is the first item under Limitations, and D6 and D10 say the store cannot do it. That is out of
+date. The pinned Qdrant (1.20) and its client have `update_filter` on upsert, and a probe of the local server
+confirmed it behaves as compare-and-swap: an update that expected revision 5 left a record at revision 1
+untouched, one that expected revision 1 applied, and a create with a filter no stored point matches left an
+existing point alone and inserted a new id. One catch, also from the probe: the response says `completed` either
+way, so the writer has to read back to learn whether it won.
+
+**Effort.** M: a `put_if` on the store trait, both stores, the contract test, the engine's retry, and the
+property state machine run against two engines on one store. **Needs:** `just test-qdrant`. **Decide:** nothing;
+it removes a limitation and costs one extra read on a write.
+
+### 24. Audit: is the store what the catalog says it is?
+
+**What.** `record-similarity audit export.jsonl`: reads an export of the caller's own database (the format
+`import` reads) and the collection, and reports ids the store lacks, ids the store has that the export does not,
+records whose text or quantities differ, and records stored under another tenant. No model: the store keeps a
+fingerprint of every field's text, and the export's text can be fingerprinted the same way.
+
+**Why here.** The service's baseline and the caller's database have to agree, and today nothing can check that
+they do. They drift apart through every failure in 22, through a save that failed after an `ACCEPTED`, through a
+restore from backup on either side. A baseline that is stale means the next edit is judged against a record that
+no longer exists. The store trait has no way to list what it holds, so it needs a `scan`.
+
+**Effort.** M. **Needs:** nothing here; at work, an export. **Decide:** whether it only reports, or can also
+repair. An import only creates (D20), and replacing a baseline is a `FORCE`, which resets the anchor.
+
+### 25. Anchors are the one thing that cannot be rebuilt: back them up
+
+**What.** `record-similarity anchors export` and `anchors restore`: every record's anchor vector, its text
+fingerprints, and its first quantities, with the model fingerprint and layout they belong to, to and from a file.
+
+**Why here.** If the collection is lost, the current baselines can be rebuilt from the caller's database with
+`import`. The anchors cannot: an anchor is the first value each field ever had, the server stores no text, and
+`import` can only rebuild one where the export still carries the original version. A catalog restored without
+them has every record's drift history reset to today, silently, which is the state a recycler wants. A Qdrant
+snapshot covers this only for as long as the model does not change; a file keyed by layout says plainly when it
+no longer applies.
+
+**Effort.** M (it shares the `scan` of 24). **Needs:** nothing. **Decide:** where such a file may be kept: it
+holds vectors and fingerprints, no text, and tenant ids.
+
+### 26. Operational metrics
+
+**What.** A small HTTP endpoint in Prometheus text format: request counts and latency by call and status, the
+embedding queue's depth and wait, texts per forward pass, the share of time the model is busy, refusals for
+overload, store latency and errors by operation, and verdict counts.
+
+**Why here.** The numbers exist and go nowhere: `WorkerSnapshot` counts batches, texts, busy time, queue wait,
+and refusals, and only the load test reads it. In service the one signal is a log line per request. This is not
+feature 10: that is one line per request about *scores*, for judging thresholds, and it is deferred. These are
+counters about the *process*, for paging someone.
+
+**Effort.** M. **Needs:** nothing. **Decide:** it opens a second port, and it overlaps a question deferred with
+feature 10 (whether to have a metrics endpoint at all). Tenants must not become label values.
+
+### 27. One tenant cannot starve the rest
+
+**What.** Fair admission in front of the embedding queue: a cap on how much of the queue one tenant may hold, or
+round-robin between tenants when it is contended.
+
+**Why here.** There is one queue of `model.queue_depth` (256) for everyone, first come first served. One
+merchant's bulk edit, or one misbehaving integration retrying without backoff, fills it, and every other
+merchant's saves get `RESOURCE_EXHAUSTED`. The load test shows how little it takes: the queue is the only buffer
+in front of one thread.
+
+**Effort.** M. **Needs:** `just load` extended with two tenants of unequal appetite. **Decide:** what a request
+without a tenant counts as.
+
+### 28. A batch call
+
+**What.** `EvaluateBatch`: many records in one request, each judged and answered on its own, sharing forward
+passes on purpose.
+
+**Why here.** "No bulk RPC" is a stated limitation. Nightly syncs and back-office tools send thousands of
+`Evaluate` calls and get batching only by accident of arrival. `import` exists but runs beside Qdrant, only
+creates, and is not something an application can call.
+
+**Effort.** M. **Needs:** nothing. **Decide:** whether a batch is all `DRY_RUN` (a report) or may write; a
+batch that writes needs every per-record rule of `Evaluate`, including the tenant check.
+
+### 29. Change a threshold without a restart, and know every replica agrees
+
+**What.** Reload `[policy]`, floors, and limits on `SIGHUP` (nothing that changes a vector), and report a digest
+of the judging configuration in `Describe` and on the start-up log line.
+
+**Why here.** D12 already separates what needs a re-index from what does not, and a threshold is the setting
+most likely to be changed in a hurry. Today that is a restart of every replica, each reloading a 90 MB model.
+And nothing says whether two replicas are judging by the same numbers: during a rolling deploy two requests for
+one record can be held to two thresholds, and nobody can see it.
+
+**Effort.** S for the digest, M with the reload. **Needs:** nothing. **Decide:** whether a reload that fails to
+parse keeps the old policy and keeps serving (recommended) or stops the server.
+
+### 30. Who forced this, and why
+
+**What.** An optional `actor` and `reason` on a `FORCE` write and on `Delete`, written to the log line and kept
+on the record (the last one only).
+
+**Why here.** `FORCE` is the reviewer's override: it stores what the policy rejected and resets the drift
+anchor. `Delete` forgets a record, so the next evaluation of that id is a creation and is accepted whatever it
+says. Both are the ways around the service, and neither leaves any trace of who used it. An integration that
+deletes and re-creates to get an edit through is indistinguishable from normal traffic.
+
+**Effort.** S. **Needs:** nothing. **Decide:** this is personal data about staff in a log and in the store, so
+it is the owner's call, like the tenant was.
+
+### 31. TLS and a caller identity
+
+**What.** TLS on the listener, and a caller identity (a client certificate or a token) that the tenant check can
+be tied to.
+
+**Why here.** The server speaks plaintext and trusts every caller; the tenant rule is a consistency check and
+says so. Behind a mesh that is enough. Anywhere else, any client on the network can delete any record, or
+`FORCE` one.
+
+**Effort.** M. **Needs:** nothing. **Decide:** whether the deployment has a mesh that already does this, in
+which case it is not worth building.
+
+### 32. Change the model without stopping
+
+**What.** A cutover in three steps the tools enforce: write to the old and the new collection for a while, back
+fill the new one with `import`, switch reads, drop the old.
+
+**Why here.** A new model is a new collection, and today the switch is a stop, an import, and a start. With 23
+(conditional writes), 24 (audit), and the registry of feature 4, the pieces of a safe cutover exist; this is the
+part that puts them in order. It is also most of the model half of feature 18.
+
+**Effort.** L. **Needs:** a candidate model, and production hardware to measure a second model's cost on.
+**Decide:** only worth it once a model change is actually planned.
+
 ## What to build first
 
 1. **Structured calibration output (7).** Real labeled data is about to arrive, and nearly every other feature
@@ -588,10 +779,28 @@ probably wants its own field configuration, since menu items do not have the sam
 5. **Bulk re-index with anchor carry-over (16).** Whatever the first four show to be better can only reach
    production through a re-index, and today that is slow, manual, and resets drift history.
 
+### For production, in this order
+
+1. **21, readiness and drain.** A day, and it changes what every deploy and every Qdrant outage looks like.
+2. **22, deadlines and cancelled requests.** The server is at its worst exactly under overload, and a cancelled
+   write is the one way the store and the caller's database part without either knowing.
+3. **23, conditional writes.** It removes the first limitation in the README, and the store turns out to
+   support it.
+4. **24 and 25, audit and anchor backup,** together: they share a scan of the store, and between them they are
+   the answer to "what if the collection and the catalog disagree, or the collection is gone".
+
+Then 26 if a metrics endpoint is wanted, and 27 before the first large merchant integration. 28 to 31 wait on
+who the callers turn out to be; 32 waits for a model change.
+
 ## Things noticed along the way
 
 Not features, but found while preparing this list:
 
+- **"Qdrant has no compare-and-swap" is no longer true of the Qdrant this project pins** (found 2026-11-11,
+  preparing section E). The README's first limitation, D6, and D10 rest on it. Upsert takes an `update_filter`
+  in 1.20, and a probe of the local server showed it acting as compare-and-swap on a revision, for updates and
+  for creates. The documents are left as they are until feature 23 is decided: they describe what the code does,
+  which is still an unconditional write.
 - **A README figure was derived, not measured end to end.** "Roughly 375 field texts per second when requests
   arrive concurrently" came from the batch throughput measurement, not from a test through the gRPC queue. It has
   been replaced by a measured figure for the bulk import (2,000 four-field records in 19 seconds). Throughput

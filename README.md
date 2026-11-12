@@ -2258,7 +2258,7 @@ data/
 docs/
   decisions.md               why things are the way they are (D1 to D31)
   data-request-prompt.md     a brief for collecting labeled production data
-  feature-suggestions.md     twenty features that could be added, and which of them are built
+  feature-suggestions.md     features that could be added, built and not, the last twelve about production
   plan-features.md           a plan for the first five of them
 models/                 fetched and fine-tuned model directories (ignored by git)
 tools/                  referees, not part of any pipeline: they write the fixtures the parity tests compare with
