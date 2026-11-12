@@ -1,0 +1,14 @@
+{
+  "version": "1",
+  "name": "record-similarity",
+  "type": "collection",
+  "ignore": ["node_modules", ".git"],
+  "protobuf": {
+    "protoFiles": [
+      {
+        "path": "../crates/similarity-proto/proto/recordsimilarity/v1/similarity.proto"
+      }
+    ],
+    "importPaths": []
+  }
+}

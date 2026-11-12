@@ -1,0 +1,50 @@
+meta {
+  name: Evaluate - an ordinary edit
+  type: grpc
+  seq: 4
+}
+
+grpc {
+  url: {{server}}
+  method: /recordsimilarity.v1.RecordSimilarity/Evaluate
+  body: grpc
+  protoPath: ../crates/similarity-proto/proto/recordsimilarity/v1/similarity.proto
+  auth: none
+  methodType: unary
+}
+
+body:grpc {
+  name: message 1
+  content: '''
+    {
+      "record": {
+        "id": "bruno-1",
+        "brand_id": "brand-1",
+        "fields": {
+          "name": "Blueberry Gummies 100mg (10-pack)",
+          "category": "Edibles > Gummies",
+          "brand": "Sunny Orchard",
+          "description": "Ten vegan fruit gummies with a ripe blueberry flavor, indica-leaning and made with real fruit. 10mg THC per piece, 100mg per pouch."
+        },
+        "quantities": {
+          "weight_per_item": {
+            "min": 40,
+            "max": 40,
+            "unit": "g"
+          },
+          "thc_per_item": {
+            "min": 100,
+            "max": 100,
+            "unit": "mg"
+          }
+        }
+      },
+      "mode": "WRITE_MODE_ENFORCE"
+    }
+  '''
+}
+
+docs {
+  A pack size in the name and a reworded description. Run "Evaluate - create" first. Accepted, stored, and the
+  revision goes to 2.
+}

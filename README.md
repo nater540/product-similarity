@@ -482,6 +482,20 @@ grpcurl -plaintext -d '{"service": "recordsimilarity.v1.RecordSimilarity"}' loca
 In JSON, enum values are written by name (`"WRITE_MODE_DRY_RUN"`), 64-bit integers come back as strings
 (`"revision": "1"`), and fields at their default value (a `false`, an empty list) are omitted from responses.
 
+### With Bruno
+
+`bruno/` is a [Bruno](https://www.usebruno.com) collection with a request for every call: open the folder as a
+collection and pick the `local` environment, which points at `grpc://127.0.0.1:50051`. The requests read the
+API from the repository's `.proto` (the collection names it by a relative path), so they stay in step with it.
+
+They are numbered in an order that works on an empty server (`just serve-in-memory config.toml`): `Describe`,
+an `Import` stream that creates two records and has a third refused, the five kinds of `Evaluate`, two searches,
+two matches, and a `Delete`. Each has a note saying what to expect. Every one was sent through Bruno's own gRPC
+client (4.3.0) against a local server, and they answer as the notes say.
+
+Bodies use the names in the `.proto` as they are written there (`brand_id`, `menu_item`, `return_vector`), and
+enum values by name (`"WRITE_MODE_DRY_RUN"`).
+
 ### From Rust
 
 Depend on the `similarity-proto` crate, which contains the generated client:
@@ -2491,6 +2505,7 @@ docs/
   feature-suggestions.md     features that could be added, built and not, the last twelve about production
   plan-features.md           a plan for the first five of them
 models/                 fetched and fine-tuned model directories (ignored by git)
+bruno/                  a Bruno collection: one request for each call, in an order that runs on an empty server
 tools/                  Python, where Python is the right tool, and never at run time
   golden.py             PyTorch reference embeddings, for the parity tests
   train_golden.py       PyTorch reference training steps, for the parity tests

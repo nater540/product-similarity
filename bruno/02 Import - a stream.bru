@@ -1,0 +1,105 @@
+meta {
+  name: Import - a stream
+  type: grpc
+  seq: 2
+}
+
+grpc {
+  url: {{server}}
+  method: /recordsimilarity.v1.RecordSimilarity/Import
+  body: grpc
+  protoPath: ../crates/similarity-proto/proto/recordsimilarity/v1/similarity.proto
+  auth: none
+  methodType: bidi-streaming
+}
+
+body:grpc {
+  name: message 1
+  content: '''
+    {
+      "record": {
+        "id": "bruno-import-1",
+        "brand_id": "brand-1",
+        "fields": {
+          "name": "Blueberry Gummies 100mg",
+          "category": "Edibles > Gummies",
+          "brand": "Sunny Orchard",
+          "description": "Ten vegan fruit gummies, indica-leaning, with a ripe blueberry flavor. 10mg THC per piece, 100mg per pouch."
+        },
+        "quantities": {
+          "weight_per_item": {
+            "min": 40,
+            "max": 40,
+            "unit": "g"
+          },
+          "thc_per_item": {
+            "min": 100,
+            "max": 100,
+            "unit": "mg"
+          }
+        }
+      }
+    }
+  '''
+}
+
+body:grpc {
+  name: message 2
+  content: '''
+    {
+      "record": {
+        "id": "bruno-import-2",
+        "brand_id": "brand-1",
+        "fields": {
+          "name": "Sour Diesel Live Resin Cartridge 1g",
+          "category": "Vape Pens > Cartridges",
+          "brand": "Sunny Orchard",
+          "description": "A 1 gram 510-thread cartridge of Sour Diesel live resin, a sativa with notes of citrus and fuel. No cutting agents."
+        },
+        "quantities": {
+          "weight_per_item": {
+            "min": 1,
+            "max": 1,
+            "unit": "g"
+          },
+          "thc_per_item": {
+            "min": 84,
+            "max": 88,
+            "unit": "%"
+          }
+        }
+      },
+      "anchor": {
+        "fields": {
+          "name": "Sour Diesel Cartridge 1g",
+          "category": "Vape Pens > Cartridges"
+        }
+      }
+    }
+  '''
+}
+
+body:grpc {
+  name: message 3
+  content: '''
+    {
+      "record": {
+        "id": "bruno-import-3",
+        "brand_id": "brand-1",
+        "fields": {
+          "name": "Peach Gummies 100mg",
+          "strain": "hybrid"
+        }
+      }
+    }
+  '''
+}
+
+docs {
+  Creates records that are not stored yet: send each message, then end the stream. One answer comes back for
+  each record, in order. A record that is already stored is answered `IMPORT_OUTCOME_EXISTS` and left exactly as
+  it is, so the stream can be sent twice. `anchor` is the record as it was first created, if you have it.
+
+  The third record has a field the schema does not define and is answered `IMPORT_OUTCOME_FAILED` by itself; the
+  stream goes on. The requests after this one search and match against what it creates.
+}

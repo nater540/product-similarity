@@ -1,0 +1,41 @@
+meta {
+  name: Match - a menu item
+  type: grpc
+  seq: 11
+}
+
+grpc {
+  url: {{server}}
+  method: /recordsimilarity.v1.RecordSimilarity/Match
+  body: grpc
+  protoPath: ../crates/similarity-proto/proto/recordsimilarity/v1/similarity.proto
+  auth: none
+  methodType: unary
+}
+
+body:grpc {
+  name: message 1
+  content: '''
+    {
+      "menu_item": {
+        "fields": {
+          "name": "Blueberry Indica Gummies 100mg (10pk)"
+        },
+        "quantities": {
+          "weight_per_item": {
+            "min": 40,
+            "max": 40,
+            "unit": "g"
+          }
+        }
+      },
+      "limit": 5
+    }
+  '''
+}
+
+docs {
+  Which stored records a menu item describes, best first. The menu item goes under `menu_item` and carries no
+  `id` and no `brand_id`. Read-only. Without a threshold the decision is `MATCH_DECISION_NOT_JUDGED`: none ships,
+  because it has to be measured.
+}

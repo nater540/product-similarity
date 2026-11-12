@@ -1,0 +1,32 @@
+meta {
+  name: Evaluate - embed only
+  type: grpc
+  seq: 8
+}
+
+grpc {
+  url: {{server}}
+  method: /recordsimilarity.v1.RecordSimilarity/Evaluate
+  body: grpc
+  protoPath: ../crates/similarity-proto/proto/recordsimilarity/v1/similarity.proto
+  auth: none
+  methodType: unary
+}
+
+body:grpc {
+  name: message 1
+  content: '''
+    {
+      "record": {
+        "fields": {
+          "name": "Blueberry Gummies"
+        }
+      },
+      "return_vector": true
+    }
+  '''
+}
+
+docs {
+  No `id`: the record is embedded and nothing is compared or stored. `return_vector` returns the vector.
+}

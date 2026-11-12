@@ -1,0 +1,30 @@
+meta {
+  name: FindSimilar - by id
+  type: grpc
+  seq: 9
+}
+
+grpc {
+  url: {{server}}
+  method: /recordsimilarity.v1.RecordSimilarity/FindSimilar
+  body: grpc
+  protoPath: ../crates/similarity-proto/proto/recordsimilarity/v1/similarity.proto
+  auth: none
+  methodType: unary
+}
+
+body:grpc {
+  name: message 1
+  content: '''
+    {
+      "id": "bruno-import-1",
+      "limit": 5,
+      "brand_id": "brand-1"
+    }
+  '''
+}
+
+docs {
+  The stored records most similar to a stored one (one the import created), here within one brand. Leave `brand_id` out to search every
+  brand's records.
+}

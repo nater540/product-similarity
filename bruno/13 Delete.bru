@@ -1,0 +1,29 @@
+meta {
+  name: Delete
+  type: grpc
+  seq: 13
+}
+
+grpc {
+  url: {{server}}
+  method: /recordsimilarity.v1.RecordSimilarity/Delete
+  body: grpc
+  protoPath: ../crates/similarity-proto/proto/recordsimilarity/v1/similarity.proto
+  auth: none
+  methodType: unary
+}
+
+body:grpc {
+  name: message 1
+  content: '''
+    {
+      "id": "bruno-1",
+      "brand_id": "brand-1"
+    }
+  '''
+}
+
+docs {
+  Forgets a record. It has to name the brand the record is stored under. Change the id to `bruno-import-1` and
+  `bruno-import-2` to remove what the import created too.
+}

@@ -1,0 +1,26 @@
+meta {
+  name: Describe
+  type: grpc
+  seq: 1
+}
+
+grpc {
+  url: {{server}}
+  method: /recordsimilarity.v1.RecordSimilarity/Describe
+  body: grpc
+  protoPath: ../crates/similarity-proto/proto/recordsimilarity/v1/similarity.proto
+  auth: none
+  methodType: unary
+}
+
+body:grpc {
+  name: message 1
+  content: '''
+    {}
+  '''
+}
+
+docs {
+  What the server is running: the model's fingerprint, the fields it compares with their weights, the quantities,
+  and the thresholds in force. The field and quantity names it lists are the only keys a record may have.
+}
