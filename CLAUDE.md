@@ -138,7 +138,9 @@ changing a design. Infer conventions from the existing code first.
 - **Rust first, by the owner's choice** (D13, revised 2026-11-12): serving, training, and evaluation are Rust,
   and nothing at run time may need Python. Python is allowed where it is the best tool for a job, and not as a
   default: say why in the change. `tools/golden.py` and `tools/train_golden.py` write PyTorch fixtures for the
-  parity tests; `tools/export_onnx.py` converts a model directory for the ONNX engine.
+  parity tests; `tools/export_onnx.py` converts a model directory for the ONNX engine; `tools/demo.py` is a
+  client that walks an audience through the API on a synthetic catalog (`just demo`), and prints what the server
+  answers without asserting any of it.
 - **Burn defines the model; ONNX Runtime may compute it** (D34). `engine = "onnx"` (a build with `--features
   onnx`) runs the forward pass in C++ from `onnx/model.onnx`. Never let that file be used unchecked: the loader
   compares it with the directory's weights in Burn at every load and refuses a graph that differs, because the
@@ -146,6 +148,12 @@ changing a design. Infer conventions from the existing code first.
   the vectors are the same, and that is what the check is for. Keep `ort` behind the feature, pinned exactly, and
   out of the trainer. After changing the encoder, the pooling, or the export, run `just test-onnx` (it needs
   `just export-onnx` first).
+- **ONNX is the README's route, not the code's default** (owner, 2026-11-12). The README's setup exports the
+  model and sets `engine = "onnx"`, and the `just` recipes that run the server build with the feature. A config
+  that does not say is still `"burn"`, `config.example.toml` still says `"burn"`, and no crate has `onnx` as a
+  default feature, so `cargo test` and a plain `cargo build` download and link nothing. Do not flip any of those
+  three without the owner: the pinned verdicts and every calibration quoted in the README were made under Burn
+  with that config.
 - **Histories are measured first and judged afterwards** (D27). `calibrate-drift` replays every version on an
   engine that can reject nothing, then judges each step under the config. Never replay under the configured
   policy: after the first rejection the baseline stops moving and the rest of the history is fiction.
@@ -222,7 +230,10 @@ changing a design. Infer conventions from the existing code first.
   does not link on Debian 12)
 - Mutation testing (needs `cargo install cargo-mutants`): `just mutants -j 3`, `just mutants-diff`,
   `just mutants-train`
-- Run: `just serve` (needs Qdrant) or `just serve-in-memory`; then `just client describe`
+- Run: `just serve` (needs Qdrant) or `just serve-in-memory`; then `just client describe`. Every recipe that runs
+  the server builds it with `--features onnx` (the justfile's `features`); `just features= <recipe>` builds Burn
+  alone
+- Show it to an audience: `just serve-in-memory config.toml`, then `just demo --pause` (needs `uv`)
 - Load a catalog: `just import export.jsonl config.toml` (`--check` validates only)
 - Measure: `just throughput`, `just load`, `just calibrate`, `just calibrate-drift`, `just calibrate-match`, `just calibrate-sweep`, `just calibrate-diff`, `just verdict-gate old.ndjson pairs.full.jsonl`
 - Read a shadowed server's stdout: `just shadow-report shadow.ndjson --ids to-label.jsonl`

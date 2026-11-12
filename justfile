@@ -6,6 +6,14 @@ set positional-arguments := false
 # Where the ignored Qdrant tests look for a server.
 qdrant_url := env_var_or_default("QDRANT_URL", "http://localhost:6334")
 
+# The server's Cargo features in every recipe that runs it. `onnx` links ONNX Runtime in beside Burn, so that a config
+# may say `engine = "onnx"` (the README's route); a config that says "burn" runs exactly as it does without it. For
+# Burn alone, with nothing downloaded at build time and no C++: `just features= serve`, or set
+# RECORD_SIMILARITY_FEATURES to nothing. The build recipes (`release`, `release-onnx`), the tests, and `client`
+# (which runs no model) do not read it.
+features := env_var_or_default("RECORD_SIMILARITY_FEATURES", "onnx")
+server_features := if features == "" { "" } else { "--features " + features }
+
 default:
     @just --list --unsorted
 
@@ -70,8 +78,8 @@ snapshot:
 # Gate a calibration of labeled pairs against an earlier `--ndjson` run of the same pairs: fails on a flipped
 # verdict or a score that moved. For real pairs, where the data is: `just verdict-gate kept.ndjson pairs.full.jsonl`
 verdict-gate old pairs config="config.toml" *flags:
-    RUST_LOG=warn cargo run --release -q -p similarity-server -- calibrate --config {{ config }} {{ pairs }} --full --ndjson {{ flags }} > target/verdict-gate.ndjson
-    cargo run --release -q -p similarity-server -- calibrate-diff {{ old }} target/verdict-gate.ndjson --fail-on any-flip --fail-on moved
+    RUST_LOG=warn cargo run --release -q -p similarity-server {{ server_features }} -- calibrate --config {{ config }} {{ pairs }} --full --ndjson {{ flags }} > target/verdict-gate.ndjson
+    cargo run --release -q -p similarity-server {{ server_features }} -- calibrate-diff {{ old }} target/verdict-gate.ndjson --fail-on any-flip --fail-on moved
 
 # For a mutation run: one fixed proptest seed, so that a mutant is caught or missed the same way every time, and no
 # regression files written into the copied tree. The commit is given so that the build script does not ask `git`
@@ -122,7 +130,7 @@ ci: fmt-check clippy test deny
 
 # Download the default model into ./models, verifying checksums
 fetch-model:
-    cargo run --release -p similarity-server -- model fetch
+    cargo run --release -p similarity-server {{ server_features }} -- model fetch
 
 # Regenerate both PyTorch parity fixtures (needs `uv`; downloads PyTorch on first run)
 golden:
@@ -145,43 +153,43 @@ throughput model="models/mdbr-leaf-mt" engine="burn":
 # Score the labeled pairs and report the threshold that separates edits from recycled records.
 # Flags go last: `just calibrate data/calibration.sample.full.jsonl config.example.toml --full --split holdout`
 calibrate pairs="data/calibration.sample.jsonl" config="config.example.toml" *flags:
-    RUST_LOG=warn cargo run --release -q -p similarity-server -- calibrate --config {{ config }} {{ pairs }} {{ flags }}
+    RUST_LOG=warn cargo run --release -q -p similarity-server {{ server_features }} -- calibrate --config {{ config }} {{ pairs }} {{ flags }}
 
 # Compare two `calibrate --ndjson` runs, or one run under a second config: `just calibrate-diff old.ndjson --config-b b.toml`
 calibrate-diff *args:
-    cargo run --release -q -p similarity-server -- calibrate-diff {{ args }}
+    cargo run --release -q -p similarity-server {{ server_features }} -- calibrate-diff {{ args }}
 
 # Put a model into service if its holdout calibration passes the gate: `just promote --config c.toml --calibration holdout.ndjson`
 promote *args:
-    RUST_LOG=warn cargo run --release -q -p similarity-server -- model promote {{ args }}
+    RUST_LOG=warn cargo run --release -q -p similarity-server {{ server_features }} -- model promote {{ args }}
 
 # Replay whole edit histories to see how far products drift and where `anchor_threshold` belongs:
 # `just calibrate-drift sequences.jsonl config.toml`
 calibrate-drift histories="data/drift.sample.jsonl" config="config.example.toml" *flags:
-    RUST_LOG=warn cargo run --release -q -p similarity-server -- calibrate-drift --config {{ config }} {{ histories }} {{ flags }}
+    RUST_LOG=warn cargo run --release -q -p similarity-server {{ server_features }} -- calibrate-drift --config {{ config }} {{ histories }} {{ flags }}
 
 # Score catalog groups as `Match` would, to see how often the right product comes first and where
 # `matching.threshold` belongs: `just calibrate-match catalog-groups.jsonl config.toml --split holdout`
 calibrate-match groups="data/catalog-groups.sample.jsonl" config="config.example.toml" *flags:
-    RUST_LOG=warn cargo run --release -q -p similarity-server -- calibrate-match --config {{ config }} {{ groups }} {{ flags }}
+    RUST_LOG=warn cargo run --release -q -p similarity-server {{ server_features }} -- calibrate-match --config {{ config }} {{ groups }} {{ flags }}
 
 # Say what a server with a `[shadow]` table wrote to its stdout: `just shadow-report shadow.ndjson --ids to-label.jsonl`
 shadow-report *args:
-    cargo run --release -q -p similarity-server -- shadow-report {{ args }}
+    cargo run --release -q -p similarity-server {{ server_features }} -- shadow-report {{ args }}
 
 # Judge one recorded calibration under a grid of weights, floors, and limits, with no model:
 # `just calibrate-sweep select.ndjson --grid grid.toml --config config.toml [--evaluate other.ndjson]`
 calibrate-sweep *args:
-    cargo run --release -q -p similarity-server -- calibrate-sweep {{ args }}
+    cargo run --release -q -p similarity-server {{ server_features }} -- calibrate-sweep {{ args }}
 
 # What was recorded: every calibration and every training run, newest first (`--kind train`, `--limit 5`)
 runs *flags:
-    cargo run --release -q -p similarity-server -- runs list {{ flags }}
+    cargo run --release -q -p similarity-server {{ server_features }} -- runs list {{ flags }}
 
 # Latency and throughput through the API at several levels of concurrency, on synthetic records and a store in
 # memory: `just load config.example.toml --concurrency 1,4,16,64 --records 300`. Results are NDJSON on stdout
 load config="config.example.toml" *flags:
-    RUST_LOG=warn cargo run --release -q -p similarity-server -- load --config {{ config }} {{ flags }}
+    RUST_LOG=warn cargo run --release -q -p similarity-server {{ server_features }} -- load --config {{ config }} {{ flags }}
 
 # --- run --------------------------------------------------------------------
 
@@ -195,15 +203,20 @@ qdrant-down:
 
 # Run the server against the local Qdrant
 serve config="config.example.toml":
-    cargo run --release -p similarity-server -- serve --config {{ config }}
+    cargo run --release -p similarity-server {{ server_features }} -- serve --config {{ config }}
 
 # Load an export into the configured collection: `just import export.jsonl config.toml` (add `--check` to only validate)
 import export config="config.example.toml" *flags:
-    cargo run --release -q -p similarity-server -- import --config {{ config }} {{ export }} {{ flags }}
+    cargo run --release -q -p similarity-server {{ server_features }} -- import --config {{ config }} {{ export }} {{ flags }}
 
 # Run the server with no Qdrant at all; nothing is persisted
 serve-in-memory config="config.example.toml":
-    cargo run --release -p similarity-server -- serve --config {{ config }} --in-memory
+    cargo run --release -p similarity-server {{ server_features }} -- serve --config {{ config }} --in-memory
+
+# A walk through the API for an audience, against a running server (needs `uv`): `just serve-in-memory config.toml`
+# in one terminal, `just demo --pause` in another. It loads 300 synthetic products and sends real requests about them
+demo *args:
+    uv run tools/demo.py {{ args }}
 
 # Talk to a running server: `just client evaluate sku-1 data/examples/gummies.json`
 client *args:

@@ -917,6 +917,9 @@ that does not exist, which would have recorded a first promotion over a damaged 
 match statistics (what a score exactly at the threshold counts as, and that the two populations say which file
 and split they came from). Each got a test, and each mutation was then applied by hand to see the test fail.
 
+After the streaming import and the ONNX engine, a run at `a7b67c3` tested 681 mutants in 27 minutes: 571 caught,
+110 that do not compile, none surviving.
+
 **Why an allowlist of files.** The alternative, excluding what should not be mutated, grows a list of everything
 whose only tests need the model or Qdrant, and a new file is mutated by default whether or not its tests can run.
 The files listed are where a mutant that survives means a wrong decision.
@@ -1460,4 +1463,14 @@ the speed, and the first figure should not be quoted for a Linux deployment.
 **Not done:** x86-64, which is unmeasured and is probably what production runs on; several embedding threads
 (ONNX Runtime may make one thread per core a better design than one thread across cores); an image that has an
 exported model in it (the image bakes in the fetched model, which has no graph).
+
+**The documented route, since 2026-11-12.** The owner asked for the README to lead with this engine. Its setup
+now exports the model and writes a config with `engine = "onnx"`, and the `just` recipes that run the server
+build with the feature (the justfile's `features`, which `just features= <recipe>` empties). What did not change
+is every default in the code: a config that does not name an engine runs Burn, `config.example.toml` says
+`"burn"`, and no crate enables `onnx` by default. Those stay because of what rests on them: `cargo test` must
+build with no download beyond crates, the pinned verdicts and the README's calibrations were produced under Burn
+with that config, and a default build that could not serve the example config would be a worse first run than a
+slower one. The cost is one line of `sed` in the setup, and a link failure on a Linux older than Debian 13 for
+anyone who runs a recipe there without emptying `features`; the README's troubleshooting table names it.
 

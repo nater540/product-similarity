@@ -16,10 +16,11 @@ import_batch_records = 8
 dir = "models/mdbr-leaf-mt"
 # "cpu" (always available) or "metal" (needs a binary built with `--features metal`).
 device = "cpu"
-# What runs the model: "burn" (Rust, always available) or "onnx" (ONNX Runtime, C++, about five times faster on a
-# CPU). "onnx" needs a binary built with `--features onnx` and a model directory that `just export-onnx` has been
-# run on; the server checks the exported file against the weights before it uses it. Vectors, fingerprints, and
-# thresholds are the same under either.
+# What runs the model: "burn" (Rust, always available) or "onnx" (ONNX Runtime, C++: about two to five times faster
+# on a CPU, by platform). "onnx" needs a binary built with `--features onnx`, which the `just` recipes build, and a
+# model directory that `just export-onnx` has been run on; the server checks the exported file against the weights
+# before it uses it. Vectors, fingerprints, and thresholds are the same under either. The README's setup changes
+# this line to "onnx".
 engine = "burn"
 # Texts are truncated to this many tokens. Cost grows with the square of it.
 max_tokens = 256
