@@ -8,7 +8,8 @@ Numbers quoted here were measured on an Apple-silicon laptop CPU with a release 
 
 Burn 0.22 changed how backends work: models are plain types, and a runtime `Device` selects the backend. `ndarray`
 and `tch` are deprecated; `flex` is the pure-Rust CPU backend that replaces them. The workspace builds `flex` (with
-`simd` and `rayon`) always, and `similarity-server` adds Metal with `--features metal` for development on a Mac.
+`simd` and `rayon`) always, and the trainer adds Metal or CUDA with a feature. (The server had a Metal feature
+too, until ONNX Runtime took over the forward pass and there was nothing left for it to speed up: D34.)
 
 The server is built with no training features (`default-features = false`): no optimizer and no autodiff, and the
 encoder has no dropout layer in its module tree. Leaving those out of the serving path removes a class of "why is
@@ -681,7 +682,8 @@ store, since the usual problems (a misnamed field, a quantity sent as text) are 
 
 Everything is embedded before anything is written, and nothing is written if the model fails. The records of a
 batch are embedded in one call, on the calling thread: a command that is the model's only user has no use for the
-server's queue (D9). On a laptop CPU 2,000 four-field records import in 19 seconds.
+server's queue (D9). On a laptop CPU 2,000 four-field records imported in 19 seconds when Burn ran the model,
+and import in 5 now that ONNX Runtime does (D34).
 
 Not built: a streaming `Import` RPC. The command covers the need as long as it can run next to Qdrant, and an RPC
 that writes without judging is a larger thing to expose than a command an operator runs.
@@ -975,7 +977,8 @@ milliseconds. Nothing is logged per batch: under load that is the volume D15 war
 **What it measured** (12 cores, default model): from one caller to 64, edits per second rise from 177 to 470
 while the median latency rises from 6 ms to 116 ms, with the model busy throughout and the number of texts per
 forward pass rising from 1 to 23. Creating whole records levels off at about 80 a second once a pass is full.
-The full table is in the README.
+That was with Burn running the model. The README's table is the same test with ONNX Runtime (D34): 612 to 2,435
+edits a second, a median from 1.6 ms to 22 ms, and creates leveling off at about 400.
 
 **The loop is closed, and says so.** Each caller waits for its answer before sending again. That measures latency
 at a fixed number of callers. Latency at a fixed arrival rate, where a server that falls behind makes its queue
@@ -1372,7 +1375,9 @@ records (about one forward pass of four-field records) a stream runs at 81 recor
 concurrent callers of `Evaluate` reach, and a merchant's edit beside it takes a median 86 ms instead of 6 ms.
 At 1 the stream runs at 48 a second and the edit takes 25 ms. The default is 8: a save of 86 ms is still a fast
 save, and a bulk load is the less frequent event. It is a setting because that is a judgment about someone
-else's callers.
+else's callers. (Those figures are from when Burn ran the model. With ONNX Runtime, D34, the stream runs at 398
+records a second at 8 and the edit beside it takes 17.5 ms instead of 1.6 ms; at 1, 220 a second and 5.5 ms. The
+trade has the same shape and a fifth of the cost.)
 
 **A full queue is waited out.** A single request that finds the model's queue full is refused at once, so that
 it can back off (D9). A stream is its own back-off: it holds its batch, waits (10 ms, doubling to 250 ms), offers
@@ -1394,7 +1399,7 @@ The trade-off table in the README is `load --server` beside a stream that never 
 27), which this makes more pressing; a final summary message on the stream (the caller counts its answers, and
 the server logs one `import` line).
 
-## D34. The forward pass can run on ONNX Runtime; Burn stays the definition of the model
+## D34. ONNX Runtime runs the forward pass; Burn stays the definition of the model
 
 Asked how this would compare with a Python or a Node service, the honest answer had to be measured, and it was
 not the expected one. On the same machine, model, and texts, the Burn CPU backend had the slowest forward pass
@@ -1410,11 +1415,31 @@ short field on one core as on twelve. Then ONNX Runtime through the `ort` crate,
 Rust port and accepted for its speed once told it is a binding to C++, on condition that the gRPC service stays
 a Rust binary. It does.
 
-**An engine, behind a feature, chosen in the config.** `Embedder` runs its forward pass on one of two engines.
-Everything else is shared: the tokenizer and its D21 rule, the length buckets, truncation to `output_dim`,
-normalization, the worker thread and its batching. `engine = "onnx"` needs a binary built with `--features
-onnx`; the default build links no C++ and says so if asked for the engine. The trainer does not have the
-feature and is untouched (D13).
+**One engine for everything the server binary does, and no setting for it.** For its first day this was a
+choice: `engine = "onnx"` in the config, in a binary built with `--features onnx`, beside a default of Burn. On
+2026-11-12 the owner dropped Burn as a way to serve: it had been expected to perform better than it does, and
+keeping it was not a requirement. A second route cost a setting, a build feature, two sets of measurements, and
+a shipped config whose default was the slow one. So `model.engine` is gone, and with it `model.device` and the
+server's `metal` feature, which only ever chose how Burn ran. A config that still has either line is refused
+with a sentence that says what replaced it, not as an unknown key. Every command of `record-similarity` that
+embeds (`serve`, `import`, `load`, `compare`, the `calibrate` family, `model promote`) loads the model the same
+way and needs the exported file. `Embedder` in the core still has both engines; the tokenizer and its D21 rule,
+the length buckets, truncation to `output_dim`, normalization, the worker thread and its batching are shared.
+
+**What Burn still does.** It defines the model: the encoder, the strict loader, the fingerprint. It trains it;
+the trainer never links ONNX Runtime (D13), which is why `onnx` stays a feature of `similarity-core` that the
+server always turns on and the trainer never does. It is what every load is checked against (below). And it is
+what the tests run: the tiny encoders of `cargo test`, and the real-model tests (parity with PyTorch, the pinned
+verdicts of D22, the full stack against Qdrant), which load with `Embedder::load`. The pinned verdicts are
+statements about the model, and the engine is held to the model at every load, so they are not made a second
+time under the engine; `just test-onnx` is what holds the two to each other and to PyTorch. That is also why CI
+needs no Python.
+
+**What that costs.** A model directory is not usable by the server binary until it has been exported, which is
+Python, once for each directory: the fetched model, a fine-tuned one, and any checkpoint that is to be
+calibrated. The trainer's own validation scores are computed in Burn and need none. The server no longer builds
+without the ONNX Runtime download, and on Linux not without the C++ standard library of GCC 13; there is nothing
+to fall back to. The container image exports the model in a build stage of its own.
 
 **One model, two engines, one fingerprint.** The graph is exported from the directory's weights and computes
 the same function in another order of operations. On the pinned model the engines differ by at most 2e-7 in a
@@ -1449,8 +1474,7 @@ runtime library, which Rust does not link unless told (`.cargo/config.toml`); an
 CoreML by default there, which was slower and failed on a batch, so the session is told to prefer the CPU. On
 Linux neither applies, and something else does: the prebuilt library is compiled against the C++ standard
 library of GCC 13, so it does not link on Debian 12 (the first container build failed on exactly that). The
-image moved to Debian 13 for both variants, which the owner accepted for production on 2026-11-12, so that the
-two images differ in one build argument and nothing else.
+image moved to Debian 13, which the owner accepted for production on 2026-11-12.
 
 **Measured.** On macOS, `just throughput`: a four-field record in 4.2 ms against 20.2 ms. `just load`, through
 gRPC: one edit in 1.6 ms against 5.6 ms, and a ceiling of about 2,400 edits a second against 470, with the
@@ -1458,19 +1482,10 @@ queue, the batching, and the single embedding thread unchanged. An `Import` stre
 against 80. **In a Linux container on the same machine the gain is 1.7 to 2.4 times, not 4 to 5:** one edit in
 3.5 ms against 6.1 ms, 822 edits a second at 16 callers against 346. Burn is about as fast there as on macOS;
 ONNX Runtime's macOS build is the one that does better on that hardware. The engine is worth having at twice
-the speed, and the first figure should not be quoted for a Linux deployment.
+the speed, and the first figure should not be quoted for a Linux deployment. The Burn figures in this paragraph
+are the record of why Burn stopped serving; the README no longer carries tables a reader cannot reproduce.
 
 **Not done:** x86-64, which is unmeasured and is probably what production runs on; several embedding threads
-(ONNX Runtime may make one thread per core a better design than one thread across cores); an image that has an
-exported model in it (the image bakes in the fetched model, which has no graph).
-
-**The documented route, since 2026-11-12.** The owner asked for the README to lead with this engine. Its setup
-now exports the model and writes a config with `engine = "onnx"`, and the `just` recipes that run the server
-build with the feature (the justfile's `features`, which `just features= <recipe>` empties). What did not change
-is every default in the code: a config that does not name an engine runs Burn, `config.example.toml` says
-`"burn"`, and no crate enables `onnx` by default. Those stay because of what rests on them: `cargo test` must
-build with no download beyond crates, the pinned verdicts and the README's calibrations were produced under Burn
-with that config, and a default build that could not serve the example config would be a worse first run than a
-slower one. The cost is one line of `sed` in the setup, and a link failure on a Linux older than Debian 13 for
-anyone who runs a recipe there without emptying `features`; the README's troubleshooting table names it.
-
+(ONNX Runtime may make one thread per core a better design than one thread across cores); an exporter in Rust,
+which would take Python out of the image build and out of the fine-tuning loop; pinned versions for what the
+export script installs.

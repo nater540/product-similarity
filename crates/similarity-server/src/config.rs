@@ -110,37 +110,21 @@ impl Default for ServerConfig {
   }
 }
 
-/// Which Burn backend runs the encoder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DeviceChoice {
-  /// The pure-Rust CPU backend. Always available.
-  #[default]
-  Cpu,
-  /// The GPU through Metal. Requires a binary built with `--features metal`.
-  Metal,
-}
-
-/// What runs the model's forward pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EngineChoice {
-  /// Burn, in Rust. Always available.
-  #[default]
-  Burn,
-  /// ONNX Runtime, in C++, from `onnx/model.onnx`. Requires a binary built with `--features onnx`, and a model
-  /// directory that `just export-onnx` has been run on.
-  Onnx,
-}
-
-impl From<EngineChoice> for similarity_core::EngineChoice {
-  fn from(choice: EngineChoice) -> Self {
-    match choice {
-      EngineChoice::Burn => Self::Burn,
-      EngineChoice::Onnx => Self::Onnx,
-    }
-  }
-}
+/// Settings `[model]` used to have, with what to tell a file that still has one. Both chose how Burn ran the forward
+/// pass when Burn served; ONNX Runtime runs it now, on the CPU (docs/decisions.md, D34). They are refused by name
+/// and not as an unknown key, so that a config from before says what to do about it.
+const RETIRED_MODEL_KEYS: [(&str, &str); 2] = [
+  (
+    "engine",
+    "every command runs the model through ONNX Runtime, from the `onnx/model.onnx` that `just export-onnx` writes \
+     into the model directory",
+  ),
+  (
+    "device",
+    "ONNX Runtime runs the model, on the CPU; `--device` on `record-similarity-train` still chooses where a model \
+     is trained",
+  ),
+];
 
 /// `[model]`
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -148,10 +132,6 @@ impl From<EngineChoice> for similarity_core::EngineChoice {
 pub struct ModelConfig {
   /// A sentence-transformers model directory, as written by `record-similarity model fetch`.
   pub dir: PathBuf,
-  /// Where the encoder runs.
-  pub device: DeviceChoice,
-  /// What runs the forward pass: Burn, or ONNX Runtime from the directory's `onnx/model.onnx`.
-  pub engine: EngineChoice,
   /// Texts longer than this many tokens are truncated.
   pub max_tokens: usize,
   /// The most texts in one forward pass.
@@ -189,8 +169,6 @@ impl Default for ModelConfig {
     let options = EmbedderOptions::default();
     Self {
       dir: PathBuf::from("models/mdbr-leaf-mt"),
-      device: DeviceChoice::Cpu,
-      engine: EngineChoice::Burn,
       max_tokens: options.max_tokens,
       batch_size: options.batch_size,
       // Deliberately not 256, even though that is what `config.example.toml` sets for the default model: a
@@ -430,6 +408,13 @@ impl Config {
   /// Returns an error naming the offending key if the text is not valid TOML, has an unknown or missing key, or
   /// describes an invalid schema or policy.
   pub fn parse(text: &str) -> anyhow::Result<Self> {
+    let table: toml::Table = toml::from_str(text)?;
+    let model = table.get("model").and_then(toml::Value::as_table);
+    for (key, why) in RETIRED_MODEL_KEYS {
+      if model.is_some_and(|model| model.contains_key(key)) {
+        bail!("`model.{key}` is no longer a setting: {why}. Remove the line");
+      }
+    }
     let config: Self = toml::from_str(text)?;
     // Building these is the validation; the server builds them again from the same data when it starts.
     config.schema()?;
@@ -609,18 +594,6 @@ mod tests {
     assert!(Config::parse(&format!("[server]\nimport_batch_records = 0\n{MINIMAL}")).is_err());
     let small = Config::parse(&format!("[server]\nimport_batch_records = 2\n{MINIMAL}")).unwrap();
     assert_eq!(small.server.import_batch_records, 2);
-    assert_eq!(config.model.device, DeviceChoice::Cpu);
-    assert_eq!(
-      config.model.engine,
-      EngineChoice::Burn,
-      "the engine that needs nothing but this binary"
-    );
-    let onnx = Config::parse(&format!("[model]\nengine = \"onnx\"\n{MINIMAL}")).unwrap();
-    assert_eq!(
-      similarity_core::EngineChoice::from(onnx.model.engine),
-      similarity_core::EngineChoice::Onnx
-    );
-    assert!(Config::parse(&format!("[model]\nengine = \"tensorrt\"\n{MINIMAL}")).is_err());
     assert_eq!(
       config.model.output_dim, None,
       "truncation is opt-in: it is only safe for some models"
@@ -704,7 +677,6 @@ mod tests {
 
       [model]
       dir = "models/gte-small"
-      device = "metal"
       max_tokens = 128
       batch_size = 8
       queue_depth = 16
@@ -729,7 +701,6 @@ mod tests {
     )
     .unwrap();
     assert_eq!(config.server.listen.to_string(), "0.0.0.0:9000");
-    assert_eq!(config.model.device, DeviceChoice::Metal);
     assert_eq!(config.model.embedder_options().max_tokens, 128);
     assert_eq!(
       config.qdrant.settings(Some("key".to_owned())).timeout,
@@ -985,6 +956,29 @@ mod tests {
     assert!(Config::parse(&MINIMAL.replace("threshold = 0.8", "threshold = 8")).is_err());
     assert!(Config::parse(&MINIMAL.replace("weight = 1.0", "weight = 0")).is_err());
     assert!(Config::parse(&format!("[model]\nqueue_depth = 0\n{MINIMAL}")).is_err());
-    assert!(Config::parse(&format!("[model]\ndevice = \"cuda\"\n{MINIMAL}")).is_err());
+  }
+
+  #[test]
+  fn a_setting_that_chose_how_burn_ran_the_model_is_refused_by_name_and_says_what_replaced_it() {
+    for (line, expected) in [
+      ("engine = \"onnx\"", "`model.engine` is no longer a setting"),
+      ("engine = \"burn\"", "`model.engine` is no longer a setting"),
+      ("device = \"cpu\"", "`model.device` is no longer a setting"),
+      ("device = \"metal\"", "`model.device` is no longer a setting"),
+    ] {
+      let error = Config::parse(&format!("[model]\n{line}\n{MINIMAL}"))
+        .unwrap_err()
+        .to_string();
+      assert!(error.contains(expected), "{line}: {error}");
+      assert!(error.contains("ONNX Runtime"), "{line}: {error}");
+      assert!(error.contains("Remove the line"), "{line}: {error}");
+    }
+    // Any other key the table does not have is still an unknown key, as before.
+    let error = Config::parse(&format!("[model]\nengines = \"onnx\"\n{MINIMAL}"))
+      .unwrap_err()
+      .to_string();
+    assert!(error.contains("unknown field `engines`"), "{error}");
+    // And the keys are only retired under `[model]`: a field of a record may be called `engine`.
+    assert!(Config::parse(&format!("{MINIMAL}\n[fields.engine]\nweight = 1.0\n")).is_ok());
   }
 }

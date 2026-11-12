@@ -41,6 +41,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      # `RUSTFLAGS` in the environment replaces the flags in `.cargo/config.toml`, it does not add to them, and the
+      # macOS link needs the one that is there: ONNX Runtime's library calls into the compiler's runtime library.
+      RUSTFLAGS: ${{ runner.os == 'macOS' && '-D warnings -C link-arg=-fapple-link-rtlib' || '-D warnings' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

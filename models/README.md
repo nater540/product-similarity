@@ -40,3 +40,9 @@ Every directory these tools write holds a `provenance.json`: for a fetched model
 and the checksum of each file; for a trained one, the base model, the data, the options, and the base's own
 provenance nested inside. It is a note about the model and not part of it, so it changes no fingerprint. See
 "Where a model came from" in the top-level README.
+
+A directory is not ready for the server until `just export-onnx <dir>` has written `onnx/model.onnx` into it: the
+file ONNX Runtime runs the model from. It is a second copy of the weights in another form, so it is no part of
+the fingerprint either, and every command that loads a model checks it against the weights first and refuses one
+that was exported from other weights. Export again after fine-tuning. See "The ONNX engine" in the top-level
+README.

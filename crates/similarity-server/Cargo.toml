@@ -12,23 +12,14 @@ publish = false
 name = "record-similarity"
 path = "src/main.rs"
 
-[features]
-# Run the encoder on the GPU through Metal. For development on Apple silicon; production images build without it
-# and run on the CPU (`flex`) backend. Select it at runtime with `device = "metal"` in the config.
-metal = ["burn/metal"]
-# Run the encoder through ONNX Runtime (C++), which is several times faster on a CPU than Burn's backend. Select it
-# at run time with `engine = "onnx"` under `[model]`, for a model directory that `just export-onnx` has been run on.
-onnx = ["similarity-core/onnx"]
-
 [dependencies]
-similarity-core.workspace = true
+# With `onnx`: every command of this binary runs the forward pass through ONNX Runtime (C++), checked against Burn
+# at load (docs/decisions.md, D34). The feature stays a feature of the core so that the trainer builds without it.
+similarity-core = { workspace = true, features = ["onnx"] }
 similarity-log.workspace = true
 similarity-runs.workspace = true
 similarity-proto.workspace = true
 similarity-store.workspace = true
-
-# Named here only so that this crate, where the process is assembled, can switch backends on with a feature.
-burn.workspace = true
 
 tonic.workspace = true
 tonic-health.workspace = true

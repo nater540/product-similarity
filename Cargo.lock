@@ -6121,7 +6121,6 @@ name = "similarity-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "burn",
  "clap",
  "proptest",
  "serde",

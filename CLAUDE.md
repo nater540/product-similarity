@@ -1,9 +1,9 @@
 # record-similarity
 
 A gRPC server (tonic) that decides whether an edit to a record is still the same record, to catch "recycled"
-marketplace listings. Each revision is embedded field by field with a small BERT-class sentence encoder running on
-[Burn](https://burn.dev), compared with the stored baseline, and accepted or rejected against calibrated
-thresholds. A record's quantities (weight, volume, potency) are compared as numbers beside that, never embedded.
+marketplace listings. Each revision is embedded field by field with a small BERT-class sentence encoder (defined
+and trained in [Burn](https://burn.dev), run by ONNX Runtime), compared with the stored baseline, and accepted or
+rejected against calibrated thresholds. A record's quantities (weight, volume, potency) are compared as numbers beside that, never embedded.
 Vectors live in Qdrant, which also provides neighbor search.
 
 Read `README.md` for behavior and `docs/decisions.md` (D1 to D34) for why each piece is the way it is before
@@ -130,7 +130,8 @@ changing a design. Infer conventions from the existing code first.
   selects it, `ndarray` is deprecated in favor of `flex`, and records/recorders were replaced by `burn-store`.
   Check the crate source under `~/.cargo/registry` rather than trusting memory.
 - If the model or its revision changes: update the pinned revision and checksums in `fetch.rs`, regenerate the
-  parity fixture (`just golden`), re-calibrate, and update `models/README.md`.
+  parity fixture (`just golden`), export it again (`just export-onnx`), re-calibrate, and update
+  `models/README.md`.
 - **`output_dim` has no default on purpose** (D4): truncation is only valid for Matryoshka-trained models. When
   comparing models with `calibrate`, check the logged `dimension=` to confirm each ran at the width you meant.
 - **Every command and number in `README.md` was run and measured.** Keep it that way: re-run an example before
@@ -141,19 +142,20 @@ changing a design. Infer conventions from the existing code first.
   parity tests; `tools/export_onnx.py` converts a model directory for the ONNX engine; `tools/demo.py` is a
   client that walks an audience through the API on a synthetic catalog (`just demo`), and prints what the server
   answers without asserting any of it.
-- **Burn defines the model; ONNX Runtime may compute it** (D34). `engine = "onnx"` (a build with `--features
-  onnx`) runs the forward pass in C++ from `onnx/model.onnx`. Never let that file be used unchecked: the loader
-  compares it with the directory's weights in Burn at every load and refuses a graph that differs, because the
-  file goes stale silently when the weights change. Never put the engine into the fingerprint or the layout id:
-  the vectors are the same, and that is what the check is for. Keep `ort` behind the feature, pinned exactly, and
-  out of the trainer. After changing the encoder, the pooling, or the export, run `just test-onnx` (it needs
-  `just export-onnx` first).
-- **ONNX is the README's route, not the code's default** (owner, 2026-11-12). The README's setup exports the
-  model and sets `engine = "onnx"`, and the `just` recipes that run the server build with the feature. A config
-  that does not say is still `"burn"`, `config.example.toml` still says `"burn"`, and no crate has `onnx` as a
-  default feature, so `cargo test` and a plain `cargo build` download and link nothing. Do not flip any of those
-  three without the owner: the pinned verdicts and every calibration quoted in the README were made under Burn
-  with that config.
+- **Burn defines the model; ONNX Runtime computes it** (D34). Every command of `record-similarity` that embeds
+  loads the directory's weights in Burn and runs the forward pass in C++ from `onnx/model.onnx`. There is no
+  setting for it and no Burn serving path: the owner dropped that on 2026-11-12, and `model.engine`,
+  `model.device`, and the server's `metal` and `onnx` features went with it. Do not bring a choice back. Never
+  let the exported file be used unchecked: the loader compares it with the directory's weights in Burn at every
+  load and refuses a graph that differs, because the file goes stale silently when the weights change. Never put
+  the engine into the fingerprint or the layout id: the vectors are the same, and that is what the check is for.
+  `ort` stays a feature of `similarity-core` that the server always enables and the trainer never does, pinned
+  exactly. The tests stay on Burn, the reference: the tiny encoders, and the real-model tests, which load with
+  `Embedder::load`. After changing the encoder, the pooling, or the export, run `just test-onnx` (it needs
+  `just export-onnx` first), which is what holds the two engines to each other.
+- **A model directory is not usable until it is exported.** `just export-onnx <dir>` after `model fetch`, after a
+  fine-tune, and for any checkpoint that is to be calibrated. It is the one step that needs Python, and nothing
+  at run time does.
 - **Histories are measured first and judged afterwards** (D27). `calibrate-drift` replays every version on an
   engine that can reject nothing, then judges each step under the config. Never replay under the configured
   policy: after the first rejection the baseline stops moving and the rest of the history is fiction.
@@ -219,20 +221,19 @@ changing a design. Infer conventions from the existing code first.
 
 ## Commands
 
-- Build: `just build` (`cargo build --workspace`); release binary: `just release`; with Metal: `just release-metal`
+- Build: `just build` (`cargo build --workspace`); release binary: `just release`. The first build of the server
+  downloads ONNX Runtime's prebuilt library; on Linux it links only against GCC 13's C++ library or later
 - Test (fast): `just test`, or one crate: `just test similarity-core`
 - Lint: `just clippy`; format: `just fmt`; everything CI runs: `just ci`
-- Model: `just fetch-model`; Qdrant: `just qdrant-up` / `just qdrant-down`
+- Model: `just fetch-model`, then `just export-onnx` (needs `uv`); Qdrant: `just qdrant-up` / `just qdrant-down`
 - Slow tests: `just test-parity`, `just test-snapshot`, `just test-qdrant`, `just test-real`; `just snapshot` rewrites
   the pinned verdicts
-- The ONNX engine: `just export-onnx <model-dir>` (needs `uv`), `just release-onnx`, `just test-onnx`,
-  `just throughput <model-dir> onnx`; in a container, `just image <tag> onnx` (Debian 13: the prebuilt runtime
-  does not link on Debian 12)
+- The engine: `just export-onnx <model-dir>` (needs `uv`), `just test-onnx`, `just throughput <model-dir>` and
+  `just throughput <model-dir> burn` for the reference beside it; `just image <tag>` exports inside the build
+  (Debian 13: the prebuilt runtime does not link on Debian 12)
 - Mutation testing (needs `cargo install cargo-mutants`): `just mutants -j 3`, `just mutants-diff`,
   `just mutants-train`
-- Run: `just serve` (needs Qdrant) or `just serve-in-memory`; then `just client describe`. Every recipe that runs
-  the server builds it with `--features onnx` (the justfile's `features`); `just features= <recipe>` builds Burn
-  alone
+- Run: `just serve` (needs Qdrant) or `just serve-in-memory`; then `just client describe`
 - Show it to an audience: `just serve-in-memory config.toml`, then `just demo --pause` (needs `uv`)
 - Load a catalog: `just import export.jsonl config.toml` (`--check` validates only)
 - Measure: `just throughput`, `just load`, `just calibrate`, `just calibrate-drift`, `just calibrate-match`, `just calibrate-sweep`, `just calibrate-diff`, `just verdict-gate old.ndjson pairs.full.jsonl`

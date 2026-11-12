@@ -188,8 +188,8 @@ client can make the same call (`Import(stream ImportRequest) returns (stream Imp
 `similarity.proto`).
 
 - **A stream shares the server's one model with everyone else.** While it runs, a merchant's save waits behind
-  it. On a 12-core development machine a stream created about 80 products a second, and an ordinary edit took a
-  median of 86 ms beside it where it takes 6 ms alone. Those are that machine's numbers; time the first thousand
+  it. On a 12-core development machine a stream created about 400 products a second, and an ordinary edit took a
+  median of 18 ms beside it where it takes 2 ms alone. Those are that machine's numbers; time the first thousand
   here and tell me what you see. If the service is already taking edits, load outside editing hours, or ask me
   about lowering `server.import_batch_records`.
 - A product that fails does not stop the stream. One that is already stored is left alone and counted.

@@ -20,11 +20,11 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use sha2::{Digest as _, Sha256};
 use similarity_core::provenance::Build;
 use similarity_core::record::hex_prefix;
-use similarity_core::{Device, Embedder, Provenance};
+use similarity_core::{Device, Embedder, EngineChoice, Provenance};
 use similarity_log::Init;
 use similarity_proto::v1::record_similarity_client::RecordSimilarityClient;
 use similarity_runs::{Input, ModelRef, Spec, Status};
-use similarity_server::config::{Config, DeviceChoice};
+use similarity_server::config::Config;
 use similarity_server::engine::{Engine, store_layout};
 use similarity_server::fetch::{self, FetchRequest};
 use similarity_server::import::{self, Failure, Summary};
@@ -451,27 +451,6 @@ impl From<FailOn> for diff::FailOn {
   }
 }
 
-fn device(choice: DeviceChoice) -> anyhow::Result<Device> {
-  match choice {
-    DeviceChoice::Cpu => Ok(Device::flex()),
-    DeviceChoice::Metal => metal_device(),
-  }
-}
-
-#[cfg(feature = "metal")]
-#[expect(
-  clippy::unnecessary_wraps,
-  reason = "must match the signature of the build without Metal, which fails"
-)]
-fn metal_device() -> anyhow::Result<Device> {
-  Ok(Device::metal(burn::tensor::DeviceKind::DefaultDevice))
-}
-
-#[cfg(not(feature = "metal"))]
-fn metal_device() -> anyhow::Result<Device> {
-  anyhow::bail!("`device = \"metal\"` needs a binary built with `--features metal`; this one runs on the CPU only")
-}
-
 /// What a command does when the configuration names another model than the one it loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tie {
@@ -503,17 +482,21 @@ fn check_tie(config: &Config, fingerprint: &str, tie: Tie) -> anyhow::Result<()>
   Ok(())
 }
 
+/// The model every command embeds with: the directory's weights, read by Burn, with the forward pass run by ONNX
+/// Runtime from the directory's exported graph, which the load holds to those weights (docs/decisions.md, D34).
+/// There is no setting for this. The device is the one Burn makes that check on, and nothing is served from it.
 fn load_embedder(config: &Config, tie: Tie) -> anyhow::Result<Embedder> {
   let started = std::time::Instant::now();
   let embedder = Embedder::load_with(
     &config.model.dir,
-    device(config.model.device)?,
+    Device::flex(),
     &config.model.embedder_options(),
-    config.model.engine.into(),
+    EngineChoice::Onnx,
   )
   .with_context(|| {
     format!(
-      "cannot load the model from {}; run `record-similarity model fetch` first",
+      "cannot load the model from {}; `record-similarity model fetch` downloads it, and `just export-onnx` writes \
+       the `onnx/model.onnx` it is run from",
       config.model.dir.display()
     )
   })?;
@@ -529,7 +512,6 @@ fn load_embedder(config: &Config, tie: Tie) -> anyhow::Result<Embedder> {
     dir = %config.model.dir.display(),
     fingerprint = embedder.fingerprint(),
     dimension = embedder.dimension(),
-    device = ?config.model.device,
     engine = embedder.engine().as_str(),
     elapsed = ?started.elapsed(),
     written_by = origin.as_ref().map(|origin| origin.tool.as_str()),
@@ -1717,16 +1699,5 @@ mod tests {
       (fetch::DEFAULT_REPO, fetch::DEFAULT_REVISION)
     );
     assert_eq!(args.dir, None, "the directory follows the repository unless given");
-  }
-
-  #[test]
-  fn metal_is_refused_with_a_useful_message_when_not_compiled_in() {
-    if cfg!(feature = "metal") {
-      assert!(device(DeviceChoice::Metal).is_ok());
-    } else {
-      let error = device(DeviceChoice::Metal).unwrap_err().to_string();
-      assert!(error.contains("--features metal"), "{error}");
-    }
-    assert!(device(DeviceChoice::Cpu).is_ok());
   }
 }

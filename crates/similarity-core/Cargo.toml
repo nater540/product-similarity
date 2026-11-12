@@ -11,8 +11,8 @@ publish = false
 [features]
 # Exposes `similarity_core::testing` (tiny in-memory models) to the tests of crates built on this one.
 testing = []
-# Lets an `Embedder` run its forward pass through ONNX Runtime (C++) from `onnx/model.onnx`, where the model
-# directory has one. Off by default: the default build is Rust all the way down.
+# Lets an `Embedder` run its forward pass through ONNX Runtime (C++) from the model directory's `onnx/model.onnx`.
+# The server turns it on, always; it is a feature so that the trainer, which depends on this crate, links no C++.
 onnx = ["dep:ort"]
 
 [dependencies]
