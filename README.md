@@ -467,6 +467,12 @@ grpcurl -plaintext -d '{"id": "sku-1", "limit": 5, "tenant": "merchant-1"}' \
 grpcurl -plaintext -d '{"record": {"fields": {"name": "blueberry gummy 100 mg"}}, "limit": 3, "min_similarity": 0.5}' \
   localhost:50051 recordsimilarity.v1.RecordSimilarity/FindSimilar
 
+# Which stored records a listing from elsewhere describes. The listing goes under `listing`, where the calls
+# above have `record`, and carries no `id` and no `tenant`. A client that drops keys it does not know sends an
+# empty request for any other shape, and is answered "`listing` is required".
+grpcurl -plaintext -d '{"listing": {"fields": {"name": "Blueberry Indica Gummies 100mg (10pk)"}}, "limit": 1}' \
+  localhost:50051 recordsimilarity.v1.RecordSimilarity/Match
+
 grpcurl -plaintext -d '{"id": "sku-1", "tenant": "merchant-1"}' localhost:50051 recordsimilarity.v1.RecordSimilarity/Delete
 
 # Health, as a load balancer would ask.
