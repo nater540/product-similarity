@@ -65,6 +65,8 @@ enum Command {
   CalibrateDiff(CalibrateDiffArgs),
   /// Replay whole edit histories and report how far products drift, to choose `anchor_threshold`.
   CalibrateDrift(CalibrateDriftArgs),
+  /// Judge one recorded calibration under every combination of a grid of weights, floors, and limits. No model.
+  CalibrateSweep(CalibrateSweepArgs),
   /// Load a whole catalog into the store: every record of an export that is not stored yet becomes a baseline.
   Import(ImportArgs),
   /// Look at the runs that were recorded.
@@ -256,6 +258,34 @@ struct CalibrateArgs {
   /// Do not record this run.
   #[arg(long)]
   no_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct CalibrateSweepArgs {
+  /// The calibration to rank the points on: the output of `calibrate --ndjson`, or a run's `events.ndjson`.
+  select: PathBuf,
+  /// The configuration the grid varies. Every setting the grid does not name keeps its value.
+  #[arg(long, short, default_value = "config.toml")]
+  config: PathBuf,
+  /// The grid: a TOML file with, for each setting to vary, the values to try.
+  #[arg(long)]
+  grid: PathBuf,
+  /// A second calibration, of the same model on other pairs. The best points are judged on it at the threshold
+  /// chosen on the first, which is the one count here that the sweep was not fitted to.
+  #[arg(long)]
+  evaluate: Option<PathBuf>,
+  /// How many of the best points to report.
+  #[arg(long, default_value_t = 10)]
+  top: usize,
+  /// Refuse a grid with more combinations than this.
+  #[arg(long, default_value_t = 100_000)]
+  max_points: usize,
+  /// Write the sweep as NDJSON events on stdout in place of the report.
+  #[arg(long)]
+  ndjson: bool,
+  /// Fixes the resampling behind the intervals.
+  #[arg(long, default_value_t = 0)]
+  seed: u64,
 }
 
 #[derive(Debug, Args)]
@@ -709,6 +739,37 @@ fn duration(seconds: f64) -> String {
   }
 }
 
+impl CalibrateSweepArgs {
+  fn run(self) -> anyhow::Result<()> {
+    let config = Config::load(&self.config)?;
+    let select = read_run(&self.select)?;
+    let evaluate = self.evaluate.as_deref().map(read_run).transpose()?;
+    let grid_text =
+      std::fs::read_to_string(&self.grid).with_context(|| format!("cannot read {}", self.grid.display()))?;
+    let grid =
+      offline::sweep::parse_grid(&grid_text, &config).with_context(|| format!("in {}", self.grid.display()))?;
+    let sweep = offline::sweep::sweep(
+      &select,
+      evaluate.as_ref(),
+      &config,
+      &grid,
+      self.top,
+      self.max_points,
+      self.seed,
+    )?;
+    if self.ndjson {
+      offline::sweep::emit(&sweep, &select, evaluate.as_ref(), self.seed);
+    } else {
+      write!(
+        std::io::stdout().lock(),
+        "{}",
+        offline::sweep::render_sweep(&sweep, evaluate.is_some())
+      )?;
+    }
+    Ok(())
+  }
+}
+
 impl CalibrateDriftArgs {
   fn run(self) -> anyhow::Result<()> {
     let config = Config::load(&self.config)?;
@@ -1108,6 +1169,7 @@ fn main() -> ExitCode {
     Command::Calibrate(args) => args.run(run.as_ref()),
     Command::CalibrateDiff(args) => args.run(),
     Command::CalibrateDrift(args) => args.run(),
+    Command::CalibrateSweep(args) => args.run(),
     Command::Import(args) => args.run(),
     Command::Runs(RunsCommand::List(args)) => args.run(),
     Command::Runs(RunsCommand::Compare(args)) => args.run(),

@@ -144,6 +144,18 @@ struct Cli {
   #[arg(long, default_value_t = 1.0)]
   max_grad_norm: f64,
 
+  /// The share of all steps spent warming the learning rate up to its peak
+  #[arg(long, default_value_t = 0.1)]
+  warmup_ratio: f64,
+
+  /// How far apart, in cosine distance, the two texts of a recycled pair are pushed before the loss stops caring
+  #[arg(long, default_value_t = similarity_train::loss::DEFAULT_MARGIN)]
+  margin: f64,
+
+  /// How sharply the catalog-group loss tells a listing's own catalog entry from the others in its batch
+  #[arg(long, default_value_t = similarity_train::loss::DEFAULT_SCALE)]
+  scale: f64,
+
   /// Log progress every this many steps
   #[arg(long, default_value_t = 10)]
   log_every: usize,
@@ -733,7 +745,9 @@ impl Cli {
       max_grad_norm: (self.max_grad_norm > 0.0).then_some(self.max_grad_norm),
       dropout: !self.no_dropout,
       seed: self.seed,
-      ..TrainOptions::default()
+      warmup_ratio: self.warmup_ratio,
+      margin: self.margin,
+      scale: self.scale,
     }
   }
 
@@ -1390,6 +1404,34 @@ mod tests {
     resumed.prune(None);
     assert_eq!(resumed.own.len(), 2);
     assert!(third.exists());
+  }
+
+  /// Every option that changes a training step can be set from the command line, so that it can be varied and is
+  /// in the run's record when it is.
+  #[test]
+  fn the_loss_and_schedule_settings_are_flags_and_default_to_what_they_always_were() {
+    let plain = Cli::parse_from(["x", "--base", "b", "--out", "o", "--pairs", "p"]);
+    let defaults = TrainOptions::default();
+    assert_eq!(
+      (plain.warmup_ratio, plain.margin, plain.scale),
+      (defaults.warmup_ratio, defaults.margin, defaults.scale)
+    );
+    let set = Cli::parse_from([
+      "x",
+      "--base",
+      "b",
+      "--out",
+      "o",
+      "--pairs",
+      "p",
+      "--warmup-ratio",
+      "0.2",
+      "--margin",
+      "0.4",
+      "--scale",
+      "30",
+    ]);
+    assert_eq!((set.warmup_ratio, set.margin, set.scale), (0.2, 0.4, 30.0));
   }
 
   #[test]

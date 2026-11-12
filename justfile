@@ -144,6 +144,11 @@ calibrate-diff *args:
 calibrate-drift histories="data/drift.sample.jsonl" config="config.example.toml" *flags:
     RUST_LOG=warn cargo run --release -q -p similarity-server -- calibrate-drift --config {{ config }} {{ histories }} {{ flags }}
 
+# Judge one recorded calibration under a grid of weights, floors, and limits, with no model:
+# `just calibrate-sweep select.ndjson --grid grid.toml --config config.toml [--evaluate other.ndjson]`
+calibrate-sweep *args:
+    cargo run --release -q -p similarity-server -- calibrate-sweep {{ args }}
+
 # What was recorded: every calibration and every training run, newest first (`--kind train`, `--limit 5`)
 runs *flags:
     cargo run --release -q -p similarity-server -- runs list {{ flags }}

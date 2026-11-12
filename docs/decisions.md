@@ -1062,3 +1062,45 @@ suggested.
 
 **Left out:** grouping calibrations under the training run that produced their model, per-field range bars, and
 a shared x range across calibrations. Each is a layout refinement over data the page already has.
+
+## D29. A policy is swept on measurements already made; training is swept by hand
+
+Choosing weights, floors, and limits meant editing a config and running `calibrate-diff --config-b` once per
+idea. Each of those is free: the settings change what is made of a calibration's measurements, not the
+measurements (D17). So a grid of them is judged in one command, `calibrate-sweep`, on one recorded run, with no
+model.
+
+**Each point is judged at its own best threshold.** Changing a weight moves every overall similarity, so the
+threshold that was right before is not right after, and comparing points at one fixed threshold would compare
+how well each happens to suit that number. The threshold search is exact and cheap (every cut between two
+neighboring scores is tried), so it is done per point and `policy.threshold` is refused as an axis.
+`anchor_threshold` is refused too: pairs have no history (D27).
+
+**The ranking is errors, then margin, then the order written.** Errors under the point's whole policy, floors
+and limits included, since fitting those is the purpose. The margin breaks ties because a point that separates
+the labels with more room is the better bet on other data. The order of the grid breaks what is left, so that
+the ranking depends on nothing but the grid.
+
+**A sweep overfits, and says so.** A grid of a thousand points fitted to a few hundred pairs will find one that
+looks better by chance. The report says the counts are optimistic, and `--evaluate` judges the best points on a
+second calibration at the threshold chosen on the first, never chosen again: the only numbers in it that were
+not fitted. It refuses a second run from another model, since a threshold does not carry between models (D3).
+The same rule as for models (D24): rank on the validation split, evaluate once on the holdout.
+
+**Points in the same proportions are one point.** Only the ratios of weights matter to a weighted mean, so
+`2:4` and `1:2` are the same configuration. They are collapsed, and a point's id is a hash of the configuration
+it amounts to, so that the same point has the same id in every sweep.
+
+**The winner is printed as something to try.** A sweep is a search, and what it finds is a hypothesis. The
+report prints the settings and says to run `calibrate` under them and compare with `calibrate-diff`.
+
+**The training sweep is not built.** The suggestion asked for one command that trains at every point of a grid
+of training options and seeds, and scores each. What was built instead is everything such a command would rest
+on: every option that changes a training step is a flag (`--warmup-ratio`, `--margin`, and `--scale` were not),
+every run is recorded with its options (D23), a model is chosen on a validation split by a score that needs no
+threshold (D24), and runs are compared and drawn (D28). A loop that calls the trainer is a few lines of shell on
+top of that. An orchestrator of its own is worth building once real fine-tuning has shown which options are worth
+sweeping, and how many runs a sweep can afford: each point is a whole training run. Two things in the suggestion
+would have been wrong in any case: sweeping the number of passes by picking checkpoints (the learning-rate
+schedule depends on the total number of steps, so the checkpoint after pass two of four is not the model two
+passes would give), and judging trained models at the configured thresholds, which belong to the base model.

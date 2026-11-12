@@ -32,7 +32,7 @@ record has an anchor (plans 11 and 18). `calibrate-diff --config-b` is not affec
 | 3 | [Checkpoint evaluation](03-checkpoint-evaluation.md) | medium, **built** | | Results cannot go in a checkpoint (D18); catalog groups leak validation brands |
 | 4 | [Model registry and gate](04-model-registry.md) | medium | | A model has a digest, not a fingerprint; the server cannot read a local registry |
 | 5 | [Run report and compare](05-run-report.md) | medium, **built** | 2, 3 for curves | Comparing calibrations is already `calibrate-diff`; resumes need a chain |
-| 6 | [Sweeps](06-hyperparameter-sweeps.md) | large | 3 | Calibration code is not in core; epochs cannot be swept by picking checkpoints |
+| 6 | [Sweeps](06-hyperparameter-sweeps.md) | large, **half built** (the policy sweep) | 3 | Calibration code is not in core; epochs cannot be swept by picking checkpoints |
 | 9 | [Verdict snapshot](09-verdict-snapshot.md) | medium, **built** | | Refill cases need an anchor on a pair; output has timestamps, so not byte-stable |
 | 10 | [Score telemetry](10-score-telemetry.md) | medium | shares a step with 19 | Per-field values need flat lines joined on a request id; nothing is timed today |
 | 11 | [Drift calibration](11-drift-calibration.md) | medium, **built** | `sequences.jsonl` to be useful | Replaying in `ENFORCE` makes up everything after the first rejection |

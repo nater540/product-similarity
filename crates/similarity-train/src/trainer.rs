@@ -115,6 +115,21 @@ impl TrainOptions {
     if self.max_grad_norm.is_some_and(|norm| !(norm.is_finite() && norm > 0.0)) {
       return refuse("`max_grad_norm` must be a positive number".to_owned());
     }
+    if !(0.0..1.0).contains(&self.warmup_ratio) {
+      return refuse(format!(
+        "`warmup_ratio` must be at least 0 and below 1, not {}: it is the share of the steps spent warming up",
+        self.warmup_ratio
+      ));
+    }
+    if !(0.0..=2.0).contains(&self.margin) {
+      return refuse(format!(
+        "`margin` must be a cosine distance, between 0 and 2, not {}: it is how far apart recycles are pushed",
+        self.margin
+      ));
+    }
+    if !(self.scale.is_finite() && self.scale > 0.0) {
+      return refuse(format!("`scale` must be a positive number, not {}", self.scale));
+    }
     Ok(())
   }
 }
@@ -1289,6 +1304,11 @@ mod tests {
     assert!(refused(|options| options.widths = vec![24, 25]).contains("width 25"));
     assert!(refused(|options| options.widths = Vec::new()).contains("no embedding width"));
     assert!(refused(|options| options.epochs = 0).contains("epochs"));
+    assert!(refused(|options| options.warmup_ratio = 1.0).contains("warmup_ratio"));
+    assert!(refused(|options| options.warmup_ratio = -0.1).contains("warmup_ratio"));
+    assert!(refused(|options| options.margin = 2.5).contains("cosine distance"));
+    assert!(refused(|options| options.margin = f64::NAN).contains("margin"));
+    assert!(refused(|options| options.scale = 0.0).contains("scale"));
     assert!(refused(|options| options.batch_size = 1).contains("batch_size"));
     assert!(refused(|options| options.learning_rate = 0.0).contains("learning_rate"));
     assert!(refused(|options| options.max_grad_norm = Some(0.0)).contains("max_grad_norm"));

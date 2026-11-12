@@ -201,6 +201,11 @@ with only its SVG backend). The optional W&B exporter described above would live
 
 ### 6. Hyperparameter sweeps
 
+**Half built** (D29). The policy sweep exists as `calibrate-sweep`: a grid of weights, floors, and limits judged
+on one recorded calibration with no model, each point at its own best threshold, with an optional second run
+that the sweep was not fitted to. The training sweep does not: every training option is now a flag and every
+run is recorded and comparable, so a sweep is a shell loop, but there is no command that runs it.
+
 **What.** `record-similarity-train sweep sweep.toml`. The file gives fixed options and axes (learning rate,
 epochs, `--dims`, batch size, dropout, and three or more seeds per point). Each point runs as a child run under a
 parent sweep run (feature 2), keeps one checkpoint by default, and is scored by full-policy calibration on the

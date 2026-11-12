@@ -6,7 +6,7 @@ marketplace listings. Each revision is embedded field by field with a small BERT
 thresholds. A record's quantities (weight, volume, potency) are compared as numbers beside that, never embedded.
 Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D28) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D29) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -71,7 +71,7 @@ changing a design. Infer conventions from the existing code first.
 - `crates/similarity-runs`: the local record of runs (D23): the manifest, starting and ending a run, reading runs
   back. It records and lists; it decides nothing.
 - `crates/similarity-server`: config, the embedding worker thread, `Engine` (all behavior), the thin gRPC layer,
-  `model fetch`, `import`, `compare`/`calibrate`/`calibrate-drift` (the `offline` module), `load` (the load
+  `model fetch`, `import`, `compare`/`calibrate`/`calibrate-drift`/`calibrate-sweep` (the `offline` module), `load` (the load
   test), `runs` (reading recorded runs back, comparing and reporting them), and the `record-similarity` binary.
   Keep `grpc.rs` free of decisions.
 - `crates/similarity-train`: fine-tuning (data, losses, schedule, training loop) and the `record-similarity-train`
@@ -130,6 +130,10 @@ changing a design. Infer conventions from the existing code first.
   policy: after the first rejection the baseline stops moving and the rest of the history is fiction.
   `anchor_threshold = 0.85` in `config.example.toml` is a starting point, not a measurement; do not replace it
   with a number from `data/drift.sample.jsonl`, which is synthetic.
+- **A sweep is a search, and what it finds is fitted** (D29). `calibrate-sweep` ranks on one calibration and may
+  evaluate the best points on another at the threshold already chosen. Never report a swept point's errors on
+  the run it was ranked on as if they were a measurement, and never let it choose a threshold on the evaluation
+  run.
 - **The holdout chooses nothing** (D24). A checkpoint, a threshold, or a setting is chosen on the `validation`
   split (`record-similarity pairs carve` makes one), and the holdout is measured once, for what was chosen. Do
   not add a code path, a recipe, or a sentence in the README that picks anything by its holdout numbers. Models
@@ -172,7 +176,7 @@ changing a design. Infer conventions from the existing code first.
   `just mutants-train`
 - Run: `just serve` (needs Qdrant) or `just serve-in-memory`; then `just client describe`
 - Load a catalog: `just import export.jsonl config.toml` (`--check` validates only)
-- Measure: `just throughput`, `just load`, `just calibrate`, `just calibrate-drift`, `just calibrate-diff`, `just verdict-gate old.ndjson pairs.full.jsonl`
+- Measure: `just throughput`, `just load`, `just calibrate`, `just calibrate-drift`, `just calibrate-sweep`, `just calibrate-diff`, `just verdict-gate old.ndjson pairs.full.jsonl`
 - See what was run: `just runs` (`calibrate` and the trainer each leave a directory under `runs/`; `--no-run`
   turns that off); `record-similarity runs compare A B`; `record-similarity runs report A B --out report.html`
 - Make a validation split: `record-similarity pairs carve pairs.full.jsonl --fraction F > pairs.carved.jsonl`

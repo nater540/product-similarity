@@ -166,6 +166,7 @@ The binary is `record-similarity` (`target/release/record-similarity` after `jus
 | `record-similarity calibrate [--config config.toml] PAIRS.jsonl [--full] [--split S] [--model DIR] [--ndjson]` | Scores labeled pairs and suggests a threshold. See [Choosing thresholds](#choosing-thresholds). |
 | `record-similarity calibrate-diff OLD.ndjson (NEW.ndjson \| --config-b CONFIG) [--fail-on WHAT]` | Compares two calibrations, or one under a second configuration. See [Comparing two calibrations](#comparing-two-calibrations). |
 | `record-similarity calibrate-drift [--config config.toml] HISTORIES.jsonl [--ndjson]` | Replays whole edit histories and reports how far products drift. See [The drift threshold](#the-drift-threshold). |
+| `record-similarity calibrate-sweep SELECT.ndjson --grid GRID.toml [--config config.toml] [--evaluate OTHER.ndjson]` | Judges one recorded calibration under a grid of weights, floors, and limits. See [Trying many configurations at once](#trying-many-configurations-at-once). |
 | `record-similarity runs list [--runs DIR] [--kind KIND] [--limit N]` | Lists what was recorded: every calibration and every training run. See [Recorded runs](#recorded-runs). |
 | `record-similarity runs compare A B`, `runs report A [B ...] [--out report.html]` | Compares two recorded runs as text, or writes an HTML page for up to six. See [Recorded runs](#recorded-runs). |
 | `record-similarity pairs carve PAIRS.jsonl --fraction F [--from S] [--into S] [--salt TEXT]` | Gives a share of one split's owners a split of their own. See [Choose a model, then measure it once](#3-choose-a-model-then-measure-it-once). |
@@ -862,6 +863,62 @@ A pair's `pair_id` is the one the file gave it; a pair without one gets a finger
 pair has the same id in every run. Similarities are rounded to six places. `schema_field` and `schema_quantity`
 lines after the first say which fields and quantities the run was scored with, and their weights and limits.
 
+### Trying many configurations at once
+
+Weights, field floors, and quantity limits change what is made of a calibration's measurements, not the
+measurements. So a whole grid of them can be judged on one recorded calibration, with no model loaded:
+
+```toml
+# grid.toml: every list is an axis, and the points are every combination of them.
+[fields.name]
+weight = [2.0, 4.0, 6.0]
+reject_below = ["off", 0.75, 0.80, 0.90]
+
+[fields.category]
+weight = [1.5, 3.0]
+
+[quantities.weight_per_item]
+reject_above_factor = ["off", 1.5]
+```
+
+```sh
+just calibrate data/calibration.sample.full.jsonl config.example.toml --full --split calibrate --ndjson > select.ndjson
+just calibrate data/calibration.sample.full.jsonl config.example.toml --full --split holdout --ndjson > holdout.ndjson
+just calibrate-sweep select.ndjson --grid grid.toml --config config.example.toml --evaluate holdout.ndjson --top 3
+```
+
+```text
+points 48 judged (0 more were the same configuration as an earlier one, 0 are not valid)
+
+      threshold  margin rejected accepted   on the evaluation run
+now       0.895   0.046        0        0       0     0   the configuration as it is
+1         0.857   0.072        0        0       0     0   category.weight = 1.5, name.weight = 6, name.reject_below = off, weight_per_item.reject_above_factor = off
+2         0.857   0.072        0        0       0     0   category.weight = 1.5, name.weight = 6, name.reject_below = off, weight_per_item.reject_above_factor = 1.5
+3         0.857   0.072        0        0       0     0   category.weight = 1.5, name.weight = 6, name.reject_below = 0.75, weight_per_item.reject_above_factor = off
+...
+no point gets fewer pairs wrong than the configuration as it is.
+The first point gets as many wrong with more room around its threshold (a margin of 0.072 against 0.046). On this few pairs that is a hint, not a result.
+```
+
+- **Each point is judged at the overall threshold that is best for it,** with its floors and limits applied. That
+  is why `policy.threshold` is not an axis: it is already searched exactly, for every point.
+  `policy.anchor_threshold` is not one either, since pairs have no history (see
+  [The drift threshold](#the-drift-threshold)).
+- **Points are ranked by how many pairs they get wrong,** then by the margin around their threshold. `"off"`
+  means no floor, or no limit. Weights only matter relative to each other, so combinations in the same
+  proportions are judged once.
+- **A sweep fits its settings to the pairs it ranks on, and its counts are optimistic** by an amount that grows
+  with the grid. `--evaluate` judges the best points on a second calibration, of the same model on other pairs,
+  at the threshold chosen on the first. Those two columns are the only ones here that were not fitted. Rank on
+  the `validation` split and evaluate once on the holdout, for the same reason a model is chosen that way
+  ([Choose a model, then measure it once](#3-choose-a-model-then-measure-it-once)).
+- The best point is something to try, not to paste: put it in a copy of the config, run `calibrate` under it, and
+  compare with `calibrate-diff`. `--ndjson` writes the sweep as `policy_sweep`, `policy_point`, and
+  `policy_point_setting` lines.
+
+Training options are swept by hand, for now: run the trainer once per setting (every option that changes a
+training step is a flag, and every run is [recorded](#recorded-runs)), then `runs compare` or `runs report`.
+
 ### The drift threshold
 
 `anchor_threshold` rejects a revision that is too far from the record as first stored, however small each step
@@ -1119,6 +1176,9 @@ just release-train metal        # or: just release-train cuda
 | `--epochs` | `2` | Passes over the data. |
 | `--batch-size` | `32` | Larger batches give the catalog-group loss more negatives per step, and cost memory. |
 | `--learning-rate` | `2e-5` | The peak, after a warm-up over the first 10% of steps. Lower it if the model gets worse on pairs held back from training. |
+| `--warmup-ratio` | `0.1` | The share of all steps spent warming the learning rate up to its peak. |
+| `--margin` | `0.5` | How far apart, in cosine distance, the two texts of a recycled pair are pushed before the loss stops caring. |
+| `--scale` | `20` | How sharply the catalog-group loss tells a listing's own catalog entry from the others in its batch. |
 | `--max-tokens` | `256` | Match `model.max_tokens` in the server config. |
 | `--device` | `cpu` | `cpu`, `metal`, or `cuda`. The GPU ones need a binary built with that feature. |
 | `--seed` | `0` | Fixes the batch order and dropout. |
@@ -1785,7 +1845,7 @@ data/
   regression.snapshot.ndjson      what the pinned model and the example config make of them
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D28)
+  decisions.md               why things are the way they are (D1 to D29)
   data-request-prompt.md     a brief for collecting labeled production data
   feature-suggestions.md     twenty features that could be added, none built yet
   plan-features.md           a plan for the first five of them

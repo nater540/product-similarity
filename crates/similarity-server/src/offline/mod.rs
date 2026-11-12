@@ -30,6 +30,7 @@ pub mod histories;
 pub mod pairs;
 pub mod report;
 pub mod stats;
+pub mod sweep;
 #[cfg(test)]
 pub(crate) mod testing;
 
