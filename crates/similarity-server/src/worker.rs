@@ -16,7 +16,7 @@
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::time::{Duration, Instant};
 
@@ -50,6 +50,13 @@ pub trait TextEmbedder: Send + Sync + 'static {
 
   /// Identifies the model behind the vectors, see [`Embedder::fingerprint`].
   fn fingerprint(&self) -> &str;
+
+  /// Whether this embedder can still embed at all. An embedder that runs the model where it is called always
+  /// can; one that hands texts to a thread cannot once that thread is gone, and a server that is asked whether
+  /// it is ready has to know.
+  fn alive(&self) -> bool {
+    true
+  }
 }
 
 /// An embedder that runs the model on the calling thread, with no queue in front of it.
@@ -130,6 +137,8 @@ struct WorkerStats {
   overloaded: AtomicU64,
   busy_ns: AtomicU64,
   queue_wait_ns: AtomicU64,
+  /// Set when the thread ends, for whatever reason.
+  stopped: AtomicBool,
 }
 
 fn count(value: usize) -> u64 {
@@ -169,7 +178,11 @@ impl EmbedWorker {
     let stats = Arc::clone(&handle.stats);
     std::thread::Builder::new()
       .name("embed-worker".to_owned())
-      .spawn(move || run(&embedder, &jobs, max_batch_texts.max(1), &stats))?;
+      .spawn(move || {
+        // Dropped however the thread ends, a panic included: that is the one way to learn that it has.
+        let _stopped = Stopped(Arc::clone(&stats));
+        run(&embedder, &jobs, max_batch_texts.max(1), &stats);
+      })?;
     Ok(handle)
   }
 
@@ -187,7 +200,20 @@ impl EmbedWorker {
   }
 }
 
+/// Marks the embedding thread as gone when the thread lets go of it.
+struct Stopped(Arc<WorkerStats>);
+
+impl Drop for Stopped {
+  fn drop(&mut self) {
+    self.0.stopped.store(true, Ordering::Relaxed);
+  }
+}
+
 impl TextEmbedder for EmbedWorker {
+  fn alive(&self) -> bool {
+    !self.stats.stopped.load(Ordering::Relaxed)
+  }
+
   async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, EmbedError> {
     if texts.is_empty() {
       return Ok(Vec::new());
@@ -515,6 +541,42 @@ mod tests {
       tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     worker.stats()
+  }
+
+  /// A worker says whether its thread is still there, which is what a readiness answer needs: a handle whose
+  /// thread has ended can only ever answer `WorkerGone`.
+  #[tokio::test]
+  async fn a_worker_knows_when_its_thread_has_ended() {
+    let options = similarity_core::EmbedderOptions {
+      max_tokens: 16,
+      batch_size: 8,
+      output_dim: None,
+    };
+    let worker = EmbedWorker::spawn(similarity_core::testing::tiny_embedder(&options), 4, 8).unwrap();
+    assert!(worker.alive());
+    worker.embed(vec!["blueberry gummies".to_owned()]).await.unwrap();
+    assert!(worker.alive(), "serving a request does not end it");
+
+    // A thread that has ended, however it ended: here by returning, and a panic unwinds through the same mark.
+    let (queue, jobs) = sync_channel(1);
+    let stats = Arc::<WorkerStats>::default();
+    let ended = Arc::clone(&stats);
+    std::thread::spawn(move || {
+      let _stopped = Stopped(ended);
+      drop(jobs);
+    })
+    .join()
+    .unwrap();
+    let orphan = EmbedWorker {
+      queue,
+      dimension: 4,
+      fingerprint: Arc::from("none"),
+      stats,
+    };
+    assert!(!orphan.alive());
+    assert_eq!(orphan.embed(vec!["a".to_owned()]).await, Err(EmbedError::WorkerGone));
+    // An embedder that runs the model where it is called has no thread to lose.
+    assert!(WordBagEmbedder::new("test").alive());
   }
 
   /// A full queue refuses a request at once, and that is counted where a load test can read it.

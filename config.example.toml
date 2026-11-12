@@ -10,6 +10,17 @@ listen = "127.0.0.1:50051"
 # thread, and every other request waits while it runs: a larger number loads a catalog faster and makes a
 # save by anybody else wait longer while a stream is running. The README has the measurement.
 import_batch_records = 8
+# How often the server asks its store whether it still answers. Its readiness (the health service's answer for
+# `recordsimilarity.v1.RecordSimilarity`) is that old at most. Liveness, the empty service name, does not depend
+# on the store.
+store_check_every_ms = 2000
+# On SIGTERM the server reports "not ready" at once and goes on serving for this long, so that whatever sends it
+# requests can notice and stop before the listener closes. Ctrl-C skips it. What it should be depends on how
+# fast your load balancer acts on a failed readiness check.
+drain_notice_ms = 5000
+# After that, requests already in flight get this long to finish before the server stops anyway. Keep the sum of
+# the two under the time your orchestrator allows a process to stop (30 seconds by default on Kubernetes).
+drain_deadline_ms = 20000
 
 [model]
 # A sentence-transformers model directory, as written by `record-similarity model fetch`, with the `onnx/model.onnx`

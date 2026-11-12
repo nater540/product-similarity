@@ -99,6 +99,14 @@ pub struct ServerConfig {
   /// embedding thread, and every other request waits while it runs: larger batches load a catalog faster and
   /// make somebody's save wait longer.
   pub import_batch_records: usize,
+  /// How often the server asks its store whether it still answers. The readiness it reports is that old at
+  /// most, plus the time one check takes.
+  pub store_check_every_ms: u64,
+  /// On `SIGTERM`, how long the server goes on serving after it has started reporting "not ready", so that
+  /// whatever sends it requests can notice and stop before the listener closes.
+  pub drain_notice_ms: u64,
+  /// After that, how long requests already in flight are given to finish before the server stops anyway.
+  pub drain_deadline_ms: u64,
 }
 
 impl Default for ServerConfig {
@@ -106,6 +114,25 @@ impl Default for ServerConfig {
     Self {
       listen: SocketAddr::from(([127, 0, 0, 1], 50051)),
       import_batch_records: crate::engine::DEFAULT_IMPORT_BATCH,
+      store_check_every_ms: millis(crate::Lifecycle::default().store_check_every),
+      drain_notice_ms: millis(crate::Lifecycle::default().drain_notice),
+      drain_deadline_ms: millis(crate::Lifecycle::default().drain_deadline),
+    }
+  }
+}
+
+fn millis(duration: Duration) -> u64 {
+  u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+impl ServerConfig {
+  /// How the server reports its health and how it stops, as configured.
+  #[must_use]
+  pub const fn lifecycle(&self) -> crate::Lifecycle {
+    crate::Lifecycle {
+      store_check_every: Duration::from_millis(self.store_check_every_ms),
+      drain_notice: Duration::from_millis(self.drain_notice_ms),
+      drain_deadline: Duration::from_millis(self.drain_deadline_ms),
     }
   }
 }
@@ -436,6 +463,9 @@ impl Config {
       bail!("`qdrant.collection` must not be blank");
     }
     config.matching.settings()?;
+    if config.server.store_check_every_ms == 0 {
+      bail!("`server.store_check_every_ms` must be positive: the store is asked that often whether it answers");
+    }
     if config.server.import_batch_records == 0 {
       bail!("`server.import_batch_records` must be at least 1");
     }
@@ -594,6 +624,31 @@ mod tests {
     assert!(Config::parse(&format!("[server]\nimport_batch_records = 0\n{MINIMAL}")).is_err());
     let small = Config::parse(&format!("[server]\nimport_batch_records = 2\n{MINIMAL}")).unwrap();
     assert_eq!(small.server.import_batch_records, 2);
+    // How the server reports its health and stops: the library's defaults, unless the file says otherwise.
+    assert_eq!(config.server.lifecycle(), crate::Lifecycle::default());
+    assert_eq!(
+      (
+        config.server.store_check_every_ms,
+        config.server.drain_notice_ms,
+        config.server.drain_deadline_ms
+      ),
+      (2000, 5000, 20000)
+    );
+    let stopping = "[server]\nstore_check_every_ms = 250\ndrain_notice_ms = 0\ndrain_deadline_ms = 1500\n";
+    assert_eq!(
+      Config::parse(&format!("{stopping}{MINIMAL}"))
+        .unwrap()
+        .server
+        .lifecycle(),
+      crate::Lifecycle {
+        store_check_every: Duration::from_millis(250),
+        drain_notice: Duration::ZERO,
+        drain_deadline: Duration::from_millis(1500),
+      }
+    );
+    // A store that is never asked is a readiness that is never true or false.
+    let never = Config::parse(&format!("[server]\nstore_check_every_ms = 0\n{MINIMAL}")).unwrap_err();
+    assert!(never.to_string().contains("store_check_every_ms"), "{never}");
     assert_eq!(
       config.model.output_dim, None,
       "truncation is opt-in: it is only safe for some models"

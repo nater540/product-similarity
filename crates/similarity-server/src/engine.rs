@@ -546,6 +546,22 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     Ok(plan.finish(&self.schema, dimension, &embedded)?)
   }
 
+  /// Whether a request sent now could be served: the embedder can still embed and the store answers. It embeds
+  /// nothing and reads no record. This is what the server's readiness is made from.
+  ///
+  /// # Errors
+  ///
+  /// [`EngineError::Unavailable`] if the embedding thread has stopped or the store cannot be reached, and
+  /// whatever else the store says is wrong with it.
+  pub async fn check(&self) -> Result<(), EngineError> {
+    if !self.embedder.alive() {
+      return Err(EngineError::Unavailable(
+        "the embedding thread has stopped: nothing can be embedded until the server is started again".to_owned(),
+      ));
+    }
+    Ok(self.store.check().await?)
+  }
+
   /// Embeds a record and, when it has an id, judges it against its stored baseline.
   ///
   /// # Errors
@@ -1184,6 +1200,10 @@ pub(crate) mod racing {
   }
 
   impl VectorStore for Raced {
+    async fn check(&self) -> Result<(), StoreError> {
+      self.store.check().await
+    }
+
     async fn get(&self, id: &str) -> Result<Option<StoredRecord>, StoreError> {
       self.reads.fetch_add(1, Ordering::Relaxed);
       let found = self.store.get(id).await;
@@ -1360,6 +1380,10 @@ mod tests {
   }
 
   impl VectorStore for Slow {
+    async fn check(&self) -> Result<(), StoreError> {
+      self.0.check().await
+    }
+
     async fn get(&self, id: &str) -> Result<Option<StoredRecord>, StoreError> {
       self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
       let found = self.0.get(id).await;
@@ -1842,6 +1866,10 @@ mod tests {
   }
 
   impl VectorStore for Refusing {
+    async fn check(&self) -> Result<(), StoreError> {
+      self.inner.check().await
+    }
+
     async fn get(&self, id: &str) -> Result<Option<StoredRecord>, StoreError> {
       self.inner.get(id).await
     }
@@ -3570,6 +3598,10 @@ mod tests {
   }
 
   impl VectorStore for Contended {
+    async fn check(&self) -> Result<(), StoreError> {
+      self.inner.check().await
+    }
+
     async fn get(&self, id: &str) -> Result<Option<StoredRecord>, StoreError> {
       self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
       self.inner.get(id).await
@@ -3672,6 +3704,85 @@ mod tests {
     assert_eq!(reads(&engine), 3);
     assert_eq!(recorder.told().len(), 3);
     assert_eq!(engine.store.inner.get("p1").await.unwrap().unwrap(), gummies);
+  }
+
+  /// Readiness is made from two things, and a request is served only when both hold: the embedder can embed and
+  /// the store answers. Asking embeds nothing and reads nothing.
+  #[tokio::test]
+  async fn an_engine_is_ready_when_its_embedder_is_alive_and_its_store_answers() {
+    struct Unreachable(MemoryStore);
+    impl VectorStore for Unreachable {
+      async fn check(&self) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable("connection refused".to_owned()))
+      }
+      async fn get(&self, id: &str) -> Result<Option<StoredRecord>, StoreError> {
+        self.0.get(id).await
+      }
+      async fn put(&self, record: &StoredRecord) -> Result<(), StoreError> {
+        self.0.put(record).await
+      }
+      async fn put_if(&self, record: &StoredRecord, expected: Expected) -> Result<bool, StoreError> {
+        self.0.put_if(record, expected).await
+      }
+      async fn delete(&self, id: &str) -> Result<bool, StoreError> {
+        self.0.delete(id).await
+      }
+      async fn delete_if(&self, id: &str, version: Version) -> Result<bool, StoreError> {
+        self.0.delete_if(id, version).await
+      }
+      async fn search(&self, query: SearchQuery<'_>) -> Result<Vec<Neighbor>, StoreError> {
+        self.0.search(query).await
+      }
+      async fn search_vectors(&self, query: SearchQuery<'_>) -> Result<Vec<Found>, StoreError> {
+        self.0.search_vectors(query).await
+      }
+    }
+    struct Stopped(WordBagEmbedder);
+    impl TextEmbedder for Stopped {
+      async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.0.embed(texts).await
+      }
+      fn dimension(&self) -> usize {
+        self.0.dimension()
+      }
+      fn fingerprint(&self) -> &str {
+        self.0.fingerprint()
+      }
+      fn alive(&self) -> bool {
+        false
+      }
+    }
+
+    let ready = engine();
+    assert_eq!(ready.check().await, Ok(()));
+    assert_eq!(ready.embedder.embedded(), 0, "nothing was embedded to find that out");
+
+    let policy = Policy::new(0.75, None).unwrap();
+    let embedder = WordBagEmbedder::new("word-bag-v1");
+    let (layout, dimension) = store_layout(&schema(), &embedder);
+    let no_store = Engine::new(
+      Unreachable(MemoryStore::new(layout.clone(), dimension)),
+      embedder,
+      schema(),
+      policy,
+    );
+    let error = no_store.check().await.unwrap_err();
+    assert!(
+      matches!(&error, EngineError::Unavailable(message) if message.contains("connection refused")),
+      "{error:?}"
+    );
+
+    let no_thread = Engine::new(
+      MemoryStore::new(layout, dimension),
+      Stopped(WordBagEmbedder::new("word-bag-v1")),
+      schema(),
+      policy,
+    );
+    let error = no_thread.check().await.unwrap_err();
+    assert!(
+      matches!(&error, EngineError::Unavailable(message) if message.contains("embedding thread")),
+      "{error:?}"
+    );
   }
 
   async fn seeded() -> TestEngine {

@@ -72,7 +72,7 @@ and because each would put a Python service in the loop.
 | 18 | Shadow evaluation of a candidate model | Serving | L | Real traffic |
 | 19 | Structured reason codes and explanations | Serving | M | No |
 | 20 | Menu-item to brand-product matching | Serving | L | Yes |
-| 21 | Readiness that tells the truth, and a drain on shutdown | Production | S | No |
+| 21 | Readiness that tells the truth, and a drain on shutdown (built) | Production | S | No |
 | 22 | Deadlines honored, writes that survive a cancelled request | Production | M | No |
 | 23 | Conditional writes across replicas (built) | Production | M | No |
 | 24 | Audit of the store against the catalog | Production | M | An export |
@@ -598,6 +598,11 @@ when Qdrant is slow or gone, and what it cannot recover if the collection is los
 the code, because a suggestion about production is only worth as much as the fault it names is real.
 
 ### 21. Readiness that tells the truth, and a drain on shutdown
+
+**Built** (D37). What came out differently: the two answers are the two service names the standard health
+service already has (the empty name for liveness), not two services; "the model has answered a warm-up pass"
+needed nothing new, because the server does not listen until it has; Ctrl-C skips the notice; and a second
+signal ends whichever wait the server is in.
 
 **What.** Two health services instead of one answer. *Live*: the process is up. *Ready*: the model has answered
 a warm-up pass, the embedding thread is alive, and Qdrant answered a cheap call within the last few seconds. On

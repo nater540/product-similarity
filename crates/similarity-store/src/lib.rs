@@ -166,6 +166,15 @@ pub struct Found {
 /// Methods return `impl Future + Send` rather than using `async fn` so that a server generic over the store can
 /// spawn the futures onto a multi-threaded runtime.
 pub trait VectorStore: Send + Sync + 'static {
+  /// Asks the store whether it can be used right now, as cheaply as it can be asked: what a server's readiness
+  /// answer is made from. It reads and writes no record.
+  ///
+  /// # Errors
+  ///
+  /// [`StoreError::Unavailable`] if the store cannot be reached, [`StoreError::Collection`] if it can and what
+  /// this store keeps its records in is no longer there.
+  fn check(&self) -> impl Future<Output = Result<()>> + Send;
+
   /// Fetches a record by id. `Ok(None)` if there is none.
   ///
   /// # Errors
@@ -230,6 +239,10 @@ pub trait VectorStore: Send + Sync + 'static {
 
 /// A shared store is a store: two engines in one process, or a test standing in for two replicas, hold one each.
 impl<S: VectorStore> VectorStore for Arc<S> {
+  fn check(&self) -> impl Future<Output = Result<()>> + Send {
+    self.as_ref().check()
+  }
+
   fn get(&self, id: &str) -> impl Future<Output = Result<Option<StoredRecord>>> + Send {
     self.as_ref().get(id)
   }

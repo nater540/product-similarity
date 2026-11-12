@@ -98,6 +98,11 @@ fn neighbor(record: &StoredRecord, similarity: f32) -> Neighbor {
 }
 
 impl VectorStore for MemoryStore {
+  async fn check(&self) -> Result<()> {
+    // There is nothing to reach. What can be wrong with it is a writer that panicked with the lock held.
+    self.records.read().map(|_| ()).map_err(|_| Self::poisoned())
+  }
+
   async fn get(&self, id: &str) -> Result<Option<StoredRecord>> {
     let records = self.records.read().map_err(|_| Self::poisoned())?;
     match records.get(id) {

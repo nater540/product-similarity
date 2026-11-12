@@ -165,7 +165,7 @@ The honest assessment, since the question was asked:
 So: Qdrant is a reasonable choice because neighbor search is wanted and it is pleasant to operate, not because the
 scale demands it. If the organization already runs Postgres, a table with a `bytea` or `pgvector` column would do
 the same job at this scale with one fewer service and with transactional writes. The store is behind a trait
-(`VectorStore`, seven methods, one contract test suite), so that swap is a few hundred lines.
+(`VectorStore`, eight methods, one contract test suite), so that swap is a few hundred lines.
 
 Layout in Qdrant: one collection, one point per record, two named vectors. `current` is HNSW-indexed and is what
 searches match. `anchor` (see D8) is only ever read by id, so its HNSW graph is disabled (`m = 0`) and it lives on
@@ -371,12 +371,12 @@ Whether fine-tuning improves verdicts is a question for real labeled data and a 
 
 ## D14. A brand, once set, must be named
 
-A record may carry a `brand_id`: the key of the brand it belongs to. It is stored with the record and filters searches. It
-is also checked: once a record has a brand, an `Evaluate` or `Delete` for its id must name the same one. Naming
-another is refused, and so is naming none. The second half matters as much as the first: the mistake the check
-exists for is a caller that has lost track of whose record it is editing, and a check that can be skipped by
-leaving a field out does not catch that. A record stored without a brand takes the first one a revision names,
-which is how a catalog indexed before brands were in use gains them.
+A record may carry a `brand_id`: the key of the brand it belongs to. It is stored with the record and filters
+searches. It is also checked: once a record has a brand, an `Evaluate` or `Delete` for its id must name the same
+one. Naming another is refused, and so is naming none. The second half matters as much as the first: the mistake
+the check exists for is a caller that has lost track of whose record it is editing, and a check that can be
+skipped by leaving a field out does not catch that. A record stored without a brand takes the first one a revision
+names, which is how a catalog indexed before brands were in use gains them.
 
 This is a consistency check and not access control. The server does not authenticate anyone (see the README's
 limitations), so a caller that can reach it can always supply the right brand.
@@ -1279,9 +1279,9 @@ The report prints each rate with its interval instead, which says the same thing
 
 ## D32. Matching a menu item to a record is a read, scored exactly, with a threshold nobody has measured yet
 
-The same model and the same stored catalog can answer a second question: not "is this edit still the same
-record?" but "which stored record is this menu item for?". A menu item is an entry on a retailer's menu, in the
-retailer's words, often with only a name. `FindSimilar` with an ad hoc record already half-answers it, and D5 says why only
+The same model and the same stored catalog can answer a second question: not "is this edit still the same record?"
+but "which stored record is this menu item for?". A menu item is an entry on a retailer's menu, in the retailer's
+words, often with only a name. `FindSimilar` with an ad hoc record already half-answers it, and D5 says why only
 half.
 
 **The search score is the exact score times a factor, and the factor is known.** For a menu item `Q` and a stored
@@ -1614,3 +1614,51 @@ names, and no other tool reads them yet. This is the one time; the rule stands.
 
 **What was left alone.** The plans under `docs/plans/` are records of what was proposed and say so at the top.
 The curated cases and their pinned verdicts hold no brand and no menu item, and did not change.
+
+## D37. Live and ready are two answers, and a server leaves the rotation before it stops
+
+The server said `SERVING` once, before its first request, and never anything else. A replica whose Qdrant had
+gone away kept saying it, and a load balancer kept sending it requests to answer `UNAVAILABLE`. And when it was
+told to stop it closed its listener at once, so the last requests of every rolling deploy raced the close.
+
+**Two questions.** *Is the process up?* is the health service's empty service name, and the answer is yes for
+as long as it runs. *Could a request be served now?* is `recordsimilarity.v1.RecordSimilarity`. They are kept
+apart because they call for opposite things: a process that is not live should be restarted, and a process
+that is not ready should be left alone and sent nothing. A replica whose store is down is the second kind.
+One answer for both would have an orchestrator restarting healthy processes for as long as Qdrant was away.
+
+**Ready means two things hold** (`Engine::check`): the embedding thread is alive, and the store answered the
+last time it was asked. The store is asked every `server.store_check_every_ms` (2 seconds), with a call that
+reads no record: for Qdrant, whether the collection exists, which also catches a collection deleted under a
+running server. A check that takes longer than the interval counts as no answer. "The model has answered a
+warm-up pass" needed nothing: the server does not listen until it has. The first answer is found out before
+the listener can be asked, so a server that starts with its store down has never said ready.
+
+**Not ready is advice, not a gate.** A request that arrives anyway is answered as well as it can be. Refusing
+it would make the health check a second thing that can be wrong about the store, and the store's own error is
+the better answer.
+
+**One failed check is enough, and so is one that succeeds.** No counting of failures before the answer
+changes: the thing that reads this answer (a kubelet, a load balancer) already has a threshold of its own, and
+two of them multiply into a delay nobody chose.
+
+**Stopping has an order.** On `SIGTERM`: not ready at once and still live; serving for
+`server.drain_notice_ms` (5 seconds) so that whoever routes requests can act on that; then the listener
+closes; then the requests in flight get `server.drain_deadline_ms` (20 seconds); then the process exits, with
+a warning if it left any behind. The two defaults add up to less than the 30 seconds Kubernetes gives a pod.
+They are not measurements and not thresholds: what the notice should be is how long a deployment's load
+balancer takes to act, which only the deployment knows.
+
+**Ctrl-C is not `SIGTERM`.** A person at a keyboard has no load balancer to wait for, so Ctrl-C stops without
+the notice. And a second signal of either kind ends whichever wait the server is in: asking twice means now.
+
+**What is lost at the deadline is nothing that was promised.** A request cut off there was never answered. A
+write is one conditional step in the store (D35), so it happened or it did not, and an `Import` stream that
+ends early is sent again (D33).
+
+**Checked against the real thing.** With Qdrant stopped and started under a running server, the health
+service went `SERVING`, `NOT_SERVING` (and live throughout), `SERVING`. With the notice at 1.5 seconds, the
+server exited 1.60 seconds after `SIGTERM` and 0.09 seconds after Ctrl-C.
+
+**Not done:** a count of the requests left behind at the deadline (that is a metric, proposal 26); taking a
+failing request as a sign that the store is down, sooner than the next check; anything on a cluster.

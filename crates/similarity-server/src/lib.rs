@@ -35,11 +35,13 @@ pub mod worker;
 
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use similarity_proto::v1::record_similarity_server::RecordSimilarityServer;
 use similarity_store::VectorStore;
 use tokio::net::TcpListener;
+use tokio::sync::{mpsc, oneshot};
 use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
 
@@ -47,15 +49,45 @@ use crate::engine::Engine;
 use crate::grpc::GrpcService;
 use crate::worker::TextEmbedder;
 
-/// Serves the gRPC API on `listener` until `shutdown` resolves, then finishes in-flight requests and returns.
-///
-/// Alongside the API it serves the standard gRPC health service (for load balancers and Kubernetes probes) and
-/// server reflection (so `grpcurl` works without the `.proto`). Taking a bound listener rather than an address lets
-/// a caller bind port 0 and learn the port before serving, which is how the end-to-end tests run.
+/// How the server reports its health, and how it stops (docs/decisions.md, D37).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lifecycle {
+  /// How often the store is asked whether it still answers. The readiness the server reports is that old at
+  /// most, plus the time one check takes; a check that takes longer than this counts as no answer.
+  pub store_check_every: Duration,
+  /// On [`Stop::Drain`], how long the server goes on serving after it has started reporting "not ready".
+  pub drain_notice: Duration,
+  /// After that, how long requests already in flight are given before the server stops anyway.
+  pub drain_deadline: Duration,
+}
+
+impl Default for Lifecycle {
+  fn default() -> Self {
+    Self {
+      store_check_every: Duration::from_secs(2),
+      drain_notice: Duration::from_secs(5),
+      drain_deadline: Duration::from_secs(20),
+    }
+  }
+}
+
+/// How a server is asked to stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+  /// Stop taking requests now and finish the ones in flight. What a person at a keyboard means by Ctrl-C, and
+  /// what a test means.
+  Now,
+  /// Leave the rotation first: report "not ready", go on serving for [`Lifecycle::drain_notice`] so that a load
+  /// balancer can notice, and only then stop taking requests. What an orchestrator means by `SIGTERM`.
+  Drain,
+}
+
+/// Serves the gRPC API on `listener` until `shutdown` resolves, then finishes in-flight requests and returns:
+/// [`serve_until`] for a caller with one way of stopping and no settings of its own.
 ///
 /// # Errors
 ///
-/// Returns an error if the reflection descriptor cannot be loaded or the transport fails.
+/// As [`serve_until`].
 pub async fn serve<S, E>(
   engine: Arc<Engine<S, E>>,
   listener: TcpListener,
@@ -65,10 +97,53 @@ where
   S: VectorStore,
   E: TextEmbedder,
 {
+  let (asked, stops) = mpsc::channel(1);
+  let ask = async {
+    shutdown.await;
+    // The receiver is only gone if the server has already stopped by itself.
+    let _ = asked.send(Stop::Now).await;
+    // Kept, and never used again: a sender that is dropped would read as a second request to stop.
+    std::future::pending::<()>().await;
+  };
+  tokio::select! {
+    served = serve_until(engine, listener, stops, Lifecycle::default()) => served,
+    () = ask => Ok(()),
+  }
+}
+
+/// Serves the gRPC API on `listener` until it is asked to stop on `stops`, and stops the way it was asked.
+///
+/// Alongside the API it serves the standard gRPC health service and server reflection (so `grpcurl` works
+/// without the `.proto`). Health has two answers. The empty service name is *liveness*: the process is up and
+/// its listener answers. `recordsimilarity.v1.RecordSimilarity` is *readiness*: a request sent now could be
+/// served, because the embedding thread is alive and the store answered the last time it was asked
+/// ([`Engine::check`], every [`Lifecycle::store_check_every`]). A server that is not ready is still live, and
+/// still answers what it is sent: readiness is advice to whoever routes requests, not a gate.
+///
+/// Stopping, on [`Stop::Drain`]: not ready at once, serving for the notice, then no new requests and up to the
+/// deadline for the ones in flight. A second request to stop during either wait ends that wait. [`Stop::Now`]
+/// has no notice. A channel whose senders are all gone is a request to stop now.
+///
+/// Taking a bound listener rather than an address lets a caller bind port 0 and learn the port before serving,
+/// which is how the end-to-end tests run.
+///
+/// # Errors
+///
+/// Returns an error if the reflection descriptor cannot be loaded or the transport fails.
+pub async fn serve_until<S, E>(
+  engine: Arc<Engine<S, E>>,
+  listener: TcpListener,
+  mut stops: mpsc::Receiver<Stop>,
+  lifecycle: Lifecycle,
+) -> anyhow::Result<()>
+where
+  S: VectorStore,
+  E: TextEmbedder,
+{
   let (health_reporter, health_service) = tonic_health::server::health_reporter();
-  health_reporter
-    .set_serving::<RecordSimilarityServer<GrpcService<S, E>>>()
-    .await;
+  // The first answer is found out before the listener can be asked for it, so that it is never a guess.
+  let ready = report::<S, E>(&health_reporter, None, checked(&engine, lifecycle).await).await;
+  let watch = tokio::spawn(watch(Arc::clone(&engine), health_reporter.clone(), lifecycle, ready));
   let reflection = tonic_reflection::server::Builder::configure()
     .register_encoded_file_descriptor_set(similarity_proto::FILE_DESCRIPTOR_SET)
     // Without this the health service still answers, but reflection-driven tools such as `grpcurl` cannot find it.
@@ -76,16 +151,142 @@ where
     .build_v1()
     .context("cannot build the gRPC reflection service")?;
 
-  Server::builder()
+  let (close, closed) = oneshot::channel::<()>();
+  let server = Server::builder()
     .add_service(health_service)
     .add_service(reflection)
     .add_service(RecordSimilarityServer::new(GrpcService::new(engine)))
     // `TcpIncoming` rather than a bare stream of connections: only it applies `TCP_NODELAY`, without which Nagle's
     // algorithm can hold a small unary response back for tens of milliseconds, several times the cost of
     // computing it.
-    .serve_with_incoming_shutdown(TcpIncoming::from(listener).with_nodelay(Some(true)), shutdown)
-    .await
-    .context("the gRPC server stopped with an error")
+    .serve_with_incoming_shutdown(TcpIncoming::from(listener).with_nodelay(Some(true)), async {
+      let _ = closed.await;
+    });
+  tokio::pin!(server);
+  let stopped_with_an_error = "the gRPC server stopped with an error";
+
+  let stop = tokio::select! {
+    outcome = &mut server => {
+      watch.abort();
+      return outcome.context(stopped_with_an_error);
+    }
+    stop = stops.recv() => stop.unwrap_or(Stop::Now),
+  };
+  // Out of the rotation before anything else, and for good: the watch must not put the server back in.
+  watch.abort();
+  let _ = watch.await;
+  health_reporter
+    .set_not_serving::<RecordSimilarityServer<GrpcService<S, E>>>()
+    .await;
+  let notice = match stop {
+    Stop::Now => Duration::ZERO,
+    Stop::Drain => lifecycle.drain_notice,
+  };
+  tracing::info!(
+    notice_ms = millis(notice),
+    deadline_ms = millis(lifecycle.drain_deadline),
+    "stopping: no longer ready"
+  );
+  if !notice.is_zero() {
+    tokio::select! {
+      outcome = &mut server => return outcome.context(stopped_with_an_error),
+      () = tokio::time::sleep(notice) => {}
+      () = asked_again(&mut stops) => tracing::info!("asked to stop again: the notice is cut short"),
+    }
+  }
+
+  // No new requests from here: the listener closes, and connections end as their requests do.
+  let _ = close.send(());
+  tokio::select! {
+    outcome = &mut server => outcome.context(stopped_with_an_error),
+    () = tokio::time::sleep(lifecycle.drain_deadline) => {
+      // Returning is all there is to do: the connections are the runtime's, and end when the process does, which
+      // for the binary is next.
+      tracing::warn!(
+        deadline_ms = millis(lifecycle.drain_deadline),
+        "the drain deadline passed with requests still in flight: stopping without them"
+      );
+      Ok(())
+    }
+    () = asked_again(&mut stops) => {
+      tracing::warn!("asked to stop again with requests still in flight: stopping without them");
+      Ok(())
+    }
+  }
+}
+
+fn millis(duration: Duration) -> u64 {
+  u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Resolves when the server is asked to stop once more, and never if nobody is left to ask.
+async fn asked_again(stops: &mut mpsc::Receiver<Stop>) {
+  if stops.recv().await.is_none() {
+    std::future::pending::<()>().await;
+  }
+}
+
+/// One look at whether a request could be served now: `None` if it could, or why not.
+async fn checked<S, E>(engine: &Engine<S, E>, lifecycle: Lifecycle) -> Option<String>
+where
+  S: VectorStore,
+  E: TextEmbedder,
+{
+  match tokio::time::timeout(lifecycle.store_check_every, engine.check()).await {
+    Ok(Ok(())) => None,
+    Ok(Err(error)) => Some(error.to_string()),
+    Err(_) => Some(format!(
+      "the store did not answer within {} ms",
+      millis(lifecycle.store_check_every)
+    )),
+  }
+}
+
+/// Makes the readiness answer what was just found, and says so when that is a change. `was` is the answer before
+/// (`None` before the first), and the answer now is returned.
+async fn report<S, E>(reporter: &tonic_health::server::HealthReporter, was: Option<bool>, found: Option<String>) -> bool
+where
+  S: VectorStore,
+  E: TextEmbedder,
+{
+  let ready = found.is_none();
+  if was == Some(ready) {
+    return ready;
+  }
+  match found {
+    None => {
+      reporter
+        .set_serving::<RecordSimilarityServer<GrpcService<S, E>>>()
+        .await;
+      // The first answer of a server that starts well is not news; coming back is.
+      if was.is_some() {
+        tracing::info!("ready again");
+      }
+    }
+    Some(reason) => {
+      reporter
+        .set_not_serving::<RecordSimilarityServer<GrpcService<S, E>>>()
+        .await;
+      tracing::warn!(reason, "not ready");
+    }
+  }
+  ready
+}
+
+/// Keeps the readiness answer true for as long as the server serves.
+async fn watch<S, E>(
+  engine: Arc<Engine<S, E>>,
+  reporter: tonic_health::server::HealthReporter,
+  lifecycle: Lifecycle,
+  mut ready: bool,
+) where
+  S: VectorStore,
+  E: TextEmbedder,
+{
+  loop {
+    tokio::time::sleep(lifecycle.store_check_every).await;
+    ready = report::<S, E>(&reporter, Some(ready), checked(&engine, lifecycle).await).await;
+  }
 }
 
 #[cfg(test)]
@@ -831,5 +1032,377 @@ mod tests {
     running.stop.send(()).unwrap();
     drop((running.client, running.channel, health));
     running.server.await.unwrap().unwrap();
+  }
+
+  // ---- Health and stopping (D37) ---------------------------------------------------------------------------
+
+  use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+  use similarity_store::{Expected, Found, Neighbor, SearchQuery, StoreError, StoredRecord, Version};
+  use tonic_health::pb::health_check_response::ServingStatus;
+
+  use crate::worker::EmbedError;
+
+  const LIVE: &str = "";
+  const READY: &str = "recordsimilarity.v1.RecordSimilarity";
+
+  /// A store whose readiness check a test can make fail, or never answer. Everything else is the memory store.
+  struct Faulty {
+    inner: MemoryStore,
+    down: Arc<AtomicBool>,
+    silent: Arc<AtomicBool>,
+  }
+
+  impl VectorStore for Faulty {
+    async fn check(&self) -> Result<(), StoreError> {
+      if self.silent.load(Ordering::Relaxed) {
+        std::future::pending::<()>().await;
+      }
+      if self.down.load(Ordering::Relaxed) {
+        return Err(StoreError::Unavailable("connection refused".to_owned()));
+      }
+      self.inner.check().await
+    }
+
+    async fn get(&self, id: &str) -> Result<Option<StoredRecord>, StoreError> {
+      self.inner.get(id).await
+    }
+
+    async fn put(&self, record: &StoredRecord) -> Result<(), StoreError> {
+      self.inner.put(record).await
+    }
+
+    async fn put_if(&self, record: &StoredRecord, expected: Expected) -> Result<bool, StoreError> {
+      self.inner.put_if(record, expected).await
+    }
+
+    async fn delete(&self, id: &str) -> Result<bool, StoreError> {
+      self.inner.delete(id).await
+    }
+
+    async fn delete_if(&self, id: &str, version: Version) -> Result<bool, StoreError> {
+      self.inner.delete_if(id, version).await
+    }
+
+    async fn search(&self, query: SearchQuery<'_>) -> Result<Vec<Neighbor>, StoreError> {
+      self.inner.search(query).await
+    }
+
+    async fn search_vectors(&self, query: SearchQuery<'_>) -> Result<Vec<Found>, StoreError> {
+      self.inner.search_vectors(query).await
+    }
+  }
+
+  /// An embedder a test can declare dead, and can hold: a request that reaches it waits at the gate until the
+  /// test lets it through, which is what a request in flight is.
+  struct Gated {
+    inner: WordBagEmbedder,
+    alive: Arc<AtomicBool>,
+    gate: Arc<tokio::sync::Semaphore>,
+    waiting: Arc<AtomicUsize>,
+  }
+
+  impl TextEmbedder for Gated {
+    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, EmbedError> {
+      self.waiting.fetch_add(1, Ordering::Relaxed);
+      let passed = self.gate.acquire().await;
+      drop(passed);
+      self.inner.embed(texts).await
+    }
+
+    fn dimension(&self) -> usize {
+      self.inner.dimension()
+    }
+
+    fn fingerprint(&self) -> &str {
+      self.inner.fingerprint()
+    }
+
+    fn alive(&self) -> bool {
+      self.alive.load(Ordering::Relaxed)
+    }
+  }
+
+  struct Lived {
+    client: RecordSimilarityClient<Channel>,
+    channel: Channel,
+    stops: mpsc::Sender<Stop>,
+    server: tokio::task::JoinHandle<anyhow::Result<()>>,
+    down: Arc<AtomicBool>,
+    silent: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
+    gate: Arc<tokio::sync::Semaphore>,
+    waiting: Arc<AtomicUsize>,
+  }
+
+  /// A server over a store and an embedder the test controls. `open` says whether the embedder's gate starts
+  /// open; `down` is the store's answer to the first check, the one made before the listener answers.
+  async fn live(lifecycle: Lifecycle, open: bool, down: bool) -> Lived {
+    let schema = Schema::new(vec![FieldSpec {
+      name: "name".to_owned(),
+      weight: 1.0,
+      required: true,
+      reject_below: None,
+    }])
+    .unwrap();
+    let inner = WordBagEmbedder::new("word-bag-v1");
+    let (layout, dimension) = store_layout(&schema, &inner);
+    let (down, silent, alive) = (
+      Arc::new(AtomicBool::new(down)),
+      Arc::new(AtomicBool::new(false)),
+      Arc::new(AtomicBool::new(true)),
+    );
+    let gate = Arc::new(tokio::sync::Semaphore::new(if open { 1_000_000 } else { 0 }));
+    let waiting = Arc::new(AtomicUsize::new(0));
+    let store = Faulty {
+      inner: MemoryStore::new(layout, dimension),
+      down: Arc::clone(&down),
+      silent: Arc::clone(&silent),
+    };
+    let embedder = Gated {
+      inner,
+      alive: Arc::clone(&alive),
+      gate: Arc::clone(&gate),
+      waiting: Arc::clone(&waiting),
+    };
+    let engine = Arc::new(Engine::new(store, embedder, schema, Policy::new(0.75, None).unwrap()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stops, asked) = mpsc::channel(4);
+    let server = tokio::spawn(serve_until(engine, listener, asked, lifecycle));
+    let channel = Channel::from_shared(format!("http://{address}"))
+      .unwrap()
+      .connect()
+      .await
+      .unwrap();
+    Lived {
+      client: RecordSimilarityClient::new(channel.clone()),
+      channel,
+      stops,
+      server,
+      down,
+      silent,
+      alive,
+      gate,
+      waiting,
+    }
+  }
+
+  /// Checks quickly, so that a test does not wait long for a change to be noticed; long waits for stopping, so
+  /// that a test that sees the server stop knows it was not a wait running out.
+  fn quick() -> Lifecycle {
+    Lifecycle {
+      store_check_every: Duration::from_millis(10),
+      drain_notice: Duration::from_mins(10),
+      drain_deadline: Duration::from_mins(10),
+    }
+  }
+
+  async fn health(channel: &Channel, service: &str) -> ServingStatus {
+    tonic_health::pb::health_client::HealthClient::new(channel.clone())
+      .check(tonic_health::pb::HealthCheckRequest {
+        service: service.to_owned(),
+      })
+      .await
+      .unwrap()
+      .into_inner()
+      .status()
+  }
+
+  /// Waits for readiness to become `wanted`. Ten seconds is far more than a 10 ms check needs; it is a bound on
+  /// a broken server, not an expectation of a working one.
+  async fn becomes(channel: &Channel, wanted: ServingStatus) {
+    for _ in 0..2000 {
+      if health(channel, READY).await == wanted {
+        return;
+      }
+      tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!(
+      "readiness did not become {wanted:?}: it is {:?}",
+      health(channel, READY).await
+    );
+  }
+
+  fn named(name: &str) -> pb::EvaluateRequest {
+    pb::EvaluateRequest {
+      record: Some(pb::Record {
+        id: Some("p1".to_owned()),
+        fields: HashMap::from([("name".to_owned(), name.to_owned())]),
+        ..pb::Record::default()
+      }),
+      ..pb::EvaluateRequest::default()
+    }
+  }
+
+  /// The server's result once it has stopped, which it must do well within `within`.
+  async fn stopped(server: tokio::task::JoinHandle<anyhow::Result<()>>, within: Duration) {
+    tokio::time::timeout(within, server)
+      .await
+      .expect("the server did not stop")
+      .unwrap()
+      .unwrap();
+  }
+
+  /// Two questions, two answers. A store that stops answering makes the server not ready, and leaves it live:
+  /// the process is fine, and restarting it would not bring the store back.
+  #[tokio::test]
+  async fn a_store_that_stops_answering_makes_the_server_not_ready_and_leaves_it_live() {
+    let mut running = live(quick(), true, false).await;
+    assert_eq!(health(&running.channel, LIVE).await, ServingStatus::Serving);
+    assert_eq!(health(&running.channel, READY).await, ServingStatus::Serving);
+
+    running.down.store(true, Ordering::Relaxed);
+    becomes(&running.channel, ServingStatus::NotServing).await;
+    assert_eq!(health(&running.channel, LIVE).await, ServingStatus::Serving);
+    // Not ready is advice to whoever routes requests, not a gate: what arrives is still answered.
+    running.client.describe(pb::DescribeRequest {}).await.unwrap();
+
+    running.down.store(false, Ordering::Relaxed);
+    becomes(&running.channel, ServingStatus::Serving).await;
+
+    // A check that gets no answer at all is no answer: the watch does not wait on it for ever.
+    running.silent.store(true, Ordering::Relaxed);
+    becomes(&running.channel, ServingStatus::NotServing).await;
+    running.silent.store(false, Ordering::Relaxed);
+    becomes(&running.channel, ServingStatus::Serving).await;
+
+    running.stops.send(Stop::Now).await.unwrap();
+    drop((running.client, running.channel));
+    stopped(running.server, Duration::from_secs(30)).await;
+  }
+
+  /// The first answer is found out, not assumed: a server that starts with its store down has never said ready.
+  #[tokio::test]
+  async fn a_server_that_starts_without_its_store_is_not_ready_from_its_first_answer() {
+    let slow_to_notice = Lifecycle {
+      store_check_every: Duration::from_mins(10),
+      ..quick()
+    };
+    let running = live(slow_to_notice, true, true).await;
+    assert_eq!(health(&running.channel, READY).await, ServingStatus::NotServing);
+    assert_eq!(health(&running.channel, LIVE).await, ServingStatus::Serving);
+    drop(running.stops);
+    drop((running.client, running.channel));
+    // Nobody left to ask it to stop is a request to stop.
+    stopped(running.server, Duration::from_secs(30)).await;
+  }
+
+  #[tokio::test]
+  async fn a_server_whose_embedding_thread_has_stopped_is_not_ready() {
+    let running = live(quick(), true, false).await;
+    assert_eq!(health(&running.channel, READY).await, ServingStatus::Serving);
+    running.alive.store(false, Ordering::Relaxed);
+    becomes(&running.channel, ServingStatus::NotServing).await;
+    assert_eq!(health(&running.channel, LIVE).await, ServingStatus::Serving);
+    running.stops.send(Stop::Now).await.unwrap();
+    drop((running.client, running.channel));
+    stopped(running.server, Duration::from_secs(30)).await;
+  }
+
+  /// What an orchestrator's `SIGTERM` gets: out of the rotation at once, still serving while the notice lasts,
+  /// and only then closed.
+  #[tokio::test]
+  async fn a_drain_leaves_the_rotation_first_and_serves_through_the_notice() {
+    let lifecycle = Lifecycle {
+      drain_notice: Duration::from_millis(400),
+      ..quick()
+    };
+    let mut running = live(lifecycle, true, false).await;
+    let asked = std::time::Instant::now();
+    running.stops.send(Stop::Drain).await.unwrap();
+    becomes(&running.channel, ServingStatus::NotServing).await;
+    assert_eq!(health(&running.channel, LIVE).await, ServingStatus::Serving);
+    // The store answers, and the server stays out all the same: a draining server does not come back.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(health(&running.channel, READY).await, ServingStatus::NotServing);
+    let created = running.client.evaluate(named("blueberry gummies")).await.unwrap();
+    assert_eq!(created.into_inner().verdict(), pb::Verdict::Created);
+
+    drop((running.client, running.channel));
+    stopped(running.server, Duration::from_secs(30)).await;
+    assert!(
+      asked.elapsed() >= Duration::from_millis(400),
+      "it stopped after {:?}, before the notice was over",
+      asked.elapsed()
+    );
+  }
+
+  /// A person at a keyboard is not made to wait for a load balancer that is not there, and an orchestrator that
+  /// asks twice means now.
+  #[tokio::test]
+  async fn stop_now_gives_no_notice_and_asking_again_cuts_one_short() {
+    let running = live(quick(), true, false).await;
+    running.stops.send(Stop::Now).await.unwrap();
+    drop((running.client, running.channel));
+    stopped(running.server, Duration::from_secs(30)).await;
+
+    let running = live(quick(), true, false).await;
+    running.stops.send(Stop::Drain).await.unwrap();
+    becomes(&running.channel, ServingStatus::NotServing).await;
+    assert!(!running.server.is_finished(), "the notice is ten minutes long");
+    running.stops.send(Stop::Drain).await.unwrap();
+    drop((running.client, running.channel));
+    stopped(running.server, Duration::from_secs(30)).await;
+  }
+
+  /// Stopping does not cut off a request that is being answered: the listener closes, and the server waits.
+  #[tokio::test]
+  async fn a_request_in_flight_is_answered_before_the_server_stops() {
+    let running = live(quick(), false, false).await;
+    let mut client = running.client.clone();
+    let in_flight = tokio::spawn(async move { client.evaluate(named("blueberry gummies")).await });
+    while running.waiting.load(Ordering::Relaxed) == 0 {
+      tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    running.stops.send(Stop::Now).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(!running.server.is_finished(), "it is waiting for the request");
+    assert!(!in_flight.is_finished());
+
+    running.gate.add_permits(1);
+    let answered = in_flight.await.unwrap().unwrap();
+    assert_eq!(answered.into_inner().verdict(), pb::Verdict::Created);
+    drop((running.client, running.channel));
+    stopped(running.server, Duration::from_secs(30)).await;
+  }
+
+  /// A request that never finishes does not keep the server for ever: the deadline ends the wait, and so does
+  /// being asked again.
+  #[tokio::test]
+  async fn the_deadline_or_a_second_request_ends_a_drain_that_requests_do_not() {
+    for asked_twice in [false, true] {
+      let lifecycle = Lifecycle {
+        drain_deadline: if asked_twice {
+          Duration::from_mins(10)
+        } else {
+          Duration::from_millis(200)
+        },
+        ..quick()
+      };
+      let running = live(lifecycle, false, false).await;
+      let mut client = running.client.clone();
+      let in_flight = tokio::spawn(async move { client.evaluate(named("blueberry gummies")).await });
+      while running.waiting.load(Ordering::Relaxed) == 0 {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+      }
+      let asked = std::time::Instant::now();
+      running.stops.send(Stop::Now).await.unwrap();
+      if asked_twice {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!running.server.is_finished(), "the deadline is ten minutes away");
+        running.stops.send(Stop::Now).await.unwrap();
+      }
+      stopped(running.server, Duration::from_secs(30)).await;
+      if !asked_twice {
+        assert!(asked.elapsed() >= Duration::from_millis(200), "{:?}", asked.elapsed());
+      }
+      // The request the server gave up on was never answered. Its connection belongs to the runtime, not to the
+      // server, and ends when the process does: here the test ends it.
+      assert!(!in_flight.is_finished(), "asked twice: {asked_twice}");
+      in_flight.abort();
+      drop((running.client, running.channel));
+    }
   }
 }

@@ -6,7 +6,7 @@ and trained in [Burn](https://burn.dev), run by ONNX Runtime), compared with the
 rejected against calibrated thresholds. A record's quantities (weight, volume, potency) are compared as numbers
 beside that, never embedded. Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D36) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D37) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -101,6 +101,12 @@ changing a design. Infer conventions from the existing code first.
   entry is a product or a record. The old names are refused wherever they could be read without an error and
   mean nothing (a tolerant file format, a stored point), and reserved in the `.proto`. "The owner" in these
   documents is the person who owns the project, and is not a name for anything in the data.
+- **Live and ready are two answers** (D37). The health service's empty name is liveness and is `SERVING` while
+  the process runs; `recordsimilarity.v1.RecordSimilarity` is readiness and is `Engine::check`: the embedding
+  thread is alive and the store answered its last check. Never make liveness depend on the store (an
+  orchestrator would restart a healthy process because Qdrant is down), and never make a request wait on or be
+  refused by readiness: it is advice to whoever routes requests. Stopping is in one order: not ready, the
+  notice, the listener, the deadline. A new `VectorStore` needs a `check` that is cheap and reads no record.
 - **Every write the engine makes is conditional on what it read** (D35). `Engine` never calls `VectorStore::put`
   or `delete`: it calls `put_if` with the version it judged against (or `Expected::Absent` for a record it found
   missing) and `delete_if`, and when one comes back `false` it has written nothing and reads and judges again,

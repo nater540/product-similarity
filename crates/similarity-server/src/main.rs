@@ -24,6 +24,7 @@ use similarity_core::{Device, Embedder, EngineChoice, Provenance};
 use similarity_log::Init;
 use similarity_proto::v1::record_similarity_client::RecordSimilarityClient;
 use similarity_runs::{Input, ModelRef, Spec, Status};
+use similarity_server::Stop;
 use similarity_server::config::Config;
 use similarity_server::engine::{Engine, store_layout};
 use similarity_server::fetch::{self, FetchRequest};
@@ -537,29 +538,39 @@ fn load_embedder(config: &Config, tie: Tie) -> anyhow::Result<Embedder> {
   Ok(embedder)
 }
 
-async fn shutdown_signal() {
-  let interrupt = tokio::signal::ctrl_c();
+/// Passes every request to stop on to the server, for as long as the process lives: Ctrl-C as [`Stop::Now`] (a
+/// person is waiting), `SIGTERM` as [`Stop::Drain`] (an orchestrator is taking the replica out). Every one is
+/// sent, because a second one during a drain means "now".
+async fn stop_signals(asked: tokio::sync::mpsc::Sender<Stop>) {
   #[cfg(unix)]
-  {
-    let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
-    match terminate {
-      Ok(mut terminate) => {
-        tokio::select! {
-          _ = interrupt => {}
-          _ = terminate.recv() => {}
-        }
+  let mut terminate = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+    Ok(terminate) => Some(terminate),
+    Err(error) => {
+      tracing::warn!(%error, "cannot listen for SIGTERM; only Ctrl-C will stop the server");
+      None
+    }
+  };
+  loop {
+    #[cfg(unix)]
+    let stop = if let Some(terminate) = terminate.as_mut() {
+      tokio::select! {
+        _ = tokio::signal::ctrl_c() => Stop::Now,
+        _ = terminate.recv() => Stop::Drain,
       }
-      Err(error) => {
-        tracing::warn!(%error, "cannot listen for SIGTERM; only Ctrl-C will stop the server");
-        let _ = interrupt.await;
-      }
+    } else {
+      let _ = tokio::signal::ctrl_c().await;
+      Stop::Now
+    };
+    #[cfg(not(unix))]
+    let stop = {
+      let _ = tokio::signal::ctrl_c().await;
+      Stop::Now
+    };
+    if asked.send(stop).await.is_err() {
+      // The server has stopped and is not listening any more.
+      return;
     }
   }
-  #[cfg(not(unix))]
-  {
-    let _ = interrupt.await;
-  }
-  tracing::info!("shutting down: finishing in-flight requests");
 }
 
 async fn serve_with<S: VectorStore>(
@@ -590,7 +601,10 @@ async fn serve_with<S: VectorStore>(
     .await
     .with_context(|| format!("cannot listen on {listen}"))?;
   tracing::info!(address = %listener.local_addr()?, "serving gRPC");
-  let served = similarity_server::serve(Arc::new(engine), listener, shutdown_signal()).await;
+  let (asked, stops) = tokio::sync::mpsc::channel(4);
+  let signals = tokio::spawn(stop_signals(asked));
+  let served = similarity_server::serve_until(Arc::new(engine), listener, stops, config.server.lifecycle()).await;
+  signals.abort();
   if let Some(summaries) = summaries {
     summaries.abort();
   }

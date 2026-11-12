@@ -436,6 +436,19 @@ fn decode_payload(id: &str, payload: HashMap<String, Value>) -> Result<PointPayl
 }
 
 impl VectorStore for QdrantStore {
+  async fn check(&self) -> Result<()> {
+    // One small call that needs the server to answer and the collection to be there. A collection can be
+    // deleted under a running server, and every request after that fails: that is not ready either.
+    if self.collection_exists().await? {
+      Ok(())
+    } else {
+      Err(StoreError::Collection {
+        collection: self.collection.clone(),
+        reason: "it no longer exists".to_owned(),
+      })
+    }
+  }
+
   async fn get(&self, id: &str) -> Result<Option<StoredRecord>> {
     let response = self
       .client

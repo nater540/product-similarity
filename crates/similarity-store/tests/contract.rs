@@ -77,6 +77,10 @@ fn assert_same_direction(left: &[f32], right: &[f32]) {
 
 /// `store` and `other_layout` are two views of the same underlying data, opened under different layouts.
 async fn contract<S: VectorStore>(store: &S, other_layout: &S) {
+  // A store that can be used says so, with or without anything in it, under either layout.
+  store.check().await.unwrap();
+  other_layout.check().await.unwrap();
+
   // Nothing there yet.
   assert_eq!(store.get("gummies").await.unwrap(), None);
   assert!(!store.delete("gummies").await.unwrap());
@@ -536,6 +540,10 @@ impl SharedMemory {
 }
 
 impl VectorStore for SharedMemory {
+  async fn check(&self) -> similarity_store::Result<()> {
+    self.with(async |store| store.check().await).await
+  }
+
   async fn get(&self, id: &str) -> similarity_store::Result<Option<StoredRecord>> {
     self.with(async |store| store.get(id).await).await
   }
@@ -633,6 +641,15 @@ async fn the_qdrant_store_honors_the_contract() {
   // Clean up before reporting, so a failed assertion does not leave a collection behind.
   store.delete_collection().await.unwrap();
   outcome.unwrap();
+
+  // A store whose collection was deleted under it can be reached and cannot be used, and says which.
+  match store.check().await {
+    Err(StoreError::Collection { collection, reason }) => {
+      assert_eq!(collection, settings.collection);
+      assert!(reason.contains("no longer exists"), "{reason}");
+    }
+    other => panic!("expected the collection to be reported gone, got {other:?}"),
+  }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

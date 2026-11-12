@@ -287,7 +287,8 @@ Ways to run it:
   The container runs as a non-root user and reads `/etc/record-similarity/config.toml`; mount your own file
   there to override the defaults.
 
-The server stops cleanly on Ctrl-C or `SIGTERM`, finishing in-flight requests first.
+The server stops cleanly on Ctrl-C or `SIGTERM`, finishing in-flight requests first. `SIGTERM` leaves the load
+balancer's rotation before it closes the listener: [Health and shutdown](#health-and-shutdown).
 
 ## Making requests
 
@@ -475,8 +476,11 @@ grpcurl -plaintext -d '{"menu_item": {"fields": {"name": "Blueberry Indica Gummi
 
 grpcurl -plaintext -d '{"id": "sku-1", "brand_id": "brand-1"}' localhost:50051 recordsimilarity.v1.RecordSimilarity/Delete
 
-# Health, as a load balancer would ask.
+# Readiness, as a load balancer would ask: could a request be served now?
 grpcurl -plaintext -d '{"service": "recordsimilarity.v1.RecordSimilarity"}' localhost:50051 grpc.health.v1.Health/Check
+
+# Liveness, the empty service name: is the process up?
+grpcurl -plaintext -d '{"service": ""}' localhost:50051 grpc.health.v1.Health/Check
 ```
 
 In JSON, enum values are written by name (`"WRITE_MODE_DRY_RUN"`), 64-bit integers come back as strings
@@ -1995,6 +1999,9 @@ commented starting point.
 | Key | Default | Meaning |
 |---|---|---|
 | `server.listen` | `127.0.0.1:50051` | Address to serve gRPC on. Use `0.0.0.0:50051` in a container. |
+| `server.store_check_every_ms` | `2000` | How often the store is asked whether it still answers; readiness is that old at most. See [Health and shutdown](#health-and-shutdown). |
+| `server.drain_notice_ms` | `5000` | On `SIGTERM`, how long the server goes on serving after it starts reporting not ready. |
+| `server.drain_deadline_ms` | `20000` | After that, how long requests in flight are given before the server stops anyway. |
 | `server.import_batch_records` | `8` | The most records of an `Import` stream embedded as one batch. Larger loads a catalog faster and makes every other request wait longer while a stream runs; see [Creating records over a stream](#creating-records-over-a-stream). At least 1. |
 | `model.dir` | `models/mdbr-leaf-mt` | The model directory: what `model fetch` or the trainer wrote, with the `onnx/model.onnx` that `just export-onnx` adds. There is no setting for what runs the model or where: ONNX Runtime does, on the CPU. |
 | `model.max_tokens` | `256` | Text beyond this many tokens is ignored. Cost grows with its square. |
@@ -2250,17 +2257,54 @@ content at the time of the import.
 
 ### Health and shutdown
 
-The server implements the standard gRPC health service; the service name to check is
-`recordsimilarity.v1.RecordSimilarity`. For Kubernetes:
+The server implements the standard gRPC health service, and it has two answers:
+
+| Service name | The question | `SERVING` when |
+|---|---|---|
+| empty | Is the process up? (liveness) | Always, while it runs. |
+| `recordsimilarity.v1.RecordSimilarity` | Could a request be served now? (readiness) | The embedding thread is alive and the store answered the last time it was asked, which is every `server.store_check_every_ms` (2 seconds). |
+
+A server whose Qdrant has gone away is not ready and is still live: restarting it would not bring Qdrant back,
+and sending it requests gets them `UNAVAILABLE`. It says so on stderr (`not ready`, with the reason, and
+`ready again`), and it finds out its first answer before it listens, so it never reports ready on a guess. Not
+ready is advice to whoever routes requests, not a gate: a request that arrives anyway is answered as well as it
+can be. With Qdrant stopped under a running server and started again, the `status` each `Health/Check` gave,
+asked through `grpcurl`:
+
+```text
+ready, Qdrant up:    SERVING
+ready, Qdrant down:  NOT_SERVING
+live,  Qdrant down:  SERVING
+ready, Qdrant back:  SERVING
+```
+
+For Kubernetes (not run on a cluster here; the probes ask exactly what was asked above):
 
 ```yaml
+livenessProbe:
+  grpc:
+    port: 50051
 readinessProbe:
   grpc:
     port: 50051
     service: recordsimilarity.v1.RecordSimilarity
+terminationGracePeriodSeconds: 30   # more than drain_notice_ms + drain_deadline_ms, which are 5 s + 20 s
 ```
 
-It shuts down gracefully on `SIGTERM`.
+**Stopping.** On `SIGTERM` the server:
+
+1. reports not ready, at once, and stays live;
+2. goes on serving for `server.drain_notice_ms` (5 seconds), so that the load balancer can act on that before
+   anything is refused;
+3. closes the listener, and gives the requests in flight up to `server.drain_deadline_ms` (20 seconds);
+4. exits. Requests still running then are cut off, and a `WARN` line says the deadline passed.
+
+A second `SIGTERM`, or Ctrl-C, ends whichever wait it is in. Ctrl-C alone skips the notice: there is a person at
+the keyboard and no load balancer. With the notice set to 1.5 seconds and nothing in flight, the server exited
+1.60 seconds after `SIGTERM` and 0.09 seconds after Ctrl-C.
+
+Nothing is lost by a request that is cut off: a write is one conditional step in the store, so it happened or
+it did not, and an `Import` stream that ends early is sent again.
 
 ### Capacity
 
@@ -2502,7 +2546,7 @@ data/
   regression.snapshot.ndjson      what the pinned model and the example config make of them
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D36)
+  decisions.md               why things are the way they are (D1 to D37)
   data-request-prompt.md     a brief for collecting labeled production data
   import-prompt.md           a brief for loading the real catalog into a running service
   feature-suggestions.md     features that could be added, built and not, the last twelve about production
