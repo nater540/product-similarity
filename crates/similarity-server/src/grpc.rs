@@ -24,6 +24,7 @@ use crate::engine::{
 };
 use crate::import_stream::{self, Answer, PATIENCE};
 use crate::metrics::{self, Call, Metrics};
+use crate::span::{self, Stage};
 use crate::worker::{self, TextEmbedder};
 
 /// The tonic service wrapping an [`Engine`].
@@ -275,7 +276,9 @@ impl<S: VectorStore, E: TextEmbedder> GrpcService<S, E> {
       mode,
       threshold: request.threshold,
     });
-    let output = worker::by(deadline, evaluated).await?;
+    let (output, spent) = span::traced(worker::by(deadline, evaluated)).await;
+    self.metrics.staged(Call::Evaluate, &spent);
+    let output = output?;
     self.metrics.evaluated(output.verdict, mode);
     tracing::info!(
       id = id.as_deref().unwrap_or(""),
@@ -286,6 +289,12 @@ impl<S: VectorStore, E: TextEmbedder> GrpcService<S, E> {
       revision = output.revision,
       measure_changed = output.measure_changed,
       elapsed_ms = milliseconds(started),
+      lock_ms = spent.milliseconds(Stage::Lock),
+      read_ms = spent.milliseconds(Stage::StoreRead),
+      queue_ms = spent.milliseconds(Stage::Queue),
+      model_ms = spent.milliseconds(Stage::Model),
+      pass_texts = spent.pass_texts,
+      write_ms = spent.milliseconds(Stage::StoreWrite),
       "evaluate"
     );
 
@@ -328,10 +337,17 @@ impl<S: VectorStore, E: TextEmbedder> GrpcService<S, E> {
       brand_id: request.brand_id,
       min_similarity: request.min_similarity,
     });
-    let neighbors = worker::by(deadline, found).await?;
+    let (neighbors, spent) = span::traced(worker::by(deadline, found)).await;
+    self.metrics.staged(Call::FindSimilar, &spent);
+    let neighbors = neighbors?;
     tracing::info!(
       neighbors = neighbors.len(),
       elapsed_ms = milliseconds(started),
+      read_ms = spent.milliseconds(Stage::StoreRead),
+      queue_ms = spent.milliseconds(Stage::Queue),
+      model_ms = spent.milliseconds(Stage::Model),
+      pass_texts = spent.pass_texts,
+      search_ms = spent.milliseconds(Stage::Search),
       "find_similar"
     );
 
@@ -350,8 +366,18 @@ impl<S: VectorStore, E: TextEmbedder> GrpcService<S, E> {
   async fn deleted(&self, request: Request<pb::DeleteRequest>) -> Result<Response<pb::DeleteResponse>, Status> {
     let started = Instant::now();
     let pb::DeleteRequest { id, brand_id } = request.into_inner();
-    let deleted = self.engine.delete(id.clone(), brand_id).await?;
-    tracing::info!(%id, deleted, elapsed_ms = milliseconds(started), "delete");
+    let (deleted, spent) = span::traced(self.engine.delete(id.clone(), brand_id)).await;
+    self.metrics.staged(Call::Delete, &spent);
+    let deleted = deleted?;
+    tracing::info!(
+      %id,
+      deleted,
+      elapsed_ms = milliseconds(started),
+      lock_ms = spent.milliseconds(Stage::Lock),
+      read_ms = spent.milliseconds(Stage::StoreRead),
+      write_ms = spent.milliseconds(Stage::StoreWrite),
+      "delete"
+    );
     Ok(Response::new(pb::DeleteResponse { deleted }))
   }
 
@@ -418,7 +444,9 @@ impl<S: VectorStore, E: TextEmbedder> GrpcService<S, E> {
       brand_id: request.brand_id,
       threshold: request.threshold,
     });
-    let output = worker::by(deadline, matched).await?;
+    let (output, spent) = span::traced(worker::by(deadline, matched)).await;
+    self.metrics.staged(Call::Match, &spent);
+    let output = output?;
     self.metrics.matched(output.decision);
     tracing::info!(
       candidates = output.candidates.len(),
@@ -429,6 +457,10 @@ impl<S: VectorStore, E: TextEmbedder> GrpcService<S, E> {
         .map(|candidate| six(candidate.comparison.similarity)),
       decision = ?output.decision,
       elapsed_ms = milliseconds(started),
+      queue_ms = spent.milliseconds(Stage::Queue),
+      model_ms = spent.milliseconds(Stage::Model),
+      pass_texts = spent.pass_texts,
+      search_ms = spent.milliseconds(Stage::Search),
       "match"
     );
 
@@ -705,6 +737,78 @@ mod tests {
         "missing `{series}` in:\n{page}"
       );
     }
+  }
+
+  /// A request's log line says where its time went, and the same times are summed for the metrics: for the
+  /// stages the request met, and no others.
+  #[test]
+  fn a_requests_log_line_and_the_metrics_say_where_its_time_went() {
+    use similarity_core::{FieldSpec, Policy, Schema};
+    use similarity_store::MemoryStore;
+
+    use crate::engine::store_layout;
+    use crate::worker::EmbedWorker;
+
+    let counted = Arc::new(Metrics::new("tiny"));
+    let service_metrics = Arc::clone(&counted);
+    let captured = similarity_log::testing::capture("info", move || {
+      let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+      runtime.block_on(async {
+        let options = similarity_core::EmbedderOptions {
+          max_tokens: 16,
+          batch_size: 8,
+          output_dim: None,
+        };
+        let worker = EmbedWorker::spawn(similarity_core::testing::tiny_embedder(&options), 4, 8).unwrap();
+        let schema = Schema::new(vec![FieldSpec {
+          name: "name".to_owned(),
+          weight: 1.0,
+          required: true,
+          reject_below: None,
+        }])
+        .unwrap();
+        let (layout, dimension) = store_layout(&schema, &worker);
+        let store = MemoryStore::new(layout, dimension);
+        let engine = Engine::new(store, worker, schema, Policy::new(0.75, None).unwrap());
+        let service = GrpcService::new(Arc::new(engine), service_metrics);
+        let request = Request::new(pb::EvaluateRequest {
+          record: Some(pb::Record {
+            id: Some("p1".to_owned()),
+            fields: [("name".to_owned(), "blueberry gummies".to_owned())].into(),
+            ..pb::Record::default()
+          }),
+          ..pb::EvaluateRequest::default()
+        });
+        service.evaluate(request).await.unwrap();
+      });
+    });
+    let lines: Vec<serde_json::Value> = captured
+      .logs
+      .iter()
+      .map(|line| serde_json::from_str(line).unwrap())
+      .collect();
+    let line = lines.iter().find(|line| line["message"] == "evaluate").unwrap();
+    for field in ["lock_ms", "read_ms", "queue_ms", "model_ms", "write_ms", "elapsed_ms"] {
+      assert!(line[field].is_number(), "{field} in {line}");
+    }
+    assert_eq!(line["pass_texts"], 1, "one field, one text, alone in its pass");
+    let (model, whole) = (line["model_ms"].as_f64().unwrap(), line["elapsed_ms"].as_f64().unwrap());
+    assert!(model > 0.0 && model <= whole + 0.01, "{line}");
+    assert!(
+      line.get("search_ms").is_none(),
+      "an evaluation searches nothing: {line}"
+    );
+
+    let page = counted.render(&crate::metrics::Polled::default());
+    let stage = |stage: &str| {
+      let series = format!("record_similarity_request_stage_seconds_total{{call=\"Evaluate\",stage=\"{stage}\"}} ");
+      page
+        .lines()
+        .find_map(|line| line.strip_prefix(&series)?.parse::<f64>().ok())
+    };
+    assert!(stage("model").unwrap() > 0.0, "{page}");
+    assert_eq!(stage("search"), None, "a stage no request met is not a series");
+    assert!(!page.contains("call=\"Match\",stage="), "{page}");
   }
 
   /// One of each kind of reason, with numbers that are awkward on purpose.

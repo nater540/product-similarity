@@ -6,7 +6,7 @@ and trained in [Burn](https://burn.dev), run by ONNX Runtime), compared with the
 rejected against calibrated thresholds. A record's quantities (weight, volume, potency) are compared as numbers
 beside that, never embedded. Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D39) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D40) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -73,7 +73,7 @@ changing a design. Infer conventions from the existing code first.
   back. It records and lists; it decides nothing.
 - `crates/similarity-server`: config, the embedding worker thread, `Engine` (all behavior), the thin gRPC layer,
   `import_stream` (the loop behind the streaming `Import` call), `metrics` (what the server counts about itself,
-  and the HTTP endpoint that serves it),
+  and the HTTP endpoint that serves it), `span` (where one request's time went),
   `model fetch`, `import`, `compare`/`calibrate`/`calibrate-drift`/`calibrate-match`/`calibrate-sweep` (the `offline` module), `load` (the load
   test), `runs` (reading recorded runs back, comparing and reporting them), `shadow` (a candidate policy judging
   live requests), `registry` (which model was put into service, and the gate), and the `record-similarity`
@@ -118,6 +118,12 @@ changing a design. Infer conventions from the existing code first.
   measured from outside by `Measured`; do not put counting into a store. Do not add a metrics library, a push
   exporter, or a vendor's client: the text format is what Datadog, OpenTelemetry, and Prometheus all read, and
   that is the reason for it.
+- **A request accounts for its own time** (D40). Every `.await` on something a request waits for (its record's
+  lock, the store, the model) is inside `span::timed` with a `Stage`, and the gRPC layer puts the times on the
+  request's log line and into `record_similarity_request_stage_seconds_total`. A new wait gets a stage, or it
+  disappears into "the server's own work", which is supposed to be nothing. The log fields and the stage names
+  are interfaces: add, never rename. Before proposing a performance change, read where the time goes
+  (`just load ... --server` against a server logging at `info`); it has been guessed wrong before.
 - **A request can be dropped anywhere it waits, and a write never is** (D38). The transport drops a handler
   when its caller's deadline runs out or the caller hangs up, so every `.await` in a request is a place it can
   end. Before the write that is free, and has to stay free: nothing may be left half done there. The write

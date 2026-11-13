@@ -29,6 +29,7 @@ use tokio::net::TcpListener;
 use tonic::{Code, Status};
 
 use crate::engine::{Verdict, WriteMode};
+use crate::span::{Stage, Timings};
 use crate::worker::WorkerSnapshot;
 
 /// The path the metrics are served at.
@@ -306,6 +307,8 @@ pub struct Metrics {
   import_records: [AtomicU64; 3],
   store_seconds: [Histogram; 8],
   store_errors: [AtomicU64; 8],
+  /// Nanoseconds requests spent on each stage, by call.
+  stage_ns: [[AtomicU64; 6]; 6],
 }
 
 impl Metrics {
@@ -355,6 +358,16 @@ impl Metrics {
   pub fn imported(&self, created: u64, existing: u64, failed: u64) {
     for (counter, amount) in self.import_records.iter().zip([created, existing, failed]) {
       counter.fetch_add(amount, Ordering::Relaxed);
+    }
+  }
+
+  /// A request of this call ended, having spent its time as `timings` says ([`crate::span`]).
+  pub fn staged(&self, call: Call, timings: &Timings) {
+    let Some(stages) = self.stage_ns.get(call.index()) else {
+      return;
+    };
+    for (stage, total) in Stage::ALL.iter().zip(stages) {
+      total.fetch_add(nanoseconds(timings.spent(*stage)), Ordering::Relaxed);
     }
   }
 
@@ -492,6 +505,27 @@ impl Metrics {
       if histogram.count() > 0 {
         let labels = format!("call=\"{}\"", call.name());
         histogram.render(out, "record_similarity_request_duration_seconds", &labels);
+      }
+    }
+    family(
+      out,
+      "record_similarity_request_stage_seconds_total",
+      "counter",
+      "Time answered requests spent waiting, by call and by what for. The rest of a request's duration is the \
+       server's own work.",
+    );
+    for (call, stages) in Call::ALL.iter().zip(&self.stage_ns) {
+      for (stage, total) in Stage::ALL.iter().zip(stages) {
+        let total = read(total);
+        if total > 0 {
+          let _ = writeln!(
+            out,
+            "record_similarity_request_stage_seconds_total{{call=\"{}\",stage=\"{}\"}} {}",
+            call.name(),
+            stage.name(),
+            seconds(total)
+          );
+        }
       }
     }
   }

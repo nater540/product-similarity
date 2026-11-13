@@ -2351,7 +2351,7 @@ scrape_configs:
       - targets: ["<host>:9464"]
 ```
 
-The page a real server gave was read back with the Prometheus Python client's parser (21 metrics, 164 samples,
+The page a real server gave was read back with the Prometheus Python client's parser (22 metrics, 172 samples,
 every histogram cumulative and ending at its count). It has not been scraped by Prometheus, a Collector, or a
 Datadog Agent here.
 
@@ -2360,6 +2360,7 @@ Datadog Agent here.
 | `record_similarity_requests_total{call,code}` | Requests that ended, by call (`Evaluate`, `FindSimilar`, `Match`, `Delete`, `Import`, `Describe`) and gRPC status code. `CANCELLED` is a request whose caller gave up. |
 | `record_similarity_request_duration_seconds{call}` | A histogram of how long they took, whatever the answer. |
 | `record_similarity_requests_in_flight{call}` | Requests being served now. An `Import` stream is one for as long as it is open. |
+| `record_similarity_request_stage_seconds_total{call,stage}` | Time answered requests spent waiting, by what for: `lock`, `store_read`, `queue` (for the model), `model` (the forward pass), `store_write`, `search`. Over the duration's sum it is where the time goes ([Where a request's time goes](#where-a-requests-time-goes)). |
 | `record_similarity_evaluations_total{verdict,mode}` | `Evaluate` answers by verdict (`created`, `accepted`, `rejected`, `embedded`) and by the write mode asked for (`enforce`, `dry_run`, `force`). |
 | `record_similarity_matches_total{decision}` | `Match` answers by decision (`matched`, `no_match`, `not_judged`). |
 | `record_similarity_import_records_total{outcome}` | Records of ended `Import` streams: `created`, `exists`, `failed`. |
@@ -2400,7 +2401,7 @@ record_similarity_ready 1
   how the server behaves.
 - **A series that says nothing is left out**: a status code no request has ended with, and the latency of a
   call or store operation that has not been used. `OK` is there for every call from the first scrape, at zero
-  if need be. A server that had just started gave 66 series, and 164 after that run; each call or store
+  if need be. A server that had just started gave 66 series, and 172 after that run; each call or store
   operation that comes into use adds its 14. That matters where series are what you pay for.
 - **Latencies are counted into buckets from 1 ms to 2.5 s.** The buckets are how finely a latency can be read
   back, not limits on anything.
@@ -2507,6 +2508,56 @@ written under the brand `load-test` and deleted afterwards, and the worker's sid
 `model_busy`, `queue_wait_ms`, `abandoned`, `too_late`) is left out, since a client cannot see it. No record
 text is in any result.
 
+#### Where a request's time goes
+
+Every request accounts for its own time. Its log line carries, beside `elapsed_ms`, what it spent waiting and
+for what, and the same times are summed for the metrics
+(`record_similarity_request_stage_seconds_total`):
+
+```json
+{"message":"evaluate","id":"load-1-1794535793-c4-10","verdict":"Accepted","similarity":0.986988,"anchor_similarity":0.986988,"stored":true,"revision":2,"measure_changed":false,"elapsed_ms":3.46,"lock_ms":0.0,"read_ms":0.003,"queue_ms":1.199,"model_ms":2.231,"pass_texts":3,"write_ms":0.008}
+```
+
+| Field | The wait |
+|---|---|
+| `lock_ms` | For the record's lock: another request in this process had it. |
+| `read_ms` | For the store to return the stored record. |
+| `queue_ms` | For the model: from joining the queue to being taken into a forward pass. |
+| `model_ms` | The forward pass, from being put together to the answer. `pass_texts` is how many texts were in it, this request's and everybody else's. |
+| `write_ms` | For the store to take the write. |
+| `search_ms` | For the store to search (`find_similar` and `match`). |
+
+What is left of `elapsed_ms` is the server's own work: validating, scoring, translating. Mean milliseconds per
+`Evaluate`, from the log lines of `just load ... --server` runs of 1,000 records at each level, same machine:
+
+| Store | Callers | Phase | Whole | Lock | Read | Wait for model | Forward pass | Write | Texts in the pass |
+|---|---|---|---|---|---|---|---|---|---|
+| memory | 1 | edit | 1.48 | 0.00 | 0.00 | 0.01 | 1.45 | 0.00 | 1.0 |
+| memory | 16 | edit | 8.34 | 0.27 | 0.00 | 1.91 | 6.12 | 0.02 | 12.3 |
+| memory | 64 | edit | 24.71 | 2.76 | 0.00 | 10.19 | 11.70 | 0.03 | 28.4 |
+| memory | 64 | create | 153.79 | 17.15 | 0.00 | 116.83 | 19.78 | 0.01 | 31.9 |
+| Qdrant | 1 | edit | 3.13 | 0.00 | 0.22 | 0.01 | 1.40 | 1.48 | 1.0 |
+| Qdrant | 16 | edit | 10.07 | 0.25 | 0.34 | 1.87 | 4.37 | 3.21 | 7.1 |
+| Qdrant | 64 | edit | 33.64 | 4.29 | 0.41 | 4.60 | 9.43 | 14.87 | 19.0 |
+| Qdrant | 64 | create | 151.93 | 19.26 | 0.31 | 108.33 | 19.47 | 4.54 | 31.9 |
+| Qdrant | 64 | resave | 1.13 | 0.10 | 1.01 | | | | |
+
+- **The server's own work is nothing**: 0.01 to 0.03 ms in every row. A request is its waits.
+- **Alone, a request is the forward pass**, and with Qdrant, the pass and the write in equal parts. Tokenizing
+  is 1 to 3% of a pass (0.012 ms of 1.15 for a name, 0.34 ms of 15.6 for eight whole records).
+- **With company, it is the wait for the model.** A pass holds 32 texts, so 64 callers creating four-field
+  records are eight passes of work, and each waits about six of them for its turn. Sharing a pass is what makes
+  that bearable: one name alone takes 1.15 ms, and 32 names in one pass take 6.5.
+- **Against Qdrant the write grows with the callers**, from 1.5 ms alone to 14.9 ms at 64, where it is the
+  largest part of an edit. That is the store's limit ([Past what a server can do](#past-what-a-server-can-do)).
+- **The lock is waited for by requests for different records.** There are 256 locks and a record's id picks
+  one, so with 64 requests in flight about one in five shares a lock with another and waits out its whole
+  request: 17 to 19 ms of a 150 ms create.
+
+The caller's own figure was within 0.5 ms of the server's for a create and 1 ms for an edit at 64 callers, and
+2.5 ms above it for a save with no changes, which the server answers in 0.02: the load test sends everything
+over one connection.
+
 #### Past what a server can do
 
 Nothing above asks a server for more than it can do: each caller waits for its answer, however long that takes.
@@ -2579,7 +2630,8 @@ sends the edit again is answered from what was stored, without the model. Nothin
 in flight at once; that is not built.
 
 In service, every `evaluate`, `find_similar`, `match`, and `delete` log line carries `elapsed_ms`: the time from
-the first line of the handler to the log line. An `Import` stream writes one `import` line when it ends, with how
+the first line of the handler to the log line, and what the request spent that time waiting for
+([Where a request's time goes](#where-a-requests-time-goes)). An `Import` stream writes one `import` line when it ends, with how
 many records it created, found stored, and failed, how many batches it made, and how often it waited for the
 model. What the server is doing as a whole, as counts for a monitoring system, is under [Metrics](#metrics).
 

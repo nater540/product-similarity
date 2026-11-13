@@ -1876,3 +1876,43 @@ not ready and counted three failed checks within five seconds.
 OTLP; a histogram of the wait for the model, which today is a sum to divide by a count; the same for texts per
 pass; process metrics (memory, file descriptors), which a platform reports itself; TLS or authentication on the
 endpoint, which like the gRPC port has neither and belongs behind the mesh; and anything per brand, on purpose.
+
+## D40. A request accounts for its own time
+
+A log line said how long a request took and the metrics said how long requests take. Neither said what a
+request was waiting for, and at 64 callers a request is 25 ms of which the server's own work is 0.02. Where
+the rest goes decides what is worth changing, and guessing it was wrong twice in one day: the store turned out
+to be the limit against Qdrant (D38), and a lock turned out to be waited for by requests for different
+records (below).
+
+**Six waits, timed where they happen** (`span.rs`): for the record's lock, for the store reading, for the
+model (from joining the queue to being taken into a pass), for the forward pass, for the store writing, and for
+the store searching. Each is timed around its `.await` (`span::timed`), and the embedding thread tells a
+request how long it had waited when its pass began and how many texts the pass held. Whatever is left of the
+request's duration is the server's own work and the runtime's.
+
+**Kept on the request's task, like its deadline** (D38): a task-local that the gRPC layer opens around the
+engine call and reads when the call ends. The engine's signatures do not change, code outside a request (an
+import stream, a command, a test) adds to nothing, and a request that is dropped takes its times with it.
+
+**Two places to read it.** The request's log line carries the times in milliseconds beside `elapsed_ms`, which
+is a request's own span, to be read for one slow request. The metrics carry the sums by call and stage
+(`record_similarity_request_stage_seconds_total`), which over the duration's sum is where time goes on the
+whole. Both are additions to interfaces that only grow (D17, D39).
+
+**Not distributed tracing.** There is no trace id, no parent, and no exporter. The owner's company is moving
+toward OpenTelemetry (D39), and when a collector exists these six waits are the spans a request would have;
+until then an exporter would be a dependency with nowhere to send to. What a request is waiting for does not
+need one.
+
+**What it showed, on the development laptop** (the README has the table):
+
+- Alone, a request is the forward pass: 1.45 of 1.48 ms for an edit. Tokenizing is 1 to 3% of a pass.
+- With company it is the wait for the model: 10 of 25 ms for an edit at 64 callers, 117 of 154 for a create.
+- Against Qdrant in Docker the write goes from 1.5 ms alone to 14.9 ms at 64 callers, the largest part of an
+  edit there.
+- The per-record lock (D10, D35) is waited for by requests for *different* records: 256 locks, picked by a
+  hash of the id, so with 64 requests in flight about one in five shares a lock with another and waits out its
+  whole request. 17 ms of a 154 ms create. Not changed here: this decision is the instrument, and what to do
+  about each of these is the owner's to weigh.
+

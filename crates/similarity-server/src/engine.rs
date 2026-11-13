@@ -34,6 +34,7 @@ use similarity_core::{
 use similarity_store::{Expected, Neighbor, SearchQuery, StoreError, StoredRecord, VectorStore};
 use tokio::sync::{Mutex, OwnedMutexGuard, watch};
 
+use crate::span::{self, Stage};
 use crate::worker::{EmbedError, TextEmbedder};
 
 /// The most records of an import stream taken into one batch, unless the configuration says otherwise. With four
@@ -761,7 +762,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       ));
     };
 
-    let held = self.hold(&id).await?;
+    let held = span::timed(Stage::Lock, self.hold(&id)).await?;
     let asked = (input.mode, input.threshold);
     for _ in 0..WRITE_ATTEMPTS {
       let attempt = self.attempt(&held, (&id, brand_id.as_deref()), &prepared, asked, &policy);
@@ -783,7 +784,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     asked: (WriteMode, Option<f32>),
     policy: &Policy,
   ) -> Result<Option<EvaluateOutput>, EngineError> {
-    let baseline = self.store.get(id).await?;
+    let baseline = span::timed(Stage::StoreRead, self.store.get(id)).await?;
     if let Some(stored) = &baseline {
       same_brand(stored, brand_id)?;
     }
@@ -858,7 +859,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       }
       Ok((Some(finish()), Change::Stored(record.revision)))
     };
-    self.committed(held, "evaluate", &named, write).await
+    span::timed(Stage::StoreWrite, self.committed(held, "evaluate", &named, write)).await
   }
 
   /// The record a revision that is to be written leaves stored: `baseline`'s next revision.
@@ -1004,7 +1005,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       }
       Ok((Some(finish()), Change::Stored(revision)))
     };
-    self.committed(held, "evaluate", &named, write).await
+    span::timed(Stage::StoreWrite, self.committed(held, "evaluate", &named, write)).await
   }
 
   /// Imports records that are not stored yet, embedding all of them in one call to the model.
@@ -1239,7 +1240,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
         let Some(id) = required_text("id", Some(id))? else {
           return Err(EngineError::InvalidArgument("`id` is required".to_owned()));
         };
-        let Some(stored) = self.store.get(&id).await? else {
+        let Some(stored) = span::timed(Stage::StoreRead, self.store.get(&id)).await? else {
           return Err(EngineError::NotFound(format!("no record `{id}` is stored")));
         };
         (stored.vectors.composite, Some(id))
@@ -1258,7 +1259,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       exclude_id: exclude_id.as_deref(),
       min_similarity: input.min_similarity,
     };
-    Ok(self.store.search(query).await?)
+    Ok(span::timed(Stage::Search, self.store.search(query)).await?)
   }
 
   /// Finds the stored records `input.menu_item` describes, best first, and decides whether the best is a match.
@@ -1304,16 +1305,14 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     let prepared = self.prepare(&input.menu_item)?;
     let menu_item = self.embed(&prepared, None).await?;
 
-    let found = self
-      .store
-      .search_vectors(SearchQuery {
-        vector: &menu_item.composite,
-        limit: limit.saturating_mul(self.matching.overfetch).min(MAX_MATCH_FETCH),
-        brand_id: brand_id.as_deref(),
-        exclude_id: None,
-        min_similarity: None,
-      })
-      .await?;
+    let searched = self.store.search_vectors(SearchQuery {
+      vector: &menu_item.composite,
+      limit: limit.saturating_mul(self.matching.overfetch).min(MAX_MATCH_FETCH),
+      brand_id: brand_id.as_deref(),
+      exclude_id: None,
+      min_similarity: None,
+    });
+    let found = span::timed(Stage::Search, searched).await?;
     let candidates = matching::rank(
       &self.schema,
       self.embedder.dimension(),
@@ -1346,9 +1345,9 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       return Err(EngineError::InvalidArgument("`id` is required".to_owned()));
     };
     let brand_id = required_text("brand_id", brand_id)?;
-    let held = self.hold(&id).await?;
+    let held = span::timed(Stage::Lock, self.hold(&id)).await?;
     for _ in 0..WRITE_ATTEMPTS {
-      let Some(stored) = self.store.get(&id).await? else {
+      let Some(stored) = span::timed(Stage::StoreRead, self.store.get(&id)).await? else {
         return Ok(false);
       };
       same_brand(&stored, brand_id.as_deref())?;
@@ -1359,7 +1358,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
         let deleted = store.delete_if(&gone, read).await?;
         Ok((deleted, if deleted { Change::Deleted } else { Change::Nothing }))
       };
-      if self.committed(&held, "delete", &id, write).await? {
+      if span::timed(Stage::StoreWrite, self.committed(&held, "delete", &id, write)).await? {
         return Ok(true);
       }
     }
@@ -1469,6 +1468,7 @@ pub(crate) mod racing {
 mod tests {
   use std::pin::Pin;
   use std::sync::Arc;
+  use std::time::Duration;
 
   use similarity_core::{FieldSpec, QuantitySpec};
   use similarity_store::{Found, MemoryStore, Version};
@@ -4586,5 +4586,126 @@ mod tests {
     assert!(matches!(error, EngineError::Unavailable(_)), "{error:?}");
     assert_eq!(recorder.told(), []);
     all_written(&engine).await;
+  }
+
+  // ---- Where a request's time went (D40) ----------------------------------------------------------------------
+
+  /// A store that takes its time, a different time for each kind of operation, so that a test can tell which
+  /// one a request waited for.
+  struct Sleepy(MemoryStore);
+
+  const READS: Duration = Duration::from_millis(15);
+  const WRITES: Duration = Duration::from_millis(40);
+  const SEARCHES: Duration = Duration::from_millis(25);
+
+  impl VectorStore for Sleepy {
+    async fn check(&self) -> Result<(), StoreError> {
+      self.0.check().await
+    }
+
+    async fn get(&self, id: &str) -> Result<Option<StoredRecord>, StoreError> {
+      tokio::time::sleep(READS).await;
+      self.0.get(id).await
+    }
+
+    async fn put(&self, record: &StoredRecord) -> Result<(), StoreError> {
+      self.0.put(record).await
+    }
+
+    async fn put_if(&self, record: &StoredRecord, expected: Expected) -> Result<bool, StoreError> {
+      tokio::time::sleep(WRITES).await;
+      self.0.put_if(record, expected).await
+    }
+
+    async fn delete(&self, id: &str) -> Result<bool, StoreError> {
+      self.0.delete(id).await
+    }
+
+    async fn delete_if(&self, id: &str, version: Version) -> Result<bool, StoreError> {
+      tokio::time::sleep(WRITES).await;
+      self.0.delete_if(id, version).await
+    }
+
+    async fn search(&self, query: SearchQuery<'_>) -> Result<Vec<Neighbor>, StoreError> {
+      tokio::time::sleep(SEARCHES).await;
+      self.0.search(query).await
+    }
+
+    async fn search_vectors(&self, query: SearchQuery<'_>) -> Result<Vec<Found>, StoreError> {
+      tokio::time::sleep(SEARCHES).await;
+      self.0.search_vectors(query).await
+    }
+  }
+
+  fn sleepy() -> Engine<Sleepy, WordBagEmbedder> {
+    let embedder = WordBagEmbedder::new("word-bag-v1");
+    let (layout, dimension) = store_layout(&schema(), &embedder);
+    let store = Sleepy(MemoryStore::new(layout, dimension));
+    Engine::new(store, embedder, schema(), Policy::new(0.75, None).unwrap())
+  }
+
+  /// Each wait of a request is put down to what it was a wait for: a read as a read, a write as a write, a
+  /// search as a search, and nothing to a stage the request never reached.
+  #[tokio::test]
+  async fn a_request_knows_what_it_waited_for() {
+    use crate::span::{Stage, traced};
+
+    let engine = sleepy();
+    let (created, spent) = traced(engine.evaluate(evaluate_input(Some("p1"), &GUMMIES))).await;
+    assert_eq!(created.unwrap().verdict, Verdict::Created);
+    assert!(
+      spent.spent(Stage::StoreRead) >= READS && spent.spent(Stage::StoreRead) < WRITES,
+      "{spent:?}"
+    );
+    assert!(spent.spent(Stage::StoreWrite) >= WRITES, "{spent:?}");
+    assert!(
+      spent.spent(Stage::Lock) < READS,
+      "nobody else had the record: {spent:?}"
+    );
+    assert_eq!(spent.spent(Stage::Search), Duration::ZERO);
+
+    // A save with no changes reads and does not write.
+    let (resaved, spent) = traced(engine.evaluate(evaluate_input(Some("p1"), &GUMMIES))).await;
+    assert!(!resaved.unwrap().stored);
+    assert!(spent.spent(Stage::StoreRead) >= READS, "{spent:?}");
+    assert_eq!(spent.spent(Stage::StoreWrite), Duration::ZERO);
+
+    let (near, spent) = traced(engine.find_similar(similar_to_id("p1"))).await;
+    near.unwrap();
+    assert!(
+      spent.spent(Stage::StoreRead) >= READS && spent.spent(Stage::Search) >= SEARCHES,
+      "{spent:?}"
+    );
+    assert_eq!(spent.spent(Stage::StoreWrite), Duration::ZERO);
+
+    let (matched, spent) = traced(engine.match_menu_item(menu_item(&MENU_ITEM))).await;
+    matched.unwrap();
+    assert!(spent.spent(Stage::Search) >= SEARCHES, "{spent:?}");
+    assert_eq!(spent.spent(Stage::StoreRead), Duration::ZERO);
+
+    let (deleted, spent) = traced(engine.delete("p1".to_owned(), None)).await;
+    assert!(deleted.unwrap());
+    assert!(
+      spent.spent(Stage::StoreRead) >= READS && spent.spent(Stage::StoreWrite) >= WRITES,
+      "{spent:?}"
+    );
+  }
+
+  /// A request for a record that another request is being served for waits for it, and that wait is the lock's:
+  /// not the store's, which it had not reached.
+  #[tokio::test]
+  async fn a_request_that_waits_for_its_record_puts_the_wait_down_to_the_lock() {
+    use crate::span::{Stage, traced};
+
+    let engine = sleepy();
+    let first = traced(engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)));
+    let second = traced(engine.evaluate(evaluate_input(Some("p1"), &GUMMIES_EDITED)));
+    let ((first, alone), (second, behind)) = tokio::join!(first, second);
+    assert_eq!(first.unwrap().verdict, Verdict::Created);
+    assert_eq!(second.unwrap().verdict, Verdict::Accepted);
+    assert!(alone.spent(Stage::Lock) < READS, "{alone:?}");
+    // The first read and wrote while the second waited.
+    assert!(behind.spent(Stage::Lock) >= READS + WRITES, "{behind:?}");
+    assert!(behind.spent(Stage::StoreRead) < behind.spent(Stage::Lock), "{behind:?}");
   }
 }

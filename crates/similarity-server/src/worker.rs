@@ -39,6 +39,8 @@ use std::time::{Duration, Instant};
 use similarity_core::Embedder;
 use tokio::sync::oneshot;
 
+use crate::span::{self, Stage};
+
 /// Why texts could not be embedded.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EmbedError {
@@ -97,6 +99,11 @@ fn least_wait(texts: u64, fastest_ns_per_text: u64) -> Option<Duration> {
 struct Waiting {
   stats: Arc<WorkerStats>,
   left: AtomicBool,
+  /// How long the request had waited when it was taken into a pass, in nanoseconds, and how many texts the pass
+  /// held: written by the thread as the pass starts, and read by the request when it is answered, to say where
+  /// its time went ([`crate::span`]).
+  waited_ns: AtomicU64,
+  pass_texts: AtomicU64,
 }
 
 impl Waiting {
@@ -111,7 +118,15 @@ impl Waiting {
     Some(Arc::new(Self {
       stats: Arc::clone(stats),
       left: AtomicBool::new(false),
+      waited_ns: AtomicU64::new(0),
+      pass_texts: AtomicU64::new(0),
     }))
+  }
+
+  /// The request was taken into a pass of `texts` texts, having waited this long.
+  fn taken(&self, waited: Duration, texts: u64) {
+    self.waited_ns.store(nanoseconds(waited), Ordering::Relaxed);
+    self.pass_texts.store(texts, Ordering::Relaxed);
   }
 
   fn leave(&self) {
@@ -361,7 +376,13 @@ impl TextEmbedder for EmbedWorker {
         waiting: Arc::clone(&leaving.0),
       })
       .map_err(|_| EmbedError::WorkerGone)?;
-    response.await.map_err(|_| EmbedError::WorkerGone)?
+    let answer = response.await.map_err(|_| EmbedError::WorkerGone)?;
+    // Where the time went, for the request this is part of: waiting to be taken, and the pass itself.
+    let waited = Duration::from_nanos(leaving.0.waited_ns.load(Ordering::Relaxed));
+    span::spent(Stage::Queue, waited);
+    span::spent(Stage::Model, queued.elapsed().saturating_sub(waited));
+    span::shared_pass(leaving.0.pass_texts.load(Ordering::Relaxed));
+    answer
   }
 
   fn dimension(&self) -> usize {
@@ -556,7 +577,11 @@ fn run(embedder: &Embedder, jobs: &Receiver<Job>, max_batch_texts: usize, stats:
     let taken = Instant::now();
     let waited: Duration = batch
       .iter()
-      .map(|job| taken.saturating_duration_since(job.queued))
+      .map(|job| {
+        let waited = taken.saturating_duration_since(job.queued);
+        job.waiting.taken(waited, texts);
+        waited
+      })
       .sum();
     stats.batches.fetch_add(1, Ordering::Relaxed);
     stats.jobs.fetch_add(count(batch.len()), Ordering::Relaxed);
@@ -1331,5 +1356,30 @@ mod tests {
       std::task::Poll::Pending => std::task::Poll::Ready(None),
     })
     .await
+  }
+
+  /// A request the thread served learns where its time went: how long it waited to be taken, how long the pass
+  /// took, and how many texts shared the pass. Between them the two times are the whole of the wait.
+  #[tokio::test]
+  async fn a_request_the_thread_served_knows_how_long_it_waited_and_what_pass_it_was_in() {
+    let options = similarity_core::EmbedderOptions {
+      max_tokens: 16,
+      batch_size: 8,
+      output_dim: None,
+    };
+    let worker = EmbedWorker::spawn(similarity_core::testing::tiny_embedder(&options), 4, 8).unwrap();
+    let asked = Instant::now();
+    let (vectors, spent) = span::traced(worker.embed(vec!["blueberry".to_owned(), "gummies".to_owned()])).await;
+    let whole = asked.elapsed();
+    assert_eq!(vectors.unwrap().len(), 2);
+    assert_eq!(spent.pass_texts, 2);
+    assert!(spent.spent(Stage::Model) > Duration::ZERO, "{spent:?}");
+    assert!(spent.accounted() <= whole, "{spent:?} of {whole:?}");
+    assert_eq!(spent.spent(Stage::Queue) + spent.spent(Stage::Model), spent.accounted());
+
+    // A request that was refused was in no pass, and waited for none.
+    let (refused, spent) = span::traced(by(Some(Instant::now()), worker.embed(vec!["late".to_owned()]))).await;
+    assert_eq!(refused, Err(EmbedError::TooLate));
+    assert_eq!(spent, span::Timings::default());
   }
 }
