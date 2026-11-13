@@ -2439,7 +2439,7 @@ each as a process of its own (`--server`) on a store in memory:
 | Callers | Deadline | Before: answered in time | Before: a second | Now: answered in time | Now: a second |
 |---|---|---|---|---|---|
 | 128 | 50 ms | 2,061 and 2,152 | 251 and 261 | 12,780 and 12,788 | 2,374 and 2,364 |
-| 256 | 50 ms | 98 and 105 | 14 and 15 | 7,557 and 7,561 | 2,319 and 2,320 |
+| 256 | 50 ms | 98 and 105 | 13.5 and 14.5 | 7,557 and 7,561 | 2,319 and 2,320 |
 
 - **Before, a server that fell behind stopped answering.** The embedding thread took requests in the order
   they came, whether or not anybody was still waiting. Once the wait passed the deadline, everything it reached

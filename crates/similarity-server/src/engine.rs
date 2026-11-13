@@ -4276,17 +4276,28 @@ mod tests {
   }
 
   /// Runs `request` until one more write has reached the gate, and drops it there: a caller that hung up, or
-  /// whose deadline ran out, while its write was on its way to the store.
+  /// whose deadline ran out, while its write was on its way to the store. A request that never gets that far
+  /// fails the test, and does not hang it.
   async fn dropped_mid_write<T>(store: &Pausing, request: impl Future<Output = T>) {
     let before = store.arrived();
     let mut request = std::pin::pin!(request);
-    while store.arrived() == before {
+    for _ in 0..10_000 {
+      if store.arrived() != before {
+        return;
+      }
       tokio::select! {
         biased;
         _ = &mut request => panic!("the request was answered before its write reached the store"),
         () = tokio::task::yield_now() => {}
       }
     }
+    panic!("the request never got as far as its write");
+  }
+
+  /// Every write in flight has ended. One that never does fails the test, and does not hang it.
+  async fn all_written(engine: &GatedEngine) {
+    let mut settled = Box::pin(engine.settled());
+    assert!(!still_waiting(&mut settled).await, "a write is still in flight");
   }
 
   const GONE: &str = "a write finished after the request that asked for it had gone";
@@ -4302,7 +4313,7 @@ mod tests {
       let store = Arc::clone(&engine.store);
       store.open();
       engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
-      engine.settled().await;
+      all_written(&engine).await;
 
       dropped_mid_write(&store, engine.evaluate(evaluate_input(Some("p1"), &GUMMIES_EDITED))).await;
       assert_eq!(store.inner.get("p1").await.unwrap().unwrap().revision, 1, "not yet");
@@ -4321,7 +4332,7 @@ mod tests {
       assert!(still_waiting(&mut settled).await, "and it counts as in flight");
 
       store.open();
-      settled.await;
+      assert!(!still_waiting(&mut settled).await, "the write never ended");
       assert_eq!(store.inner.get("p1").await.unwrap().unwrap().revision, 2);
       let told = recorder.told();
       assert_eq!(told.len(), 2);
@@ -4354,7 +4365,7 @@ mod tests {
       for _ in 0..2 {
         store.open();
       }
-      engine.settled().await;
+      all_written(&engine).await;
       assert_eq!(store.inner.get("p1").await.unwrap().unwrap().revision, 1);
       assert_eq!(store.inner.get("p2").await.unwrap().unwrap().revision, 1);
       assert_eq!(
@@ -4366,7 +4377,7 @@ mod tests {
       dropped_mid_write(&store, engine.delete("p1".to_owned(), None)).await;
       assert!(store.inner.get("p1").await.unwrap().is_some());
       store.open();
-      engine.settled().await;
+      all_written(&engine).await;
       assert_eq!(store.inner.get("p1").await.unwrap(), None);
     });
     let said: Vec<_> = logged
@@ -4407,7 +4418,7 @@ mod tests {
         .await
         .unwrap();
       assert!(engine.delete("p1".to_owned(), None).await.unwrap());
-      engine.settled().await;
+      all_written(&engine).await;
     });
     assert_eq!(logged, Vec::<serde_json::Value>::new());
   }
@@ -4429,7 +4440,7 @@ mod tests {
       for _ in 0..50 {
         tokio::task::yield_now().await;
       }
-      engine.settled().await;
+      all_written(&engine).await;
       assert_eq!(engine.store.arrived(), 0, "no write was started");
       assert_eq!(engine.store.inner.get("p1").await.unwrap(), None);
       assert_eq!(recorder.told(), []);
@@ -4452,7 +4463,7 @@ mod tests {
       store.fail();
       dropped_mid_write(&store, engine.evaluate(evaluate_input(Some("p1"), &GUMMIES))).await;
       store.open();
-      engine.settled().await;
+      all_written(&engine).await;
       assert_eq!(recorder.told(), [], "a write that failed is not an outcome");
     });
     assert_eq!(logged.len(), 1, "{logged:?}");
@@ -4485,7 +4496,7 @@ mod tests {
       store.inner.put(&theirs).await.unwrap();
 
       store.open();
-      engine.settled().await;
+      all_written(&engine).await;
       assert_eq!(store.inner.get("p1").await.unwrap().unwrap(), theirs);
       assert_eq!(recorder.told().len(), 1, "only the creation");
     });
@@ -4502,6 +4513,6 @@ mod tests {
     let error = engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap_err();
     assert!(matches!(error, EngineError::Unavailable(_)), "{error:?}");
     assert_eq!(recorder.told(), []);
-    engine.settled().await;
+    all_written(&engine).await;
   }
 }

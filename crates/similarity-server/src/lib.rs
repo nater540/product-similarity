@@ -1267,6 +1267,18 @@ mod tests {
     }
   }
 
+  /// Waits until a request is held at the embedder's gate. Ten seconds is a bound on a broken server: a request
+  /// that never gets there fails the test, and does not hang it.
+  async fn held_at_the_gate(running: &Lived) {
+    for _ in 0..5000 {
+      if running.waiting.load(Ordering::Relaxed) > 0 {
+        return;
+      }
+      tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    panic!("no request reached the embedder");
+  }
+
   /// The server's result once it has stopped, which it must do well within `within`.
   async fn stopped(server: tokio::task::JoinHandle<anyhow::Result<()>>, within: Duration) {
     tokio::time::timeout(within, server)
@@ -1384,9 +1396,7 @@ mod tests {
     let running = live(quick(), false, false).await;
     let mut client = running.client.clone();
     let in_flight = tokio::spawn(async move { client.evaluate(named("blueberry gummies")).await });
-    while running.waiting.load(Ordering::Relaxed) == 0 {
-      tokio::time::sleep(Duration::from_millis(2)).await;
-    }
+    held_at_the_gate(&running).await;
 
     running.stops.send(Stop::Now).await.unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1416,9 +1426,7 @@ mod tests {
       let running = live(lifecycle, false, false).await;
       let mut client = running.client.clone();
       let in_flight = tokio::spawn(async move { client.evaluate(named("blueberry gummies")).await });
-      while running.waiting.load(Ordering::Relaxed) == 0 {
-        tokio::time::sleep(Duration::from_millis(2)).await;
-      }
+      held_at_the_gate(&running).await;
       let asked = std::time::Instant::now();
       running.stops.send(Stop::Now).await.unwrap();
       if asked_twice {

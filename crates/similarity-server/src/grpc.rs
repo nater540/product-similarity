@@ -553,6 +553,16 @@ mod tests {
       Some(received + Duration::from_millis(250))
     );
     assert_eq!(deadline(&with("soon"), received), None);
+
+    // As the transport hands a request over: the header it arrived with is in the metadata.
+    let arrived = tonic::codegen::http::Request::builder()
+      .header(GRPC_TIMEOUT, "3S")
+      .body(())
+      .unwrap();
+    assert_eq!(
+      deadline(&Request::from_http(arrived), received),
+      Some(received + Duration::from_secs(3))
+    );
   }
 
   /// The deadline a caller sends reaches the embedding thread, through the handler and the engine: a request
