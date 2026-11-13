@@ -386,6 +386,7 @@ mod tests {
       anchor_quantities: Quantities::new(),
       revision: 3,
       updated_at: 1_700_000_000,
+      anchor: None,
     }
   }
 

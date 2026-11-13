@@ -34,7 +34,7 @@ use similarity_core::score::Evaluation;
 use similarity_core::testing::{WORDS, tiny_embedder};
 use similarity_core::vector::cosine;
 use similarity_core::{EmbedderOptions, FieldSpec, Policy, Quantity, QuantitySpec, Reason, Schema};
-use similarity_store::{Entry, MemoryStore, Scan, StoredRecord, VectorStore};
+use similarity_store::{Entry, MemoryStore, Read, Scan, StoredRecord, VectorStore};
 
 use crate::engine::racing::Raced;
 use crate::locks::Locks;
@@ -1671,7 +1671,7 @@ proptest! {
       import_export(&engine, &export_text(&stored_lines)).await;
       let ids: Vec<String> = engine
         .store()
-        .scan(None, 1000)
+        .scan(None, 1000, Read::Payload)
         .await
         .unwrap()
         .entries

@@ -43,8 +43,8 @@ use similarity_core::{Quantities, RecordVectors};
 use uuid::Uuid;
 
 use crate::{
-  Cursor, Entry, Expected, Found, Neighbor, Page, Result, Scan, ScannedRecord, SearchQuery, StoreError, StoredRecord,
-  VectorStore, Version,
+  Cursor, Entry, Expected, Found, Neighbor, Page, Read, Result, Scan, ScannedRecord, SearchQuery, StoreError,
+  StoredRecord, VectorStore, Version,
 };
 
 const CURRENT: &str = "current";
@@ -350,21 +350,7 @@ impl QdrantStore {
 impl QdrantStore {
   /// The dense vector `name` of the point holding record `id`, checked to have this store's width.
   fn dense(&self, id: &str, vectors: Option<&VectorsOutput>, name: &str) -> Result<Vec<f32>> {
-    match vectors.and_then(|vectors| vectors.get_vector_by_name(name)) {
-      Some(StoredVector::Dense(dense)) if dense.data.len() == self.dimension => Ok(dense.data),
-      Some(StoredVector::Dense(dense)) => Err(StoreError::Corrupt {
-        id: id.to_owned(),
-        reason: format!(
-          "vector `{name}` has {} components, expected {}",
-          dense.data.len(),
-          self.dimension
-        ),
-      }),
-      _ => Err(StoreError::Corrupt {
-        id: id.to_owned(),
-        reason: format!("dense vector `{name}` is missing"),
-      }),
-    }
+    dense(self.dimension, id, vectors, name)
   }
 
   /// The point a record is stored as. `write` is the mark of a conditional write, and `None` for a plain one.
@@ -456,6 +442,24 @@ impl QdrantStore {
   }
 }
 
+/// The dense vector `name` of the point holding record `id`, checked to have `dimension` components.
+fn dense(dimension: usize, id: &str, vectors: Option<&VectorsOutput>, name: &str) -> Result<Vec<f32>> {
+  match vectors.and_then(|vectors| vectors.get_vector_by_name(name)) {
+    Some(StoredVector::Dense(dense)) if dense.data.len() == dimension => Ok(dense.data),
+    Some(StoredVector::Dense(dense)) => Err(StoreError::Corrupt {
+      id: id.to_owned(),
+      reason: format!(
+        "vector `{name}` has {} components, expected {dimension}",
+        dense.data.len()
+      ),
+    }),
+    _ => Err(StoreError::Corrupt {
+      id: id.to_owned(),
+      reason: format!("dense vector `{name}` is missing"),
+    }),
+  }
+}
+
 fn decode_payload(id: &str, payload: HashMap<String, Value>) -> Result<PointPayload> {
   // A point from before 2026-11-12 keeps its brand under `tenant`. Read as it is, it would be a record that
   // belongs to nobody, and the rule that a request must name a record's brand would let anyone through.
@@ -494,9 +498,9 @@ fn point_of(cursor: &Cursor) -> Option<PointId> {
   }
 }
 
-/// What a scan says of one point, for a store of `layout`: what [`QdrantStore::get`] would make of it, without its
-/// vectors and without failing.
-fn entry(layout: &str, point: RetrievedPoint) -> Entry {
+/// What a scan says of one point, for a store of `layout` whose vectors have `dimension` components: what
+/// [`QdrantStore::get`] would make of it, with no more of its vectors than `read` asks for, and without failing.
+fn entry(layout: &str, dimension: usize, point: RetrievedPoint, read: Read) -> Entry {
   // Looked up before decoding, so that a point that cannot be decoded can still say which record it is. It is
   // only believed if the point is the one that record is kept at: anything can be written into a payload, and a
   // point `get` would never look at must not be taken for the record it names.
@@ -513,15 +517,17 @@ fn entry(layout: &str, point: RetrievedPoint) -> Entry {
       },
     };
   };
+  // A record that cannot be decoded, or whose anchor was asked for and cannot be had, is stored and unreadable.
+  let unreadable = |id: String, error: StoreError| Entry::Unreadable {
+    id: Some(id),
+    reason: match error {
+      StoreError::Corrupt { reason, .. } => reason,
+      other => other.to_string(),
+    },
+  };
   let payload = match decode_payload(&id, point.payload) {
     Ok(payload) => payload,
-    Err(StoreError::Corrupt { reason, .. }) => return Entry::Unreadable { id: Some(id), reason },
-    Err(other) => {
-      return Entry::Unreadable {
-        id: Some(id),
-        reason: other.to_string(),
-      };
-    }
+    Err(error) => return unreadable(id, error),
   };
   if payload.layout != layout {
     return Entry::OtherLayout {
@@ -529,6 +535,13 @@ fn entry(layout: &str, point: RetrievedPoint) -> Entry {
       layout: payload.layout,
     };
   }
+  let anchor = match read {
+    Read::Payload => None,
+    Read::Anchor => match dense(dimension, &id, point.vectors.as_ref(), ANCHOR) {
+      Ok(anchor) => Some(anchor),
+      Err(error) => return unreadable(id, error),
+    },
+  };
   Entry::Record(ScannedRecord {
     id,
     brand_id: payload.brand_id,
@@ -537,12 +550,13 @@ fn entry(layout: &str, point: RetrievedPoint) -> Entry {
     anchor_quantities: payload.anchor_quantities,
     revision: payload.revision,
     updated_at: payload.updated_at,
+    anchor,
   })
 }
 
 impl Scan for QdrantStore {
   /// In the order of the point ids, which is Qdrant's own and no order of the record ids.
-  async fn scan(&self, from: Option<&Cursor>, limit: usize) -> Result<Page> {
+  async fn scan(&self, from: Option<&Cursor>, limit: usize, read: Read) -> Result<Page> {
     if limit == 0 {
       return Err(StoreError::Invalid(
         "a scan needs a page of at least one entry".to_owned(),
@@ -550,8 +564,13 @@ impl Scan for QdrantStore {
     }
     let mut request = ScrollPointsBuilder::new(self.collection.as_str())
       .limit(u32::try_from(limit).unwrap_or(u32::MAX))
-      .with_payload(true)
-      .with_vectors(false);
+      .with_payload(true);
+    request = match read {
+      Read::Payload => request.with_vectors(false),
+      Read::Anchor => request.with_vectors(VectorsSelector {
+        names: vec![ANCHOR.to_owned()],
+      }),
+    };
     if let Some(cursor) = from {
       let first = point_of(cursor)
         .ok_or_else(|| StoreError::Invalid("the cursor is not one a scan of this store gave".to_owned()))?;
@@ -574,7 +593,7 @@ impl Scan for QdrantStore {
       entries: response
         .result
         .into_iter()
-        .map(|point| entry(&self.layout, point))
+        .map(|point| entry(&self.layout, self.dimension, point, read))
         .collect(),
       next,
     })
@@ -833,7 +852,7 @@ mod tests {
       }),
     );
     assert_eq!(
-      entry("model-a|name", point),
+      entry("model-a|name", 3, point, Read::Payload),
       Entry::Record(ScannedRecord {
         id: "product-42".to_owned(),
         brand_id: Some("brand-7".to_owned()),
@@ -842,8 +861,83 @@ mod tests {
         anchor_quantities: Quantities::from([("weight".to_owned(), Quantity::single(1.0, "g"))]),
         revision: 3,
         updated_at: 1_700_000_000,
+        anchor: None,
       })
     );
+  }
+
+  /// The point with `anchor` as its anchor vector, the way a scan that asked for anchors gets it back.
+  fn with_anchor(mut point: RetrievedPoint, anchor: &[f32]) -> RetrievedPoint {
+    use qdrant_client::qdrant::vectors_output::VectorsOptions;
+    use qdrant_client::qdrant::{DenseVector, NamedVectorsOutput, VectorOutput};
+
+    let vector = VectorOutput {
+      vector: Some(StoredVector::Dense(DenseVector { data: anchor.to_vec() })),
+      ..VectorOutput::default()
+    };
+    point.vectors = Some(VectorsOutput {
+      vectors_options: Some(VectorsOptions::Vectors(NamedVectorsOutput {
+        vectors: HashMap::from([(ANCHOR.to_owned(), vector)]),
+      })),
+    });
+    point
+  }
+
+  #[test]
+  fn a_scan_asked_for_anchors_gives_a_record_its_anchor_and_a_scan_that_was_not_gives_none() {
+    let point = || {
+      with_anchor(
+        stored(
+          "product-42",
+          serde_json::json!({"record_id": "product-42", "layout": "model-a|name"}),
+        ),
+        &[0.0, 0.6, 0.8],
+      )
+    };
+    let anchor_of = |entry: Entry| match entry {
+      Entry::Record(record) => record.anchor,
+      other => panic!("expected a record, got {other:?}"),
+    };
+    assert_eq!(
+      anchor_of(entry("model-a|name", 3, point(), Read::Anchor)),
+      Some(vec![0.0, 0.6, 0.8])
+    );
+    assert_eq!(anchor_of(entry("model-a|name", 3, point(), Read::Payload)), None);
+  }
+
+  #[test]
+  fn a_record_whose_anchor_was_asked_for_and_cannot_be_had_is_unreadable_and_says_which_record() {
+    let payload = || serde_json::json!({"record_id": "product-42", "layout": "model-a|name"});
+    // No vectors at all, and an anchor of another width than the collection's.
+    for (point, why) in [
+      (stored("product-42", payload()), "is missing"),
+      (
+        with_anchor(stored("product-42", payload()), &[0.6, 0.8]),
+        "has 2 components, expected 3",
+      ),
+    ] {
+      match entry("model-a|name", 3, point.clone(), Read::Anchor) {
+        Entry::Unreadable { id, reason } => {
+          assert_eq!(id.as_deref(), Some("product-42"));
+          assert!(reason.contains("`anchor`") && reason.contains(why), "{reason}");
+        }
+        other => panic!("expected an unreadable point, got {other:?}"),
+      }
+      // A scan that does not want the anchor does not look at it.
+      assert!(matches!(
+        entry("model-a|name", 3, point, Read::Payload),
+        Entry::Record(_)
+      ));
+    }
+    // A record of another layout is named, whatever is asked of it: its anchor is not this store's to read.
+    let other = stored(
+      "product-42",
+      serde_json::json!({"record_id": "product-42", "layout": "model-b|name"}),
+    );
+    assert!(matches!(
+      entry("model-a|name", 3, other, Read::Anchor),
+      Entry::OtherLayout { .. }
+    ));
   }
 
   #[test]
@@ -853,7 +947,7 @@ mod tests {
       serde_json::json!({"record_id": "product-42", "layout": "model-b|name", "hashes": {"name": "00ff"}}),
     );
     assert_eq!(
-      entry("model-a|name", point),
+      entry("model-a|name", 3, point, Read::Payload),
       Entry::OtherLayout {
         id: "product-42".to_owned(),
         layout: "model-b|name".to_owned()
@@ -867,7 +961,7 @@ mod tests {
       "product-42",
       serde_json::json!({"record_id": "product-42", "tenant": "brand-7", "layout": "model-a|name"}),
     );
-    match entry("model-a|name", point) {
+    match entry("model-a|name", 3, point, Read::Payload) {
       Entry::Unreadable { id, reason } => {
         assert_eq!(id.as_deref(), Some("product-42"));
         assert!(reason.contains("`tenant`"), "{reason}");
@@ -881,7 +975,7 @@ mod tests {
     let mut point = stored("product-42", serde_json::json!({"note": "written by something else"}));
     point.id = Some(PointId::from(7));
     assert_eq!(
-      entry("model-a|name", point),
+      entry("model-a|name", 3, point, Read::Payload),
       Entry::Unreadable {
         id: None,
         reason: "it does not say which record it is".to_owned()
@@ -898,7 +992,7 @@ mod tests {
     );
     point.id = Some(point_id("product-43"));
     assert_eq!(
-      entry("model-a|name", point),
+      entry("model-a|name", 3, point, Read::Payload),
       Entry::Unreadable {
         id: None,
         reason: "it says it is record `product-42`, which is kept at another point".to_owned()

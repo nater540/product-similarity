@@ -322,6 +322,7 @@ mod tests {
       anchor_quantities: similarity_core::Quantities::new(),
       revision: 4,
       updated_at: 1_700_000_900,
+      anchor: None,
     };
     let mut findings = compare(&expected, &stored, AUDITED.exported_at);
     let mut summary = Summary::default();

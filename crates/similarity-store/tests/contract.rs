@@ -26,7 +26,7 @@ use qdrant_client::qdrant::ScrollPointsBuilder;
 use similarity_core::vector::{cosine, normalize};
 use similarity_core::{Quantities, Quantity, RecordVectors};
 use similarity_store::{
-  Cursor, Entry, Expected, MemoryStore, Page, QdrantSettings, QdrantStore, Scan, ScannedRecord, SearchQuery,
+  Cursor, Entry, Expected, MemoryStore, Page, QdrantSettings, QdrantStore, Read, Scan, ScannedRecord, SearchQuery,
   StoreError, StoredRecord, VectorStore, Version,
 };
 
@@ -528,10 +528,15 @@ async fn conditional<S: VectorStore>(store: &S, other_layout: &S) {
 }
 
 /// Everything a scan of `store` lists from `from` on, a page of `limit` at a time.
-async fn scanned_from<S: Scan>(store: &S, mut from: Option<Cursor>, limit: usize) -> Vec<Entry> {
+async fn scanned_from<S: Scan>(store: &S, from: Option<Cursor>, limit: usize) -> Vec<Entry> {
+  scanned_with(store, from, limit, Read::Payload).await
+}
+
+/// The same, with the vectors `read` asks for.
+async fn scanned_with<S: Scan>(store: &S, mut from: Option<Cursor>, limit: usize, read: Read) -> Vec<Entry> {
   let mut entries = Vec::new();
   loop {
-    let Page { entries: page, next } = store.scan(from.as_ref(), limit).await.unwrap();
+    let Page { entries: page, next } = store.scan(from.as_ref(), limit, read).await.unwrap();
     assert!(page.len() <= limit, "a page of {} for a limit of {limit}", page.len());
     entries.extend(page);
     match next {
@@ -554,13 +559,16 @@ fn id_of(entry: &Entry) -> &str {
 async fn scanning<S: VectorStore + Scan>(store: &S, other_layout: &S) {
   // Nothing stored is one empty page, and a page of nothing is not a page.
   assert_eq!(
-    store.scan(None, 10).await.unwrap(),
+    store.scan(None, 10, Read::Payload).await.unwrap(),
     Page {
       entries: Vec::new(),
       next: None
     }
   );
-  assert!(matches!(store.scan(None, 0).await, Err(StoreError::Invalid(_))));
+  assert!(matches!(
+    store.scan(None, 0, Read::Payload).await,
+    Err(StoreError::Invalid(_))
+  ));
 
   // Nine records of this layout, with and without a brand and quantities, and two of another.
   let mut stored = Vec::new();
@@ -575,6 +583,8 @@ async fn scanning<S: VectorStore + Scan>(store: &S, other_layout: &S) {
       written.anchor_quantities = quantities(&[("weight", Quantity::single(1.0, "g"))]);
     }
     written.revision = u64::from(index) + 1;
+    // An anchor of its own, so that a scan that gave one record another's would be seen.
+    written.anchor = unit([0.0, 1.0, f32::from(index), 0.0, 0.0, 1.0]);
     store.put(&written).await.unwrap();
     stored.push(written);
   }
@@ -614,6 +624,30 @@ async fn scanning<S: VectorStore + Scan>(store: &S, other_layout: &S) {
       Entry::Unreadable { .. } => panic!("everything here can be read: {entry:?}"),
     }
   }
+  // Asked for the anchors, a scan lists the same records in the same order, each with the anchor a read of it
+  // gives. A record of another layout is still only named: its anchor means nothing here.
+  for limit in [3, 100] {
+    let anchored = scanned_with(store, None, limit, Read::Anchor).await;
+    assert_eq!(anchored.len(), whole.len());
+    for (with, without) in anchored.iter().zip(&whole) {
+      match (with, without) {
+        (Entry::Record(with), Entry::Record(without)) => {
+          let read = store.get(&with.id).await.unwrap().unwrap();
+          assert_same_direction(with.anchor.as_deref().unwrap(), &read.anchor);
+          assert_eq!(without.anchor, None, "a scan reads no vector it was not asked for");
+          assert_eq!(
+            ScannedRecord {
+              anchor: None,
+              ..with.clone()
+            },
+            *without
+          );
+        }
+        (with, without) => assert_eq!(with, without),
+      }
+    }
+  }
+
   let even = whole
     .iter()
     .find_map(|entry| match entry {
@@ -642,7 +676,7 @@ async fn scanning<S: VectorStore + Scan>(store: &S, other_layout: &S) {
   // A scan is not a snapshot, and the store is written to between its pages. Here: a record already listed is
   // deleted, the very record the next page starts at is deleted, one further on is rewritten, and one is
   // created.
-  let first = store.scan(None, 4).await.unwrap();
+  let first = store.scan(None, 4, Read::Payload).await.unwrap();
   let seen: Vec<String> = first.entries.iter().map(|entry| id_of(entry).to_owned()).collect();
   assert_eq!(seen, order[..4]);
   let (gone_seen, gone_unseen) = (order[0].clone(), order[4].clone());
@@ -733,8 +767,8 @@ impl VectorStore for SharedMemory {
 }
 
 impl Scan for SharedMemory {
-  async fn scan(&self, from: Option<&Cursor>, limit: usize) -> similarity_store::Result<Page> {
-    self.with(async |store| store.scan(from, limit).await).await
+  async fn scan(&self, from: Option<&Cursor>, limit: usize, read: Read) -> similarity_store::Result<Page> {
+    self.with(async |store| store.scan(from, limit, read).await).await
   }
 }
 
@@ -1131,7 +1165,7 @@ async fn opening_a_collection_changes_nothing_about_it_and_lists_what_it_holds()
   let opened = QdrantStore::open(&settings, LAYOUT, DIM).await;
   let indexes = indexed_fields(&settings).await;
   let listed = match &opened {
-    Ok(opened) => Some(opened.scan(None, 10).await),
+    Ok(opened) => Some(opened.scan(None, 10, Read::Payload).await),
     Err(_) => None,
   };
   let wrong_width = QdrantStore::open(&settings, LAYOUT, DIM + 1).await;

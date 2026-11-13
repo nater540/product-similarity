@@ -26,7 +26,7 @@ use std::io::BufRead;
 use anyhow::Context;
 use serde::Deserialize;
 use similarity_core::Schema;
-use similarity_store::{Entry, Scan};
+use similarity_store::{Entry, Read, Scan};
 
 use crate::import::{self, ImportLine};
 
@@ -251,7 +251,7 @@ pub async fn run<S: Scan>(
   let mut from = None;
   loop {
     let page = store
-      .scan(from.as_ref(), options.page_records.max(1))
+      .scan(from.as_ref(), options.page_records.max(1), Read::Payload)
       .await
       .with_context(|| {
         format!(
@@ -708,9 +708,9 @@ mod tests {
   struct Failing(MemoryStore);
 
   impl Scan for Failing {
-    async fn scan(&self, from: Option<&Cursor>, limit: usize) -> similarity_store::Result<Page> {
+    async fn scan(&self, from: Option<&Cursor>, limit: usize, read: Read) -> similarity_store::Result<Page> {
       match from {
-        None => self.0.scan(None, limit).await,
+        None => self.0.scan(None, limit, read).await,
         Some(_) => Err(StoreError::Unavailable("connection reset".to_owned())),
       }
     }

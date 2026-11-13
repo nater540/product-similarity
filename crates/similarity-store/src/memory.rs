@@ -11,8 +11,8 @@ use std::sync::RwLock;
 use similarity_core::vector::cosine;
 
 use crate::{
-  Cursor, Entry, Expected, Found, Neighbor, Page, Result, Scan, ScannedRecord, SearchQuery, StoreError, StoredRecord,
-  VectorStore, Version,
+  Cursor, Entry, Expected, Found, Neighbor, Page, Read, Result, Scan, ScannedRecord, SearchQuery, StoreError,
+  StoredRecord, VectorStore, Version,
 };
 
 /// A [`VectorStore`] that keeps everything in memory.
@@ -176,7 +176,7 @@ impl VectorStore for MemoryStore {
 impl Scan for MemoryStore {
   /// In the order of the records' ids. The map has no order of its own, so every page sorts the ids that are
   /// left: fine for what this store is for, and it leaves the map the requests use as it was.
-  async fn scan(&self, from: Option<&Cursor>, limit: usize) -> Result<Page> {
+  async fn scan(&self, from: Option<&Cursor>, limit: usize, read: Read) -> Result<Page> {
     if limit == 0 {
       return Err(StoreError::Invalid(
         "a scan needs a page of at least one entry".to_owned(),
@@ -197,7 +197,10 @@ impl Scan for MemoryStore {
       .filter_map(|id| records.get(id))
       .map(|(layout, record)| {
         if *layout == self.layout {
-          Entry::Record(ScannedRecord::from(record))
+          Entry::Record(ScannedRecord {
+            anchor: (read == Read::Anchor).then(|| record.anchor.clone()),
+            ..ScannedRecord::from(record)
+          })
         } else {
           Entry::OtherLayout {
             id: record.id.clone(),

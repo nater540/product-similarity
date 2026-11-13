@@ -242,10 +242,20 @@ pub trait VectorStore: Send + Sync + 'static {
   fn search_vectors(&self, query: SearchQuery<'_>) -> impl Future<Output = Result<Vec<Found>>> + Send;
 }
 
-/// A stored record as a scan lists it: everything but its vectors.
-///
-/// A scan is for comparing what is stored with what should be, by fingerprint and by number. The two composites
-/// are most of a record's size and no part of that comparison, so a scan does not read them.
+/// Which of a record's vectors a scan reads. They are most of a record's size, so a scan reads none it was not
+/// asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Read {
+  /// Neither: what is stored beside the vectors is enough to compare a record with what it should be, by
+  /// fingerprint and by number.
+  Payload,
+  /// The anchor as well: the one thing a store holds that nothing else can give back, for whoever keeps a copy
+  /// of it. The current composite is never read by a scan: it can be made again from the record's text.
+  Anchor,
+}
+
+/// A stored record as a scan lists it: everything but its current composite, and its anchor only when the scan
+/// was asked for it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScannedRecord {
   /// [`StoredRecord::id`].
@@ -262,8 +272,11 @@ pub struct ScannedRecord {
   pub revision: u64,
   /// [`StoredRecord::updated_at`].
   pub updated_at: u64,
+  /// [`StoredRecord::anchor`], if the scan read it ([`Read::Anchor`]).
+  pub anchor: Option<Vec<f32>>,
 }
 
+/// A record as a scan that reads no vector lists it.
 impl From<&StoredRecord> for ScannedRecord {
   fn from(record: &StoredRecord) -> Self {
     Self {
@@ -274,6 +287,7 @@ impl From<&StoredRecord> for ScannedRecord {
       anchor_quantities: record.anchor_quantities.clone(),
       revision: record.revision,
       updated_at: record.updated_at,
+      anchor: None,
     }
   }
 }
@@ -322,18 +336,19 @@ pub struct Page {
 /// that is created or deleted while the scan runs may be listed or not. No record is ever listed twice.
 pub trait Scan: Send + Sync + 'static {
   /// The next page of at most `limit` entries, from the start of the store (`None`) or from where the last page
-  /// said to go on ([`Page::next`]).
+  /// said to go on ([`Page::next`]), with the vectors `read` asks for.
   ///
   /// # Errors
   ///
   /// [`StoreError::Invalid`] if `limit` is zero, [`StoreError::Unavailable`] if the store cannot be read. A
-  /// single entry that cannot be read is not an error: it is an [`Entry::Unreadable`].
-  fn scan(&self, from: Option<&Cursor>, limit: usize) -> impl Future<Output = Result<Page>> + Send;
+  /// single entry that cannot be read is not an error: it is an [`Entry::Unreadable`], and so is a record whose
+  /// anchor was asked for and is not there.
+  fn scan(&self, from: Option<&Cursor>, limit: usize, read: Read) -> impl Future<Output = Result<Page>> + Send;
 }
 
 impl<S: Scan> Scan for Arc<S> {
-  fn scan(&self, from: Option<&Cursor>, limit: usize) -> impl Future<Output = Result<Page>> + Send {
-    self.as_ref().scan(from, limit)
+  fn scan(&self, from: Option<&Cursor>, limit: usize, read: Read) -> impl Future<Output = Result<Page>> + Send {
+    self.as_ref().scan(from, limit, read)
   }
 }
 
