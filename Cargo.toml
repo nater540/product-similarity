@@ -90,6 +90,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.10"
 # Qdrant point ids must be an integer or a UUID; record ids are arbitrary strings, so they are mapped through UUIDv5.
 uuid = { version = "1", features = ["v5"] }
+# A backup of anchors keeps each vector as its bytes, in base64: the numbers that were stored, exactly, in a
+# line of text. The version is the one tonic already brings in.
+base64 = "0.22"
 # `model fetch` only: a blocking, dependency-light HTTPS client, so no second async HTTP stack in the binary.
 ureq = "3"
 
