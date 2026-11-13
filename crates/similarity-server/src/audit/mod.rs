@@ -31,6 +31,7 @@ use similarity_store::{Entry, Scan};
 use crate::import::{self, ImportLine};
 
 pub mod compare;
+pub mod report;
 
 pub use compare::{Difference, Expected, Finding, Kind, Summary, compare};
 
