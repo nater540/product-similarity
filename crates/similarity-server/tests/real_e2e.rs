@@ -24,9 +24,10 @@ use std::sync::Arc;
 use similarity_core::{Device, Embedder};
 use similarity_proto::v1 as pb;
 use similarity_proto::v1::record_similarity_client::RecordSimilarityClient;
+use similarity_server::anchors;
 use similarity_server::audit::{self, Kind};
 use similarity_server::config::Config;
-use similarity_server::engine::{Engine, EvaluateInput, RecordInput, WriteMode, store_layout};
+use similarity_server::engine::{Engine, EvaluateInput, RecordInput, Restored, WriteMode, store_layout};
 use similarity_server::import::{self, Options, Summary};
 use similarity_server::worker::{DirectEmbedder, EmbedWorker};
 use similarity_store::{QdrantStore, VectorStore};
@@ -639,6 +640,127 @@ async fn an_imported_catalog_audits_clean_in_qdrant_and_what_is_done_to_it_after
   })
   .await;
 
+  store.delete_collection().await.unwrap();
+  outcome.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs ./models/mdbr-leaf-mt and a Qdrant server at $QDRANT_URL; run with `just test-real`"]
+async fn anchors_backed_up_from_qdrant_are_restored_to_a_catalog_that_was_lost_and_imported_again() {
+  let lines = |with_originals: bool| {
+    [
+      export_line("sku-1", "Blueberry Gummies 100mg", None),
+      export_line(
+        "sku-2",
+        "Blueberry Gummies 100mg (Indica)",
+        with_originals.then_some("Blueberry Gummies"),
+      ),
+      export_line("sku-3", "Raspberry Gummies 100mg", None),
+    ]
+    .join("\n")
+  };
+  let options = Options {
+    batch_records: 2,
+    stop_on_error: false,
+  };
+
+  // A collection whose second record has come some way from what it was created as, and a backup of it, taken
+  // from the collection opened the way the command opens it.
+  let before = importing("anchors_before").await;
+  let (backup, had) = {
+    let Importing {
+      engine,
+      store,
+      config,
+      layout: (layout, dimension),
+    } = before;
+    let settings = config.qdrant.settings(std::env::var("QDRANT_API_KEY").ok());
+    let outcome = tokio::spawn(async move {
+      import::run(&engine, lines(true).as_bytes(), options, |_| {}, |_| {})
+        .await
+        .unwrap();
+      let opened = QdrantStore::open(&settings, layout.as_str(), dimension).await.unwrap();
+      let header = anchors::file::Header {
+        format: anchors::file::FORMAT,
+        fingerprint: "the pinned model".to_owned(),
+        layout,
+        dimension,
+        collection: settings.collection.clone(),
+        taken_at: 1_794_591_798,
+      };
+      let (bytes, exported) = anchors::export(&opened, &header, Vec::new(), 2, |_, _| {}, |_| {})
+        .await
+        .unwrap();
+      assert_eq!(
+        (exported.records, exported.other_layout, exported.unreadable),
+        (3, 0, 0)
+      );
+      (bytes, opened.get("sku-2").await.unwrap().unwrap())
+    })
+    .await;
+    // The collection is lost, here on purpose.
+    store.delete_collection().await.unwrap();
+    outcome.unwrap()
+  };
+  assert!(
+    similarity_core::vector::cosine(&had.anchor, &had.vectors.composite).unwrap() < 0.999,
+    "the record had come some way from its anchor"
+  );
+
+  // A new collection, loaded from a database that knows what each product is and not what it was.
+  let Importing {
+    engine,
+    store,
+    layout: (layout, dimension),
+    ..
+  } = importing("anchors_after").await;
+  let reader = store.clone();
+  let outcome = tokio::spawn(async move {
+    import::run(&engine, lines(false).as_bytes(), options, |_| {}, |_| {})
+      .await
+      .unwrap();
+    let imported = reader.get("sku-2").await.unwrap().unwrap();
+    assert!(similarity_core::vector::cosine(&imported.anchor, &imported.vectors.composite).unwrap() > 0.9999);
+
+    let restore = || async {
+      let mut told = Vec::new();
+      let summary = anchors::restore(
+        &engine,
+        (&layout, dimension),
+        || Ok(backup.as_slice()),
+        true,
+        |id, outcome| told.push((id.to_owned(), *outcome.as_ref().unwrap())),
+        |_| {},
+      )
+      .await
+      .unwrap();
+      told.sort();
+      (summary, told)
+    };
+    let (summary, told) = restore().await;
+    assert_eq!(
+      told,
+      [
+        ("sku-1".to_owned(), Restored::Already),
+        ("sku-2".to_owned(), Restored::Restored),
+        ("sku-3".to_owned(), Restored::Already),
+      ],
+      "an anchor that went into Qdrant and came back is still told from one that did not move"
+    );
+    assert_eq!((summary.records, summary.failed), (3, 0));
+
+    // The anchor is the one the lost collection held, through a file and two round trips to Qdrant.
+    let restored = reader.get("sku-2").await.unwrap().unwrap();
+    assert!(similarity_core::vector::cosine(&restored.anchor, &had.anchor).unwrap() > 0.999_999);
+    assert_eq!(restored.anchor_quantities, had.anchor_quantities);
+    assert_eq!((restored.revision, &restored.vectors.hashes), (2, &had.vectors.hashes));
+    let (_, again) = restore().await;
+    assert!(
+      again.iter().all(|(_, outcome)| *outcome == Restored::Already),
+      "{again:?}"
+    );
+  })
+  .await;
   store.delete_collection().await.unwrap();
   outcome.unwrap();
 }
