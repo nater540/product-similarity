@@ -702,14 +702,14 @@ holds vectors and fingerprints, no text, and brand ids.
 
 ### 26. Operational metrics
 
-**Built** (D39), on the `metrics` crate and its Prometheus exporter, behind a typed front so that label values
-stay words fixed in one file. (A first version was written by hand and replaced the same day: the owner would
-rather depend on a maintained crate than maintain one.) It is off, and nothing is counted, until
-`metrics.listen` is set. Verdicts are counted with the write mode asked for, and requests that were dropped
-because their caller gave up are counted as `CANCELLED`. A request's waits (D40) are histograms and `tracing`
-spans. The same counts can be pushed to an OpenTelemetry collector over gRPC (`metrics.otlp_endpoint`). Both
-routes were run against Prometheus and an OpenTelemetry Collector in Docker (`just observe-up`) and agreed; a
-Datadog Agent has not been tried.
+**Built** (D39 and D40), and not as proposed below. What was built is a trace of every request (the call, and
+inside it what it waited for: its record's lock, the store, the model) and six metrics for what no trace shows,
+all as OpenTelemetry, sent to a collector over gRPC (`telemetry.otlp_endpoint`); the metrics can be served as a
+Prometheus page as well (`telemetry.metrics_listen`). It is off until asked for. (A first version was written
+by hand and a second used the `metrics` crate with a bridge to OpenTelemetry; both were replaced the same day:
+the owner would rather depend on maintained crates, and found the trace of a request worth more than counts.)
+It was run against an OpenTelemetry Collector, Jaeger, and Prometheus in Docker (`just observe-up`); a Datadog
+Agent has not been tried.
 
 **What.** A small HTTP endpoint in Prometheus text format: request counts and latency by call and status, the
 embedding queue's depth and wait, texts per forward pass, the share of time the model is busy, refusals for

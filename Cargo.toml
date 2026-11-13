@@ -55,20 +55,20 @@ tokio-stream = { version = "0.1", default-features = false }
 # The metrics endpoint is one HTTP/1.1 route (docs/decisions.md, D39). Already in the tree through `tonic`, which
 # routes with it; these two features are the listener and the protocol a scraper speaks.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
-# What the server counts about itself goes through the `metrics` facade, and the Prometheus exporter renders it
-# (docs/decisions.md, D39). No default features: the exporter's own HTTP listener and push gateway are not used.
-metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.18", default-features = false }
-# The same counts pushed to an OpenTelemetry collector over gRPC (OTLP), for a deployment that has one. The bridge
-# from `metrics` is built against OpenTelemetry 0.31, so that is the version of all three; its gRPC client is the
-# `tonic` already here.
-# `internal-logs`: a collector that cannot be reached is said through `tracing`, like everything else here.
-metrics-exporter-otel = "0.3"
-opentelemetry = { version = "0.31", default-features = false, features = ["metrics", "internal-logs"] }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = ["metrics", "internal-logs"] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["metrics", "grpc-tonic", "internal-logs"] }
-# The collector's side of OTLP, for the test that receives what the server sends.
-opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "metrics"] }
+# Telemetry (docs/decisions.md, D39 and D40), all of it OpenTelemetry's: its API and SDK for the few metrics and
+# for traces, its two exporters (OTLP over gRPC to a collector, whose client is the `tonic` already here, and a
+# Prometheus page), `tracing-opentelemetry` to make `tracing` spans its spans, and the tonic layer that starts a
+# span for each call and takes the caller's trace from the request. `internal-logs`: a collector that cannot be
+# reached is said through `tracing`, like everything else here.
+opentelemetry = { version = "0.33", default-features = false, features = ["metrics", "trace", "internal-logs"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "trace", "internal-logs"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["metrics", "trace", "grpc-tonic", "internal-logs"] }
+opentelemetry-prometheus = { version = "0.33", default-features = false }
+prometheus = { version = "0.14", default-features = false }
+tracing-opentelemetry = { version = "0.34", default-features = false }
+tonic-tracing-opentelemetry = "0.42"
+# A collector for tests: it receives over gRPC what a server sends and hands it to the test.
+fake-opentelemetry-collector = "0.42"
 
 # The default features pull in `reqwest` for snapshot downloads, which this service never does.
 qdrant-client = { version = "1.20", default-features = false }

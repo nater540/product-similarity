@@ -1182,6 +1182,7 @@ fn main() -> ExitCode {
   similarity_log::init_with(Init {
     record,
     results_on_stdout: true,
+    tracing: None,
   });
   match (&run, unopened) {
     (Some(run), None) => tracing::info!(run = run.id(), dir = %run.dir().display(), "run recorded"),

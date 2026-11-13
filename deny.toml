@@ -32,6 +32,9 @@ allow = [
   "CDLA-Permissive-2.0",
   "MPL-2.0",
   "BSL-1.0",
+  # A public-domain dedication: no conditions on use, closed-source included, and no patent grant either. Allowed
+  # by the owner on 2026-11-12 for the tonic tracing middleware (`tonic-tracing-opentelemetry` and its SDK crate).
+  "CC0-1.0",
 ]
 confidence-threshold = 0.9
 

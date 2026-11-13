@@ -21,7 +21,6 @@
 use std::fmt;
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use similarity_core::matching::{self, Candidate, Decision, Ranked};
@@ -427,7 +426,7 @@ struct Delivery<T> {
   call: &'static str,
   id: String,
   /// Counts every line this writes, for a monitoring system that does not read logs.
-  unanswered: Arc<AtomicU64>,
+  metrics: Arc<Metrics>,
 }
 
 impl<T> Delivery<T> {
@@ -465,18 +464,8 @@ impl<T> Drop for Delivery<T> {
         "a write failed after the request that asked for it had gone, and may or may not have been applied"
       ),
     }
-    self.unanswered.fetch_add(1, Ordering::Relaxed);
+    self.metrics.write_unanswered();
   }
-}
-
-/// The engine's writes, as a monitoring system is told about them ([`Engine::writes`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Writes {
-  /// On their way to the store right now.
-  pub in_flight: u64,
-  /// Finished, or failed, after the request that asked for them had gone, since the engine was made. Each has a
-  /// log line.
-  pub unanswered: u64,
 }
 
 /// Counts a write as in flight for as long as it exists.
@@ -510,9 +499,8 @@ pub struct Engine<S, E> {
   lock_hasher: RandomState,
   /// How many writes are in flight.
   writes: watch::Sender<usize>,
-  /// How many writes ended with nobody to tell.
-  unanswered: Arc<AtomicU64>,
-  /// Where the wait for a record's lock is counted. Nothing is kept unless a server asks ([`Self::with_metrics`]).
+  /// Where a write that ended with nobody to tell is counted. Kept nowhere unless a server asks
+  /// ([`Self::with_metrics`]).
   metrics: Arc<Metrics>,
 }
 
@@ -575,7 +563,6 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       locks: (0..LOCK_STRIPES).map(|_| Arc::new(Mutex::new(()))).collect(),
       lock_hasher: RandomState::new(),
       writes: watch::Sender::new(0),
-      unanswered: Arc::default(),
       metrics: Arc::new(Metrics::discarded()),
     }
   }
@@ -599,7 +586,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     self
   }
 
-  /// The same engine, counting into `metrics` what only it can see: how long requests wait for a record's lock.
+  /// The same engine, counting into `metrics` what only it can see: the writes that end with nobody to tell.
   #[must_use]
   pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
     self.metrics = metrics;
@@ -650,14 +637,13 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       .ok_or_else(|| EngineError::Internal("lock stripe out of range".to_owned()))
   }
 
-  /// Waits for the record's lock, and says how long that took: a wait here is another request, in this process,
-  /// for a record that picks the same lock.
+  /// Waits for the record's lock. The wait is a span in the request's trace: it is another request, in this
+  /// process, for a record that picks the same lock.
   async fn hold(&self, id: &str) -> Result<Held, EngineError> {
     let lock = Arc::clone(self.lock_for(id)?);
-    let asked = std::time::Instant::now();
-    let held = lock.lock_owned().instrument(tracing::debug_span!("lock")).await;
-    self.metrics.lock_waited(asked.elapsed());
-    Ok(Arc::new(held))
+    Ok(Arc::new(
+      lock.lock_owned().instrument(tracing::debug_span!("lock")).await,
+    ))
   }
 
   /// Runs `write` to its end and returns what it returns, whether or not this request is still there to be told.
@@ -675,7 +661,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     W: Future<Output = Result<(T, Change), EngineError>> + Send + 'static,
   {
     let (held, in_flight) = (Arc::clone(held), InFlight::begin(&self.writes));
-    let (delivery_id, unanswered) = (id.to_owned(), Arc::clone(&self.unanswered));
+    let (delivery_id, metrics) = (id.to_owned(), Arc::clone(&self.metrics));
     let writing = async move {
       let result = write.await;
       // The lock goes before the count does, and both before the result can be seen: a request that waited for
@@ -686,7 +672,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
         result: Some(result),
         call,
         id: delivery_id,
-        unanswered,
+        metrics,
       }
     };
     // On a task of its own, and still part of the request to anybody tracing it.
@@ -699,14 +685,6 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       Err(stopped) => Err(EngineError::Internal(format!(
         "the write of record `{id}` did not run to its end, and may or may not have been applied: {stopped}"
       ))),
-    }
-  }
-
-  /// How many writes are in flight, and how many have ended with nobody to tell.
-  pub fn writes(&self) -> Writes {
-    Writes {
-      in_flight: u64::try_from(*self.writes.borrow()).unwrap_or(u64::MAX),
-      unanswered: self.unanswered.load(Ordering::Relaxed),
     }
   }
 
@@ -1486,13 +1464,14 @@ pub(crate) mod racing {
 mod tests {
   use std::pin::Pin;
   use std::sync::Arc;
-  use std::time::Duration;
 
   use similarity_core::{FieldSpec, QuantitySpec};
   use similarity_store::{Found, MemoryStore, Version};
 
   use super::racing::Raced;
   use super::*;
+  use crate::telemetry::Telemetry;
+  use crate::telemetry::testing::paged;
   use crate::worker::testing::WordBagEmbedder;
 
   type TestEngine = Engine<MemoryStore, WordBagEmbedder>;
@@ -4282,7 +4261,7 @@ mod tests {
 
   type GatedEngine = Engine<Pausing, WordBagEmbedder>;
 
-  fn gated() -> (GatedEngine, Arc<Recorder>) {
+  fn gated() -> (GatedEngine, Arc<Recorder>, Telemetry) {
     let embedder = WordBagEmbedder::new("word-bag-v1");
     let (layout, dimension) = store_layout(&schema(), &embedder);
     let store = Pausing {
@@ -4292,8 +4271,16 @@ mod tests {
       failing: std::sync::atomic::AtomicBool::new(false),
     };
     let recorder = Arc::new(Recorder::default());
-    let engine = Engine::new(store, embedder, schema(), Policy::new(0.75, None).unwrap());
-    (engine.with_observer(recorder.clone()), recorder)
+    let counted = paged();
+    let engine = Engine::new(store, embedder, schema(), Policy::new(0.75, None).unwrap())
+      .with_metrics(counted.metrics())
+      .with_observer(recorder.clone());
+    (engine, recorder, counted)
+  }
+
+  /// How many writes have been counted as ended with nobody to tell.
+  fn unanswered(counted: &Telemetry) -> Option<f64> {
+    crate::telemetry::testing::counted(counted, crate::metrics::UNANSWERED_WRITES)
   }
 
   /// Runs `scene` on one thread and returns the warnings it logged. A write that outlives its request has
@@ -4370,7 +4357,7 @@ mod tests {
   /// and is judged against what the write left, so a retry of the same content is answered "unchanged".
   #[test]
   fn a_write_whose_request_has_gone_is_finished_observed_and_logged() {
-    let (engine, recorder) = gated();
+    let (engine, recorder, counted) = gated();
     let logged = warnings(async {
       let store = Arc::clone(&engine.store);
       store.open();
@@ -4393,11 +4380,9 @@ mod tests {
       let mut settled = Box::pin(engine.settled());
       assert!(still_waiting(&mut settled).await, "and it counts as in flight");
       assert_eq!(
-        engine.writes(),
-        Writes {
-          in_flight: 1,
-          unanswered: 0
-        }
+        unanswered(&counted),
+        Some(0.0),
+        "there from the start, and not counted before it is true"
       );
 
       store.open();
@@ -4407,14 +4392,7 @@ mod tests {
       assert_eq!(told.len(), 2);
       assert_eq!((told[1].stored, told[1].revision), (true, 2));
 
-      assert_eq!(
-        engine.writes(),
-        Writes {
-          in_flight: 0,
-          unanswered: 1
-        },
-        "counted where the line is written"
-      );
+      assert_eq!(unanswered(&counted), Some(1.0), "counted where the line is written");
       let retried = ended(&mut retry).await.unwrap();
       assert_eq!(
         (retried.verdict, retried.stored, retried.revision),
@@ -4434,7 +4412,7 @@ mod tests {
   /// delete.
   #[test]
   fn a_create_an_import_and_a_delete_each_outlive_their_request() {
-    let (engine, recorder) = gated();
+    let (engine, recorder, counted) = gated();
     let logged = warnings(async {
       let store = Arc::clone(&engine.store);
       dropped_mid_write(&store, engine.evaluate(evaluate_input(Some("p1"), &GUMMIES))).await;
@@ -4456,7 +4434,7 @@ mod tests {
       store.open();
       all_written(&engine).await;
       assert_eq!(store.inner.get("p1").await.unwrap(), None);
-      assert_eq!(engine.writes().unanswered, 3);
+      assert_eq!(unanswered(&counted), Some(3.0));
     });
     let said: Vec<_> = logged
       .iter()
@@ -4485,7 +4463,7 @@ mod tests {
   /// line is for the writes nobody was told about, and has to be rare enough to be read.
   #[test]
   fn a_write_whose_request_is_still_there_logs_nothing() {
-    let (engine, _) = gated();
+    let (engine, _, counted) = gated();
     let logged = warnings(async {
       engine.store.open_wide();
       engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
@@ -4495,13 +4473,7 @@ mod tests {
         .unwrap();
       assert!(engine.delete("p1".to_owned(), None).await.unwrap());
       all_written(&engine).await;
-      assert_eq!(
-        engine.writes(),
-        Writes {
-          in_flight: 0,
-          unanswered: 0
-        }
-      );
+      assert_eq!(unanswered(&counted), Some(0.0));
     });
     assert_eq!(logged, Vec::<serde_json::Value>::new());
   }
@@ -4510,7 +4482,7 @@ mod tests {
   /// finish, nobody to tell, and nothing to log.
   #[test]
   fn a_request_dropped_before_it_writes_leaves_nothing_behind() {
-    let (engine, recorder) = gated();
+    let (engine, recorder, counted) = gated();
     let logged = warnings(async {
       {
         let mut reading = Box::pin(engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)));
@@ -4527,6 +4499,7 @@ mod tests {
       assert_eq!(engine.store.arrived(), 0, "no write was started");
       assert_eq!(engine.store.inner.get("p1").await.unwrap(), None);
       assert_eq!(recorder.told(), []);
+      assert_eq!(unanswered(&counted), Some(0.0));
 
       // The record's lock went with the request: the next one is not kept waiting.
       engine.store.open_wide();
@@ -4541,7 +4514,7 @@ mod tests {
   /// hold it or not, and the line says exactly that, so that whoever reads it knows which record to look at.
   #[test]
   fn a_write_that_fails_after_its_request_has_gone_is_logged_as_unknown() {
-    let (engine, recorder) = gated();
+    let (engine, recorder, counted) = gated();
     let logged = warnings(async {
       let store = Arc::clone(&engine.store);
       store.fail();
@@ -4549,7 +4522,7 @@ mod tests {
       store.open();
       all_written(&engine).await;
       assert_eq!(recorder.told(), [], "a write that failed is not an outcome");
-      assert_eq!(engine.writes().unanswered, 1, "nobody was told of this one either");
+      assert_eq!(unanswered(&counted), Some(1.0), "nobody was told of this one either");
     });
     assert_eq!(logged.len(), 1, "{logged:?}");
     let line = &logged[0];
@@ -4568,7 +4541,7 @@ mod tests {
   /// gone there is no second attempt, nobody to tell, and nothing worth a line.
   #[test]
   fn a_write_that_loses_its_race_after_its_request_has_gone_says_nothing() {
-    let (engine, recorder) = gated();
+    let (engine, recorder, counted) = gated();
     let logged = warnings(async {
       let store = Arc::clone(&engine.store);
       store.open();
@@ -4585,8 +4558,8 @@ mod tests {
       assert_eq!(store.inner.get("p1").await.unwrap().unwrap(), theirs);
       assert_eq!(recorder.told().len(), 1, "only the creation");
       assert_eq!(
-        engine.writes().unanswered,
-        0,
+        unanswered(&counted),
+        Some(0.0),
         "nothing changed, so there was nothing to tell"
       );
     });
@@ -4597,100 +4570,13 @@ mod tests {
   /// line about a request that had gone.
   #[tokio::test]
   async fn a_write_that_fails_is_the_requests_error_while_the_request_is_there() {
-    let (engine, recorder) = gated();
+    let (engine, recorder, counted) = gated();
     engine.store.fail();
     engine.store.open_wide();
     let error = engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap_err();
     assert!(matches!(error, EngineError::Unavailable(_)), "{error:?}");
     assert_eq!(recorder.told(), []);
     all_written(&engine).await;
-  }
-
-  // ---- What only the engine can count (D39) -------------------------------------------------------------------
-
-  /// A store that takes a while to read and to write, so that a request for a record is still being served
-  /// when the next one for it arrives.
-  struct Sleepy(MemoryStore);
-
-  const TAKES: Duration = Duration::from_millis(20);
-
-  impl VectorStore for Sleepy {
-    async fn check(&self) -> Result<(), StoreError> {
-      self.0.check().await
-    }
-
-    async fn get(&self, id: &str) -> Result<Option<StoredRecord>, StoreError> {
-      tokio::time::sleep(TAKES).await;
-      self.0.get(id).await
-    }
-
-    async fn put(&self, record: &StoredRecord) -> Result<(), StoreError> {
-      self.0.put(record).await
-    }
-
-    async fn put_if(&self, record: &StoredRecord, expected: Expected) -> Result<bool, StoreError> {
-      tokio::time::sleep(TAKES).await;
-      self.0.put_if(record, expected).await
-    }
-
-    async fn delete(&self, id: &str) -> Result<bool, StoreError> {
-      self.0.delete(id).await
-    }
-
-    async fn delete_if(&self, id: &str, version: Version) -> Result<bool, StoreError> {
-      self.0.delete_if(id, version).await
-    }
-
-    async fn search(&self, query: SearchQuery<'_>) -> Result<Vec<Neighbor>, StoreError> {
-      self.0.search(query).await
-    }
-
-    async fn search_vectors(&self, query: SearchQuery<'_>) -> Result<Vec<Found>, StoreError> {
-      self.0.search_vectors(query).await
-    }
-  }
-
-  /// The wait for a record's lock is counted, once for every request that takes one, and it is the wait: a
-  /// request that found its record free waited no time, and one that arrived while another was being served
-  /// waited for that one's read and write.
-  #[tokio::test]
-  async fn the_wait_for_a_records_lock_is_counted() {
-    let embedder = WordBagEmbedder::new("word-bag-v1");
-    let (layout, dimension) = store_layout(&schema(), &embedder);
-    let metrics = Arc::new(Metrics::exported("word-bag-v1").unwrap());
-    let engine = Engine::new(
-      Sleepy(MemoryStore::new(layout, dimension)),
-      embedder,
-      schema(),
-      Policy::new(0.75, None).unwrap(),
-    )
-    .with_metrics(Arc::clone(&metrics));
-    let waited = |series: &str| -> f64 {
-      let page = metrics.render(&crate::metrics::Polled::default());
-      let series = format!("record_similarity_lock_wait_seconds_{series} ");
-      page
-        .lines()
-        .find_map(|line| line.strip_prefix(&series)?.parse().ok())
-        .unwrap_or(f64::NAN)
-    };
-
-    engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
-    assert!((waited("count") - 1.0).abs() < f64::EPSILON);
-    assert!(waited("sum") < TAKES.as_secs_f64(), "nobody else had the record");
-
-    let (first, second) = tokio::join!(
-      engine.evaluate(evaluate_input(Some("p2"), &GUMMIES)),
-      engine.evaluate(evaluate_input(Some("p2"), &GUMMIES_EDITED)),
-    );
-    assert_eq!(first.unwrap().verdict, Verdict::Created);
-    assert_eq!(second.unwrap().verdict, Verdict::Accepted);
-    assert!((waited("count") - 3.0).abs() < f64::EPSILON);
-    assert!(
-      waited("sum") >= (TAKES + TAKES).as_secs_f64(),
-      "the second waited for the first to read and to write"
-    );
-    // A request with no id takes no lock, and is not counted as having waited for one.
-    engine.evaluate(evaluate_input(None, &GUMMIES)).await.unwrap();
-    assert!((waited("count") - 3.0).abs() < f64::EPSILON);
+    assert_eq!(unanswered(&counted), Some(0.0), "the request was told");
   }
 }

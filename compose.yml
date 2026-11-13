@@ -2,9 +2,10 @@
 #
 #   docker compose up -d qdrant                  # just the vector store, for `cargo run` and the ignored tests
 #   docker compose --profile server up --build   # the server too, built from this checkout
-#   docker compose --profile observability up -d # Prometheus and an OpenTelemetry Collector, to watch a server
+#   docker compose --profile observability up -d # a Collector, Jaeger, and Prometheus, to watch a server
 #
-# Qdrant's dashboard is at http://localhost:6333/dashboard, and Prometheus is at http://localhost:9090.
+# Qdrant's dashboard is at http://localhost:6333/dashboard, Jaeger (traces) is at http://localhost:16686, and
+# Prometheus (metrics) is at http://localhost:9090.
 
 services:
   qdrant:
@@ -25,8 +26,8 @@ services:
     environment:
       RUST_LOG: info
 
-  # What a server's metrics are sent to and read by (README, "Metrics"; `just observe-up`). The server itself
-  # runs on this machine, with `metrics.listen` and `metrics.otlp_endpoint` set.
+  # What a server's traces and metrics are sent to and read by (README, "Telemetry"; `just observe-up`). The
+  # server itself runs on this machine, with `telemetry.otlp_endpoint` and `telemetry.metrics_listen` set.
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.130.0
     profiles: ["observability"]
@@ -34,13 +35,21 @@ services:
     volumes:
       - ./deploy/observability/otel-collector.yml:/etc/otel-collector.yml:ro
     ports:
-      - "127.0.0.1:4317:4317" # OTLP over gRPC, which the server pushes to
+      - "127.0.0.1:4317:4317" # OTLP over gRPC, which the server sends to
+
+  # Keeps the traces the collector passes on, in memory, and shows them.
+  jaeger:
+    image: jaegertracing/jaeger:2.8.0
+    profiles: ["observability"]
+    ports:
+      - "127.0.0.1:16686:16686" # the web page and the query API
 
   prometheus:
     image: prom/prometheus:v3.5.0
     profiles: ["observability"]
     depends_on:
       - otel-collector
+      - jaeger
     volumes:
       - ./deploy/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:

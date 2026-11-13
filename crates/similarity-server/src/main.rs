@@ -30,12 +30,12 @@ use similarity_server::engine::{Engine, store_layout};
 use similarity_server::fetch::{self, FetchRequest};
 use similarity_server::import::{self, Failure, Summary};
 use similarity_server::load;
-use similarity_server::metrics::{Measured, Metrics, Polled};
 use similarity_server::offline::events::{self, Run};
 use similarity_server::offline::{self, Confidence, Offline, RecordFields, Selection, diff};
 use similarity_server::registry::{self, Registry};
 use similarity_server::runs;
 use similarity_server::shadow::{self, PolicyShadow};
+use similarity_server::telemetry::{self, Telemetry, Traced};
 use similarity_server::worker::{DirectEmbedder, EmbedWorker, TextEmbedder};
 use similarity_store::{MemoryStore, QdrantStore, VectorStore};
 
@@ -579,74 +579,29 @@ async fn stop_signals(asked: tokio::sync::mpsc::Sender<Stop>) {
   }
 }
 
-/// Keeps the server's counts going wherever the configuration sends them, and returns the task that does it
-/// until it is aborted: the page at `/metrics` if there is an address for one, and, every few seconds, the
-/// counts that are kept elsewhere brought up to date for a collector that is pushed to and never asks.
-async fn keep_metrics<S: VectorStore>(
-  config: &Config,
-  metrics: &Arc<Metrics>,
-  engine: &Arc<Engine<Measured<S>, EmbedWorker>>,
-  worker: EmbedWorker,
+/// Serves the metrics page on `address`, and returns the task that does it until it is aborted.
+async fn serve_metrics_page(
+  address: std::net::SocketAddr,
+  telemetry: &Arc<Telemetry>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-  let engine = Arc::clone(engine);
-  let polled = move || {
-    let writes = engine.writes();
-    Polled {
-      worker: Some(worker.stats()),
-      waiting: worker.waiting(),
-      writes_in_flight: writes.in_flight,
-      writes_unanswered: writes.unanswered,
-    }
-  };
-  let listener = match config.metrics.listen {
-    Some(address) => {
-      let listener = tokio::net::TcpListener::bind(address)
-        .await
-        .with_context(|| format!("cannot serve metrics on {address}"))?;
-      tracing::info!(address = %listener.local_addr()?, path = similarity_server::metrics::PATH, "serving metrics");
-      Some(listener)
-    }
-    None => None,
-  };
-  if let Some(otlp) = config.metrics.otlp() {
-    tracing::info!(
-      endpoint = otlp.endpoint.as_str(),
-      every_ms = config.metrics.otlp_interval_ms,
-      "sending metrics to a collector"
-    );
-  }
-  let (rendered, kept) = (Arc::clone(metrics), Arc::clone(metrics));
-  let asked = polled.clone();
-  // Once now, so that the first push to a collector has every count in it, at zero.
-  kept.poll(&polled());
-  let page = async move {
-    match listener {
-      Some(listener) => {
-        let render = move || rendered.render(&asked());
-        if let Err(error) = similarity_server::metrics::serve(listener, render, std::future::pending()).await {
-          // The server goes on serving its callers: metrics are for watching it, not part of what it does.
-          tracing::error!(error = format!("{error:#}"), "the metrics endpoint has stopped");
-        }
-      }
-      None => std::future::pending().await,
-    }
-  };
-  let upkeep = async move {
-    loop {
-      tokio::time::sleep(similarity_server::metrics::UPKEEP_EVERY).await;
-      kept.poll(&polled());
-      kept.upkeep();
-    }
-  };
+  let listener = tokio::net::TcpListener::bind(address)
+    .await
+    .with_context(|| format!("cannot serve metrics on {address}"))?;
+  tracing::info!(address = %listener.local_addr()?, path = telemetry::PATH, "serving metrics");
+  let rendered = Arc::clone(telemetry);
+  let render = move || rendered.page().unwrap_or_default();
   Ok(tokio::spawn(async move {
-    tokio::join!(page, upkeep);
+    if let Err(error) = telemetry::serve_page(listener, render, std::future::pending()).await {
+      // The server goes on serving its callers: metrics are for watching it, not part of what it does.
+      tracing::error!(error = format!("{error:#}"), "the metrics page has stopped");
+    }
   }))
 }
 
 async fn serve_with<S: VectorStore>(
   store: S,
   worker: EmbedWorker,
-  metrics: Arc<Metrics>,
+  telemetry: Arc<Telemetry>,
   config: &Config,
   listen: std::net::SocketAddr,
 ) -> anyhow::Result<()> {
@@ -654,10 +609,10 @@ async fn serve_with<S: VectorStore>(
   // A candidate policy, if the configuration names one. It is told about every judged request and decides none
   // (docs/decisions.md, D30).
   let shadow = PolicyShadow::from_config(config, worker.dimension())?.map(Arc::new);
-  // The store is counted from the outside, so that no store has to know it is being measured.
-  let store = Measured::new(store, Arc::clone(&metrics));
-  let mut engine = Engine::new(store, worker.clone(), schema.clone(), policy)
-    .with_metrics(Arc::clone(&metrics))
+  // Each of the store's operations is a span in a request's trace, made from the outside, so that no store has
+  // to know it is watched.
+  let mut engine = Engine::new(Traced(store), worker, schema.clone(), policy)
+    .with_metrics(telemetry.metrics())
     .with_matching(config.matching.settings()?)
     .with_import_batch(config.server.import_batch_records);
   let mut summaries = None;
@@ -675,24 +630,30 @@ async fn serve_with<S: VectorStore>(
     .await
     .with_context(|| format!("cannot listen on {listen}"))?;
   tracing::info!(address = %listener.local_addr()?, "serving gRPC");
+  if let Some(endpoint) = &config.telemetry.otlp_endpoint {
+    tracing::info!(
+      endpoint = endpoint.as_str(),
+      metrics_every_ms = config.telemetry.metrics_interval_ms,
+      trace_sample_ratio = config.telemetry.trace_sample_ratio,
+      "sending traces and metrics to a collector"
+    );
+  }
+  // Up before the first request and until after the last: a scrape during a drain is how a deploy is watched.
+  let page = match config.telemetry.metrics_listen {
+    Some(address) => Some(serve_metrics_page(address, &telemetry).await?),
+    None => None,
+  };
   let (asked, stops) = tokio::sync::mpsc::channel(4);
   let signals = tokio::spawn(stop_signals(asked));
-  let engine = Arc::new(engine);
-  // Up before the first request and until after the last: a scrape during a drain is how a deploy is watched.
-  let kept = if metrics.is_kept() {
-    Some(keep_metrics(config, &metrics, &engine, worker).await?)
-  } else {
-    None
-  };
-  let last = Arc::clone(&metrics);
-  let served = similarity_server::serve_until(engine, listener, stops, config.server.lifecycle(), metrics).await;
+  let lifecycle = config.server.lifecycle();
+  let served = similarity_server::serve_until(Arc::new(engine), listener, stops, lifecycle, telemetry.metrics()).await;
   signals.abort();
-  if let Some(kept) = kept {
-    kept.abort();
+  if let Some(page) = page {
+    page.abort();
   }
-  // What was counted since the last push goes to the collector before the process does. It waits for the
-  // collector's answer, so it is off the runtime's own threads.
-  let _ = tokio::task::spawn_blocking(move || last.shutdown()).await;
+  // What has not been sent yet goes to the collector before the process does. It waits for the collector's
+  // answer, so it is off the runtime's own threads.
+  let _ = tokio::task::spawn_blocking(move || telemetry.shutdown()).await;
   if let Some(summaries) = summaries {
     summaries.abort();
   }
@@ -703,31 +664,55 @@ async fn serve_with<S: VectorStore>(
   served
 }
 
+/// What a server needs before anything is logged: its configuration, the runtime it will run on, and its
+/// telemetry. The layer that sends a server's spans to a collector is part of the one logging setup
+/// (`similarity_log::Init::tracing`), so it has to exist when logging starts, and the connection to the
+/// collector lives on the runtime.
+struct Serving {
+  config: Config,
+  runtime: tokio::runtime::Runtime,
+  telemetry: Telemetry,
+}
+
 impl ServeArgs {
-  fn run(self) -> anyhow::Result<()> {
+  /// Reads the configuration and starts what it says about telemetry. Nothing is logged here: logging is not
+  /// set up yet, and what goes wrong is the caller's to report once it is.
+  fn prepare(&self) -> anyhow::Result<(Serving, Option<similarity_log::Tracing>)> {
     let config = Config::load(&self.config)?;
-    let listen = self.listen.unwrap_or(config.server.listen);
-    let embedder = load_embedder(&config, Tie::Enforced)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
       .enable_all()
       .build()
       .context("cannot start tokio")?;
-    // What the server counts about itself (docs/decisions.md, D39): kept for a page, for a collector, for both,
-    // or, with neither configured, not at all. The connection to a collector lives on the runtime.
-    let metrics = {
+    let (telemetry, tracing) = {
       let _on_the_runtime = runtime.enter();
-      let (page, otlp) = (config.metrics.listen.is_some(), config.metrics.otlp());
-      Arc::new(Metrics::kept(embedder.fingerprint(), page, otlp.as_ref())?)
+      Telemetry::start(&config.telemetry.settings())?
     };
+    let serving = Serving {
+      config,
+      runtime,
+      telemetry,
+    };
+    Ok((serving, tracing))
+  }
+
+  fn run(self, serving: Serving) -> anyhow::Result<()> {
+    let Serving {
+      config,
+      runtime,
+      telemetry,
+    } = serving;
+    let telemetry = Arc::new(telemetry);
+    let listen = self.listen.unwrap_or(config.server.listen);
+    let embedder = load_embedder(&config, Tie::Enforced)?;
     let (depth, batch) = (config.model.queue_depth, config.model.batch_size);
-    let worker = EmbedWorker::spawn_measured(embedder, depth, batch, Arc::clone(&metrics))
+    let worker = EmbedWorker::spawn_measured(embedder, depth, batch, &telemetry.metrics())
       .context("cannot start the embedding thread")?;
     let (layout, dimension) = store_layout(&config.schema()?, &worker);
 
     runtime.block_on(async {
       if self.in_memory {
         tracing::warn!("--in-memory: vectors are not persisted and are lost when the server stops");
-        serve_with(MemoryStore::new(layout, dimension), worker, metrics, &config, listen).await
+        serve_with(MemoryStore::new(layout, dimension), worker, telemetry, &config, listen).await
       } else {
         let settings = config.qdrant.settings(self.qdrant_api_key);
         let store = QdrantStore::connect(&settings, layout, dimension)
@@ -739,7 +724,7 @@ impl ServeArgs {
             )
           })?;
         tracing::info!(url = %settings.url, collection = %settings.collection, dimension, "connected to Qdrant");
-        serve_with(store, worker, metrics, &config, listen).await
+        serve_with(store, worker, telemetry, &config, listen).await
       }
     })
   }
@@ -1582,9 +1567,18 @@ fn main() -> ExitCode {
   };
   // Logs are one JSON object per line on stderr (see `similarity-log`). The reports that `model fetch`,
   // `compare`, and `calibrate` print for a person to read are not logs, and stay as text on stdout.
+  // A server's telemetry is part of how it logs, so it is started first (see `Serving`).
+  let (serving, tracing) = match &cli.command {
+    Command::Serve(args) => match args.prepare() {
+      Ok((serving, tracing)) => (Some(Ok(serving)), tracing),
+      Err(error) => (Some(Err(error)), None),
+    },
+    _ => (None, None),
+  };
   similarity_log::init_with(Init {
     record,
     results_on_stdout,
+    tracing,
   });
   match (&run, unopened) {
     (Some(run), None) => tracing::info!(run = run.id(), dir = %run.dir().display(), "run recorded"),
@@ -1595,7 +1589,11 @@ fn main() -> ExitCode {
   }
 
   let outcome = match cli.command {
-    Command::Serve(args) => args.run(),
+    Command::Serve(args) => match serving {
+      Some(Ok(serving)) => args.run(serving),
+      Some(Err(error)) => Err(error),
+      None => Err(anyhow::anyhow!("the server was not prepared")),
+    },
     Command::Model(ModelCommand::Fetch(args)) => args.run(),
     Command::Model(ModelCommand::Promote(args)) => args.run(),
     Command::Model(ModelCommand::Register(args)) => args.run(),

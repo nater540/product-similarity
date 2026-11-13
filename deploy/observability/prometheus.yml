@@ -1,8 +1,9 @@
-# Prometheus for `just observe-up`: the two ways the server's counts get out, side by side.
+# Prometheus for `just observe-up`: the two ways the server's metrics get out, side by side.
 #
-# - `record-similarity-page` scrapes the server's own page (`metrics.listen`), on the machine Docker runs on.
-# - `record-similarity-pushed` scrapes the collector, which holds what the server pushed to it over gRPC
-#   (`metrics.otlp_endpoint`).
+# - `record-similarity-page` scrapes the server's own page (`telemetry.metrics_listen`), on the machine Docker
+#   runs on.
+# - `record-similarity-pushed` scrapes the collector, which holds what the server sent to it over gRPC
+#   (`telemetry.otlp_endpoint`).
 #
 # The same metric appears once under each job, and the two should agree.
 

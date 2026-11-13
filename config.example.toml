@@ -123,20 +123,23 @@ weight = 2.0
 # right one may not be among the first few. `calibrate-match` reports what a given value loses.
 overfetch = 5
 
-# Counts about the server itself (requests, latency, the embedding queue, the store, verdicts), for a monitoring
-# system. Optional, and nothing is counted unless one of these is set. Nothing about any record is in them.
+# Telemetry: traces of requests, and a few metrics about the server itself. Optional, and with nothing set here
+# no span is made and no metric is kept. Nothing about a record's text is in either.
 #
-# `listen` opens a second port that serves the counts as plain HTTP at /metrics in the Prometheus text format,
-# which a Datadog agent, an OpenTelemetry collector, and Prometheus all come and read. Use 0.0.0.0 inside a
-# container; 9464 is the port OpenTelemetry's Prometheus exporters use.
+# `otlp_endpoint` is an OpenTelemetry collector, and both go to it over gRPC (OTLP): every request as a trace
+# (the call, and inside it what it waited for: its record's lock, the store, the model), and the metrics every
+# `metrics_interval_ms`. Plain `http://` only. `trace_sample_ratio` is the share of traces kept, for requests
+# that do not arrive as part of a trace already.
 #
-# `otlp_endpoint` pushes the same counts to an OpenTelemetry collector over gRPC (OTLP), every
-# `otlp_interval_ms`. Plain `http://` only. Either, both, or neither.
+# `metrics_listen` also serves the metrics as plain HTTP at /metrics in the Prometheus text format, for
+# whatever comes and reads it. Use 0.0.0.0 inside a container; 9464 is the port OpenTelemetry's Prometheus
+# exporters use.
 #
-#   [metrics]
-#   listen = "127.0.0.1:9464"
+#   [telemetry]
 #   otlp_endpoint = "http://127.0.0.1:4317"
-#   otlp_interval_ms = 60000
+#   metrics_interval_ms = 60000
+#   trace_sample_ratio = 1.0
+#   metrics_listen = "127.0.0.1:9464"
 
 # A candidate policy, judged in the shadow of the one above. Optional, and off unless the table is there.
 #

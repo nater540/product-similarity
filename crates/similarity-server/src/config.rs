@@ -44,45 +44,50 @@ pub struct Config {
   /// How `Match` decides and how far it looks.
   #[serde(default)]
   pub matching: MatchingConfig,
-  /// Where a monitoring system reads the server's counts. Optional; with no address there is no endpoint.
+  /// Where the server's traces and metrics go. Optional; with nothing set there are none.
   #[serde(default)]
-  pub metrics: MetricsConfig,
+  pub telemetry: TelemetryConfig,
 }
 
-/// `[metrics]`: where the server's counts about itself go (docs/decisions.md, D39). Two ways, either or both; with
-/// neither, nothing is counted.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// `[telemetry]`: where a server's traces and metrics go (docs/decisions.md, D39 and D40). With nothing set, no
+/// span is made and no metric is kept.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
-pub struct MetricsConfig {
-  /// The address to serve `/metrics` on, in the Prometheus text format, for whatever comes and reads it. Not
-  /// set by default: a second open port is something a deployment asks for.
-  pub listen: Option<SocketAddr>,
-  /// An OpenTelemetry collector to push the counts to over gRPC (OTLP), as `http://host:4317`. Not set by
-  /// default.
+pub struct TelemetryConfig {
+  /// An OpenTelemetry collector to send traces and metrics to over gRPC (OTLP), as `http://host:4317`. Not set
+  /// by default.
   pub otlp_endpoint: Option<String>,
-  /// How often the counts are pushed to it, in milliseconds.
-  pub otlp_interval_ms: u64,
+  /// How often the metrics are sent to it, in milliseconds.
+  pub metrics_interval_ms: u64,
+  /// An address to serve the metrics on as well, at `/metrics` in the Prometheus text format, for whatever
+  /// comes and reads it. Not set by default: a second open port is something a deployment asks for.
+  pub metrics_listen: Option<SocketAddr>,
+  /// The share of traces that are kept, from 0 to 1, among requests that are not already part of a trace.
+  pub trace_sample_ratio: f64,
 }
 
-impl Default for MetricsConfig {
+impl Default for TelemetryConfig {
   fn default() -> Self {
+    let unset = crate::telemetry::Settings::default();
     Self {
-      listen: None,
       otlp_endpoint: None,
-      // What an OpenTelemetry SDK does when it is not told: once a minute.
-      otlp_interval_ms: 60_000,
+      metrics_interval_ms: millis(unset.metrics_every),
+      metrics_listen: None,
+      trace_sample_ratio: unset.trace_sample_ratio,
     }
   }
 }
 
-impl MetricsConfig {
-  /// The collector to push to, if one is configured.
+impl TelemetryConfig {
+  /// What to start, as configured.
   #[must_use]
-  pub fn otlp(&self) -> Option<crate::metrics::Otlp> {
-    self.otlp_endpoint.as_ref().map(|endpoint| crate::metrics::Otlp {
-      endpoint: endpoint.clone(),
-      every: Duration::from_millis(self.otlp_interval_ms),
-    })
+  pub fn settings(&self) -> crate::telemetry::Settings {
+    crate::telemetry::Settings {
+      otlp_endpoint: self.otlp_endpoint.clone(),
+      metrics_every: Duration::from_millis(self.metrics_interval_ms),
+      metrics_page: self.metrics_listen.is_some(),
+      trace_sample_ratio: self.trace_sample_ratio,
+    }
   }
 }
 
@@ -509,24 +514,32 @@ impl Config {
     if config.server.import_batch_records == 0 {
       bail!("`server.import_batch_records` must be at least 1");
     }
-    if let Some(endpoint) = &config.metrics.otlp_endpoint {
+    let telemetry = &config.telemetry;
+    if let Some(endpoint) = &telemetry.otlp_endpoint {
       // The gRPC client is built without TLS, like the server: both sit behind the platform's mesh.
       let Some(authority) = endpoint.strip_prefix("http://") else {
         bail!(
-          "`metrics.otlp_endpoint` is `{endpoint}`; it has to be `http://host:port`, a collector's OTLP gRPC \
+          "`telemetry.otlp_endpoint` is `{endpoint}`; it has to be `http://host:port`, a collector's OTLP gRPC \
            address (usually port 4317). TLS is not built in"
         );
       };
       if authority.is_empty() || authority.contains(char::is_whitespace) {
-        bail!("`metrics.otlp_endpoint` is `{endpoint}`, which names no host");
-      }
-      if config.metrics.otlp_interval_ms == 0 {
-        bail!("`metrics.otlp_interval_ms` must be positive: the counts are sent that often");
+        bail!("`telemetry.otlp_endpoint` is `{endpoint}`, which names no host");
       }
     }
-    if config.metrics.listen == Some(config.server.listen) {
+    if telemetry.metrics_interval_ms == 0 {
+      bail!("`telemetry.metrics_interval_ms` must be positive: the metrics are sent that often");
+    }
+    if !(0.0..=1.0).contains(&telemetry.trace_sample_ratio) {
       bail!(
-        "`metrics.listen` is `server.listen` ({}): the metrics are plain HTTP and need an address of their own",
+        "`telemetry.trace_sample_ratio` is {}; it is a share of traces, from 0 to 1",
+        telemetry.trace_sample_ratio
+      );
+    }
+    if telemetry.metrics_listen == Some(config.server.listen) {
+      bail!(
+        "`telemetry.metrics_listen` is `server.listen` ({}): the metrics page is plain HTTP and needs an address \
+         of its own",
         config.server.listen
       );
     }
@@ -1060,66 +1073,56 @@ mod tests {
     assert!(Config::parse(&format!("{MINIMAL}\n[modle]\ndir = \"x\"")).is_err());
   }
 
-  /// The metrics endpoint is off until it is given an address, and the address cannot be the gRPC one: the two
-  /// speak different protocols.
+  /// Telemetry is off until it is asked for: no collector, no page. What is asked for is checked when the file is
+  /// read, not when the first span fails to arrive: a collector's address this build cannot reach (TLS, or no
+  /// host), a share of traces that is not one, a page on the gRPC port.
   #[test]
-  fn the_metrics_endpoint_is_off_unless_it_is_given_an_address_of_its_own() {
-    assert_eq!(Config::parse(MINIMAL).unwrap().metrics.listen, None);
+  fn telemetry_is_off_until_asked_for_and_checked_when_the_file_is_read() {
+    let unset = crate::telemetry::Settings::default();
+    assert_eq!(Config::parse(MINIMAL).unwrap().telemetry.settings(), unset);
     let shipped = Config::parse(include_str!("../../../config.example.toml")).unwrap();
-    assert_eq!(shipped.metrics.listen, None, "the example opens no second port");
-
-    let on = Config::parse(&format!("[metrics]\nlisten = \"0.0.0.0:9464\"\n{MINIMAL}")).unwrap();
-    assert_eq!(on.metrics.listen, Some(SocketAddr::from(([0, 0, 0, 0], 9464))));
-
-    let same = format!("[server]\nlisten = \"127.0.0.1:7000\"\n[metrics]\nlisten = \"127.0.0.1:7000\"\n{MINIMAL}");
-    let error = Config::parse(&same).unwrap_err().to_string();
-    assert!(
-      error.contains("metrics.listen") && error.contains("127.0.0.1:7000"),
-      "{error}"
-    );
-    assert!(Config::parse(&format!("[metrics]\nlistn = \"0.0.0.0:9464\"\n{MINIMAL}")).is_err());
-  }
-
-  /// A collector to push to is an `http://` address and an interval. Neither is set unless asked for, and an
-  /// address this build cannot reach (TLS, or no host) is refused when the file is read, not when the first
-  /// push fails.
-  #[test]
-  fn a_collector_to_push_metrics_to_is_an_http_address_and_an_interval() {
-    assert_eq!(Config::parse(MINIMAL).unwrap().metrics.otlp(), None);
-    let shipped = Config::parse(include_str!("../../../config.example.toml")).unwrap();
-    assert_eq!(shipped.metrics.otlp(), None, "the example pushes nowhere");
-
-    let on = Config::parse(&format!(
-      "[metrics]\notlp_endpoint = \"http://collector:4317\"\n{MINIMAL}"
-    ))
-    .unwrap();
     assert_eq!(
-      on.metrics.otlp(),
-      Some(crate::metrics::Otlp {
-        endpoint: "http://collector:4317".to_owned(),
-        every: Duration::from_mins(1),
-      })
+      shipped.telemetry.settings(),
+      unset,
+      "the example sends nothing anywhere"
     );
-    let both =
-      "[metrics]\nlisten = \"0.0.0.0:9464\"\notlp_endpoint = \"http://collector:4317\"\notlp_interval_ms = 10000\n";
-    let both = Config::parse(&format!("{both}{MINIMAL}")).unwrap();
-    assert!(both.metrics.listen.is_some());
-    assert_eq!(both.metrics.otlp().unwrap().every, Duration::from_secs(10));
+    assert_eq!((unset.otlp_endpoint.clone(), unset.metrics_page), (None, false));
+
+    let on = "[telemetry]\notlp_endpoint = \"http://collector:4317\"\nmetrics_interval_ms = 10000\n\
+              metrics_listen = \"0.0.0.0:9464\"\ntrace_sample_ratio = 0.25\n";
+    let on = Config::parse(&format!("{on}{MINIMAL}")).unwrap();
+    assert_eq!(
+      on.telemetry.settings(),
+      crate::telemetry::Settings {
+        otlp_endpoint: Some("http://collector:4317".to_owned()),
+        metrics_every: Duration::from_secs(10),
+        metrics_page: true,
+        trace_sample_ratio: 0.25,
+      }
+    );
+    assert_eq!(
+      on.telemetry.metrics_listen,
+      Some(SocketAddr::from(([0, 0, 0, 0], 9464)))
+    );
 
     for (wrong, says) in [
       ("otlp_endpoint = \"https://collector:4317\"", "TLS"),
       ("otlp_endpoint = \"collector:4317\"", "http://host:port"),
       ("otlp_endpoint = \"http://\"", "no host"),
-      (
-        "otlp_endpoint = \"http://collector:4317\"\notlp_interval_ms = 0",
-        "otlp_interval_ms",
-      ),
+      ("metrics_interval_ms = 0", "metrics_interval_ms"),
+      ("trace_sample_ratio = 1.5", "trace_sample_ratio"),
+      ("trace_sample_ratio = -0.1", "trace_sample_ratio"),
+      ("metrics_listen = \"127.0.0.1:50051\"", "metrics_listen"),
+      ("metrics_listn = \"0.0.0.0:9464\"", "metrics_listn"),
     ] {
-      let error = Config::parse(&format!("[metrics]\n{wrong}\n{MINIMAL}"))
-        .unwrap_err()
-        .to_string();
+      let error = format!(
+        "{:#}",
+        Config::parse(&format!("[telemetry]\n{wrong}\n{MINIMAL}")).unwrap_err()
+      );
       assert!(error.contains(says), "{wrong}: {error}");
     }
+    // The table this replaced, for a day, is not read as if it still meant something.
+    assert!(Config::parse(&format!("[metrics]\nlisten = \"0.0.0.0:9464\"\n{MINIMAL}")).is_err());
   }
 
   #[test]

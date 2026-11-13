@@ -28,6 +28,7 @@ use std::fs::File;
 use std::sync::Mutex;
 
 use tracing::{Metadata, Subscriber};
+use tracing_subscriber::Registry;
 use tracing_subscriber::filter::{EnvFilter, FilterExt, filter_fn};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::fmt::format::{Format, Json, JsonFields};
@@ -77,6 +78,11 @@ where
   subscriber_with(logs, Some(results), None::<fn() -> std::io::Sink>, filter)
 }
 
+/// A layer that is not a line of output: what sends a server's spans to a tracing backend. It is made by
+/// whoever knows where the spans go, and added here, because there is one subscriber and this crate builds it.
+/// It brings its own filter, so what it wants to see does not change what is logged.
+pub type Tracing = Box<dyn Layer<Registry> + Send + Sync + 'static>;
+
 /// Builds the subscriber of a process that may be recording a run.
 ///
 /// `logs` receives filtered logs and every failure. `results`, if given, receives every result. `record`, if
@@ -93,6 +99,22 @@ where
   R: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
   K: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
 {
+  subscriber_traced(logs, results, record, filter, None)
+}
+
+/// As [`subscriber_with`], and with `tracing`, if there is one, beside the lines.
+pub fn subscriber_traced<L, R, K>(
+  logs: L,
+  results: Option<R>,
+  record: Option<K>,
+  filter: EnvFilter,
+  tracing: Option<Tracing>,
+) -> impl Subscriber + Send + Sync + 'static
+where
+  L: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
+  R: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
+  K: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
+{
   let log_lines = json_layer(logs).with_filter(filter.and(filter_fn(is_result).not()).or(filter_fn(is_failure)));
   let result_lines = results.map(|results| json_layer(results).with_filter(filter_fn(is_result)));
   let record_lines = record.map(|record| {
@@ -103,13 +125,13 @@ where
     )
   });
   tracing_subscriber::registry()
+    .with(tracing)
     .with(log_lines)
     .with(result_lines)
     .with(record_lines)
 }
 
 /// How a process logs, beyond the two streams every process has.
-#[derive(Debug)]
 pub struct Init {
   /// The file that keeps everything the run emits, if the process is recording a run. Each event is one write of
   /// one line, unbuffered, so a run that is killed keeps everything up to its last line.
@@ -117,6 +139,20 @@ pub struct Init {
   /// Whether results go to stdout. False only where stdout carries a report for a person and the same results
   /// are in the record: results on stdout are otherwise never switched off.
   pub results_on_stdout: bool,
+  /// What sends the process's spans to a tracing backend, if it has one. `None` for every process but a server
+  /// that was configured with a collector.
+  pub tracing: Option<Tracing>,
+}
+
+impl std::fmt::Debug for Init {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter
+      .debug_struct("Init")
+      .field("record", &self.record)
+      .field("results_on_stdout", &self.results_on_stdout)
+      .field("tracing", &self.tracing.is_some())
+      .finish()
+  }
 }
 
 /// Starts logging for the process: logs and failures to stderr, results to stdout, panics reported as failures.
@@ -126,6 +162,7 @@ pub fn init() {
   init_with(Init {
     record: None,
     results_on_stdout: true,
+    tracing: None,
   });
 }
 
@@ -135,7 +172,14 @@ pub fn init_with(init: Init) {
   let results = init
     .results_on_stdout
     .then_some(std::io::stdout as fn() -> std::io::Stdout);
-  subscriber_with(std::io::stderr, results, init.record.map(Mutex::new), filter).init();
+  subscriber_traced(
+    std::io::stderr,
+    results,
+    init.record.map(Mutex::new),
+    filter,
+    init.tracing,
+  )
+  .init();
 
   // Rust's default panic message is several lines of plain text. In a stream of JSON lines that is the one entry
   // a reader most needs to parse, so it is reported as an event like any other failure.

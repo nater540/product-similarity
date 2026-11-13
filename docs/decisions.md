@@ -1806,135 +1806,143 @@ server asked to stop waits for the write.
 one); a count of abandoned and refused requests where an operator can see it, which is a metric (proposal 26);
 deadlines on the store's own calls beyond `qdrant.timeout_ms`.
 
-## D39. The server counts what it is doing, and serves the counts in the one format everything reads
+## D39. A few metrics about the process, as OpenTelemetry, and nothing about a record in them
 
-The numbers existed and went nowhere. The embedding thread counted its passes, its texts, its busy time, and
-its refusals, and only the load test read them. In service the one signal was a log line per request. Nobody
-could be paged on "the model is at its limit" or "the store has started failing" without parsing logs.
+The numbers existed and went nowhere. The embedding thread counted its passes, its busy time, and its
+refusals, and only the load test read them. In service the one signal was a log line per request. Nobody could
+be paged on "the model is at its limit" without parsing logs.
 
-**One format, pulled.** `GET /metrics` in the Prometheus text format. The owner's company runs Datadog today
-and is moving toward OpenTelemetry and Prometheus (2026-11-12). The text format is what all three read: the
-Datadog Agent's OpenMetrics check, the OpenTelemetry Collector's Prometheus receiver, and Prometheus. So the
-server does not know which of them is asking, and the migration changes a scrape target and nothing here.
+**Three versions in one day (2026-11-12), and the third is the decision.** The first was written by hand:
+atomics, a histogram, and the Prometheus text format. It worked, and the owner's judgment was that it was also
+five hundred lines somebody has to maintain. The second was the `metrics` crate with its Prometheus exporter,
+and, when the owner asked for a push to an OpenTelemetry collector, a bridge crate between `metrics` and the
+OpenTelemetry SDK. The bridge was one person's, four hundred lines, and two releases behind the SDK, which held
+every OpenTelemetry crate here back with it; the owner asked why it was needed. It was needed only because the
+counting was not OpenTelemetry's to begin with. The third version records into OpenTelemetry's own metrics
+API, and the `metrics` crate, its exporter, and the bridge are gone. The owner's company runs Datadog today
+and is moving toward OpenTelemetry and Prometheus, and this is where it is going.
 
-**Counted by the `metrics` crate, rendered by its Prometheus exporter.** The first version of this, for half a
-day, was written by hand: arrays of atomics, a histogram, and the text format, about five hundred lines. It
-worked, and the owner's judgment was that it was also five hundred lines somebody has to maintain, where the
-`metrics` crate and its exporter are maintained by somebody else and are what the rest of the ecosystem uses.
-That is the decision (2026-11-12). It also buys the thing the hand-written one could not: sending the same
-counts another way is another exporter of that crate, not a second implementation, and the first of those was
-added the same day (below).
+**Six, where there were twenty-one.** The owner's view, once the first two versions had counted everything
+that could be counted, was that a request's trace is worth more than "how many X happened" (D40). What stays
+is what no single request's trace shows:
 
-**Pushed as well, over gRPC, to an OpenTelemetry collector** (`metrics.otlp_endpoint`). The owner asked for it,
-and it is where the company is going. The counts go to two recorders at once, the Prometheus exporter's and
-`metrics-exporter-otel`'s, which hands them to the OpenTelemetry SDK; its periodic reader pushes them through
-the project's own OTLP exporter, whose gRPC client is the `tonic` already in the build. The same names, the
-same label values as attributes, the same buckets, cumulative sums. Three things to know about it:
+- `record_similarity_embed_pass_duration_seconds`: how long forward passes take. The rate of its sum is the
+  share of the time the model is busy, which is the server's capacity (D38).
+- `record_similarity_embed_waiting`: requests waiting for the model now.
+- `record_similarity_embed_refused_total{reason}` and `record_similarity_embed_abandoned_total`: callers turned
+  away, and callers who gave up (D38).
+- `record_similarity_writes_unanswered_total`: writes that ended after their caller had gone (D38), counted
+  where their log line is written, so the two cannot disagree.
+- `record_similarity_evaluations_total{verdict,mode}`: the verdicts going out. A verdict is counted with the
+  write mode the request asked for, because a rejection of a dry run is a preview and a rejection under
+  `enforce` is a refusal, and a rate of "rejected" that mixes them means nothing.
 
-- *The bridge is the thin part.* `metrics` and the OpenTelemetry SDK are each well kept. The crate between
-  them is one person's, four hundred lines, and built against OpenTelemetry 0.31 when 0.33 is current, so all
-  three OpenTelemetry crates here are 0.31. If it falls further behind, the alternative is to record into the
-  OpenTelemetry API directly from `Metrics`, which is the one type that would change.
-- *A push that fails is quiet.* The exporter logs it at `debug`. The server does not notice and does not need
-  to: the next push carries the totals. Only the last push, on stopping, is this server's to report, and it
-  does, at `WARN`.
-- *The totals kept elsewhere are brought up to date on a timer* (every five seconds), since a collector that is
-  pushed to never asks, where a page is brought up to date as it is read.
+Gone, because a trace says it per request and a tracing backend adds it up: requests and their latency by call
+and status, the store's latency and errors, the wait for a lock, the wait for the model, texts per pass,
+imports, matches, readiness (the health service answers that), and the two `_info` series.
 
-**Behind a typed front, with a recorder of its own.** The rest of the server does not use the crate's macros.
-It calls methods of `Metrics` (`begin`, `evaluated`, `stored`, `passed`), and `Metrics` holds its own recorder
-rather than installing the process-wide one. Three things depend on that. A label value is a word fixed in
-`metrics.rs`, so a call site cannot invent a label or spell one wrong, and "nothing about a record is a label"
-is a property of the types and not a habit. Two servers in one process, which is what the tests are, do not
-count into each other. And a server with no `metrics.listen` is given a recorder that keeps nothing.
+**One small file, made to be added to.** `metrics.rs` is a struct of instruments behind methods (`passed`,
+`refused`, `abandoned`, `write_unanswered`, `evaluated`, `watch_waiting`). Adding a metric is a name, a field,
+a line where they are made, and a method. The rest of the server calls a method, so an attribute value is a
+word fixed in that file: a call site cannot invent one or spell one wrong, and "nothing about a record is an
+attribute" is a property of the types and not a habit. `Metrics` is made from a meter and does not know where
+its numbers go; two servers in one process, which is what the tests are, each have their own.
 
-**Off until it is given an address** (`metrics.listen`), because it opens a second port, and a second port is
-something a deployment asks for. With no address and no collector nothing is counted at all. The port is HTTP/1.1 and not the gRPC
-port, which speaks HTTP/2 only and which scrapers do not. The endpoint is one `axum` route that asks the
-exporter for the page; `axum` was in the tree through `tonic`. The exporter's own listener is not used: it
-would not know when to read the counts that are kept elsewhere (below).
+**Nothing about a record is an attribute.** No id, no brand, no text, no score. A brand as an attribute would
+be a time series per brand per metric, in a system billed by the series, about something a monitoring system
+has no business knowing. Scores are a different question with a different answer: that is proposal 10, one
+line per request for judging thresholds, and it is still deferred.
 
-**Nothing about a record is a label.** No id, no brand, no text, no score. A brand as a label would be a time
-series per brand per metric, in a system billed by the series, about something a monitoring system has no
-business knowing; the proposal said so and this holds it. Scores are a different question with a different
-answer: that is proposal 10, one line per request for judging thresholds, and it is still deferred. These are
-counts about the process, for paging someone.
+**Sent to a collector, and served as a page, by the SDK.** With `telemetry.otlp_endpoint` the SDK's periodic
+reader sends them over gRPC every `telemetry.metrics_interval_ms`, through its OTLP exporter, whose client is
+the `tonic` already in the build. With `telemetry.metrics_listen` the SDK's Prometheus exporter keeps them for
+a page, and one `axum` route serves it; `axum` was in the tree through `tonic`. The page exists because
+Prometheus, a Collector's Prometheus receiver, and a Datadog Agent all read it, and a deployment that has no
+collector yet can still be scraped. The names are written whole in `metrics.rs` (`_total`, `_seconds`), and
+the exporter is told to add nothing, so the two routes show the same names. With neither set, the instruments
+are no-ops and nothing is kept.
 
-**Where each count is made:**
+**Every count is there from the start, at zero**, so that a rate over it exists from the first reading and a
+first occurrence is an increase, not a new series. A fresh server gave 17 series, and 31 from its first
+forward pass on, however it is used.
 
-- *Requests* in the gRPC layer, by a guard made on the first line of each handler. It counts the request as
-  answered with the handler's result, and as `CANCELLED` if it is dropped unanswered, which is what the
-  transport does to a handler whose caller gave up (D38) and what it tells that caller. So the counts add up
-  to the requests that arrived, and a deadline that runs out is visible. An `Import` stream is one call, open
-  until the stream ends on the server.
-- *Verdicts, decisions, and imported records* in the same layer, when an answer is made. A verdict is counted
-  with the write mode the request asked for, because a rejection of a dry run is a preview and a rejection
-  under `enforce` is a refusal, and a rate of "rejected" that mixes them means nothing.
-- *The store* from the outside, by a wrapper around whatever store the server was given (`Measured`). No store
-  knows it is measured, and the contract test is not involved. An operation is counted when it ends.
-- *Forward passes* by the embedding thread as it runs them: how long each took and how many texts it held, and
-  how long each request had waited when its pass began. *The wait for a record's lock* by the engine.
-- *Totals kept elsewhere* are read each time the page is asked for, not counted again: what the embedding
-  thread refused and passed over, how many requests are waiting for it, and the engine's writes. The writes
-  nobody was told about (D38) are counted where their log line is written, so the two cannot disagree.
+**The buckets** run from 1 ms to 2.5 s (1, 2.5, 5, 10, 25, 50, 100, 250, 500 ms, 1 s, 2.5 s). They are a
+resolution, not a threshold: nothing is decided by them. One short text takes about a millisecond and a full
+pass ten to twenty.
 
-**A series whose zero means something is there from the start**: `OK` for every call, so that a rate over it
-exists, and the verdicts, decisions, import outcomes, and store errors. A status code no request has ended
-with, and the latency of anything that has not happened, appear when they first do. A fresh server gave 62
-series, and 213 after a load run. That matters where series cost money, and its price is the usual one: the
-first occurrence of an error code appears as a new series and not as an increase from zero.
+**The names are an interface**, as the event names are (D17): add a metric or an attribute value, never
+rename one or change what it counts. The second version's names that are gone were in service for a day and
+on nobody's dashboard.
 
-**The buckets** run from 1 ms to 2.5 s (1, 2.5, 5, 10, 25, 50, 100, 250, 500 ms, 1 s, 2.5 s), and for texts
-in a pass from 1 to 128 by doubling. They are a resolution, not a threshold: nothing is decided by them, and
-they were chosen to straddle what was measured (a save with no changes under a millisecond, an edit at 1.6 ms
-alone and 22 ms at 64 callers, a create at 140 ms there). The exporter would otherwise report quantiles, which
-cannot be added up across replicas.
+**A collector that is away costs only the telemetry.** The SDK retries and gives up, logs one `WARN` and one
+`ERROR` for each send that failed, and sends the totals whole when the collector is back. Measured: a load run
+was as fast without the collector as with it, and the server took 0.92 seconds to stop instead of 0.02.
 
-**The names are an interface**, as the event names are (D17): add a metric or a label value, never rename
-one or change what it counts.
+**Checked against the real thing** (`just observe-up`: an OpenTelemetry Collector 0.130.0, Jaeger 2.8.0, and
+Prometheus 3.5.0 in Docker), with Prometheus scraping the page and scraping the Collector that the server
+sent to: both targets up, the same 31 series by each route, and the same values. In the tests, a collector
+that keeps what it is sent (`fake-opentelemetry-collector`) receives the six from a served request.
 
-**Checked against the real thing.** A server started with the endpoint on served the page; after a load run it
-was read back by the Prometheus Python client's parser (21 metrics, 213 samples, every histogram cumulative
-and ending at its count); and on `SIGTERM` the next scrape said not ready while the server was still serving.
-With the hand-written version, against Qdrant, the store's own time showed up where it was spent and stopping
-Qdrant under the server showed as not ready and as failed checks; the wrapper that measures the store did not
-change. The push was received by a collector written for the test, the OTLP `MetricsService` from the
-OpenTelemetry project's protocol crate: in a test, and from the real binary, which pushed every second as
-configured with counts that matched its page, resumed by itself after the collector was killed and started
-again, and pushed once more on `SIGTERM`. And against the real things (`just observe-up`: Prometheus 3.5.0 and
-an OpenTelemetry Collector 0.130.0 in Docker), with Prometheus scraping the page and scraping the Collector
-that the server pushed to: both targets up, the same 33 names and 213 series by each route, the same values,
-and nothing from `promtool check metrics`.
+**Not done:** a Datadog Agent, by either route; delta temporality, which some backends prefer and the
+exporter can be told to use; TLS to the collector; process metrics (memory, file descriptors), which a
+platform reports itself; TLS or authentication on the page, which like the gRPC port has neither and belongs
+behind the mesh; and anything per brand, on purpose.
 
-**Not done:** a Datadog Agent, by either route; delta temporality, which some backends prefer and the exporter can be told to use; TLS to the
-collector; DogStatsD, which is another exporter; process metrics (memory, file
-descriptors), which a platform reports itself; TLS or authentication on the endpoint, which like the gRPC port
-has neither and belongs behind the mesh; and anything per brand, on purpose.
+## D40. A request is a trace, and what it waited for is in it
 
-## D40. A request's waits are measured where they happen, and are spans
+A log line said how long a request took. Nothing said what it was waiting for, and at 64 callers a request is
+25 ms of which the server's own work is 0.02. Where the rest goes decides what is worth changing, and guessing
+it was wrong twice in one day: the store turned out to be the limit against Qdrant (D38), and a lock turned
+out to be waited for by requests for different records (below).
 
-A log line said how long a request took and the metrics said how long requests take. Neither said what a
-request was waiting for, and at 64 callers a request is 25 ms of which the server's own work is 0.02. Where
-the rest goes decides what is worth changing, and guessing it was wrong twice in one day: the store turned out
-to be the limit against Qdrant (D38), and a lock turned out to be waited for by requests for different
-records (below).
+**Each call is a span, and each wait is a span inside it.** The transport's layer
+(`tonic-tracing-opentelemetry`) makes a span for every call, named for it, with OpenTelemetry's attributes for
+a gRPC call and its status, and continues the caller's trace when the request carries a W3C `traceparent`.
+Inside it the handler makes one for its own work (`evaluate`, `find_similar`, `match`, `delete`, `import`),
+and inside that are the waits: `lock` for the record's lock, `store` for each call to the store with its
+`operation`, and `embed` for the model, with how long the request waited for its pass (`waited_ms`) and how
+many texts the pass held (`pass_texts`). The write is in the trace although it runs on a task of its own
+(D38): the task is given the request's span.
 
-**Four waits, each a histogram and a span.** For the record's lock (`record_similarity_lock_wait_seconds`,
-span `lock`), for the store (`record_similarity_store_duration_seconds` by operation, span `store`), for the
-model (`record_similarity_embed_wait_seconds`, from joining the queue to being taken into a pass), and the
-forward pass (`record_similarity_embed_pass_duration_seconds`); the last two are one span, `embed`, since a
-request cannot tell them apart while it waits. All of them are inside the request's own span, `request`, the
-write included, though it runs on a task of its own (D38).
+**With the crates that exist for it**, by the owner's choice (2026-11-12, as D39). The first version kept a
+request's waits in a task-local and put them on its log line; nothing else could read it. The second made
+them `tracing` spans and a histogram each, and exported no span. The owner then said the trace was the part
+worth having, and the histograms went (D39). The spans are `tracing`'s, which this workspace already logs
+through; `tracing-opentelemetry` turns them into OpenTelemetry spans; and the SDK sends them in batches to
+the collector named by `telemetry.otlp_endpoint`. `tonic-tracing-opentelemetry` is CC0-1.0, which the owner
+allowed in `deny.toml` for it (2026-11-12).
 
-**With the crates that exist for it**, by the owner's choice (2026-11-12, as D39): the histograms are the
-`metrics` crate's, and the spans are `tracing`'s, which this workspace already logs through. The first version
-kept a request's waits in a task-local and put them on its log line (`lock_ms`, `queue_ms`, and so on). It
-worked and was all its own: nothing else could read it. Spans are what a tracing backend reads.
+**What a span says about a record is its id and what came of it**: the mode asked for, the verdict, whether
+it was stored, its revision; a match's decision; whether a delete found anything. Never a record's text, its
+brand, or a score. The id is what makes a trace findable from a complaint about a record, and it is already
+on the request's log line.
 
-**Nothing exports the spans yet.** They are made at `debug`, so a server nobody is tracing makes none. Seeing
-one request drawn end to end takes a layer such as `tracing-opentelemetry` and somewhere to send to, and that
-is a decision about the owner's tracing backend that has not been made. `similarity-log` does not print spans
-(D15): its lines are flat, and a span's timings come from the standard formatter as text.
+**The spans are made only for the trace.** They are at `debug` and the tracing layer has a filter of its own,
+so a server with no collector makes none, and the log lines do not change with or without one (D15:
+`similarity-log` prints events, flat, and no spans). The layer has to be part of the one subscriber the
+process has, and `tracing-subscriber` cannot add this one afterwards (its `reload` layer does not pass on
+what the layer needs to find its spans), so the telemetry is started before logging is and handed to
+`similarity_log::init_with` as a layer. `similarity-log` still sets up all logging and knows nothing about
+OpenTelemetry.
+
+**Health checks are not traced**: something asks every few seconds. **An `Import` stream is one trace**, with
+every record's spans in it. That is right for the streams this was tried with and will be a very long trace
+for a catalog; it has not been changed, because how an import should be traced is a question about how it is
+used.
+
+**Sampling is the caller's decision first.** A request that arrives inside a trace is kept or not as its
+caller decided; one that starts a trace here is kept with probability `telemetry.trace_sample_ratio`, 1 by
+default. Sampling saves what is sent and stored. It does not save the making of the spans.
+
+**What it costs, measured**: 0.04 ms on an edit alone (1.61 to 1.65 ms), and at 64 callers 5% of the edits and
+7% of the resaves a second, with every trace kept. With none kept it was nearly the same.
+
+**Checked against the real thing.** `just observe-up` runs a Collector that passes traces to Jaeger. A load
+run of 4 callers and 50 records left 284 traces there, one for each call, with the spans above in each. With
+the ratio at 0 Jaeger was sent nothing. With the collector stopped and started again, requests were traced
+from then on, and the traces of the ones it missed were lost. In the tests a request with a `traceparent` is
+served over a real connection and a collector that keeps what it is sent holds six spans in the caller's
+trace, each wait inside the call that made it, and none for the health check that came first.
 
 **What the first version showed, on the development laptop** (the README has the table):
 
@@ -1946,3 +1954,7 @@ is a decision about the owner's tracing backend that has not been made. `similar
   hash of the id, so with 64 requests in flight about one in five shares a lock with another and waits out its
   whole request. 17 ms of a 154 ms create. Not changed here: this decision is the instrument, and what to do
   about each of these is the owner's to weigh.
+
+**Not done:** traces of `calibrate`, `import`, and the other commands, which are not requests; TLS to the
+collector; trace ids on the log lines, which would join the two; and anything that samples by what a request
+turned out to be (keeping every rejection, say), which is a collector's job.

@@ -2023,9 +2023,10 @@ commented starting point.
 | `server.store_check_every_ms` | `2000` | How often the store is asked whether it still answers; readiness is that old at most. See [Health and shutdown](#health-and-shutdown). |
 | `server.drain_notice_ms` | `5000` | On `SIGTERM`, how long the server goes on serving after it starts reporting not ready. |
 | `server.drain_deadline_ms` | `20000` | After that, how long requests in flight are given before the server stops anyway. |
-| `metrics.listen` | none (no endpoint) | Where `/metrics` is served, in the Prometheus text format. See [Metrics](#metrics). |
-| `metrics.otlp_endpoint` | none (no push) | An OpenTelemetry collector to push the same counts to over gRPC, as `http://host:4317`. |
-| `metrics.otlp_interval_ms` | `60000` | How often they are pushed. |
+| `telemetry.otlp_endpoint` | none (nothing sent) | An OpenTelemetry collector that traces and metrics are sent to over gRPC, as `http://host:4317`. See [Telemetry](#telemetry). |
+| `telemetry.metrics_interval_ms` | `60000` | How often the metrics are sent to it. |
+| `telemetry.trace_sample_ratio` | `1.0` | The share of traces kept, from 0 to 1, for requests that do not arrive inside a trace already. |
+| `telemetry.metrics_listen` | none (no page) | Where `/metrics` is served, in the Prometheus text format. |
 | `server.import_batch_records` | `8` | The most records of an `Import` stream embedded as one batch. Larger loads a catalog faster and makes every other request wait longer while a stream runs; see [Creating records over a stream](#creating-records-over-a-stream). At least 1. |
 | `model.dir` | `models/mdbr-leaf-mt` | The model directory: what `model fetch` or the trainer wrote, with the `onnx/model.onnx` that `just export-onnx` adds. There is no setting for what runs the model or where: ONNX Runtime does, on the CPU. |
 | `model.max_tokens` | `256` | Text beyond this many tokens is ignored. Cost grows with its square. |
@@ -2332,127 +2333,143 @@ Nothing is lost by a request that is cut off at the deadline: a write is one con
 it happened or it did not, sending the request again is safe either way
 ([Errors](#errors)), and an `Import` stream that ends early is sent again.
 
-### Metrics
+### Telemetry
 
-The server counts what it is doing, and the counts can go to a monitoring system two ways. Both are off until
-the config asks, and a server that is asked for neither keeps no counts at all:
+Two things leave the server for whoever watches it, both as [OpenTelemetry](https://opentelemetry.io) and both
+off until the config asks: a **trace** of each request, and a few **metrics** about the process.
 
 ```toml
-[metrics]
-listen = "0.0.0.0:9464"                   # a page to be read: GET /metrics, Prometheus text format
-otlp_endpoint = "http://collector:4317"   # or pushed: OpenTelemetry (OTLP) over gRPC
-otlp_interval_ms = 60000                  # how often it is pushed
+[telemetry]
+otlp_endpoint = "http://collector:4317"   # traces and metrics, over gRPC (OTLP)
+metrics_interval_ms = 60000               # how often the metrics are sent
+trace_sample_ratio = 1.0                  # the share of traces kept
+metrics_listen = "0.0.0.0:9464"           # and the metrics as a page: GET /metrics, Prometheus text format
 ```
 
-**Read.** `listen` opens a second port, for whatever comes and asks.
+With none of it set, no span is made, no metric is kept, and no connection is opened.
 
-`GET /metrics` on that port answers in the Prometheus text format, which is what a Datadog Agent (its
-OpenMetrics check), an OpenTelemetry Collector (its Prometheus receiver), and Prometheus itself all read: point
-whichever you run at `http://<host>:9464/metrics`. For Prometheus that is:
+**A request is a trace.** Each call is a span, and inside it is a span for the call's own work and one for each
+thing it waited for: its record's lock, each call to the store, and the model. A request that arrives with a
+W3C `traceparent` header continues its caller's trace, so the server's part appears inside whatever called it.
+An edit, as Jaeger showed it, from the run below:
 
-```yaml
-scrape_configs:
-  - job_name: record-similarity
-    static_configs:
-      - targets: ["<host>:9464"]
+```text
+recordsimilarity.v1.RecordSimilarity/Evaluate    3.811 ms  rpc.grpc.status_code=0
+  evaluate                                       3.765 ms  record.id=load-1-1794545086-c4-12 mode=Enforce verdict=Accepted stored=true revision=2
+    lock                                         0.001 ms
+    store                                        0.002 ms  operation=get
+    embed                                        3.697 ms  waited_ms=1.725 pass_texts=2
+    store                                        0.005 ms  operation=put_if
 ```
 
-**Pushed.** `otlp_endpoint` sends the same counts to an OpenTelemetry collector over gRPC, every
-`otlp_interval_ms` and once more as the server stops. They arrive as OpenTelemetry metrics under the same
-names: counters as cumulative sums, latencies as histograms with the same buckets and seconds as their unit,
-label values as attributes, and `service.name` `record-similarity`. Plain `http://` only: like the server's own
-port, the client is built without TLS. A collector that cannot be reached costs the server nothing but the
-push, and it sends again when the collector is back. A failed push is logged at `debug` by the OpenTelemetry
-exporter (`RUST_LOG=info,opentelemetry-otlp=debug` shows each one), and at `WARN` here only for the last one,
-on stopping.
+That request spent 1.7 ms waiting for the model and 2 ms in a forward pass it shared with another, and next to
+nothing anywhere else. A save with no changes is the same without `embed` and the write (0.044 ms); a `Delete`
+is `delete` with `lock` and two `store` spans; `FindSimilar` and `Match` are `find_similar` and `match`.
 
-The counting is the [`metrics`](https://crates.io/crates/metrics) crate's. The page is its Prometheus
-exporter's, and the push is the OpenTelemetry SDK's OTLP exporter behind
-[`metrics-exporter-otel`](https://crates.io/crates/metrics-exporter-otel); this server only says what is counted
-and where.
+- **What a span says about a record** is its id, the mode asked for, the verdict, whether it was stored, and
+  its revision; for a `Match`, the decision. Never a record's text, its brand, or a score.
+- **The write is in the trace**, though it runs on a task of its own and finishes whether or not the caller
+  waits ([Errors](#errors)).
+- **Health checks are not traced.** Something asks every few seconds, and a trace of each would bury the rest.
+- **An `Import` stream is one trace**, with every record's `lock` and `store` spans and each batch's `embed`
+  in it: 50 records were 209 spans. A long stream is a long trace.
+- **`trace_sample_ratio`** is the share of traces kept for requests that start one here. A request that
+  arrives inside a trace is kept or not as its caller decided. At `0.0` Jaeger was sent nothing, and the
+  metrics arrived as before.
+- The call's span is [`tonic-tracing-opentelemetry`](https://crates.io/crates/tonic-tracing-opentelemetry)'s,
+  with OpenTelemetry's names for a gRPC call (`rpc.system`, `rpc.service`, `rpc.method`,
+  `rpc.grpc.status_code`). The ones inside are this server's `tracing` spans, passed on by
+  [`tracing-opentelemetry`](https://crates.io/crates/tracing-opentelemetry).
 
-**Trying both.** `just observe-up` starts Prometheus and an OpenTelemetry Collector in Docker
-(`compose.yml`, profile `observability`; their two small configs are in `deploy/observability/`). Prometheus
-scrapes the server's page as the job `record-similarity-page`, and scrapes the Collector, which holds what the
-server pushed to it, as `record-similarity-pushed`:
+**The metrics are six**, for what no single request's trace shows: how close the model is to its limit, who is
+waiting for it, who was turned away, and what verdicts are going out. How long a kind of request takes, how
+often it fails, and what it waited for are read from the traces.
+
+| Metric | What it says |
+|---|---|
+| `record_similarity_embed_pass_duration_seconds` | A histogram of forward passes of the model. The rate of its sum is the share of the time the model is busy; at 1 the server is at its limit ([Capacity](#capacity)). Its count is the passes. |
+| `record_similarity_embed_waiting` | Requests waiting for the model now; `model.queue_depth` is the most there can be. |
+| `record_similarity_embed_refused_total{reason}` | Requests refused without being embedded: `queue_full` (`RESOURCE_EXHAUSTED`) and `too_late` (`DEADLINE_EXCEEDED`). |
+| `record_similarity_embed_abandoned_total` | Requests passed over because their caller had gone ([Past what a server can do](#past-what-a-server-can-do)). |
+| `record_similarity_writes_unanswered_total` | Writes that finished, or failed, after their caller had gone. Each has a `WARN` line ([Errors](#errors)). |
+| `record_similarity_evaluations_total{verdict,mode}` | `Evaluate` answers by verdict (`created`, `accepted`, `rejected`, `embedded`) and by the write mode asked for (`enforce`, `dry_run`, `force`). |
+
+They go to the collector every `metrics_interval_ms` and once more as the server stops, as cumulative sums and
+a histogram with seconds as its unit. `metrics_listen` also opens a second port that answers `GET /metrics` in
+the Prometheus text format, which Prometheus, an OpenTelemetry Collector's Prometheus receiver, and a Datadog
+Agent's OpenMetrics check all read. Either, both, or neither. The page after a short `just load` run, without
+the histogram's buckets and the verdicts nobody got:
+
+```text
+record_similarity_embed_abandoned_total 0
+record_similarity_embed_pass_duration_seconds_sum 0.48271787900000007
+record_similarity_embed_pass_duration_seconds_count 74
+record_similarity_embed_refused_total{reason="queue_full"} 0
+record_similarity_embed_refused_total{reason="too_late"} 0
+record_similarity_embed_waiting 0
+record_similarity_evaluations_total{mode="dry_run",verdict="created"} 32
+record_similarity_evaluations_total{mode="enforce",verdict="accepted"} 100
+record_similarity_evaluations_total{mode="enforce",verdict="created"} 50
+record_similarity_writes_unanswered_total 0
+```
+
+- **Nothing about a record is in them.** No id, no brand, no text, no score. An attribute is one of the words
+  in the table. Scores, and what the thresholds make of them, are what `calibrate` and a shadow are for.
+- **Every count is there from the start, at zero**, so a rate over it exists from the first reading. A server
+  that had just started gave 17 series, and 31 from its first forward pass on, however it is used. That
+  matters where series are what you pay for.
+- **Passes are counted into buckets from 1 ms to 2.5 s.** The buckets are how finely a duration can be read
+  back, not limits on anything.
+- **The names are an interface**, like the event names: a metric or an attribute value may be added, and none
+  will be renamed.
+- All of it is the OpenTelemetry SDK's: its metrics API, its OTLP exporter, and its Prometheus exporter for
+  the page. This server only says what is measured ([`metrics.rs`](crates/similarity-server/src/metrics.rs),
+  where adding one is a name, a field, and a method).
+
+**A collector that cannot be reached costs the server nothing but the telemetry.** With the collector stopped,
+a load run went as fast as with it (972 edits a second with four callers, 971 without it), each failed send
+was one `WARN` (`Export.Failed.Exhausted`) and one `ERROR` (`PeriodicReader.ExportError` or
+`BatchSpanProcessor.ExportError`) from the SDK, and the server took 0.92 seconds to stop where it otherwise
+takes 0.02. When the collector was started again the metrics arrived whole, since they are totals (364
+`Evaluate` answers by both routes, 182 of them from while it was away), and requests were traced from then on.
+The traces of the requests it missed were lost. Plain `http://` only: like the server's own port, the
+connection is made without TLS.
+
+**What it costs.** Mean milliseconds for an `Evaluate` alone and answers a second with 64 callers, from
+`just load --server --concurrency 1,64 --records 2000` against a server on a store in memory, two servers and
+two runs of each (one server for the last row), same machine, with a collector to send to:
+
+| Telemetry | Edit alone | Resave alone | Edits/s at 64 | Resaves/s at 64 |
+|---|---|---|---|---|
+| off | 1.61 to 1.62 ms | 0.08 ms | 2,343 to 2,397 | 24,080 to 25,062 |
+| on, every trace kept | 1.65 to 1.66 ms | 0.09 ms | 2,204 to 2,285 | 22,270 to 23,302 |
+| on, `trace_sample_ratio = 0.0` | 1.64 to 1.65 ms | 0.09 ms | 2,278 to 2,279 | 23,146 to 24,042 |
+
+About 0.04 ms a request, and of what a busy server answers, 5% of the edits and 7% of the resaves. Keeping fewer
+traces saves what is sent and stored, and little of the server's time: the spans are made either way.
+
+**Trying it.** `just observe-up` starts an OpenTelemetry Collector, Jaeger, and Prometheus in Docker
+(`compose.yml`, profile `observability`; the two small configs are in `deploy/observability/`). The Collector
+passes the traces to Jaeger and holds the metrics for Prometheus, which scrapes it as the job
+`record-similarity-pushed` and scrapes the server's own page as `record-similarity-page`:
 
 ```sh
-just observe-up                      # Prometheus at http://localhost:9090, OTLP gRPC on 127.0.0.1:4317
-# in a copy of the config:  [metrics]  listen = "127.0.0.1:9464"  otlp_endpoint = "http://127.0.0.1:4317"
+just observe-up                      # Jaeger at http://localhost:16686, Prometheus at http://localhost:9090
+# in a copy of the config:
+#   [telemetry]
+#   otlp_endpoint = "http://127.0.0.1:4317"
+#   metrics_interval_ms = 5000
+#   metrics_listen = "127.0.0.1:9464"
 just serve-in-memory config.toml
 just load config.toml --server http://127.0.0.1:50051 --concurrency 4 --records 50
 just observe-down
 ```
 
 On Linux the page has to listen on `0.0.0.0:9464` for the Prometheus container to reach it. Run that way here
-(Prometheus 3.5.0, Collector 0.130.0), both targets were up, and Prometheus held the same 33 metric names and
-213 series under each job, with the same values: 182 `Evaluate` requests, 578 texts in forward passes, 150
-conditional writes under a millisecond. `promtool check metrics`, run on the page, had nothing to say. A
+(Collector 0.130.0, Jaeger 2.8.0, Prometheus 3.5.0): Jaeger held 284 traces of the service
+`record-similarity`, one for each of the 182 `Evaluate` and 100 `Delete` calls, the `Import` stream, and the
+`Describe`; both Prometheus targets were up, with the same 31 series under each job and the same values. A
 Datadog Agent has not been tried.
-
-| Metric | What it counts |
-|---|---|
-| `record_similarity_requests_total{call,code}` | Requests that ended, by call (`Evaluate`, `FindSimilar`, `Match`, `Delete`, `Import`, `Describe`) and gRPC status code. `CANCELLED` is a request whose caller gave up. |
-| `record_similarity_request_duration_seconds{call}` | A histogram of how long they took, whatever the answer. |
-| `record_similarity_requests_in_flight{call}` | Requests being served now. An `Import` stream is one for as long as it is open. |
-| `record_similarity_evaluations_total{verdict,mode}` | `Evaluate` answers by verdict (`created`, `accepted`, `rejected`, `embedded`) and by the write mode asked for (`enforce`, `dry_run`, `force`). |
-| `record_similarity_matches_total{decision}` | `Match` answers by decision (`matched`, `no_match`, `not_judged`). |
-| `record_similarity_import_records_total{outcome}` | Records of ended `Import` streams: `created`, `exists`, `failed`. |
-| `record_similarity_embed_pass_duration_seconds` | A histogram of forward passes of the model. The rate of its sum is the share of the time the model is busy; at 1 the server is at its limit ([Capacity](#capacity)). Its count is the passes. |
-| `record_similarity_embed_pass_texts` | A histogram of how many texts a pass held: how much sharing of passes the load is buying. |
-| `record_similarity_embed_wait_seconds` | A histogram of how long requests waited for the model before a pass took them. |
-| `record_similarity_embed_requests_total` | Requests the embedding thread served. |
-| `record_similarity_embed_waiting` | Requests waiting for the model now; `model.queue_depth` is the most there can be. |
-| `record_similarity_lock_wait_seconds` | A histogram of how long requests waited for their record's lock ([Where a request's time goes](#where-a-requests-time-goes)). |
-| `record_similarity_embed_refused_total{reason}` | Requests refused without being embedded: `queue_full` (`RESOURCE_EXHAUSTED`) and `too_late` (`DEADLINE_EXCEEDED`). |
-| `record_similarity_embed_abandoned_total` | Requests passed over because their caller had gone ([Past what a server can do](#past-what-a-server-can-do)). |
-| `record_similarity_store_duration_seconds{operation}` | A histogram of how long the store took, by operation (`get`, `put_if`, `delete_if`, `search`, `search_vectors`, `check`). |
-| `record_similarity_store_errors_total{operation}` | Store operations that ended in an error. |
-| `record_similarity_writes_in_flight` | Writes on their way to the store now. |
-| `record_similarity_writes_unanswered_total` | Writes that finished, or failed, after their caller had gone. Each has a `WARN` line ([Errors](#errors)). |
-| `record_similarity_ready` | 1 while the readiness check passes, 0 otherwise ([Health and shutdown](#health-and-shutdown)). |
-| `record_similarity_model_info{fingerprint}`, `record_similarity_build_info{version}` | Always 1; the label is the point. |
-
-What a server answered after a short `just load` run, in part:
-
-```text
-record_similarity_requests_total{call="Evaluate",code="OK"} 182
-record_similarity_request_duration_seconds_bucket{call="Evaluate",le="0.001"} 50
-record_similarity_request_duration_seconds_bucket{call="Evaluate",le="0.005"} 100
-record_similarity_request_duration_seconds_bucket{call="Evaluate",le="0.025"} 181
-record_similarity_request_duration_seconds_sum{call="Evaluate"} 1.2858326680000003
-record_similarity_request_duration_seconds_count{call="Evaluate"} 182
-record_similarity_evaluations_total{verdict="accepted",mode="enforce"} 100
-record_similarity_embed_pass_duration_seconds_sum 0.46119875499999996
-record_similarity_embed_pass_duration_seconds_count 75
-record_similarity_embed_pass_texts_sum 578
-record_similarity_embed_wait_seconds_sum 0.5017706630000001
-record_similarity_lock_wait_seconds_count 332
-record_similarity_store_duration_seconds_count{operation="put_if"} 150
-record_similarity_ready 1
-```
-
-- **Nothing about a record is in them.** No id, no brand, no text, no score. A label is one of the words in
-  the table, or the model's fingerprint. Scores, and what the thresholds make of them, are what `calibrate`
-  and a shadow are for.
-- **Another way of sending them is another exporter.** The `metrics` crate also has one that pushes to a
-  Datadog Agent over DogStatsD, which would take the same counts. It is not built in: a Datadog Agent reads
-  the page, and can be sent OTLP.
-- **A series that says nothing is left out**: a status code no request has ended with, and the latency of a
-  call or store operation that has not been used. `OK` is there for every call from the first scrape, at zero
-  if need be. A server that had just started gave 62 series, and 213 after that run; each call or store
-  operation that comes into use adds its 14. That matters where series are what you pay for.
-- **Latencies are counted into buckets from 1 ms to 2.5 s.** The buckets are how finely a latency can be read
-  back, not limits on anything.
-- **The endpoint is up from before the first request until the server has stopped**, so a drain can be watched:
-  after `SIGTERM`, `record_similarity_ready` was 0 on the next scrape, with the server still serving.
-- **The names are an interface**, like the event names: a metric or a label value may be added, and none will
-  be renamed.
-
-What to look at first: the rate of `_embed_pass_duration_seconds_sum` (how close to its limit the model is), the
-share of requests that end in each `code`, `_embed_refused_total` and `_embed_abandoned_total` (callers being
-turned away or giving up), `_store_errors_total` and the store's latency, `_writes_unanswered_total`, and
-`record_similarity_ready`.
 
 ### Capacity
 
@@ -2469,9 +2486,10 @@ a write one more small read: about 0.2 ms on an edit of 3 ms.
 
 The server speaks plaintext gRPC and has no authentication. Run it on a private network or behind a mesh or proxy
 that provides both. The Qdrant API key is taken from the environment, never from the config file. The metrics
-endpoint, when it is on, is plain HTTP with no authentication either, on a port of its own; it can be read and
-cannot change anything, and it carries nothing about any record. Metrics pushed to a collector go over plain
-gRPC, and carry the same and no more.
+page, when it is on, is plain HTTP with no authentication either, on a port of its own; it can be read and
+cannot change anything, and it carries nothing about any record. What is sent to a collector goes over plain
+gRPC: the same metrics, and traces, which carry record ids and verdicts and never a record's text, its brand,
+or a score.
 
 ## Performance
 
@@ -2550,16 +2568,11 @@ text is in any result.
 
 #### Where a request's time goes
 
-A request waits for four things, and each is measured where it happens: its record's lock
-(`record_similarity_lock_wait_seconds`), the store (`record_similarity_store_duration_seconds`, by operation),
-the model's queue (`record_similarity_embed_wait_seconds`), and the forward pass it is part of
-(`record_similarity_embed_pass_duration_seconds`). Over `record_similarity_request_duration_seconds` they say
-where the time goes on the whole.
-
-Each is also a [`tracing`](https://crates.io/crates/tracing) span inside the request's own span (`request`,
-with `lock`, `store`, and `embed` inside it), which is what a tracing backend would draw as one request. They
-are made at `debug`, so a server nobody is tracing makes none, and nothing here exports them: that takes a
-tracing layer such as `tracing-opentelemetry` and somewhere to send to.
+A request waits for four things: its record's lock, the store, the model's queue, and the forward pass it is
+part of. Each is a span in the request's trace (`lock`, `store`, and `embed`, which carries how long the
+request waited for its pass and how many texts the pass held), so one request's time can be read off its trace
+and many requests' from whatever the traces are sent to ([Telemetry](#telemetry)). The spans are made only
+when there is a collector to send them to.
 
 The table below was measured on an earlier build of the same day that put each request's waits on its own log
 line, which is how a request can be told to be a create, an edit, or a resave. What is left of a request's time
@@ -2668,7 +2681,7 @@ in flight at once; that is not built.
 In service, every `evaluate`, `find_similar`, `match`, and `delete` log line carries `elapsed_ms`: the time from
 the first line of the handler to the log line. An `Import` stream writes one `import` line when it ends, with how
 many records it created, found stored, and failed, how many batches it made, and how often it waited for the
-model. What the server is doing as a whole, as counts for a monitoring system, is under [Metrics](#metrics).
+model. What the server is doing as a whole, and what each request waited for, is under [Telemetry](#telemetry).
 
 ### The ONNX engine
 
@@ -2807,7 +2820,7 @@ crates/
   similarity-proto/     the .proto file and generated gRPC code
   similarity-core/      the encoder (Burn), tokenization, composite vectors, quantities, scoring, policy. No network, no async.
   similarity-store/     the VectorStore trait, an in-memory implementation, and the Qdrant one
-  similarity-server/    config, embedding worker thread, engine, gRPC service, import, calibration, and the `record-similarity` binary
+  similarity-server/    config, embedding worker thread, engine, gRPC service, import, calibration, telemetry, and the `record-similarity` binary
   similarity-train/     fine-tuning: data, losses, the training loop, and the `record-similarity-train` binary
 data/
   calibration.sample.jsonl        synthetic labeled pairs, in the strict format
@@ -2818,7 +2831,7 @@ data/
   regression.snapshot.ndjson      what the pinned model and the example config make of them
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D37)
+  decisions.md               why things are the way they are (D1 to D40)
   data-request-prompt.md     a brief for collecting labeled production data
   import-prompt.md           a brief for loading the real catalog into a running service
   feature-suggestions.md     features that could be added, built and not, the last twelve about production

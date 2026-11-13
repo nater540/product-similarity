@@ -185,14 +185,15 @@ qdrant-up:
 qdrant-down:
     docker compose down
 
-# Start Prometheus (http://localhost:9090) and an OpenTelemetry Collector (OTLP gRPC on 4317) to watch a server
-# that has `[metrics]` set: `listen = "0.0.0.0:9464"` and `otlp_endpoint = "http://127.0.0.1:4317"`
+# Start an OpenTelemetry Collector (OTLP gRPC on 4317), Jaeger (traces, http://localhost:16686), and Prometheus
+# (metrics, http://localhost:9090) to watch a server that has `[telemetry]` set:
+# `otlp_endpoint = "http://127.0.0.1:4317"` and `metrics_listen = "127.0.0.1:9464"`
 observe-up:
-    docker compose --profile observability up -d otel-collector prometheus
+    docker compose --profile observability up -d otel-collector jaeger prometheus
 
-# Stop them. Nothing is kept: Prometheus's data goes with its container
+# Stop them. Nothing is kept: the traces and Prometheus's data go with their containers
 observe-down:
-    docker compose --profile observability rm -sf otel-collector prometheus
+    docker compose --profile observability rm -sf otel-collector jaeger prometheus
 
 # Run the server against the local Qdrant
 serve config="config.example.toml":

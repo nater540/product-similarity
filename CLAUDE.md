@@ -72,8 +72,8 @@ changing a design. Infer conventions from the existing code first.
 - `crates/similarity-runs`: the local record of runs (D23): the manifest, starting and ending a run, reading runs
   back. It records and lists; it decides nothing.
 - `crates/similarity-server`: config, the embedding worker thread, `Engine` (all behavior), the thin gRPC layer,
-  `import_stream` (the loop behind the streaming `Import` call), `metrics` (what the server counts about itself,
-  and the HTTP endpoint that serves it),
+  `import_stream` (the loop behind the streaming `Import` call), `metrics` (the few numbers the server keeps
+  about itself), `telemetry` (where its traces and metrics go: the exporters, the page, the traced store),
   `model fetch`, `import`, `compare`/`calibrate`/`calibrate-drift`/`calibrate-match`/`calibrate-sweep` (the `offline` module), `load` (the load
   test), `runs` (reading recorded runs back, comparing and reporting them), `shadow` (a candidate policy judging
   live requests), `registry` (which model was put into service, and the gate), and the `record-similarity`
@@ -108,26 +108,35 @@ changing a design. Infer conventions from the existing code first.
   orchestrator would restart a healthy process because Qdrant is down), and never make a request wait on or be
   refused by readiness: it is advice to whoever routes requests. Stopping is in one order: not ready, the
   notice, the listener, the deadline. A new `VectorStore` needs a `check` that is cheap and reads no record.
-- **Metrics are counts about the process, and their names are an interface** (D39). They are the `metrics`
-  crate's: rendered by its Prometheus exporter at `/metrics` when `metrics.listen` is set, pushed to an
-  OpenTelemetry collector over gRPC when `metrics.otlp_endpoint` is, and not kept at all with neither. The
-  OpenTelemetry crates are all 0.31 because the bridge (`metrics-exporter-otel`) is; move them together or
-  not at all. **The owner prefers maintained crates to hand-written infrastructure** (2026-11-12): do not
-  bring back a hand-written counter, histogram, or text format, and reach for the ecosystem's crate first for
-  the next thing of this kind. Call the methods of `Metrics`; do not use the crate's macros or install a
-  process-wide recorder, because `Metrics` having its own recorder is what keeps label values to words fixed in
-  `metrics.rs` and keeps two servers in one process (the tests) apart. Never make a label value out of
-  anything a request carries: no id, no brand, no text, no score. Add a metric or a label value; never rename
-  one or change what it counts. Nothing in a request may wait on, or fail because of, a metric. A request is
-  counted by the guard its handler makes on its first line (dropped unanswered, it counts as `CANCELLED`), so
-  a new call needs a `Call` and a guard. A store is measured from outside by `Measured`; do not put counting
-  into a store. Another way of sending the counts is another recorder in `Metrics::kept`, which has to be
-  called inside the tokio runtime when there is a collector.
-- **A request's waits are histograms and spans** (D40). Anything a request waits for (its record's lock, the
-  store, the model) is counted into a histogram and wrapped in a `tracing` span inside the request's span, at
-  `debug`. A new wait gets both, or nobody will know it is there. Nothing exports the spans yet; do not add a
-  tracing exporter without the owner choosing where traces go. Before proposing a performance change, find out
-  where the time goes; it has been guessed wrong before.
+- **Metrics are few, about the process, and their names are an interface** (D39). They are OpenTelemetry
+  instruments in `metrics.rs`, sent to a collector over gRPC when `telemetry.otlp_endpoint` is set, served as a
+  Prometheus page when `telemetry.metrics_listen` is, and not kept at all with neither. **The owner prefers
+  maintained crates to hand-written infrastructure** (2026-11-12): do not bring back a hand-written counter,
+  histogram, or text format, or the `metrics` crate and a bridge to OpenTelemetry, and reach for the
+  ecosystem's crate first for the next thing of this kind. **The owner values a request's trace over counts**
+  (2026-11-12): a metric is for what no single trace shows (how busy the model is, who is waiting, who was
+  turned away, what verdicts go out). Before adding one, ask whether a span attribute says it; do not bring
+  back per-call request counts and latencies, store timings, or lock waits as metrics. To add one: a name, a
+  field, a line in `Metrics::new` (which also gives it its zero), and a method; call the method from the rest
+  of the server, never an instrument. Never make an attribute value out of anything a request carries: no id,
+  no brand, no text, no score. Add a metric or an attribute value; never rename one or change what it counts.
+  Nothing in a request may wait on, or fail because of, a metric. `Metrics` is made from a meter and knows no
+  exporter; exporters are built in `telemetry.rs` and nowhere else. The OpenTelemetry crates move together
+  (`opentelemetry`, `opentelemetry_sdk`, `opentelemetry-otlp`, `opentelemetry-prometheus` at one version, with
+  the `tracing-opentelemetry` and `tonic-tracing-opentelemetry` releases built for it).
+- **A request is a trace, and anything it waits for is a span in it** (D40). The transport's layer makes the
+  call's span; the handler makes one for its work (`evaluate`, `delete`, ...) at `debug`; the record's lock,
+  each store call (`telemetry::Traced`), and the model (`embed`) are spans inside it. A new wait gets a span,
+  or nobody will know it is there; a new call gets a handler span; work moved to another task is given the
+  request's span (`in_current_span`). A span may carry a record's id and what came of the request (mode,
+  verdict, stored, revision, decision), and never a record's text, its brand, or a score. Record a number as
+  `i64` or `f64` (an unsigned one is sent as text). The spans exist only for the trace: keep them at `debug`
+  under the `similarity_server` target, which is what the tracing layer's own filter lets through, and never
+  make the log lines depend on them. The layer is handed to `similarity-log` through `Init::tracing` before
+  logging starts; do not use `tracing_subscriber::reload` for it (it breaks the trace context), and do not
+  set up a second subscriber. A store is traced from outside by `Traced`; do not put spans into a store.
+  Health checks are not traced. Before proposing a performance change, find out where the time goes; it has
+  been guessed wrong before.
 - **A request can be dropped anywhere it waits, and a write never is** (D38). The transport drops a handler
   when its caller's deadline runs out or the caller hangs up, so every `.await` in a request is a place it can
   end. Before the write that is free, and has to stay free: nothing may be left half done there. The write
@@ -293,8 +302,8 @@ changing a design. Infer conventions from the existing code first.
 - Mutation testing (needs `cargo install cargo-mutants`): `just mutants -j 3`, `just mutants-diff`,
   `just mutants-train`
 - Run: `just serve` (needs Qdrant) or `just serve-in-memory`; then `just client describe`
-- Watch its metrics: `just observe-up` (Prometheus on 9090 and an OpenTelemetry Collector on 4317, in Docker;
-  the server needs `[metrics]` set), `just observe-down`
+- Watch its traces and metrics: `just observe-up` (an OpenTelemetry Collector on 4317, Jaeger on 16686, and
+  Prometheus on 9090, in Docker; the server needs `[telemetry]` set), `just observe-down`
 - Show it to an audience: `just serve-in-memory config.toml`, then `just demo --pause` (needs `uv`)
 - Load a catalog: `just import export.jsonl config.toml` (`--check` validates only)
 - Measure: `just throughput`, `just load`, `just calibrate`, `just calibrate-drift`, `just calibrate-match`, `just calibrate-sweep`, `just calibrate-diff`, `just verdict-gate old.ndjson pairs.full.jsonl`

@@ -18,13 +18,14 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt as _};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::Instrument as _;
+use tracing::field::Empty;
 
 use crate::engine::{
   Engine, EngineError, EvaluateInput, FindSimilarInput, ImportInput, Imported, MatchInput, Original, RecordInput,
   SimilarTo, Verdict, WriteMode,
 };
 use crate::import_stream::{self, Answer, PATIENCE};
-use crate::metrics::{self, Call, Metrics};
+use crate::metrics::Metrics;
 use crate::worker::{self, TextEmbedder};
 
 /// The tonic service wrapping an [`Engine`].
@@ -259,7 +260,7 @@ fn width(value: usize) -> u32 {
   u32::try_from(value).unwrap_or(u32::MAX)
 }
 
-/// Each call, from its request to its answer. The trait implementation below is these, counted.
+/// Each call, from its request to its answer. The trait implementation below is these, each inside its span.
 impl<S: VectorStore, E: TextEmbedder> GrpcService<S, E> {
   async fn evaluated(&self, request: Request<pb::EvaluateRequest>) -> Result<Response<pb::EvaluateResponse>, Status> {
     let started = Instant::now();
@@ -276,8 +277,15 @@ impl<S: VectorStore, E: TextEmbedder> GrpcService<S, E> {
       mode,
       threshold: request.threshold,
     });
+    let span = tracing::Span::current();
+    span.record("record.id", id.as_deref().unwrap_or(""));
+    span.record("mode", tracing::field::debug(mode));
     let output = worker::by(deadline, evaluated).await?;
     self.metrics.evaluated(output.verdict, mode);
+    span.record("verdict", tracing::field::debug(output.verdict));
+    span.record("stored", output.stored);
+    // As a signed number: that is what a trace's attribute is, and an unsigned one is sent as text.
+    span.record("revision", i64::try_from(output.revision).unwrap_or(i64::MAX));
     tracing::info!(
       id = id.as_deref().unwrap_or(""),
       verdict = ?output.verdict,
@@ -351,14 +359,17 @@ impl<S: VectorStore, E: TextEmbedder> GrpcService<S, E> {
   async fn deleted(&self, request: Request<pb::DeleteRequest>) -> Result<Response<pb::DeleteResponse>, Status> {
     let started = Instant::now();
     let pb::DeleteRequest { id, brand_id } = request.into_inner();
+    let span = tracing::Span::current();
+    span.record("record.id", id.as_str());
     let deleted = self.engine.delete(id.clone(), brand_id).await?;
+    span.record("deleted", deleted);
     tracing::info!(%id, deleted, elapsed_ms = milliseconds(started), "delete");
     Ok(Response::new(pb::DeleteResponse { deleted }))
   }
 
-  /// Starts an import stream. `call` is the stream's place in the metrics: it is open for as long as records are
-  /// being imported, which is long after this has returned.
-  fn imported(&self, request: Request<Streaming<pb::ImportRequest>>, call: metrics::Request) -> Response<ImportStream> {
+  /// Starts an import stream. The records are imported long after this has returned, by a task of its own, which
+  /// is a span in the call's trace all the same.
+  fn imported(&self, request: Request<Streaming<pb::ImportRequest>>) -> Response<ImportStream> {
     let started = Instant::now();
     let mut requests = request.into_inner();
     // Both channels hold one batch: a caller that sends faster than records are imported, or reads answers
@@ -384,12 +395,10 @@ impl<S: VectorStore, E: TextEmbedder> GrpcService<S, E> {
         }
       }
     });
-    let (engine, metrics) = (Arc::clone(&self.engine), Arc::clone(&self.metrics));
-    tokio::spawn(async move {
+    let engine = Arc::clone(&self.engine);
+    let importing = tracing::debug_span!("import");
+    let import = async move {
       let totals = import_stream::run(&engine, incoming, answers, PATIENCE).await;
-      metrics.imported(totals.created, totals.existing, totals.failed);
-      // The stream ran to its end, whatever became of each record: that is in each record's answer.
-      call.finished(tonic::Code::Ok);
       tracing::info!(
         records = totals.records,
         created = totals.created,
@@ -400,7 +409,8 @@ impl<S: VectorStore, E: TextEmbedder> GrpcService<S, E> {
         elapsed_ms = milliseconds(started),
         "import"
       );
-    });
+    };
+    tokio::spawn(import.instrument(importing));
 
     let responses = ReceiverStream::new(answered).map(|answer| Ok(import_response(answer)));
     Response::new(Box::pin(responses))
@@ -420,7 +430,7 @@ impl<S: VectorStore, E: TextEmbedder> GrpcService<S, E> {
       threshold: request.threshold,
     });
     let output = worker::by(deadline, matched).await?;
-    self.metrics.matched(output.decision);
+    tracing::Span::current().record("decision", tracing::field::debug(output.decision));
     tracing::info!(
       candidates = output.candidates.len(),
       fetched = output.fetched,
@@ -487,38 +497,37 @@ impl<S: VectorStore, E: TextEmbedder> GrpcService<S, E> {
   }
 }
 
-/// The span of one request, for wherever traces are collected: its waits (the record's lock, the store, the
-/// model) are spans inside it. At `debug`, so that a server nobody is tracing makes none.
-fn request_span(call: Call) -> tracing::Span {
-  tracing::debug_span!("request", call = call.name())
-}
-
-/// The API: each call counted from its arrival to its answer (docs/decisions.md, D39), and otherwise exactly the
-/// method above that it names. A handler that is dropped, because its caller's deadline ran out or the caller
-/// hung up, drops its count with it, and that is counted too.
+/// The API: each method above inside a span named for the call, in which what the call waits for (its record's
+/// lock, the store, the model) are spans of their own, and on which what came of it is written once that is
+/// known (docs/decisions.md, D40). The transport's layer has already made a span for the request as it arrived;
+/// these are inside that one. They are made at `debug`, so that a server nobody is tracing makes none.
 #[tonic::async_trait]
 impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
   async fn evaluate(&self, request: Request<pb::EvaluateRequest>) -> Result<Response<pb::EvaluateResponse>, Status> {
-    let call = self.metrics.begin(Call::Evaluate);
-    call.answered(self.evaluated(request).instrument(request_span(Call::Evaluate)).await)
+    let span = tracing::debug_span!(
+      "evaluate",
+      record.id = Empty,
+      mode = Empty,
+      verdict = Empty,
+      stored = Empty,
+      revision = Empty
+    );
+    self.evaluated(request).instrument(span).await
   }
 
   async fn find_similar(
     &self,
     request: Request<pb::FindSimilarRequest>,
   ) -> Result<Response<pb::FindSimilarResponse>, Status> {
-    let call = self.metrics.begin(Call::FindSimilar);
-    call.answered(
-      self
-        .found_similar(request)
-        .instrument(request_span(Call::FindSimilar))
-        .await,
-    )
+    self
+      .found_similar(request)
+      .instrument(tracing::debug_span!("find_similar"))
+      .await
   }
 
   async fn delete(&self, request: Request<pb::DeleteRequest>) -> Result<Response<pb::DeleteResponse>, Status> {
-    let call = self.metrics.begin(Call::Delete);
-    call.answered(self.deleted(request).instrument(request_span(Call::Delete)).await)
+    let span = tracing::debug_span!("delete", record.id = Empty, deleted = Empty);
+    self.deleted(request).instrument(span).await
   }
 
   type ImportStream = ImportStream;
@@ -527,17 +536,16 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
     &self,
     request: Request<Streaming<pb::ImportRequest>>,
   ) -> Result<Response<Self::ImportStream>, Status> {
-    Ok(self.imported(request, self.metrics.begin(Call::Import)))
+    Ok(self.imported(request))
   }
 
   async fn r#match(&self, request: Request<pb::MatchRequest>) -> Result<Response<pb::MatchResponse>, Status> {
-    let call = self.metrics.begin(Call::Match);
-    call.answered(self.matched(request).instrument(request_span(Call::Match)).await)
+    let span = tracing::debug_span!("match", decision = Empty);
+    self.matched(request).instrument(span).await
   }
 
   async fn describe(&self, _: Request<pb::DescribeRequest>) -> Result<Response<pb::DescribeResponse>, Status> {
-    let call = self.metrics.begin(Call::Describe);
-    call.answered(Ok(self.described()))
+    Ok(self.described())
   }
 }
 
@@ -642,7 +650,9 @@ mod tests {
       batch_size: 8,
       output_dim: None,
     };
-    let worker = EmbedWorker::spawn(similarity_core::testing::tiny_embedder(&options), 4, 8).unwrap();
+    let counted = crate::telemetry::testing::paged();
+    let embedder = similarity_core::testing::tiny_embedder(&options);
+    let worker = EmbedWorker::spawn_measured(embedder, 4, 8, &counted.metrics()).unwrap();
     let schema = Schema::new(vec![FieldSpec {
       name: "name".to_owned(),
       weight: 1.0,
@@ -657,8 +667,7 @@ mod tests {
       schema,
       Policy::new(0.75, None).unwrap(),
     );
-    let counted = Arc::new(Metrics::exported("tiny").unwrap());
-    let service = GrpcService::new(Arc::new(engine), Arc::clone(&counted));
+    let service = GrpcService::new(Arc::new(engine), counted.metrics());
     let record = || pb::Record {
       fields: [("name".to_owned(), "blueberry gummies".to_owned())].into(),
       ..pb::Record::default()
@@ -699,29 +708,24 @@ mod tests {
     assert_eq!(answered.verdict(), pb::Verdict::Embedded);
     assert_eq!(worker.stats().jobs, 1);
 
-    // Each of the four was counted, as the call it was and under the status code it was answered with, and only
-    // the one that was answered has a verdict.
-    let page = counted.render(&crate::metrics::Polled::default());
-    for series in [
-      "record_similarity_requests_total{call=\"Evaluate\",code=\"DEADLINE_EXCEEDED\"} 1",
-      "record_similarity_requests_total{call=\"Evaluate\",code=\"OK\"} 1",
-      "record_similarity_requests_total{call=\"FindSimilar\",code=\"DEADLINE_EXCEEDED\"} 1",
-      "record_similarity_requests_total{call=\"Match\",code=\"DEADLINE_EXCEEDED\"} 1",
-      "record_similarity_requests_total{call=\"Match\",code=\"OK\"} 0",
-      "record_similarity_evaluations_total{verdict=\"embedded\",mode=\"enforce\"} 1",
-      "record_similarity_matches_total{decision=\"not_judged\"} 0",
-      "record_similarity_requests_in_flight{call=\"Evaluate\"} 0",
-    ] {
-      assert!(
-        page.lines().any(|line| line == series),
-        "missing `{series}` in:\n{page}"
-      );
-    }
+    // The three that were refused are counted as refused for being too late, and only the one that was answered
+    // has a verdict.
+    let read = |series: &str| crate::telemetry::testing::counted(&counted, series);
+    assert_eq!(
+      read("record_similarity_embed_refused_total{reason=\"too_late\"}"),
+      Some(3.0)
+    );
+    assert_eq!(
+      read("record_similarity_embed_refused_total{reason=\"queue_full\"}"),
+      Some(0.0)
+    );
+    let answered = "record_similarity_evaluations_total{mode=\"enforce\",verdict=\"embedded\"}";
+    assert_eq!(read(answered), Some(1.0));
   }
 
-  /// A request is a span, and its waits are spans inside it: for its record's lock, for the store (each
-  /// operation by name), and for the model. Nothing reads them here; they are what a tracing backend is given.
-  /// They are made at `debug`, so a server that nobody is tracing makes none.
+  /// A call is a span, and its waits are spans inside it: for its record's lock, for the store (each operation
+  /// by name), and for the model. They are made at `debug`, so a server that nobody is tracing makes none.
+  /// (What a collector receives of them is tested in `telemetry.rs`.)
   #[test]
   fn a_request_and_its_waits_are_spans_for_whoever_collects_them() {
     use similarity_core::{FieldSpec, Policy, Schema};
@@ -729,7 +733,7 @@ mod tests {
     use tracing_subscriber::fmt::format::FmtSpan;
 
     use crate::engine::store_layout;
-    use crate::metrics::Measured;
+    use crate::telemetry::Traced;
     use crate::worker::EmbedWorker;
 
     #[derive(Clone, Default)]
@@ -772,10 +776,9 @@ mod tests {
           }])
           .unwrap();
           let (layout, dimension) = store_layout(&schema, &worker);
-          let metrics = Arc::new(Metrics::discarded());
-          let store = Measured::new(MemoryStore::new(layout, dimension), Arc::clone(&metrics));
+          let store = Traced(MemoryStore::new(layout, dimension));
           let engine = Engine::new(store, worker, schema, Policy::new(0.75, None).unwrap());
-          let service = GrpcService::new(Arc::new(engine), metrics);
+          let service = GrpcService::new(Arc::new(engine), Arc::new(Metrics::discarded()));
           let request = Request::new(pb::EvaluateRequest {
             record: Some(pb::Record {
               id: Some("p1".to_owned()),
@@ -791,21 +794,25 @@ mod tests {
     };
 
     let traced = spans_at(tracing::Level::DEBUG);
-    let new_spans: Vec<&str> = traced.lines().filter(|line| line.ends_with(": new")).collect();
-    let made = |wanted: &str| new_spans.iter().filter(|line| line.contains(wanted)).count();
-    assert_eq!(made("request{call=\"Evaluate\"}: "), 1, "{traced}");
-    // Inside the request, in the order it waits.
-    assert_eq!(made("request{call=\"Evaluate\"}:lock: "), 1, "{traced}");
-    assert_eq!(
-      made("request{call=\"Evaluate\"}:store{operation=\"get\"}: "),
-      1,
-      "{traced}"
-    );
-    assert_eq!(made("request{call=\"Evaluate\"}:embed: "), 1, "{traced}");
-    // The write runs on a task of its own (D38), and is still the request's.
-    assert_eq!(
-      made("request{call=\"Evaluate\"}:store{operation=\"put_if\"}: "),
-      1,
+    // Each line is the path of spans to the one that was made, outermost first.
+    let made = |inner: &str| {
+      traced
+        .lines()
+        .filter(|line| line.ends_with(": new") && line.contains("evaluate") && line.contains(inner))
+        .count()
+    };
+    assert_eq!(made("evaluate: "), 1, "{traced}");
+    // Inside the call, in the order it waits.
+    assert_eq!(made(":lock: "), 1, "{traced}");
+    assert_eq!(made(":store{operation=\"get\"}: "), 1, "{traced}");
+    assert_eq!(made(":embed: "), 1, "{traced}");
+    // The write runs on a task of its own (D38), and is still the call's.
+    assert_eq!(made(":store{operation=\"put_if\"}: "), 1, "{traced}");
+    // By the time it writes, the call's span says which record it is about.
+    assert!(
+      traced
+        .lines()
+        .any(|line| line.contains("record.id=\"p1\"") && line.contains(":store{operation=\"put_if\"}")),
       "{traced}"
     );
 
