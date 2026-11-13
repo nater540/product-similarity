@@ -47,7 +47,7 @@ changing a design. Infer conventions from the existing code first.
 - **The tests of the verdict-deciding files are themselves tested** (D25). After changing the scoring, the
   quantity comparison, the schema, the engine's write path, the calibration statistics, the match ranking, the
   promotion gate, or the audit's comparison, run `just mutants -j 3`
-  (25 minutes; `just mutants-diff` for a quick look) from a clean checkout, never from a tree being
+  (35 minutes; `just mutants-diff` for a quick look) from a clean checkout, never from a tree being
   edited. A surviving mutant gets a test that states the boundary. Exclude one in `.cargo/mutants.toml` only if
   the change cannot alter behavior, with the reason, and never because it is hard to kill.
 - **Verdicts on curated hard cases are pinned** (D22). `data/regression.jsonl` is synthetic and stays that way;

@@ -944,6 +944,11 @@ which is longer than the tool waits. The embedding thread (`worker.rs`) is not o
 decides no verdict, but it was run once for this change: of 100 mutants, nothing in the new queueing survived,
 and five end at the time limit because they make the thread or the choice of a pass loop for ever.
 
+After the audit (D42), `audit/compare.rs` joined the files: an audit decides no verdict, but what it calls the
+same is believed, and a comparison that was dropped is an audit that passes. A run at `fd8010d` tested 757
+mutants in 36 minutes: 624 caught, 133 that do not compile, none surviving, and none at the time limit. Of the
+37 in the new file, 35 are caught and 2 do not compile.
+
 **Why an allowlist of files.** The alternative, excluding what should not be mutated, grows a list of everything
 whose only tests need the model or Qdrant, and a new file is mutated by default whether or not its tests can run.
 The files listed are where a mutant that survives means a wrong decision.
