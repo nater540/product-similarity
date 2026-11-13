@@ -373,11 +373,8 @@ impl Metrics {
       // Never below zero, whatever happens: a gauge that wrapped would read as eighteen quintillion requests.
       let _ = in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |now| now.checked_sub(1));
     }
-    // A code this build has no name for is counted as what it is to a caller: unknown.
-    let code = usize::try_from(i32::from(code))
-      .ok()
-      .filter(|code| *code < CODES.len())
-      .unwrap_or(2);
+    // A status code is its number, from 0 to 16, which is its place in `CODES`.
+    let code = usize::try_from(i32::from(code)).unwrap_or(2);
     add(self.requests.get(call.index()).and_then(|codes| codes.get(code)), 1);
     if let Some(histogram) = self.request_seconds.get(call.index()) {
       histogram.observe(elapsed);
@@ -970,8 +967,7 @@ mod tests {
     );
   }
 
-  /// Every status code has its protocol name, in the order of its number, and a number outside them is counted
-  /// as unknown and never lost.
+  /// Every status code is counted, under its protocol name: the names are in the order of the codes' numbers.
   #[test]
   fn every_status_code_is_counted_under_its_own_name() {
     let all = [
