@@ -24,6 +24,7 @@ use std::sync::Arc;
 use similarity_core::{Device, Embedder};
 use similarity_proto::v1 as pb;
 use similarity_proto::v1::record_similarity_client::RecordSimilarityClient;
+use similarity_server::audit::{self, Kind};
 use similarity_server::config::Config;
 use similarity_server::engine::{Engine, EvaluateInput, RecordInput, WriteMode, store_layout};
 use similarity_server::import::{self, Options, Summary};
@@ -484,15 +485,24 @@ fn export_line(id: &str, name: &str, original_name: Option<&str>) -> String {
   line.to_string()
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs ./models/mdbr-leaf-mt and a Qdrant server at $QDRANT_URL; run with `just test-real`"]
-async fn a_catalog_is_imported_into_qdrant_with_its_original_versions_and_a_second_run_resumes() {
+/// An engine on the real model and a new Qdrant collection of its own.
+struct Importing {
+  engine: Engine<QdrantStore, DirectEmbedder>,
+  /// The store the engine writes to.
+  store: QdrantStore,
+  /// What both were made from.
+  config: Config,
+  /// The layout and width the collection was connected to with.
+  layout: (String, usize),
+}
+
+async fn importing(prefix: &str) -> Importing {
   let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
   let mut config = Config::parse(include_str!("../../../config.example.toml")).unwrap();
   config.model.dir = root.join(&config.model.dir);
   config.qdrant.url = std::env::var("QDRANT_URL").unwrap_or(config.qdrant.url);
   config.qdrant.collection = format!(
-    "import_{}_{}",
+    "{prefix}_{}_{}",
     std::process::id(),
     std::time::SystemTime::now()
       .duration_since(std::time::UNIX_EPOCH)
@@ -505,12 +515,138 @@ async fn a_catalog_is_imported_into_qdrant_with_its_original_versions_and_a_seco
   let (layout, dimension) = store_layout(&schema, &embedder);
   let store = QdrantStore::connect(
     &config.qdrant.settings(std::env::var("QDRANT_API_KEY").ok()),
-    layout,
+    layout.as_str(),
     dimension,
   )
   .await
   .unwrap();
   let engine = Engine::new(store.clone(), embedder, schema, config.policy().unwrap());
+  Importing {
+    engine,
+    store,
+    config,
+    layout: (layout, dimension),
+  }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs ./models/mdbr-leaf-mt and a Qdrant server at $QDRANT_URL; run with `just test-real`"]
+async fn an_imported_catalog_audits_clean_in_qdrant_and_what_is_done_to_it_afterwards_is_found() {
+  let Importing {
+    engine,
+    store,
+    config,
+    layout: (layout, dimension),
+  } = importing("audit").await;
+  let schema = config.schema().unwrap();
+  let export = [
+    export_line("sku-1", "Blueberry Gummies 100mg", None),
+    export_line("sku-2", "Blueberry Gummies 100mg (Indica)", Some("Blueberry Gummies")),
+    export_line("sku-3", "Raspberry Gummies 100mg", None),
+    export_line("sku-4", "Peach Gummies 100mg", None),
+    export_line("sku-5", "Mango Gummies 100mg", None),
+  ]
+  .join("\n");
+
+  let settings = config.qdrant.settings(std::env::var("QDRANT_API_KEY").ok());
+  let outcome = tokio::spawn(async move {
+    let options = Options {
+      batch_records: 2,
+      stop_on_error: false,
+    };
+    let imported = import::run(&engine, export.as_bytes(), options, |_| {}, |_| {})
+      .await
+      .unwrap();
+    assert_eq!(imported.imported, 5);
+
+    // The audit looks at the collection the way the command does: opened, under the layout the engine writes,
+    // and read in pages smaller than the collection.
+    let opened = QdrantStore::open(&settings, layout, dimension).await.unwrap();
+    let audit = || async {
+      let mut findings = Vec::new();
+      let options = audit::Options {
+        page_records: 2,
+        exported_at: None,
+      };
+      let summary = audit::run(
+        &opened,
+        &schema,
+        export.as_bytes(),
+        options,
+        |finding| findings.push(finding.clone()),
+        |_| {},
+      )
+      .await
+      .unwrap();
+      (summary, findings)
+    };
+    let (clean, findings) = audit().await;
+    assert_eq!(findings, []);
+    assert_eq!(
+      (clean.export_records, clean.points, clean.agree, clean.differences()),
+      (5, 5, 5, 0)
+    );
+
+    // An edit the service accepted and the caller's database never got, a record the service forgot, and one it
+    // was given that the catalog does not have.
+    let edit = EvaluateInput {
+      record: RecordInput {
+        id: Some("sku-1".to_owned()),
+        brand_id: Some("brand-1".to_owned()),
+        fields: vec![
+          ("name".to_owned(), "Blueberry Gummies 100mg - Indica".to_owned()),
+          ("category".to_owned(), GUMMIES[1].1.to_owned()),
+          ("brand".to_owned(), GUMMIES[2].1.to_owned()),
+          ("description".to_owned(), GUMMIES[3].1.to_owned()),
+        ],
+        quantities: vec![(
+          "weight_per_item".to_owned(),
+          similarity_core::Quantity::single(0.04, "kg"),
+        )],
+      },
+      mode: WriteMode::Enforce,
+      threshold: None,
+    };
+    assert!(engine.evaluate(edit).await.unwrap().stored);
+    engine
+      .delete("sku-3".to_owned(), Some("brand-1".to_owned()))
+      .await
+      .unwrap();
+    let extra = export_line("sku-9", "Sour Diesel Live Resin Cartridge 1g", None);
+    import::run(&engine, extra.as_bytes(), options, |_| {}, |_| {})
+      .await
+      .unwrap();
+
+    let (summary, findings) = audit().await;
+    let mut found: Vec<(Kind, Option<&str>, Option<&str>)> = findings
+      .iter()
+      .map(|finding| (finding.kind, finding.id.as_deref(), finding.field.as_deref()))
+      .collect();
+    found.sort();
+    assert_eq!(
+      found,
+      [
+        (Kind::NotStored, Some("sku-3"), None),
+        (Kind::NotInExport, Some("sku-9"), None),
+        // The name, and nothing else of that record: its weight is the same amount in another unit.
+        (Kind::TextDiffers, Some("sku-1"), Some("name")),
+      ]
+    );
+    assert_eq!(
+      (summary.points, summary.agree, summary.differ, summary.differences()),
+      (5, 3, 1, 3)
+    );
+  })
+  .await;
+
+  store.delete_collection().await.unwrap();
+  outcome.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs ./models/mdbr-leaf-mt and a Qdrant server at $QDRANT_URL; run with `just test-real`"]
+async fn a_catalog_is_imported_into_qdrant_with_its_original_versions_and_a_second_run_resumes() {
+  let Importing { engine, store, .. } = importing("import").await;
 
   let export = [
     export_line("sku-1", "Blueberry Gummies 100mg", None),
