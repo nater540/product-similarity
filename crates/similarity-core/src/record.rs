@@ -188,6 +188,20 @@ impl PreparedRecord {
     &self.quantities
   }
 
+  /// The text fingerprint of every field the record has a value for, by field name: what [`Plan::finish`] stores
+  /// as [`RecordVectors::hashes`], and it is where `finish` takes them from.
+  ///
+  /// They need no model, which is what lets a record that was never embedded be compared with a stored one.
+  /// `schema` must be the one the record was prepared against.
+  pub fn hashes(&self, schema: &Schema) -> BTreeMap<String, String> {
+    self
+      .fields
+      .iter()
+      .zip(schema.fields())
+      .filter_map(|(prepared, spec)| Some((spec.name.clone(), prepared.as_ref()?.hash.clone())))
+      .collect()
+  }
+
   /// Decides, field by field, whether to embed the text or reuse the baseline's vector.
   ///
   /// # Errors
@@ -217,40 +231,35 @@ impl PreparedRecord {
         match stored_block {
           Some(block) if stored_hash == Some(&prepared.hash) => Slot::Reuse {
             name: &spec.name,
-            hash: &prepared.hash,
             block,
           },
           _ => Slot::Embed {
             name: &spec.name,
-            hash: &prepared.hash,
             text: &prepared.text,
           },
         }
       })
       .collect();
-    Ok(Plan { slots })
+    Ok(Plan {
+      slots,
+      hashes: self.hashes(schema),
+    })
   }
 }
 
 #[derive(Debug)]
 enum Slot<'a> {
   Absent,
-  Reuse {
-    name: &'a str,
-    hash: &'a str,
-    block: &'a [f32],
-  },
-  Embed {
-    name: &'a str,
-    hash: &'a str,
-    text: &'a str,
-  },
+  Reuse { name: &'a str, block: &'a [f32] },
+  Embed { name: &'a str, text: &'a str },
 }
 
 /// The embedding work one record needs, and the means to finish it.
 #[derive(Debug)]
 pub struct Plan<'a> {
   slots: Vec<Slot<'a>>,
+  /// The record's fingerprints ([`PreparedRecord::hashes`]), which are stored whatever is embedded or reused.
+  hashes: BTreeMap<String, String>,
 }
 
 impl<'a> Plan<'a> {
@@ -282,12 +291,11 @@ impl<'a> Plan<'a> {
     }
 
     let mut fresh = embedded.iter();
-    let mut hashes = BTreeMap::new();
     let mut units: Vec<Option<Vec<f32>>> = Vec::with_capacity(self.slots.len());
     for slot in &self.slots {
       match slot {
         Slot::Absent => units.push(None),
-        Slot::Reuse { name, hash, block } => {
+        Slot::Reuse { name, block } => {
           // Stored blocks are scaled by the weights in force when they were written; back to unit length so that
           // `compose` applies today's weights.
           let mut unit = block.to_vec();
@@ -296,21 +304,22 @@ impl<'a> Plan<'a> {
               "stored block for `{name}` has no direction"
             )));
           }
-          hashes.insert((*name).to_owned(), (*hash).to_owned());
           units.push(Some(unit));
         }
-        Slot::Embed { name, hash, .. } => {
+        Slot::Embed { name, .. } => {
           let Some(vector) = fresh.next() else {
             return Err(Error::Incompatible(format!("no vector supplied for `{name}`")));
           };
-          hashes.insert((*name).to_owned(), (*hash).to_owned());
           units.push(Some(vector.clone()));
         }
       }
     }
 
     let composite = schema.compose(dimension, units.iter().map(Option::as_deref))?;
-    Ok(RecordVectors { composite, hashes })
+    Ok(RecordVectors {
+      composite,
+      hashes: self.hashes,
+    })
   }
 }
 
@@ -373,6 +382,19 @@ mod tests {
       text_hash(&normalize_text("blueberry gummies").unwrap()),
       "case is a real difference"
     );
+  }
+
+  #[test]
+  fn a_prepared_record_reports_the_fingerprints_it_will_be_stored_with() {
+    let schema = product_schema();
+    let prepared = PreparedRecord::new(&schema, [("name", " Blue  Dream "), ("description", " \n")]).unwrap();
+    let hashes = prepared.hashes(&schema);
+    assert_eq!(
+      hashes,
+      BTreeMap::from([("name".to_owned(), text_hash("Blue Dream"))]),
+      "the fingerprint of the normalized text, and none for a field without a value"
+    );
+    assert_eq!(fake_vectors(&schema, DIM, &[("name", "Blue Dream")]).hashes, hashes);
   }
 
   #[test]

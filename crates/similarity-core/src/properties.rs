@@ -20,7 +20,8 @@ use tokenizers::normalizers::BertNormalizer;
 use crate::embed::EmbedderOptions;
 use crate::matching::{self, Candidate};
 use crate::quantity::{self, Quantities, Quantity, QuantityChange, first_values};
-use crate::record::{RecordVectors, normalize_text, text_hash};
+use crate::record::testing::fake_embedding;
+use crate::record::{PreparedRecord, RecordVectors, normalize_text, text_hash};
 use crate::schema::{FieldSpec, QuantitySpec, Schema};
 use crate::score::{self, FieldChange, Policy, Reason};
 use crate::separation::area_under_curve;
@@ -730,5 +731,60 @@ proptest! {
     let own = Candidate { id: "own", brand_id: None, search_similarity: 0.0, vectors: &superset, quantities: &none };
     let ranked = matching::rank(&schema, DIM, &menu_item_vectors, &none, [own], 1).unwrap();
     prop_assert!((ranked[0].comparison.similarity - 1.0).abs() < 1e-5);
+  }
+}
+
+/// A field's text as a caller might send it: nothing, only whitespace, or a few words with stray whitespace
+/// around and between them.
+fn field_text() -> impl Strategy<Value = Option<String>> {
+  let spaced = (
+    proptest::sample::select(vec!["", " ", "\n", " \t "]),
+    proptest::collection::vec(proptest::sample::select(WORDS.to_vec()), 1..4),
+    proptest::sample::select(vec![" ", "  ", "\n"]),
+  )
+    .prop_map(|(around, words, between)| format!("{around}{}{around}", words.join(between)));
+  prop_oneof![
+    Just(None),
+    proptest::sample::select(vec!["", " ", "\n\t"]).prop_map(|blank| Some(blank.to_owned())),
+    spaced.prop_map(Some),
+  ]
+}
+
+proptest! {
+  #![proptest_config(cases())]
+
+  /// What a record is known by in the store can be had without a model: the fingerprints a prepared record
+  /// reports are the ones stored when it is embedded, whether its vectors are all new or partly taken from a
+  /// baseline. An audit compares an export with the store on the strength of this.
+  #[test]
+  fn the_fingerprints_of_a_prepared_record_are_the_ones_finish_stores(
+    texts in proptest::collection::vec(field_text(), 3),
+    stored in proptest::collection::vec(field_text(), 3),
+  ) {
+    let schema = Schema::new(
+      (0..3).map(|index| FieldSpec { name: format!("f{index}"), weight: 1.0, required: false, reject_below: None }).collect(),
+    ).unwrap();
+    let fields = |texts: &[Option<String>]| -> Vec<(String, String)> {
+      texts.iter().enumerate().filter_map(|(index, text)| Some((format!("f{index}"), text.clone()?))).collect()
+    };
+    let embed = |prepared: &PreparedRecord, baseline: Option<&RecordVectors>| {
+      let plan = prepared.plan(&schema, DIM, baseline).unwrap();
+      let embedded: Vec<Vec<f32>> = plan.texts().iter().map(|text| fake_embedding(text, DIM)).collect();
+      plan.finish(&schema, DIM, &embedded).unwrap()
+    };
+    let (Ok(prepared), Ok(before)) = (PreparedRecord::new(&schema, fields(&texts)), PreparedRecord::new(&schema, fields(&stored))) else {
+      // A record with no value at all is refused before it has fingerprints.
+      return Ok(());
+    };
+
+    let expected: BTreeMap<String, String> = texts
+      .iter()
+      .enumerate()
+      .filter_map(|(index, text)| Some((format!("f{index}"), text_hash(&normalize_text(text.as_deref()?)?))))
+      .collect();
+    prop_assert_eq!(&prepared.hashes(&schema), &expected);
+    prop_assert_eq!(&embed(&prepared, None).hashes, &expected);
+    let baseline = embed(&before, None);
+    prop_assert_eq!(&embed(&prepared, Some(&baseline)).hashes, &expected);
   }
 }
