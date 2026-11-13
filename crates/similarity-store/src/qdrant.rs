@@ -497,37 +497,40 @@ fn point_of(cursor: &Cursor) -> Option<PointId> {
 /// What a scan says of one point, for a store of `layout`: what [`QdrantStore::get`] would make of it, without its
 /// vectors and without failing.
 fn entry(layout: &str, point: RetrievedPoint) -> Entry {
-  // Looked up before decoding, so that a point that cannot be decoded can still say which record it is.
+  // Looked up before decoding, so that a point that cannot be decoded can still say which record it is. It is
+  // only believed if the point is the one that record is kept at: anything can be written into a payload, and a
+  // point `get` would never look at must not be taken for the record it names.
   let named = match point.payload.get(RECORD_ID_KEY).and_then(|value| value.kind.as_ref()) {
     Some(Kind::StringValue(id)) => Some(id.clone()),
     _ => None,
   };
-  let payload = match decode_payload(named.as_deref().unwrap_or_default(), point.payload) {
+  let Some(id) = named.filter(|id| point.id == Some(point_id(id))) else {
+    return Entry::Unreadable {
+      id: None,
+      reason: match point.payload.get(RECORD_ID_KEY).and_then(|value| value.kind.as_ref()) {
+        Some(Kind::StringValue(id)) => format!("it says it is record `{id}`, which is kept at another point"),
+        _ => "it does not say which record it is".to_owned(),
+      },
+    };
+  };
+  let payload = match decode_payload(&id, point.payload) {
     Ok(payload) => payload,
-    Err(StoreError::Corrupt { reason, .. }) => return Entry::Unreadable { id: named, reason },
+    Err(StoreError::Corrupt { reason, .. }) => return Entry::Unreadable { id: Some(id), reason },
     Err(other) => {
       return Entry::Unreadable {
-        id: named,
+        id: Some(id),
         reason: other.to_string(),
       };
     }
   };
-  if point.id != Some(point_id(&payload.record_id)) {
-    // A point written by something other than this service: `get` looks for a record where its id puts it, and
-    // would never find this one.
-    return Entry::Unreadable {
-      id: Some(payload.record_id),
-      reason: "the point is not the one its record id is kept at".to_owned(),
-    };
-  }
   if payload.layout != layout {
     return Entry::OtherLayout {
-      id: payload.record_id,
+      id,
       layout: payload.layout,
     };
   }
   Entry::Record(ScannedRecord {
-    id: payload.record_id,
+    id,
     brand_id: payload.brand_id,
     hashes: payload.hashes,
     quantities: payload.quantities,
@@ -877,18 +880,18 @@ mod tests {
   fn a_point_that_does_not_say_which_record_it_is_is_unreadable() {
     let mut point = stored("product-42", serde_json::json!({"note": "written by something else"}));
     point.id = Some(PointId::from(7));
-    match entry("model-a|name", point) {
-      Entry::Unreadable { id, reason } => {
-        assert_eq!(id, None);
-        assert!(reason.contains("payload"), "{reason}");
+    assert_eq!(
+      entry("model-a|name", point),
+      Entry::Unreadable {
+        id: None,
+        reason: "it does not say which record it is".to_owned()
       }
-      other => panic!("expected an unreadable point, got {other:?}"),
-    }
+    );
   }
 
   #[test]
-  fn a_point_that_is_not_where_its_record_id_puts_it_is_unreadable() {
-    // `get` would look for `product-42` at another point and say there is no such record.
+  fn a_point_that_is_not_where_its_record_id_puts_it_is_unreadable_and_is_not_taken_for_that_record() {
+    // `get` looks for `product-42` at another point. Whatever is there is that record, and this is not.
     let mut point = stored(
       "product-42",
       serde_json::json!({"record_id": "product-42", "layout": "model-a|name"}),
@@ -897,8 +900,8 @@ mod tests {
     assert_eq!(
       entry("model-a|name", point),
       Entry::Unreadable {
-        id: Some("product-42".to_owned()),
-        reason: "the point is not the one its record id is kept at".to_owned()
+        id: None,
+        reason: "it says it is record `product-42`, which is kept at another point".to_owned()
       }
     );
   }

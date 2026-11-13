@@ -293,7 +293,8 @@ pub enum Entry {
   },
   /// Something in the store that is not a record this store can read at all.
   Unreadable {
-    /// The id of the record it says it is, where it says.
+    /// The record whose place in the store this is, where it is one: a record that is stored and cannot be read.
+    /// `None` for something that is in no record's place, whatever it says it is.
     id: Option<String>,
     /// What is wrong with it.
     reason: String,
