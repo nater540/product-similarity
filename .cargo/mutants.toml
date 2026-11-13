@@ -23,6 +23,10 @@ examine_globs = [
   # An audit decides nothing, and what it calls the same is believed: a comparison that was dropped is an audit
   # that passes.
   "crates/similarity-server/src/audit/compare.rs",
+  # What a backup of anchors reads back is written into records: a vector decoded wrongly, or a file taken for
+  # whole that is not, is an anchor that is wrong and looks right. (When an anchor may be restored at all is the
+  # engine's, above.)
+  "crates/similarity-server/src/anchors/file.rs",
 ]
 
 # Every test that can kill a mutant in these files is in a crate's library target. The integration targets either
