@@ -99,7 +99,7 @@ pub struct Failure {
 
 /// The lines of an export that hold a record, parsed, with their one-based line numbers. Blank lines and lines
 /// starting with `#` are passed over, as in every other file these tools read.
-fn lines(reader: impl BufRead) -> impl Iterator<Item = (usize, anyhow::Result<ImportLine>)> {
+pub(crate) fn lines(reader: impl BufRead) -> impl Iterator<Item = (usize, anyhow::Result<ImportLine>)> {
   reader
     .lines()
     .enumerate()
@@ -189,37 +189,45 @@ pub async fn run<S: VectorStore, E: TextEmbedder>(
   Ok(summary)
 }
 
-/// Reads an export and checks every record against `schema`, without a model and without a store.
-///
-/// This is the quick way to find out whether an export will import: a misnamed field, a quantity sent as text, a
-/// missing required field, on every line that has one. `report` is called for each. Records are not embedded, so
-/// only what the schema can tell is checked; whether an id is already stored is not.
-pub fn check(schema: &Schema, export: impl BufRead, mut report: impl FnMut(&Failure)) -> Summary {
-  let validate = |record: &RecordFields| -> similarity_core::Result<()> {
+/// A line's record as an import would prepare it, or the reason an import would refuse the line, as far as the
+/// schema can tell. The one place that says what a valid line is for everything that reads an export without a
+/// model: [`check`] and the audit.
+pub(crate) fn prepared(schema: &Schema, line: &ImportLine) -> Result<PreparedRecord, String> {
+  if line.id.trim().is_empty() {
+    return Err("`id` is blank".to_owned());
+  }
+  if line.brand_id.as_deref().is_some_and(|brand| brand.trim().is_empty()) {
+    return Err("`brand_id` is present but blank; omit it or give it a value".to_owned());
+  }
+  let validate = |record: &RecordFields| -> similarity_core::Result<PreparedRecord> {
     let quantities = record
       .quantities
       .iter()
       .map(|(name, quantity)| (name, quantity.clone()));
-    PreparedRecord::new(schema, &record.texts)?.with_quantities(schema, quantities)?;
-    Ok(())
+    PreparedRecord::new(schema, &record.texts)?.with_quantities(schema, quantities)
   };
+  let record = validate(&line.record).map_err(|error| error.to_string())?;
+  if let Some(anchor) = &line.anchor {
+    validate(anchor).map_err(|error| format!("the original version: {error}"))?;
+  }
+  Ok(record)
+}
+
+/// Reads an export and checks every record against `schema`, without a model and without a store.
+///
+/// This is the quick way to find out whether an export will import: a misnamed field, a quantity sent as text, a
+/// missing required field, a blank id or brand, on every line that has one. `report` is called for each. Records
+/// are not embedded, so only what the schema can tell is checked; whether an id is already stored is not.
+pub fn check(schema: &Schema, export: impl BufRead, mut report: impl FnMut(&Failure)) -> Summary {
   let mut summary = Summary::default();
   for (number, line) in lines(export) {
     summary.records = summary.records.saturating_add(1);
     let problem = match line {
       Err(error) => Some((None, format!("{error:#}"))),
-      Ok(line) if line.id.trim().is_empty() => Some((None, "`id` is blank".to_owned())),
-      Ok(line) => validate(&line.record)
-        .map_err(|error| error.to_string())
-        .and_then(|()| {
-          line
-            .anchor
-            .as_ref()
-            .map_or(Ok(()), validate)
-            .map_err(|error| format!("the original version: {error}"))
-        })
-        .err()
-        .map(|reason| (Some(line.id), reason)),
+      Ok(line) => prepared(schema, &line).err().map(|reason| {
+        let id = Some(line.id).filter(|id| !id.trim().is_empty());
+        (id, reason)
+      }),
     };
     if let Some((id, reason)) = problem {
       summary.failed = summary.failed.saturating_add(1);
@@ -475,5 +483,24 @@ mod tests {
     let summary = check(&schema(), blank.as_bytes(), |failure| failures.push(failure.clone()));
     assert_eq!(summary.failed, 1);
     assert!(failures.last().unwrap().reason.contains("blank"));
+  }
+
+  #[tokio::test]
+  async fn a_blank_brand_is_refused_by_the_check_as_by_the_import() {
+    let blank = r#"{"id": "sku-1", "brand_id": "  ", "record": {"name": "blueberry gummies"}}"#;
+
+    let mut checked = Vec::new();
+    let summary = check(&schema(), blank.as_bytes(), |failure| checked.push(failure.clone()));
+    assert_eq!((summary.records, summary.failed), (1, 1));
+    assert_eq!(checked[0].id.as_deref(), Some("sku-1"));
+    assert!(
+      checked[0].reason.contains("`brand_id` is present but blank"),
+      "{}",
+      checked[0].reason
+    );
+
+    let (outcome, imported, _) = import(&engine(), blank, TWO_AT_A_TIME).await;
+    assert_eq!(outcome.unwrap().failed, 1, "the import refuses the same line");
+    assert!(imported[0].reason.contains("brand_id"), "{}", imported[0].reason);
   }
 }
