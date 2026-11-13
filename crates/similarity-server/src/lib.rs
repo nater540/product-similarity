@@ -12,6 +12,7 @@
 //! - [`import_stream`]: the same over a streaming call, sharing the model with live requests.
 //! - [`metrics`]: the few numbers the server keeps about itself.
 //! - [`telemetry`]: where its traces and metrics go.
+//! - [`audit`]: checking what the store holds against an export of the catalog, without a model.
 //! - [`offline`]: comparing and calibrating from the command line, without a store.
 //! - [`shadow`]: a candidate policy judging live requests without deciding any.
 //! - [`registry`]: the record of which model was put into service, and the gate that lets one in.
@@ -19,6 +20,7 @@
 // Tests compute expected values with ordinary arithmetic and compare exact floats where exactness is the point.
 #![cfg_attr(test, allow(clippy::arithmetic_side_effects, clippy::float_cmp))]
 
+pub mod audit;
 pub mod carve;
 pub mod config;
 pub mod engine;
