@@ -25,6 +25,7 @@ use similarity_log::Init;
 use similarity_proto::v1::record_similarity_client::RecordSimilarityClient;
 use similarity_runs::{Input, ModelRef, Spec, Status};
 use similarity_server::Stop;
+use similarity_server::audit::{self, report::Audited, report::Shown};
 use similarity_server::config::Config;
 use similarity_server::engine::{Engine, store_layout};
 use similarity_server::fetch::{self, FetchRequest};
@@ -80,6 +81,9 @@ enum Command {
   CalibrateSweep(CalibrateSweepArgs),
   /// Load a whole catalog into the store: every record of an export that is not stored yet becomes a baseline.
   Import(ImportArgs),
+  /// Check the store against a catalog: which records of an export are not stored, which stored records the
+  /// export does not have, and which differ in brand, text, or quantities. Embeds nothing and writes nothing.
+  Audit(AuditArgs),
   /// Look at the runs that were recorded.
   #[command(subcommand)]
   Runs(RunsCommand),
@@ -385,6 +389,34 @@ struct CalibrateDriftArgs {
   /// Fixes the resampling behind the intervals, so that a run can be reproduced.
   #[arg(long, default_value_t = 0)]
   seed: u64,
+}
+
+#[derive(Debug, Args)]
+struct AuditArgs {
+  /// The configuration file (for the model, schema, and collection to look at).
+  #[arg(long, short, default_value = "config.toml")]
+  config: PathBuf,
+  /// An export of the catalog as it should be stored, in the format `import` reads.
+  export: PathBuf,
+  /// How many findings of each kind the report lists. `--ndjson` writes every one.
+  #[arg(long, default_value_t = 10)]
+  limit: usize,
+  /// How many points are read from the store at a time.
+  #[arg(long, default_value_t = 1000)]
+  page_records: usize,
+  /// Write every finding and the counts as NDJSON events on stdout, in place of the report.
+  #[arg(long)]
+  ndjson: bool,
+  /// Fail if the export and the store differ in anything, or anything could not be compared.
+  #[arg(long)]
+  fail_on_differences: bool,
+  /// When the export was taken, in seconds since the Unix epoch (`date +%s`). A record written at or after that
+  /// time is still reported where it differs, and is not counted as a difference: it was edited since.
+  #[arg(long, value_name = "SECONDS")]
+  exported_at: Option<u64>,
+  /// The Qdrant API key.
+  #[arg(long, env = "QDRANT_API_KEY", hide_env_values = true)]
+  qdrant_api_key: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1474,6 +1506,82 @@ impl ImportArgs {
   }
 }
 
+impl AuditArgs {
+  fn run(self) -> anyhow::Result<()> {
+    let config = Config::load(&self.config)?;
+    let schema = config.schema()?;
+    let file = std::fs::File::open(&self.export).with_context(|| format!("cannot read {}", self.export.display()))?;
+    let export = std::io::BufReader::new(file);
+    let started = std::time::Instant::now();
+
+    // Nothing is embedded. The model is loaded for what it says of itself, as `import` loads it: its fingerprint
+    // is half of the layout the records are stored under, and an audit must look for the layout a server with
+    // this configuration would read.
+    let (layout, dimension) = store_layout(&schema, &DirectEmbedder(load_embedder(&config, Tie::Enforced)?));
+    let settings = config.qdrant.settings(self.qdrant_api_key.clone());
+    let options = audit::Options {
+      page_records: self.page_records,
+      exported_at: self.exported_at,
+    };
+    let mut shown = Shown::new(self.limit);
+    let found = |finding: &audit::Finding| {
+      if self.ndjson {
+        audit::report::emit_finding(finding);
+      } else {
+        shown.take(finding);
+      }
+    };
+    let progress = |summary: &audit::Summary| {
+      tracing::info!(
+        points = summary.points,
+        findings = summary.findings,
+        elapsed_s = tenths(started.elapsed()),
+        "auditing"
+      );
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .context("cannot start tokio")?;
+    let summary = runtime.block_on(async {
+      // Opened, not connected to: an audit creates no collection and no index.
+      let store = QdrantStore::open(&settings, layout.as_str(), dimension)
+        .await
+        .with_context(|| {
+          format!(
+            "cannot look at Qdrant collection `{}` at {}",
+            settings.collection, settings.url
+          )
+        })?;
+      tracing::info!(url = %settings.url, collection = %settings.collection, "opened the Qdrant collection");
+      audit::run(&store, &schema, export, options, found, progress).await
+    })?;
+
+    let export = self.export.display().to_string();
+    let audited = Audited {
+      export: &export,
+      collection: &settings.collection,
+      layout: &layout,
+      exported_at: self.exported_at,
+    };
+    if self.ndjson {
+      audit::report::emit_summary(audited, &summary, tenths(started.elapsed()));
+    } else {
+      write!(
+        std::io::stdout().lock(),
+        "{}",
+        audit::report::render(audited, &summary, &shown)
+      )?;
+    }
+    anyhow::ensure!(
+      !self.fail_on_differences || summary.differences() == 0,
+      "the export and the store differ: {} difference(s)",
+      summary.differences()
+    );
+    Ok(())
+  }
+}
+
 fn read_run(path: &Path) -> anyhow::Result<Run> {
   let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
   events::read(&text).with_context(|| format!("{} is not a calibration run", path.display()))
@@ -1607,6 +1715,7 @@ fn main() -> ExitCode {
     Command::ShadowReport(args) => args.run(),
     Command::CalibrateSweep(args) => args.run(),
     Command::Import(args) => args.run(),
+    Command::Audit(args) => args.run(),
     Command::Runs(RunsCommand::List(args)) => args.run(),
     Command::Runs(RunsCommand::Compare(args)) => args.run(),
     Command::Runs(RunsCommand::Report(args)) => args.run(),
@@ -1756,6 +1865,52 @@ mod tests {
     assert!(
       Cli::try_parse_from(["record-similarity", "import"]).is_err(),
       "an export is required"
+    );
+  }
+
+  #[test]
+  fn audit_needs_an_export_reports_by_default_and_fails_on_nothing_unless_asked() {
+    let cli = Cli::parse_from(["record-similarity", "audit", "export.jsonl"]);
+    let Command::Audit(args) = cli.command else {
+      panic!("expected audit")
+    };
+    assert_eq!(args.config, PathBuf::from("config.toml"));
+    assert_eq!((args.limit, args.page_records), (10, 1000));
+    assert_eq!(
+      (args.ndjson, args.fail_on_differences, args.exported_at),
+      (false, false, None)
+    );
+    assert!(
+      Cli::try_parse_from(["record-similarity", "audit"]).is_err(),
+      "an export is required"
+    );
+
+    let cli = Cli::parse_from([
+      "record-similarity",
+      "audit",
+      "export.jsonl",
+      "--ndjson",
+      "--fail-on-differences",
+      "--exported-at",
+      "1700000000",
+    ]);
+    let Command::Audit(args) = cli.command else {
+      panic!("expected audit")
+    };
+    assert_eq!(
+      (args.ndjson, args.fail_on_differences, args.exported_at),
+      (true, true, Some(1_700_000_000))
+    );
+    assert!(
+      Cli::try_parse_from([
+        "record-similarity",
+        "audit",
+        "export.jsonl",
+        "--exported-at",
+        "yesterday"
+      ])
+      .is_err(),
+      "the time is a number of seconds"
     );
   }
 

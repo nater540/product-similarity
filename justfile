@@ -203,6 +203,11 @@ serve config="config.example.toml":
 import export config="config.example.toml" *flags:
     cargo run --release -q -p similarity-server -- import --config {{ config }} {{ export }} {{ flags }}
 
+# Check the configured collection against an export: `just audit export.jsonl config.toml` (`--ndjson` for every
+# finding as an event, `--fail-on-differences` for an exit code, `--exported-at $(date +%s)` taken with the export)
+audit export config="config.example.toml" *flags:
+    RUST_LOG=warn cargo run --release -q -p similarity-server -- audit --config {{ config }} {{ export }} {{ flags }}
+
 # Run the server with no Qdrant at all; nothing is persisted
 serve-in-memory config="config.example.toml":
     cargo run --release -p similarity-server -- serve --config {{ config }} --in-memory
