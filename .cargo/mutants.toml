@@ -11,6 +11,8 @@ examine_globs = [
   "crates/similarity-core/src/vector.rs",
   "crates/similarity-core/src/record.rs",
   "crates/similarity-server/src/engine.rs",
+  # Which request may be at a record: the engine's write path starts here.
+  "crates/similarity-server/src/locks.rs",
   "crates/similarity-server/src/offline/stats/mod.rs",
   "crates/similarity-server/src/offline/stats/drift.rs",
   "crates/similarity-server/src/offline/stats/matching.rs",

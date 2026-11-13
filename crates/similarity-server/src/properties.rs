@@ -14,7 +14,9 @@
 //!   one was given, as its anchor;
 //! - nothing ever happens to a record other than the one a request is about;
 //! - two replicas asked about a record at the same moment end as they would have had the two requests arrived
-//!   one after the other (D10).
+//!   one after the other (D10);
+//! - within one process, a record is held by one request at a time, the one that came first, a request never
+//!   waits for a request for another record, and a record has a lock only while somebody is at it (D41).
 //!
 //! It runs on the in-memory store and the bag-of-words embedder, so it needs no model and no Qdrant. See
 //! `similarity-core`'s `properties` module for the scoring properties and for how failures are saved.
@@ -29,6 +31,8 @@ use similarity_core::{EmbedderOptions, FieldSpec, Policy, Quantity, QuantitySpec
 use similarity_store::{MemoryStore, StoredRecord, VectorStore};
 
 use crate::engine::racing::Raced;
+use crate::locks::Locks;
+use crate::locks::testing::Asking;
 
 use crate::config::ShadowEvents;
 use crate::engine::{
@@ -1243,5 +1247,62 @@ proptest! {
       );
       Ok::<(), TestCaseError>(())
     })?;
+  }
+}
+
+/// What happens at the record locks: a request for a record arrives, or one of those there leaves, whether it
+/// holds its record (it is done) or waits for it (its caller gave up).
+#[derive(Debug, Clone, Copy)]
+enum AtTheLocks {
+  Arrives(usize),
+  Leaves(usize),
+}
+
+fn at_the_locks() -> impl Strategy<Value = AtTheLocks> {
+  prop_oneof![
+    3 => (0..LOCKED.len()).prop_map(AtTheLocks::Arrives),
+    2 => any::<usize>().prop_map(AtTheLocks::Leaves),
+  ]
+}
+
+/// The records requests arrive for. Few, so that they meet.
+const LOCKED: [&str; 3] = ["a", "b", "c"];
+
+proptest! {
+  #![proptest_config(cases())]
+
+  /// Whoever arrives and leaves, in whatever order (D41): each record that anybody is at is held by exactly one
+  /// request, the one that came first of those still there, so nobody waits for a record that is free or for a
+  /// request for another record; and the table holds those records and no others.
+  #[test]
+  fn a_record_is_held_by_the_first_request_still_there_and_locked_only_while_somebody_is(
+    steps in prop::collection::vec(at_the_locks(), 0..80),
+  ) {
+    let locks = Locks::default();
+    // Everyone at a lock, in the order they came.
+    let mut there: Vec<(&str, Asking<'_>)> = Vec::new();
+    for step in steps {
+      match step {
+        AtTheLocks::Arrives(record) => {
+          let id = LOCKED.get(record).copied().unwrap_or("a");
+          there.push((id, Asking::new(&locks, id)));
+        }
+        AtTheLocks::Leaves(which) if !there.is_empty() => {
+          drop(there.remove(which % there.len()));
+        }
+        AtTheLocks::Leaves(_) => {}
+      }
+      let mut seen: Vec<&str> = Vec::new();
+      for (id, asking) in &mut there {
+        let first = !seen.contains(id);
+        prop_assert_eq!(asking.holds(), first, "`{}`, first there: {}", id, first);
+        if first {
+          seen.push(id);
+        }
+      }
+      prop_assert_eq!(locks.in_use(), seen.len());
+    }
+    drop(there);
+    prop_assert_eq!(locks.in_use(), 0);
   }
 }

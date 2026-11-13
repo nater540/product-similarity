@@ -7,8 +7,8 @@
 //!
 //! Evaluating a record is read-compare-write, and two concurrent revisions of the same id must not both be
 //! compared against the same baseline and then both be written. Two things see to that. Within one process,
-//! requests for the same id are serialized by a set of locks, the one piece of state the engine owns; requests
-//! for different ids run concurrently. Across processes, which share no lock, every write is conditional on the
+//! requests for the same id take turns at the record's lock ([`Locks`]), the one piece of state the engine owns;
+//! requests for different ids never wait for each other. Across processes, which share no lock, every write is conditional on the
 //! store still holding what was read ([`VectorStore::put_if`]): a writer that finds the record changed under it
 //! has written nothing, and reads and judges again (docs/decisions.md, D10).
 //!
@@ -19,7 +19,6 @@
 //! if the request is gone by then, the log says what it came to (D38).
 
 use std::fmt;
-use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -31,9 +30,10 @@ use similarity_core::{
   Schema,
 };
 use similarity_store::{Expected, Neighbor, SearchQuery, StoreError, StoredRecord, VectorStore};
-use tokio::sync::{Mutex, OwnedMutexGuard, watch};
+use tokio::sync::watch;
 use tracing::Instrument as _;
 
+use crate::locks::{Hold, Locks};
 use crate::metrics::Metrics;
 use crate::worker::{EmbedError, TextEmbedder};
 
@@ -50,9 +50,6 @@ pub const MAX_MATCH_FETCH: usize = 1000;
 pub const DEFAULT_NEIGHBORS: usize = 10;
 /// The most neighbors `find_similar` will return.
 pub const MAX_NEIGHBORS: usize = 100;
-/// How many independent locks guard record ids. A power of two well above the expected request concurrency, so that
-/// two different ids rarely share a lock.
-const LOCK_STRIPES: usize = 256;
 /// How many times a request reads a record, judges, and tries to write before it gives up with
 /// [`EngineError::Conflict`]. Each try after the first means another writer changed the record in the moment
 /// between this one's read and its write, which takes another replica working on the same record at the same
@@ -402,7 +399,7 @@ pub struct Judged<'a> {
 ///
 /// Shared, so that a request that is dropped while its write is on its way does not let the next request for the
 /// record in before that write has landed and been reported.
-type Held = Arc<OwnedMutexGuard<()>>;
+type Held = Arc<Hold>;
 
 /// What a write did to the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -495,8 +492,7 @@ pub struct Engine<S, E> {
   matching: Matching,
   import_batch: usize,
   observer: Option<Arc<dyn Observer>>,
-  locks: Vec<Arc<Mutex<()>>>,
-  lock_hasher: RandomState,
+  locks: Locks,
   /// How many writes are in flight.
   writes: watch::Sender<usize>,
   /// Where a write that ended with nobody to tell is counted. Kept nowhere unless a server asks
@@ -560,8 +556,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       matching: Matching::default(),
       import_batch: DEFAULT_IMPORT_BATCH,
       observer: None,
-      locks: (0..LOCK_STRIPES).map(|_| Arc::new(Mutex::new(()))).collect(),
-      lock_hasher: RandomState::new(),
+      locks: Locks::default(),
       writes: watch::Sender::new(0),
       metrics: Arc::new(Metrics::discarded()),
     }
@@ -628,22 +623,10 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     }
   }
 
-  fn lock_for(&self, id: &str) -> Result<&Arc<Mutex<()>>, EngineError> {
-    let stripes = u64::try_from(self.locks.len()).unwrap_or(u64::MAX);
-    let hash = usize::try_from(self.lock_hasher.hash_one(id).checked_rem(stripes).unwrap_or(0)).unwrap_or(0);
-    self
-      .locks
-      .get(hash)
-      .ok_or_else(|| EngineError::Internal("lock stripe out of range".to_owned()))
-  }
-
-  /// Waits for the record's lock. The wait is a span in the request's trace: it is another request, in this
-  /// process, for a record that picks the same lock.
-  async fn hold(&self, id: &str) -> Result<Held, EngineError> {
-    let lock = Arc::clone(self.lock_for(id)?);
-    Ok(Arc::new(
-      lock.lock_owned().instrument(tracing::debug_span!("lock")).await,
-    ))
+  /// Waits for the record's lock. The wait is a span in the request's trace: it is for another request, in this
+  /// process, for the same record.
+  async fn hold(&self, id: &str) -> Held {
+    Arc::new(self.locks.hold(id).instrument(tracing::debug_span!("lock")).await)
   }
 
   /// Runs `write` to its end and returns what it returns, whether or not this request is still there to be told.
@@ -758,7 +741,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       ));
     };
 
-    let held = self.hold(&id).await?;
+    let held = self.hold(&id).await;
     let asked = (input.mode, input.threshold);
     for _ in 0..WRITE_ATTEMPTS {
       let attempt = self.attempt(&held, (&id, brand_id.as_deref()), &prepared, asked, &policy);
@@ -1178,7 +1161,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       updated_at: now(),
     };
 
-    let held = self.hold(&record.id).await?;
+    let held = self.hold(&record.id).await;
     let record = Arc::new(record);
     for _ in 0..WRITE_ATTEMPTS {
       if let Some(stored) = self.store.get(&record.id).await? {
@@ -1341,7 +1324,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       return Err(EngineError::InvalidArgument("`id` is required".to_owned()));
     };
     let brand_id = required_text("brand_id", brand_id)?;
-    let held = self.hold(&id).await?;
+    let held = self.hold(&id).await;
     for _ in 0..WRITE_ATTEMPTS {
       let Some(stored) = self.store.get(&id).await? else {
         return Ok(false);
@@ -4350,6 +4333,43 @@ mod tests {
   }
 
   const GONE: &str = "a write finished after the request that asked for it had gone";
+
+  /// A record's lock is the record's own. A write that is slow for one record, here one that never lands, holds
+  /// up the next request for that record and nobody else: every other record is answered while it waits. With a
+  /// fixed number of locks shared out by a hash of the id, some of these would have waited for a stranger.
+  #[tokio::test]
+  async fn a_record_that_is_being_written_holds_up_no_other_record() {
+    let (engine, _, _) = gated();
+    let store = Arc::clone(&engine.store);
+    dropped_mid_write(&store, engine.evaluate(evaluate_input(Some("slow"), &GUMMIES))).await;
+
+    for other in 0..2_000 {
+      let id = format!("other-{other}");
+      let preview = EvaluateInput {
+        mode: WriteMode::DryRun,
+        ..evaluate_input(Some(&id), &GUMMIES)
+      };
+      let mut asked = Box::pin(engine.evaluate(preview));
+      assert!(
+        !still_waiting(&mut asked).await,
+        "`{id}` waited for a record that is not it"
+      );
+    }
+
+    let mut again = Box::pin(engine.evaluate(evaluate_input(Some("slow"), &GUMMIES)));
+    assert!(still_waiting(&mut again).await, "the record itself is still held");
+    assert_eq!(engine.locks.in_use(), 1, "and it is the only record that has a lock");
+    store.open();
+    let again = ended(&mut again).await.unwrap();
+    assert_eq!((again.verdict, again.stored), (Verdict::Accepted, false));
+    drop(again);
+    all_written(&engine).await;
+    assert_eq!(
+      engine.locks.in_use(),
+      0,
+      "which it has for as long as somebody is at it"
+    );
+  }
 
   /// The case a caller cannot handle by itself. Its request was dropped while the write was on its way, so it
   /// was told nothing, and the write went through. The engine finishes what it started: the record is stored,

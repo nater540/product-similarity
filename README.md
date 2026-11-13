@@ -2524,29 +2524,32 @@ On the same machine (12 cores, release build, default model, 300 records per lev
 
 | Callers | Phase | Requests per second | Median | 99th percentile | Texts per forward pass | Mean wait in the queue |
 |---|---|---|---|---|---|---|
-| 1 | create | 216 | 4.8 ms | 5.2 ms | 4.0 | 0.0 ms |
-| 1 | edit | 627 | 1.6 ms | 1.7 ms | 1.0 | 0.0 ms |
-| 1 | resave | 9,937 | 0.1 ms | 0.1 ms | | |
-| 4 | create | 292 | 13.7 ms | 15.5 ms | 7.9 | 5.4 ms |
-| 4 | edit | 1,090 | 3.6 ms | 4.7 ms | 2.0 | 1.5 ms |
-| 16 | create | 402 | 39.0 ms | 58.0 ms | 30.0 | 18.9 ms |
-| 16 | edit | 1,852 | 8.5 ms | 9.4 ms | 7.9 | 2.3 ms |
-| 64 | create | 401 | 139.6 ms | 280.0 ms | 30.8 | 109.0 ms |
-| 64 | edit | 2,448 | 22.4 ms | 47.4 ms | 23.1 | 9.3 ms |
-| 64 | resave | 26,764 | 2.2 ms | 4.1 ms | | |
-| 1 | stream | 406 | | | 31.6 | 0.0 ms |
+| 1 | create | 213 | 4.8 ms | 5.3 ms | 4.0 | 0.0 ms |
+| 1 | edit | 623 | 1.6 ms | 1.7 ms | 1.0 | 0.0 ms |
+| 1 | resave | 10,191 | 0.1 ms | 0.1 ms | | |
+| 4 | create | 293 | 13.7 ms | 15.3 ms | 8.0 | 5.4 ms |
+| 4 | edit | 1,061 | 3.8 ms | 4.0 ms | 2.0 | 1.4 ms |
+| 16 | create | 401 | 40.2 ms | 43.8 ms | 30.8 | 19.0 ms |
+| 16 | edit | 1,873 | 8.5 ms | 9.0 ms | 7.9 | 1.9 ms |
+| 64 | create | 398 | 156.0 ms | 170.6 ms | 30.8 | 124.2 ms |
+| 64 | edit | 2,526 | 24.5 ms | 28.0 ms | 27.3 | 10.1 ms |
+| 64 | resave | 29,337 | 2.1 ms | 2.9 ms | | |
+| 1 | stream | 405 | | | 31.6 | 0.0 ms |
 
 - **create** sends a new record, so all four fields go to the model. **edit** sends it back with the name
   changed, so one short text does: this is edit-time traffic, the figure a replica is sized by. **resave** sends
   the edited record again unchanged, so nothing reaches the model, and what is left is gRPC, the per-record lock,
   and the store. **stream** creates the same number of new records over one `Import` call.
 - **More callers buy throughput by sharing forward passes, and pay for it in latency.** From 1 caller to 64,
-  edits per second go from 627 to 2,448 while the median goes from 1.6 ms to 22 ms. The model was busy for
+  edits per second go from 623 to 2,526 while the median goes from 1.6 ms to 25 ms. The model was busy for
   nearly all of every create and edit phase (89% of the time with one caller editing, 99% and more from four):
-  one replica's ceiling on this machine is about 2,450 edits a second.
+  one replica's ceiling on this machine is about 2,500 edits a second.
+- **The slowest requests are close to the median**: at 64 callers the 99th percentile of an edit is 28 ms
+  against a median of 25. Everybody waits for the model, and nobody waits for anybody else
+  ([Where a request's time goes](#where-a-requests-time-goes)).
 - **Creating whole records levels off at about 400 a second**, 1,600 texts, once a forward pass is full
   (`model.batch_size` is 32). **One stream reaches that ceiling from a single caller**: it fills forward passes
-  on purpose, where 64 callers of `Evaluate` fill them by arriving together and wait 140 ms each to do it. The
+  on purpose, where 64 callers of `Evaluate` fill them by arriving together and wait 160 ms each to do it. The
   `import` command is no faster a second, but shares the model with nobody.
 - **No request was refused** in any phase: the queue holds 256 (`model.queue_depth`), more than 64 callers can
   fill. A refused request is counted (`overloaded`) and sent again after 5 ms.
@@ -2599,9 +2602,32 @@ from `just load ... --server` runs of 1,000 records at each level, same machine:
   that bearable: one name alone takes 1.15 ms, and 32 names in one pass take 6.5.
 - **Against Qdrant the write grows with the callers**, from 1.5 ms alone to 14.9 ms at 64, where it is the
   largest part of an edit. That is the store's limit ([Past what a server can do](#past-what-a-server-can-do)).
-- **The lock is waited for by requests for different records.** There are 256 locks and a record's id picks
-  one, so with 64 requests in flight about one in five shares a lock with another and waits out its whole
-  request: 17 to 19 ms of a 150 ms create.
+- **The lock was waited for by requests for different records**, in the build this table was measured on.
+  There were 256 locks and a record's id picked one, so with 64 requests in flight about one in five shared a
+  lock with another and waited out its whole request: 17 to 19 ms of a 150 ms create. That is the one thing in
+  the table that has been changed since (below).
+
+**A record's lock is now its own** (D41): made when the first request for the record arrives and forgotten
+when the last has left, so a request waits for the requests for its own record that came before it, and for
+nothing else. From the traces of two `just load --server` runs of 1,000 records at 64 callers on each build,
+the `lock` span of a create went from a mean of 19 and 21 ms to 0.002 ms, and of an edit from 3.1 and 3.6 ms
+to 0.002 ms; a fifth of the requests had waited, and now none did.
+
+What that bought is not a faster server. The model is the limit, and a request that no longer waits for a
+lock waits for the model instead. It bought an even one: the requests that drew a stranger's lock took twice
+as long as the rest, and now nobody does. Latency in milliseconds over `just load --server --concurrency 64
+--records 2000`, six runs of each build, taken in turn on the same machine:
+
+| Phase | Locks | Per second | Mean | Median | 90th | 99th | Slowest |
+|---|---|---|---|---|---|---|---|
+| create | 256, shared | 395 | 159.6 | 143.8 | 221.8 | 321.8 | 501.5 |
+| create | one a record | 398 | 158.6 | 160.8 | 165.3 | 168.5 | 169.9 |
+| edit | 256, shared | 2,393 | 26.4 | 23.8 | 36.1 | 56.8 | 89.8 |
+| edit | one a record | 2,464 | 25.7 | 25.8 | 27.4 | 28.4 | 28.8 |
+
+The median went up, because the lucky requests were only ever ahead of the unlucky ones. A request alone was
+the same on both (4.75 ms a create, 1.65 ms an edit), and so was a save with no changes, alone and at 64
+callers (25,000 a second): the table of locks costs nothing that could be measured.
 
 The caller's own figure was within 0.5 ms of the server's for a create and 1 ms for an edit at 64 callers, and
 2.5 ms above it for a save with no changes, which the server answers in 0.02: the load test sends everything
@@ -2831,7 +2857,7 @@ data/
   regression.snapshot.ndjson      what the pinned model and the example config make of them
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D40)
+  decisions.md               why things are the way they are (D1 to D41)
   data-request-prompt.md     a brief for collecting labeled production data
   import-prompt.md           a brief for loading the real catalog into a running service
   feature-suggestions.md     features that could be added, built and not, the last twelve about production

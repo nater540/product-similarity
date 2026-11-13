@@ -27,6 +27,7 @@ pub mod grpc;
 pub mod import;
 pub mod import_stream;
 pub mod load;
+pub mod locks;
 pub mod metrics;
 pub mod offline;
 #[cfg(test)]

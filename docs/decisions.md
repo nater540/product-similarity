@@ -243,7 +243,8 @@ edit touches one field, so a typical request embeds one short text, about 4 ms.
 
 ## D10. Per-id locking is in-process
 
-Evaluating is read, compare, write. `Engine` serializes requests for the same id with striped locks, so within one
+Evaluating is read, compare, write. `Engine` serializes requests for the same id with a lock (at first one of
+256 picked by a hash of the id; since D41 the record's own), so within one
 server two concurrent revisions cannot both pass against the same baseline. Across replicas the locks do nothing,
 and for a long time nothing else did either: this decision used to end by saying that callers had to serialize
 edits to one record themselves, or route by id. Since D35 every write is conditional on the store still holding
@@ -1953,8 +1954,54 @@ trace, each wait inside the call that made it, and none for the health check tha
 - The per-record lock (D10, D35) is waited for by requests for *different* records: 256 locks, picked by a
   hash of the id, so with 64 requests in flight about one in five shares a lock with another and waits out its
   whole request. 17 ms of a 154 ms create. Not changed here: this decision is the instrument, and what to do
-  about each of these is the owner's to weigh.
+  about each of these is the owner's to weigh. (The owner had this one changed the next day: D41.)
 
 **Not done:** traces of `calibrate`, `import`, and the other commands, which are not requests; TLS to the
 collector; trace ids on the log lines, which would join the two; and anything that samples by what a request
 turned out to be (keeping every rejection, say), which is a collector's job.
+
+## D41. A record's lock is its own
+
+D10 gave the engine 256 locks and let a hash of the id pick one. The traces of D40 showed what that costs: with
+64 requests in flight about one in five drew a lock that a request for some other record was holding, and
+waited out that request's whole length, forward pass included. Nothing was protected by the wait. The two
+records had nothing to do with each other.
+
+**One lock for each record that a request is at, and none for any other** (`locks.rs`). The lock is made when
+the first request for a record arrives and forgotten when the last one has left, whether that one held it or
+only waited. So the table is as large as the number of requests in flight, however large the catalog is, and
+there is nothing to size or tune. What each request does at the table is one lookup under a plain mutex that
+is never held across a wait.
+
+**What did not change:** requests for one record still take turns, in the order they came (the lock is still
+tokio's `Mutex`); a write that outlives its request still holds the record until it has landed (D38); the wait
+is still the `lock` span of a trace (D40); and across replicas there is still no lock at all, which is what
+conditional writes are for (D35).
+
+**Written here, on tokio's `Mutex`, and not taken from a crate.** The owner prefers maintained crates to
+hand-written infrastructure (D39), so this was looked for first. There are crates for a lock by key
+(`lockable`, `keyed-lock`, `key-mutex`), each one person's, each before 1.0, none of them what the ecosystem
+uses, and the one with the most downloads last released in June 2025. What is needed beyond the mutex is a
+map and a count, fifty lines, in the path that decides whether a write may happen, where this project tests
+its own code hardest (D25). If the owner would rather have the dependency, `Locks::hold` is the one function
+that would call it.
+
+**Held to its rules by tests that do not need the engine.** A request never waits for a request for another
+record, with 5,000 records held at once. Requests for one record are served in order. A request that gives
+up waiting holds up nobody and leaves nothing in the table. And a property (D19): over any sequence of
+arrivals and departures at three records, each record that anybody is at is held by exactly the first request
+still there, and the table holds those records and no others. In the engine, a write that never lands for one
+record leaves 2,000 other records answered and one lock in the table. That test fails on the 256 locks.
+
+**What it bought, measured** (the README has the table). The wait is gone: over two traced load runs at 64
+callers on each build, the `lock` span of a create went from a mean of 19 and 21 ms to 0.002 ms, and a fifth of
+the requests had waited where now none did. The server is not faster for it, and was not expected to be once
+the numbers were in: the model is the limit (D38), and a request that does not wait for a lock waits for the
+model. Mean latency of a create at 64 callers was 159.6 ms and is 158.6. What changed is who waits. The 99th
+percentile of a create went from 322 ms to 168, and of an edit from 57 ms to 28, because the requests that
+drew a stranger's lock took twice as long as the others and now nobody does; the median of a create rose from
+144 ms to 161 for the same reason. Edits a second went from 2,393 to 2,464. One caller alone, and saves with no
+changes at any number of callers, were the same on both builds.
+
+**Not done:** anything about the order in which requests for *different* records reach the model, which is the
+embedding thread's (D38) and is where the remaining wait is.

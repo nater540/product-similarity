@@ -6,7 +6,7 @@ and trained in [Burn](https://burn.dev), run by ONNX Runtime), compared with the
 rejected against calibrated thresholds. A record's quantities (weight, volume, potency) are compared as numbers
 beside that, never embedded. Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D40) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D41) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -72,7 +72,8 @@ changing a design. Infer conventions from the existing code first.
 - `crates/similarity-runs`: the local record of runs (D23): the manifest, starting and ending a run, reading runs
   back. It records and lists; it decides nothing.
 - `crates/similarity-server`: config, the embedding worker thread, `Engine` (all behavior), the thin gRPC layer,
-  `import_stream` (the loop behind the streaming `Import` call), `metrics` (the few numbers the server keeps
+  `import_stream` (the loop behind the streaming `Import` call), `locks` (one lock for each record a request is
+  at), `metrics` (the few numbers the server keeps
   about itself), `telemetry` (where its traces and metrics go: the exporters, the page, the traced store),
   `model fetch`, `import`, `compare`/`calibrate`/`calibrate-drift`/`calibrate-match`/`calibrate-sweep` (the `offline` module), `load` (the load
   test), `runs` (reading recorded runs back, comparing and reporting them), `shadow` (a candidate policy judging
@@ -137,6 +138,12 @@ changing a design. Infer conventions from the existing code first.
   set up a second subscriber. A store is traced from outside by `Traced`; do not put spans into a store.
   Health checks are not traced. Before proposing a performance change, find out where the time goes; it has
   been guessed wrong before.
+- **A record's lock is its own** (D41). `locks.rs` makes a lock when the first request for a record arrives
+  and forgets it when the last has left; requests for one record take turns in the order they came, and a
+  request never waits for another record's. Do not bring back a fixed number of locks picked by a hash (one
+  request in five waited out a stranger's whole request), do not keep a lock for a record nobody is at (the
+  table would grow with the catalog), and never hold the table's own mutex across an `.await`. It is one
+  process's lock: what holds across replicas is the conditional write (D35).
 - **A request can be dropped anywhere it waits, and a write never is** (D38). The transport drops a handler
   when its caller's deadline runs out or the caller hangs up, so every `.await` in a request is a place it can
   end. Before the write that is free, and has to stay free: nothing may be left half done there. The write
