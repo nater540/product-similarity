@@ -33,8 +33,9 @@ use similarity_core::{
 };
 use similarity_store::{Expected, Neighbor, SearchQuery, StoreError, StoredRecord, VectorStore};
 use tokio::sync::{Mutex, OwnedMutexGuard, watch};
+use tracing::Instrument as _;
 
-use crate::span::{self, Stage};
+use crate::metrics::Metrics;
 use crate::worker::{EmbedError, TextEmbedder};
 
 /// The most records of an import stream taken into one batch, unless the configuration says otherwise. With four
@@ -511,6 +512,8 @@ pub struct Engine<S, E> {
   writes: watch::Sender<usize>,
   /// How many writes ended with nobody to tell.
   unanswered: Arc<AtomicU64>,
+  /// Where the wait for a record's lock is counted. Nothing is kept unless a server asks ([`Self::with_metrics`]).
+  metrics: Arc<Metrics>,
 }
 
 fn required_text(what: &str, value: Option<String>) -> Result<Option<String>, EngineError> {
@@ -573,6 +576,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       lock_hasher: RandomState::new(),
       writes: watch::Sender::new(0),
       unanswered: Arc::default(),
+      metrics: Arc::new(Metrics::discarded()),
     }
   }
 
@@ -592,6 +596,13 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
   #[must_use]
   pub fn with_matching(mut self, matching: Matching) -> Self {
     self.matching = matching;
+    self
+  }
+
+  /// The same engine, counting into `metrics` what only it can see: how long requests wait for a record's lock.
+  #[must_use]
+  pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+    self.metrics = metrics;
     self
   }
 
@@ -639,9 +650,14 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       .ok_or_else(|| EngineError::Internal("lock stripe out of range".to_owned()))
   }
 
-  /// Waits for the record's lock.
+  /// Waits for the record's lock, and says how long that took: a wait here is another request, in this process,
+  /// for a record that picks the same lock.
   async fn hold(&self, id: &str) -> Result<Held, EngineError> {
-    Ok(Arc::new(Arc::clone(self.lock_for(id)?).lock_owned().await))
+    let lock = Arc::clone(self.lock_for(id)?);
+    let asked = std::time::Instant::now();
+    let held = lock.lock_owned().instrument(tracing::debug_span!("lock")).await;
+    self.metrics.lock_waited(asked.elapsed());
+    Ok(Arc::new(held))
   }
 
   /// Runs `write` to its end and returns what it returns, whether or not this request is still there to be told.
@@ -660,7 +676,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
   {
     let (held, in_flight) = (Arc::clone(held), InFlight::begin(&self.writes));
     let (delivery_id, unanswered) = (id.to_owned(), Arc::clone(&self.unanswered));
-    let task = tokio::spawn(async move {
+    let writing = async move {
       let result = write.await;
       // The lock goes before the count does, and both before the result can be seen: a request that waited for
       // this one finds the record as this write left it, and a server that waited for writes finds none.
@@ -672,7 +688,9 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
         id: delivery_id,
         unanswered,
       }
-    });
+    };
+    // On a task of its own, and still part of the request to anybody tracing it.
+    let task = tokio::spawn(writing.in_current_span());
     match task.await.map(Delivery::take) {
       Ok(Some(result)) => result.map(|(value, _)| value),
       Ok(None) => Err(EngineError::Internal(format!(
@@ -762,7 +780,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       ));
     };
 
-    let held = span::timed(Stage::Lock, self.hold(&id)).await?;
+    let held = self.hold(&id).await?;
     let asked = (input.mode, input.threshold);
     for _ in 0..WRITE_ATTEMPTS {
       let attempt = self.attempt(&held, (&id, brand_id.as_deref()), &prepared, asked, &policy);
@@ -784,7 +802,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     asked: (WriteMode, Option<f32>),
     policy: &Policy,
   ) -> Result<Option<EvaluateOutput>, EngineError> {
-    let baseline = span::timed(Stage::StoreRead, self.store.get(id)).await?;
+    let baseline = self.store.get(id).await?;
     if let Some(stored) = &baseline {
       same_brand(stored, brand_id)?;
     }
@@ -859,7 +877,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       }
       Ok((Some(finish()), Change::Stored(record.revision)))
     };
-    span::timed(Stage::StoreWrite, self.committed(held, "evaluate", &named, write)).await
+    self.committed(held, "evaluate", &named, write).await
   }
 
   /// The record a revision that is to be written leaves stored: `baseline`'s next revision.
@@ -1005,7 +1023,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       }
       Ok((Some(finish()), Change::Stored(revision)))
     };
-    span::timed(Stage::StoreWrite, self.committed(held, "evaluate", &named, write)).await
+    self.committed(held, "evaluate", &named, write).await
   }
 
   /// Imports records that are not stored yet, embedding all of them in one call to the model.
@@ -1240,7 +1258,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
         let Some(id) = required_text("id", Some(id))? else {
           return Err(EngineError::InvalidArgument("`id` is required".to_owned()));
         };
-        let Some(stored) = span::timed(Stage::StoreRead, self.store.get(&id)).await? else {
+        let Some(stored) = self.store.get(&id).await? else {
           return Err(EngineError::NotFound(format!("no record `{id}` is stored")));
         };
         (stored.vectors.composite, Some(id))
@@ -1259,7 +1277,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       exclude_id: exclude_id.as_deref(),
       min_similarity: input.min_similarity,
     };
-    Ok(span::timed(Stage::Search, self.store.search(query)).await?)
+    Ok(self.store.search(query).await?)
   }
 
   /// Finds the stored records `input.menu_item` describes, best first, and decides whether the best is a match.
@@ -1312,7 +1330,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       exclude_id: None,
       min_similarity: None,
     });
-    let found = span::timed(Stage::Search, searched).await?;
+    let found = searched.await?;
     let candidates = matching::rank(
       &self.schema,
       self.embedder.dimension(),
@@ -1345,9 +1363,9 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       return Err(EngineError::InvalidArgument("`id` is required".to_owned()));
     };
     let brand_id = required_text("brand_id", brand_id)?;
-    let held = span::timed(Stage::Lock, self.hold(&id)).await?;
+    let held = self.hold(&id).await?;
     for _ in 0..WRITE_ATTEMPTS {
-      let Some(stored) = span::timed(Stage::StoreRead, self.store.get(&id)).await? else {
+      let Some(stored) = self.store.get(&id).await? else {
         return Ok(false);
       };
       same_brand(&stored, brand_id.as_deref())?;
@@ -1358,7 +1376,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
         let deleted = store.delete_if(&gone, read).await?;
         Ok((deleted, if deleted { Change::Deleted } else { Change::Nothing }))
       };
-      if span::timed(Stage::StoreWrite, self.committed(&held, "delete", &id, write)).await? {
+      if self.committed(&held, "delete", &id, write).await? {
         return Ok(true);
       }
     }
@@ -4588,15 +4606,13 @@ mod tests {
     all_written(&engine).await;
   }
 
-  // ---- Where a request's time went (D40) ----------------------------------------------------------------------
+  // ---- What only the engine can count (D39) -------------------------------------------------------------------
 
-  /// A store that takes its time, a different time for each kind of operation, so that a test can tell which
-  /// one a request waited for.
+  /// A store that takes a while to read and to write, so that a request for a record is still being served
+  /// when the next one for it arrives.
   struct Sleepy(MemoryStore);
 
-  const READS: Duration = Duration::from_millis(15);
-  const WRITES: Duration = Duration::from_millis(40);
-  const SEARCHES: Duration = Duration::from_millis(25);
+  const TAKES: Duration = Duration::from_millis(20);
 
   impl VectorStore for Sleepy {
     async fn check(&self) -> Result<(), StoreError> {
@@ -4604,7 +4620,7 @@ mod tests {
     }
 
     async fn get(&self, id: &str) -> Result<Option<StoredRecord>, StoreError> {
-      tokio::time::sleep(READS).await;
+      tokio::time::sleep(TAKES).await;
       self.0.get(id).await
     }
 
@@ -4613,7 +4629,7 @@ mod tests {
     }
 
     async fn put_if(&self, record: &StoredRecord, expected: Expected) -> Result<bool, StoreError> {
-      tokio::time::sleep(WRITES).await;
+      tokio::time::sleep(TAKES).await;
       self.0.put_if(record, expected).await
     }
 
@@ -4622,90 +4638,59 @@ mod tests {
     }
 
     async fn delete_if(&self, id: &str, version: Version) -> Result<bool, StoreError> {
-      tokio::time::sleep(WRITES).await;
       self.0.delete_if(id, version).await
     }
 
     async fn search(&self, query: SearchQuery<'_>) -> Result<Vec<Neighbor>, StoreError> {
-      tokio::time::sleep(SEARCHES).await;
       self.0.search(query).await
     }
 
     async fn search_vectors(&self, query: SearchQuery<'_>) -> Result<Vec<Found>, StoreError> {
-      tokio::time::sleep(SEARCHES).await;
       self.0.search_vectors(query).await
     }
   }
 
-  fn sleepy() -> Engine<Sleepy, WordBagEmbedder> {
+  /// The wait for a record's lock is counted, once for every request that takes one, and it is the wait: a
+  /// request that found its record free waited no time, and one that arrived while another was being served
+  /// waited for that one's read and write.
+  #[tokio::test]
+  async fn the_wait_for_a_records_lock_is_counted() {
     let embedder = WordBagEmbedder::new("word-bag-v1");
     let (layout, dimension) = store_layout(&schema(), &embedder);
-    let store = Sleepy(MemoryStore::new(layout, dimension));
-    Engine::new(store, embedder, schema(), Policy::new(0.75, None).unwrap())
-  }
+    let metrics = Arc::new(Metrics::exported("word-bag-v1").unwrap());
+    let engine = Engine::new(
+      Sleepy(MemoryStore::new(layout, dimension)),
+      embedder,
+      schema(),
+      Policy::new(0.75, None).unwrap(),
+    )
+    .with_metrics(Arc::clone(&metrics));
+    let waited = |series: &str| -> f64 {
+      let page = metrics.render(&crate::metrics::Polled::default());
+      let series = format!("record_similarity_lock_wait_seconds_{series} ");
+      page
+        .lines()
+        .find_map(|line| line.strip_prefix(&series)?.parse().ok())
+        .unwrap_or(f64::NAN)
+    };
 
-  /// Each wait of a request is put down to what it was a wait for: a read as a read, a write as a write, a
-  /// search as a search, and nothing to a stage the request never reached.
-  #[tokio::test]
-  async fn a_request_knows_what_it_waited_for() {
-    use crate::span::{Stage, traced};
+    engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
+    assert!((waited("count") - 1.0).abs() < f64::EPSILON);
+    assert!(waited("sum") < TAKES.as_secs_f64(), "nobody else had the record");
 
-    let engine = sleepy();
-    let (created, spent) = traced(engine.evaluate(evaluate_input(Some("p1"), &GUMMIES))).await;
-    assert_eq!(created.unwrap().verdict, Verdict::Created);
-    assert!(
-      spent.spent(Stage::StoreRead) >= READS && spent.spent(Stage::StoreRead) < WRITES,
-      "{spent:?}"
+    let (first, second) = tokio::join!(
+      engine.evaluate(evaluate_input(Some("p2"), &GUMMIES)),
+      engine.evaluate(evaluate_input(Some("p2"), &GUMMIES_EDITED)),
     );
-    assert!(spent.spent(Stage::StoreWrite) >= WRITES, "{spent:?}");
-    assert!(
-      spent.spent(Stage::Lock) < READS,
-      "nobody else had the record: {spent:?}"
-    );
-    assert_eq!(spent.spent(Stage::Search), Duration::ZERO);
-
-    // A save with no changes reads and does not write.
-    let (resaved, spent) = traced(engine.evaluate(evaluate_input(Some("p1"), &GUMMIES))).await;
-    assert!(!resaved.unwrap().stored);
-    assert!(spent.spent(Stage::StoreRead) >= READS, "{spent:?}");
-    assert_eq!(spent.spent(Stage::StoreWrite), Duration::ZERO);
-
-    let (near, spent) = traced(engine.find_similar(similar_to_id("p1"))).await;
-    near.unwrap();
-    assert!(
-      spent.spent(Stage::StoreRead) >= READS && spent.spent(Stage::Search) >= SEARCHES,
-      "{spent:?}"
-    );
-    assert_eq!(spent.spent(Stage::StoreWrite), Duration::ZERO);
-
-    let (matched, spent) = traced(engine.match_menu_item(menu_item(&MENU_ITEM))).await;
-    matched.unwrap();
-    assert!(spent.spent(Stage::Search) >= SEARCHES, "{spent:?}");
-    assert_eq!(spent.spent(Stage::StoreRead), Duration::ZERO);
-
-    let (deleted, spent) = traced(engine.delete("p1".to_owned(), None)).await;
-    assert!(deleted.unwrap());
-    assert!(
-      spent.spent(Stage::StoreRead) >= READS && spent.spent(Stage::StoreWrite) >= WRITES,
-      "{spent:?}"
-    );
-  }
-
-  /// A request for a record that another request is being served for waits for it, and that wait is the lock's:
-  /// not the store's, which it had not reached.
-  #[tokio::test]
-  async fn a_request_that_waits_for_its_record_puts_the_wait_down_to_the_lock() {
-    use crate::span::{Stage, traced};
-
-    let engine = sleepy();
-    let first = traced(engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)));
-    let second = traced(engine.evaluate(evaluate_input(Some("p1"), &GUMMIES_EDITED)));
-    let ((first, alone), (second, behind)) = tokio::join!(first, second);
     assert_eq!(first.unwrap().verdict, Verdict::Created);
     assert_eq!(second.unwrap().verdict, Verdict::Accepted);
-    assert!(alone.spent(Stage::Lock) < READS, "{alone:?}");
-    // The first read and wrote while the second waited.
-    assert!(behind.spent(Stage::Lock) >= READS + WRITES, "{behind:?}");
-    assert!(behind.spent(Stage::StoreRead) < behind.spent(Stage::Lock), "{behind:?}");
+    assert!((waited("count") - 3.0).abs() < f64::EPSILON);
+    assert!(
+      waited("sum") >= (TAKES + TAKES).as_secs_f64(),
+      "the second waited for the first to read and to write"
+    );
+    // A request with no id takes no lock, and is not counted as having waited for one.
+    engine.evaluate(evaluate_input(None, &GUMMIES)).await.unwrap();
+    assert!((waited("count") - 3.0).abs() < f64::EPSILON);
   }
 }

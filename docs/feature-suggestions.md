@@ -702,12 +702,13 @@ holds vectors and fingerprints, no text, and brand ids.
 
 ### 26. Operational metrics
 
-**Built** (D39). What came out differently: no library; the format is written by hand over counts that are
-arrays of atomics, and the endpoint is a route on the HTTP server `tonic` already brought. It is off until
+**Built** (D39), on the `metrics` crate and its Prometheus exporter, behind a typed front so that label values
+stay words fixed in one file. (A first version was written by hand and replaced the same day: the owner would
+rather depend on a maintained crate than maintain one.) It is off, and nothing is counted, until
 `metrics.listen` is set. Verdicts are counted with the write mode asked for, and requests that were dropped
-because their caller gave up are counted as `CANCELLED`. The wait for the model and texts per pass are sums to
-divide, not histograms. It was read back with the Prometheus Python client's parser and has not been scraped by
-Prometheus, a Collector, or a Datadog Agent.
+because their caller gave up are counted as `CANCELLED`. A request's waits (D40) are histograms and `tracing`
+spans. It was read back with the Prometheus Python client's parser and has not been scraped by Prometheus, a
+Collector, or a Datadog Agent; DogStatsD or OTLP would be another exporter of the same crate.
 
 **What.** A small HTTP endpoint in Prometheus text format: request counts and latency by call and status, the
 embedding queue's depth and wait, texts per forward pass, the share of time the model is busy, refusals for

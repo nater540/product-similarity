@@ -25,6 +25,8 @@ tonic.workspace = true
 tonic-health.workspace = true
 tonic-reflection.workspace = true
 axum.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 
@@ -45,6 +47,8 @@ similarity-core = { workspace = true, features = ["testing"] }
 similarity-log = { workspace = true, features = ["testing"] }
 proptest.workspace = true
 tempfile.workspace = true
+# One test listens for the spans a request makes, with a subscriber of its own.
+tracing-subscriber.workspace = true
 # The example client is a single-threaded program; the server itself never uses the current-thread runtime.
 # `io-util`: the metrics endpoint is tested with a hand-written HTTP request over a socket, as a scraper sends one.
 tokio = { workspace = true, features = ["rt", "io-util"] }

@@ -124,9 +124,9 @@ weight = 2.0
 overfetch = 5
 
 # Counts about the server itself (requests, latency, the embedding queue, the store, verdicts), for a monitoring
-# system to read. Optional, and off unless `listen` is set: the counts are kept either way, and this opens a
-# second port to serve them on, as plain HTTP at /metrics in the Prometheus text format, which a Datadog agent,
-# an OpenTelemetry collector, and Prometheus all read. Nothing about any record is in them. Use 0.0.0.0 inside a
+# system to read. Optional, and off unless `listen` is set: without it nothing is counted, and with it a second
+# port serves the counts, as plain HTTP at /metrics in the Prometheus text format, which a Datadog agent, an
+# OpenTelemetry collector, and Prometheus all read. Nothing about any record is in them. Use 0.0.0.0 inside a
 # container; 9464 is the port OpenTelemetry's Prometheus exporters use.
 #
 #   [metrics]

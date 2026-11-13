@@ -2,34 +2,40 @@
 //!
 //! A log line says what one request did. These say what the server is doing: how many requests of each kind it
 //! answers and how, how long they take, what the one embedding thread is busy with, how the store behaves, and
-//! what verdicts are going out. They are counted where they happen, in memory, and written out in the Prometheus
-//! text format when something asks ([`serve`]). That format is the one thing a Datadog agent, an OpenTelemetry
-//! collector, and Prometheus itself can all read, so nothing here knows which of them is asking.
+//! what verdicts are going out.
 //!
-//! Three rules hold for everything in this module:
+//! The counting is the [`metrics`] crate's, and so is the writing out: this module names what is counted and
+//! says where, and the Prometheus exporter keeps the numbers and renders them in the text format that a Datadog
+//! agent, an OpenTelemetry collector, and Prometheus all read ([`serve`]). Another exporter of that crate (one
+//! that pushes to a Datadog agent, say) would take the same counts; nothing outside [`Metrics::exported`] knows
+//! which is in use.
+//!
+//! The rest of the server does not use the crate's macros. It calls the methods of [`Metrics`], which is given
+//! a recorder of its own rather than the process-wide one. That keeps three things true:
 //!
 //! - **Nothing about a record is a label.** No id, no brand, no text: a label value is one of a handful of
 //!   words fixed in this file (a call, a status code, a verdict), or the model's fingerprint. Each distinct
 //!   label value is a time series somebody stores and pays for, and a record's brand is nobody's business in a
-//!   monitoring system.
-//! - **Counting never fails a request and never waits.** Every count is an atomic add.
+//!   monitoring system. A call site cannot spell a label wrong, or invent one.
 //! - **The names are an interface.** Dashboards and alerts are written against them. Add a metric or a label
 //!   value; never rename one or change what it counts.
+//! - **A server that is not asked for metrics keeps none** ([`Metrics::discarded`]), and two servers in one
+//!   process, as in the tests, do not count into each other.
 
-use std::fmt::Write as _;
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use metrics::{Counter, Gauge, Histogram, Key, KeyName, Label, Level, Metadata, NoopRecorder, Recorder, SharedString};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use similarity_core::matching::Decision;
 use similarity_store::{Expected, Found, Neighbor, SearchQuery, StoreError, StoredRecord, VectorStore, Version};
 use tokio::net::TcpListener;
 use tonic::{Code, Status};
+use tracing::Instrument as _;
 
 use crate::engine::{Verdict, WriteMode};
-use crate::span::{Stage, Timings};
 use crate::worker::WorkerSnapshot;
 
 /// The path the metrics are served at.
@@ -38,23 +44,109 @@ pub const PATH: &str = "/metrics";
 /// The content type of the Prometheus text format, version 0.0.4.
 pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
-/// The upper bounds of the latency buckets: in nanoseconds for counting, and as the `le` label, in seconds.
+/// The upper bounds of the latency buckets, in seconds.
 ///
 /// From one millisecond, under which a save with no changes is answered, to two and a half seconds, by which any
 /// caller has given up. They are not thresholds and nothing is decided by them: they are how finely a latency
 /// can be read back, and each one is a time series for every call and every store operation that is used.
-const BUCKETS: [(u64, &str); 11] = [
-  (1_000_000, "0.001"),
-  (2_500_000, "0.0025"),
-  (5_000_000, "0.005"),
-  (10_000_000, "0.01"),
-  (25_000_000, "0.025"),
-  (50_000_000, "0.05"),
-  (100_000_000, "0.1"),
-  (250_000_000, "0.25"),
-  (500_000_000, "0.5"),
-  (1_000_000_000, "1"),
-  (2_500_000_000, "2.5"),
+const SECONDS: [f64; 11] = [0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5];
+
+/// The upper bounds of the buckets for how many texts a forward pass held. A pass holds `model.batch_size` at
+/// most, unless one request alone brings more.
+const TEXTS: [f64; 8] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0];
+
+const BUILD_INFO: &str = "record_similarity_build_info";
+const MODEL_INFO: &str = "record_similarity_model_info";
+const READY: &str = "record_similarity_ready";
+const REQUESTS: &str = "record_similarity_requests_total";
+const IN_FLIGHT: &str = "record_similarity_requests_in_flight";
+const REQUEST_SECONDS: &str = "record_similarity_request_duration_seconds";
+const EVALUATIONS: &str = "record_similarity_evaluations_total";
+const MATCHES: &str = "record_similarity_matches_total";
+const IMPORT_RECORDS: &str = "record_similarity_import_records_total";
+const LOCK_WAIT: &str = "record_similarity_lock_wait_seconds";
+const EMBED_WAIT: &str = "record_similarity_embed_wait_seconds";
+const PASS_SECONDS: &str = "record_similarity_embed_pass_duration_seconds";
+const PASS_TEXTS: &str = "record_similarity_embed_pass_texts";
+const EMBED_REQUESTS: &str = "record_similarity_embed_requests_total";
+const EMBED_ABANDONED: &str = "record_similarity_embed_abandoned_total";
+const EMBED_REFUSED: &str = "record_similarity_embed_refused_total";
+const EMBED_WAITING: &str = "record_similarity_embed_waiting";
+const STORE_SECONDS: &str = "record_similarity_store_duration_seconds";
+const STORE_ERRORS: &str = "record_similarity_store_errors_total";
+const WRITES_IN_FLIGHT: &str = "record_similarity_writes_in_flight";
+const WRITES_UNANSWERED: &str = "record_similarity_writes_unanswered_total";
+
+/// What each metric is, as its `# HELP` line says it.
+const COUNTERS: [(&str, &str); 8] = [
+  (
+    REQUESTS,
+    "Requests that ended, by call and gRPC status code. CANCELLED is a request whose caller went away.",
+  ),
+  (
+    EVALUATIONS,
+    "Evaluate calls that were answered, by verdict and by the write mode the request asked for.",
+  ),
+  (MATCHES, "Match calls that were answered, by decision."),
+  (
+    IMPORT_RECORDS,
+    "Records of Import streams that have ended, by what became of each.",
+  ),
+  (EMBED_REQUESTS, "Requests the embedding thread served."),
+  (
+    EMBED_ABANDONED,
+    "Requests passed over because their caller had gone before the model reached them.",
+  ),
+  (
+    EMBED_REFUSED,
+    "Requests refused without being embedded: queue_full is RESOURCE_EXHAUSTED, too_late is DEADLINE_EXCEEDED.",
+  ),
+  (STORE_ERRORS, "Store operations that ended in an error, by operation."),
+];
+
+const GAUGES: [(&str, &str); 6] = [
+  (BUILD_INFO, "Always 1. The version of the server is the label."),
+  (
+    MODEL_INFO,
+    "Always 1. The fingerprint of the model the server is running is the label.",
+  ),
+  (
+    READY,
+    "1 while the server reports itself ready (the embedding thread is alive and the store answers), 0 otherwise.",
+  ),
+  (
+    IN_FLIGHT,
+    "Requests being served right now, by call. An Import stream is one for as long as it is open.",
+  ),
+  (
+    EMBED_WAITING,
+    "Requests waiting for the model right now. model.queue_depth is the most there can be.",
+  ),
+  (WRITES_IN_FLIGHT, "Writes on their way to the store."),
+];
+
+const HISTOGRAMS: [(&str, &str); 6] = [
+  (
+    REQUEST_SECONDS,
+    "How long requests took, from the first line of the handler to the answer, by call, whatever the answer.",
+  ),
+  (
+    LOCK_WAIT,
+    "How long requests waited for their record's lock: another request in this process had it.",
+  ),
+  (
+    EMBED_WAIT,
+    "How long requests waited for the model, from joining the queue to being taken into a forward pass.",
+  ),
+  (
+    PASS_SECONDS,
+    "How long forward passes of the model took. Its sum, as a rate, is the share of the time the model is busy.",
+  ),
+  (PASS_TEXTS, "How many texts forward passes held."),
+  (
+    STORE_SECONDS,
+    "How long the store took, by operation, whether it succeeded or not.",
+  ),
 ];
 
 /// Every gRPC status code, in the order of its number, by the name the protocol gives it.
@@ -105,7 +197,9 @@ impl Call {
     Self::Import,
   ];
 
-  const fn name(self) -> &'static str {
+  /// The call's name, as the `call` label and a request's span have it.
+  #[must_use]
+  pub const fn name(self) -> &'static str {
     match self {
       Self::Describe => "Describe",
       Self::Evaluate => "Evaluate",
@@ -113,17 +207,6 @@ impl Call {
       Self::Match => "Match",
       Self::Delete => "Delete",
       Self::Import => "Import",
-    }
-  }
-
-  const fn index(self) -> usize {
-    match self {
-      Self::Describe => 0,
-      Self::Evaluate => 1,
-      Self::FindSimilar => 2,
-      Self::Match => 3,
-      Self::Delete => 4,
-      Self::Import => 5,
     }
   }
 }
@@ -173,111 +256,44 @@ impl Operation {
       Self::SearchVectors => "search_vectors",
     }
   }
+}
 
-  const fn index(self) -> usize {
-    match self {
-      Self::Check => 0,
-      Self::Get => 1,
-      Self::Put => 2,
-      Self::PutIf => 3,
-      Self::Delete => 4,
-      Self::DeleteIf => 5,
-      Self::Search => 6,
-      Self::SearchVectors => 7,
-    }
+const fn verdict_name(verdict: Verdict) -> &'static str {
+  match verdict {
+    Verdict::Created => "created",
+    Verdict::Accepted => "accepted",
+    Verdict::Rejected => "rejected",
+    Verdict::Embedded => "embedded",
   }
 }
 
-const VERDICTS: [(Verdict, &str); 4] = [
-  (Verdict::Created, "created"),
-  (Verdict::Accepted, "accepted"),
-  (Verdict::Rejected, "rejected"),
-  (Verdict::Embedded, "embedded"),
-];
-
-const MODES: [(WriteMode, &str); 3] = [
-  (WriteMode::Enforce, "enforce"),
-  (WriteMode::DryRun, "dry_run"),
-  (WriteMode::Force, "force"),
-];
-
-const DECISIONS: [(Decision, &str); 3] = [
-  (Decision::Matched, "matched"),
-  (Decision::NoMatch, "no_match"),
-  (Decision::NotJudged, "not_judged"),
-];
-
-/// What became of one record of an import, as the `outcome` label names it.
-const IMPORT_OUTCOMES: [&str; 3] = ["created", "exists", "failed"];
-
-fn nanoseconds(elapsed: Duration) -> u64 {
-  u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+const fn mode_name(mode: WriteMode) -> &'static str {
+  match mode {
+    WriteMode::Enforce => "enforce",
+    WriteMode::DryRun => "dry_run",
+    WriteMode::Force => "force",
+  }
 }
 
+const fn decision_name(decision: Decision) -> &'static str {
+  match decision {
+    Decision::Matched => "matched",
+    Decision::NoMatch => "no_match",
+    Decision::NotJudged => "not_judged",
+  }
+}
+
+/// A count of something as a gauge's value. Exact for any count below 2^53.
 #[expect(
   clippy::cast_precision_loss,
-  reason = "a total of nanoseconds is far below 2^53 for any process that will ever run"
+  reason = "requests waiting and writes in flight are far below 2^53"
 )]
-fn seconds(nanoseconds: u64) -> f64 {
-  nanoseconds as f64 / 1e9
+const fn level(count: u64) -> f64 {
+  count as f64
 }
 
-fn add(counter: Option<&AtomicU64>, amount: u64) {
-  if let Some(counter) = counter {
-    counter.fetch_add(amount, Ordering::Relaxed);
-  }
-}
-
-fn read(counter: &AtomicU64) -> u64 {
-  counter.load(Ordering::Relaxed)
-}
-
-/// How long something took, counted into [`BUCKETS`].
-#[derive(Debug, Default)]
-struct Histogram {
-  /// How many took at most each bound and more than the one before, and last, how many took longer than all.
-  counts: [AtomicU64; 12],
-  sum_ns: AtomicU64,
-}
-
-impl Histogram {
-  fn observe(&self, elapsed: Duration) {
-    let elapsed = nanoseconds(elapsed);
-    // A value exactly at a bound belongs to that bound: `le` is "less than or equal".
-    let bucket = BUCKETS
-      .iter()
-      .position(|(bound, _)| elapsed <= *bound)
-      .unwrap_or(BUCKETS.len());
-    add(self.counts.get(bucket), 1);
-    self.sum_ns.fetch_add(elapsed, Ordering::Relaxed);
-  }
-
-  fn count(&self) -> u64 {
-    self
-      .counts
-      .iter()
-      .fold(0_u64, |total, count| total.saturating_add(read(count)))
-  }
-
-  /// Writes the buckets, the sum, and the count of the series `name{labels}`. `labels` is `key="value"` or
-  /// nothing.
-  fn render(&self, out: &mut String, name: &str, labels: &str) {
-    let separator = if labels.is_empty() { "" } else { "," };
-    let mut cumulative = 0_u64;
-    for ((_, le), count) in BUCKETS.iter().zip(&self.counts) {
-      cumulative = cumulative.saturating_add(read(count));
-      let _ = writeln!(out, "{name}_bucket{{{labels}{separator}le=\"{le}\"}} {cumulative}");
-    }
-    let total = self.count();
-    let _ = writeln!(out, "{name}_bucket{{{labels}{separator}le=\"+Inf\"}} {total}");
-    let braces = if labels.is_empty() {
-      String::new()
-    } else {
-      format!("{{{labels}}}")
-    };
-    let _ = writeln!(out, "{name}_sum{braces} {}", seconds(read(&self.sum_ns)));
-    let _ = writeln!(out, "{name}_count{braces} {total}");
-  }
+fn label(key: &'static str, value: &'static str) -> Label {
+  Label::from_static_parts(key, value)
 }
 
 /// What is read from the rest of the server each time the metrics are asked for: counts that are kept where
@@ -294,38 +310,145 @@ pub struct Polled {
   pub writes_unanswered: u64,
 }
 
-/// The counts a server keeps about itself.
-#[derive(Debug, Default)]
+/// What a server counts about itself, and where the counts go.
 pub struct Metrics {
-  fingerprint: String,
-  ready: AtomicU64,
-  requests: [[AtomicU64; 17]; 6],
-  in_flight: [AtomicU64; 6],
-  request_seconds: [Histogram; 6],
-  evaluations: [[AtomicU64; 3]; 4],
-  matches: [AtomicU64; 3],
-  import_records: [AtomicU64; 3],
-  store_seconds: [Histogram; 8],
-  store_errors: [AtomicU64; 8],
-  /// Nanoseconds requests spent on each stage, by call.
-  stage_ns: [[AtomicU64; 6]; 6],
+  recorder: Box<dyn Recorder + Send + Sync>,
+  /// The exporter's other half, which renders what the recorder holds. `None` when nothing is kept.
+  exporter: Option<PrometheusHandle>,
+}
+
+impl std::fmt::Debug for Metrics {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter
+      .debug_struct("Metrics")
+      .field("exported", &self.exporter.is_some())
+      .finish_non_exhaustive()
+  }
 }
 
 impl Metrics {
-  /// Counts for a server running the model with this fingerprint, all at zero.
+  /// Counts that are kept nowhere: for a server nobody asks, a command, a test of something else. Every method
+  /// works and costs next to nothing.
   #[must_use]
-  pub fn new(fingerprint: &str) -> Self {
+  pub fn discarded() -> Self {
     Self {
-      fingerprint: fingerprint.to_owned(),
-      ..Self::default()
+      recorder: Box::new(NoopRecorder),
+      exporter: None,
     }
+  }
+
+  /// Counts for a server running the model with this fingerprint, kept by the Prometheus exporter and written
+  /// out by [`Self::render`].
+  ///
+  /// Every metric is described, and every series whose zero means something is there from the start: `OK` for
+  /// each call, so that a rate over it exists from the first scrape, and the verdicts, decisions, import
+  /// outcomes, and store errors. A status code no request has ended with, and the latency of anything that has
+  /// not happened, appear when they first do.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error if the exporter refuses the buckets, which are fixed in this file.
+  pub fn exported(fingerprint: &str) -> anyhow::Result<Self> {
+    let recorder = PrometheusBuilder::new()
+      .set_buckets(&SECONDS)
+      .and_then(|builder| builder.set_buckets_for_metric(Matcher::Full(PASS_TEXTS.to_owned()), &TEXTS))
+      .context("the metrics exporter refused its buckets")?
+      .build_recorder();
+    let metrics = Self {
+      exporter: Some(recorder.handle()),
+      recorder: Box::new(recorder),
+    };
+    for (name, help) in COUNTERS.into_iter().chain([(
+      WRITES_UNANSWERED,
+      "Writes that finished, or failed, after the request that asked for them had gone. Each has a log line.",
+    )]) {
+      let (name, help) = (KeyName::from_const_str(name), SharedString::const_str(help));
+      metrics.recorder.describe_counter(name, None, help);
+    }
+    for (name, help) in GAUGES {
+      let (name, help) = (KeyName::from_const_str(name), SharedString::const_str(help));
+      metrics.recorder.describe_gauge(name, None, help);
+    }
+    for (name, help) in HISTOGRAMS {
+      let (name, help) = (KeyName::from_const_str(name), SharedString::const_str(help));
+      metrics.recorder.describe_histogram(name, None, help);
+    }
+    metrics
+      .gauge(BUILD_INFO, vec![label("version", env!("CARGO_PKG_VERSION"))])
+      .set(1.0);
+    metrics
+      .gauge(MODEL_INFO, vec![Label::new("fingerprint", fingerprint.to_owned())])
+      .set(1.0);
+    metrics.gauge(READY, Vec::new()).set(0.0);
+    for call in Call::ALL {
+      metrics.requests(call, 0).increment(0);
+      metrics.in_flight(call).set(0.0);
+    }
+    for verdict in [
+      Verdict::Created,
+      Verdict::Accepted,
+      Verdict::Rejected,
+      Verdict::Embedded,
+    ] {
+      for mode in [WriteMode::Enforce, WriteMode::DryRun, WriteMode::Force] {
+        metrics.evaluations(verdict, mode).increment(0);
+      }
+    }
+    for decision in [Decision::Matched, Decision::NoMatch, Decision::NotJudged] {
+      metrics.matches(decision).increment(0);
+    }
+    metrics.imported(0, 0, 0);
+    for operation in Operation::ALL {
+      metrics.store_errors(operation).increment(0);
+    }
+    Ok(metrics)
+  }
+
+  fn counter(&self, name: &'static str, labels: Vec<Label>) -> Counter {
+    self
+      .recorder
+      .register_counter(&Key::from_parts(name, labels), &METADATA)
+  }
+
+  fn gauge(&self, name: &'static str, labels: Vec<Label>) -> Gauge {
+    self.recorder.register_gauge(&Key::from_parts(name, labels), &METADATA)
+  }
+
+  fn histogram(&self, name: &'static str, labels: Vec<Label>) -> Histogram {
+    self
+      .recorder
+      .register_histogram(&Key::from_parts(name, labels), &METADATA)
+  }
+
+  /// The count of requests of `call` that ended with the status code numbered `code`.
+  fn requests(&self, call: Call, code: usize) -> Counter {
+    // A number with no name in the table is counted as what it is to a caller: unknown.
+    let code = CODES.get(code).copied().unwrap_or("UNKNOWN");
+    self.counter(REQUESTS, vec![label("call", call.name()), label("code", code)])
+  }
+
+  fn in_flight(&self, call: Call) -> Gauge {
+    self.gauge(IN_FLIGHT, vec![label("call", call.name())])
+  }
+
+  fn evaluations(&self, verdict: Verdict, mode: WriteMode) -> Counter {
+    let labels = vec![label("verdict", verdict_name(verdict)), label("mode", mode_name(mode))];
+    self.counter(EVALUATIONS, labels)
+  }
+
+  fn matches(&self, decision: Decision) -> Counter {
+    self.counter(MATCHES, vec![label("decision", decision_name(decision))])
+  }
+
+  fn store_errors(&self, operation: Operation) -> Counter {
+    self.counter(STORE_ERRORS, vec![label("operation", operation.name())])
   }
 
   /// A request has arrived. What is returned counts it as in flight until it is answered, and as `CANCELLED` if
   /// it is dropped without an answer, which is what the transport does to a request whose caller has gone.
   #[must_use]
   pub fn begin(self: &Arc<Self>, call: Call) -> Request {
-    add(self.in_flight.get(call.index()), 1);
+    self.in_flight(call).increment(1.0);
     Request {
       metrics: Arc::clone(self),
       call,
@@ -336,344 +459,107 @@ impl Metrics {
 
   /// The server's readiness answer changed, or was given for the first time.
   pub fn set_ready(&self, ready: bool) {
-    self.ready.store(u64::from(ready), Ordering::Relaxed);
+    self.gauge(READY, Vec::new()).set(if ready { 1.0 } else { 0.0 });
   }
 
   /// An `Evaluate` was answered with this verdict, having asked for this mode.
   pub fn evaluated(&self, verdict: Verdict, mode: WriteMode) {
-    let row = VERDICTS.iter().position(|(known, _)| *known == verdict);
-    let column = MODES.iter().position(|(known, _)| *known == mode);
-    if let (Some(row), Some(column)) = (row, column) {
-      add(self.evaluations.get(row).and_then(|row| row.get(column)), 1);
-    }
+    self.evaluations(verdict, mode).increment(1);
   }
 
   /// A `Match` was answered with this decision.
   pub fn matched(&self, decision: Decision) {
-    let place = DECISIONS.iter().position(|(known, _)| *known == decision);
-    add(place.and_then(|place| self.matches.get(place)), 1);
+    self.matches(decision).increment(1);
   }
 
   /// An `Import` stream ended, having created, found stored, and failed this many records.
   pub fn imported(&self, created: u64, existing: u64, failed: u64) {
-    for (counter, amount) in self.import_records.iter().zip([created, existing, failed]) {
-      counter.fetch_add(amount, Ordering::Relaxed);
-    }
-  }
-
-  /// A request of this call ended, having spent its time as `timings` says ([`crate::span`]).
-  pub fn staged(&self, call: Call, timings: &Timings) {
-    let Some(stages) = self.stage_ns.get(call.index()) else {
-      return;
-    };
-    for (stage, total) in Stage::ALL.iter().zip(stages) {
-      total.fetch_add(nanoseconds(timings.spent(*stage)), Ordering::Relaxed);
+    for (outcome, records) in [("created", created), ("exists", existing), ("failed", failed)] {
+      self
+        .counter(IMPORT_RECORDS, vec![label("outcome", outcome)])
+        .increment(records);
     }
   }
 
   /// The store finished an operation, in this long, and with an error or without.
   pub fn stored(&self, operation: Operation, elapsed: Duration, failed: bool) {
-    if let Some(histogram) = self.store_seconds.get(operation.index()) {
-      histogram.observe(elapsed);
-    }
+    self
+      .histogram(STORE_SECONDS, vec![label("operation", operation.name())])
+      .record(elapsed.as_secs_f64());
     if failed {
-      add(self.store_errors.get(operation.index()), 1);
+      self.store_errors(operation).increment(1);
     }
+  }
+
+  /// A request waited this long for its record's lock.
+  pub fn lock_waited(&self, elapsed: Duration) {
+    self.histogram(LOCK_WAIT, Vec::new()).record(elapsed.as_secs_f64());
+  }
+
+  /// A request waited this long for the model before a forward pass took it.
+  pub fn embed_waited(&self, elapsed: Duration) {
+    self.histogram(EMBED_WAIT, Vec::new()).record(elapsed.as_secs_f64());
+  }
+
+  /// A forward pass of `texts` texts took this long.
+  pub fn passed(&self, texts: u64, elapsed: Duration) {
+    self.histogram(PASS_SECONDS, Vec::new()).record(elapsed.as_secs_f64());
+    self.histogram(PASS_TEXTS, Vec::new()).record(level(texts));
   }
 
   fn answered(&self, call: Call, code: Code, elapsed: Duration) {
-    if let Some(in_flight) = self.in_flight.get(call.index()) {
-      // Never below zero, whatever happens: a gauge that wrapped would read as eighteen quintillion requests.
-      let _ = in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |now| now.checked_sub(1));
-    }
+    self.in_flight(call).decrement(1.0);
     // A status code is its number, from 0 to 16, which is its place in `CODES`.
-    let code = usize::try_from(i32::from(code)).unwrap_or(2);
-    add(self.requests.get(call.index()).and_then(|codes| codes.get(code)), 1);
-    if let Some(histogram) = self.request_seconds.get(call.index()) {
-      histogram.observe(elapsed);
-    }
+    self
+      .requests(call, usize::try_from(i32::from(code)).unwrap_or(2))
+      .increment(1);
+    self
+      .histogram(REQUEST_SECONDS, vec![label("call", call.name())])
+      .record(elapsed.as_secs_f64());
   }
 
-  /// Everything, in the Prometheus text format.
-  ///
-  /// A series that says nothing is left out: a status code no request has been answered with, and the latency of
-  /// a call or a store operation that has never been used. `OK` is always there for every call, at zero if need
-  /// be, so that a rate over it exists from the first scrape.
+  /// Everything, in the Prometheus text format, with `polled` brought up to date first. Nothing at all for
+  /// counts that are not kept.
   #[must_use]
   pub fn render(&self, polled: &Polled) -> String {
-    let mut out = String::new();
-    self.render_identity(&mut out);
-    self.render_requests(&mut out);
-    self.render_outcomes(&mut out);
+    let Some(exporter) = &self.exporter else {
+      return String::new();
+    };
     if let Some(worker) = &polled.worker {
-      render_worker(&mut out, worker, polled.waiting);
+      self.counter(EMBED_REQUESTS, Vec::new()).absolute(worker.jobs);
+      self.counter(EMBED_ABANDONED, Vec::new()).absolute(worker.abandoned);
+      self
+        .counter(EMBED_REFUSED, vec![label("reason", "queue_full")])
+        .absolute(worker.overloaded);
+      self
+        .counter(EMBED_REFUSED, vec![label("reason", "too_late")])
+        .absolute(worker.too_late);
+      self.gauge(EMBED_WAITING, Vec::new()).set(level(polled.waiting));
     }
-    self.render_store(&mut out);
-    family(
-      &mut out,
-      "record_similarity_writes_in_flight",
-      "gauge",
-      "Writes on their way to the store.",
-    );
-    let _ = writeln!(out, "record_similarity_writes_in_flight {}", polled.writes_in_flight);
-    family(
-      &mut out,
-      "record_similarity_writes_unanswered_total",
-      "counter",
-      "Writes that finished, or failed, after the request that asked for them had gone. Each has a log line.",
-    );
-    let _ = writeln!(
-      out,
-      "record_similarity_writes_unanswered_total {}",
-      polled.writes_unanswered
-    );
-    out
+    self
+      .gauge(WRITES_IN_FLIGHT, Vec::new())
+      .set(level(polled.writes_in_flight));
+    self
+      .counter(WRITES_UNANSWERED, Vec::new())
+      .absolute(polled.writes_unanswered);
+    exporter.render()
   }
 
-  fn render_identity(&self, out: &mut String) {
-    family(
-      out,
-      "record_similarity_build_info",
-      "gauge",
-      "Always 1. The version of the server is the label.",
-    );
-    let _ = writeln!(
-      out,
-      "record_similarity_build_info{{version=\"{}\"}} 1",
-      escaped(env!("CARGO_PKG_VERSION"))
-    );
-    family(
-      out,
-      "record_similarity_model_info",
-      "gauge",
-      "Always 1. The fingerprint of the model the server is running is the label.",
-    );
-    let _ = writeln!(
-      out,
-      "record_similarity_model_info{{fingerprint=\"{}\"}} 1",
-      escaped(&self.fingerprint)
-    );
-    family(
-      out,
-      "record_similarity_ready",
-      "gauge",
-      "1 while the server reports itself ready (the embedding thread is alive and the store answers), 0 otherwise.",
-    );
-    let _ = writeln!(out, "record_similarity_ready {}", read(&self.ready));
-  }
-
-  fn render_requests(&self, out: &mut String) {
-    family(
-      out,
-      "record_similarity_requests_total",
-      "counter",
-      "Requests that ended, by call and gRPC status code. CANCELLED is a request whose caller went away.",
-    );
-    for (call, codes) in Call::ALL.iter().zip(&self.requests) {
-      for (place, (code, count)) in CODES.iter().zip(codes).enumerate() {
-        let count = read(count);
-        if place == 0 || count > 0 {
-          let _ = writeln!(
-            out,
-            "record_similarity_requests_total{{call=\"{}\",code=\"{code}\"}} {count}",
-            call.name()
-          );
-        }
-      }
-    }
-    family(
-      out,
-      "record_similarity_requests_in_flight",
-      "gauge",
-      "Requests being served right now, by call. An Import stream is one for as long as it is open.",
-    );
-    for (call, in_flight) in Call::ALL.iter().zip(&self.in_flight) {
-      let _ = writeln!(
-        out,
-        "record_similarity_requests_in_flight{{call=\"{}\"}} {}",
-        call.name(),
-        read(in_flight)
-      );
-    }
-    family(
-      out,
-      "record_similarity_request_duration_seconds",
-      "histogram",
-      "How long requests took, from the first line of the handler to the answer, by call, whatever the answer.",
-    );
-    for (call, histogram) in Call::ALL.iter().zip(&self.request_seconds) {
-      if histogram.count() > 0 {
-        let labels = format!("call=\"{}\"", call.name());
-        histogram.render(out, "record_similarity_request_duration_seconds", &labels);
-      }
-    }
-    family(
-      out,
-      "record_similarity_request_stage_seconds_total",
-      "counter",
-      "Time answered requests spent waiting, by call and by what for. The rest of a request's duration is the \
-       server's own work.",
-    );
-    for (call, stages) in Call::ALL.iter().zip(&self.stage_ns) {
-      for (stage, total) in Stage::ALL.iter().zip(stages) {
-        let total = read(total);
-        if total > 0 {
-          let _ = writeln!(
-            out,
-            "record_similarity_request_stage_seconds_total{{call=\"{}\",stage=\"{}\"}} {}",
-            call.name(),
-            stage.name(),
-            seconds(total)
-          );
-        }
-      }
-    }
-  }
-
-  fn render_outcomes(&self, out: &mut String) {
-    family(
-      out,
-      "record_similarity_evaluations_total",
-      "counter",
-      "Evaluate calls that were answered, by verdict and by the write mode the request asked for.",
-    );
-    for ((_, verdict), modes) in VERDICTS.iter().zip(&self.evaluations) {
-      for ((_, mode), count) in MODES.iter().zip(modes) {
-        let _ = writeln!(
-          out,
-          "record_similarity_evaluations_total{{verdict=\"{verdict}\",mode=\"{mode}\"}} {}",
-          read(count)
-        );
-      }
-    }
-    family(
-      out,
-      "record_similarity_matches_total",
-      "counter",
-      "Match calls that were answered, by decision.",
-    );
-    for ((_, decision), count) in DECISIONS.iter().zip(&self.matches) {
-      let _ = writeln!(
-        out,
-        "record_similarity_matches_total{{decision=\"{decision}\"}} {}",
-        read(count)
-      );
-    }
-    family(
-      out,
-      "record_similarity_import_records_total",
-      "counter",
-      "Records of Import streams that have ended, by what became of each.",
-    );
-    for (outcome, count) in IMPORT_OUTCOMES.iter().zip(&self.import_records) {
-      let _ = writeln!(
-        out,
-        "record_similarity_import_records_total{{outcome=\"{outcome}\"}} {}",
-        read(count)
-      );
-    }
-  }
-
-  fn render_store(&self, out: &mut String) {
-    family(
-      out,
-      "record_similarity_store_duration_seconds",
-      "histogram",
-      "How long the store took, by operation, whether it succeeded or not.",
-    );
-    for (operation, histogram) in Operation::ALL.iter().zip(&self.store_seconds) {
-      if histogram.count() > 0 {
-        let labels = format!("operation=\"{}\"", operation.name());
-        histogram.render(out, "record_similarity_store_duration_seconds", &labels);
-      }
-    }
-    family(
-      out,
-      "record_similarity_store_errors_total",
-      "counter",
-      "Store operations that ended in an error, by operation.",
-    );
-    for (operation, errors) in Operation::ALL.iter().zip(&self.store_errors) {
-      let _ = writeln!(
-        out,
-        "record_similarity_store_errors_total{{operation=\"{}\"}} {}",
-        operation.name(),
-        read(errors)
-      );
+  /// Folds what has been observed since the last time into the exporter's buckets. The exporter holds every
+  /// observation until it is rendered or this is called, so a server that nobody scrapes has to call it now and
+  /// then ([`UPKEEP_EVERY`]).
+  pub fn upkeep(&self) {
+    if let Some(exporter) = &self.exporter {
+      exporter.run_upkeep();
     }
   }
 }
 
-/// Writes the two lines that introduce a metric.
-fn family(out: &mut String, name: &str, kind: &str, help: &str) {
-  let _ = writeln!(out, "# HELP {name} {help}");
-  let _ = writeln!(out, "# TYPE {name} {kind}");
-}
+/// How often a server that keeps metrics runs [`Metrics::upkeep`]: the exporter's own interval when it is left to
+/// do it itself.
+pub const UPKEEP_EVERY: Duration = Duration::from_secs(5);
 
-/// A label value as the text format wants it: backslash, quote, and newline escaped.
-fn escaped(value: &str) -> String {
-  value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
-}
-
-fn render_worker(out: &mut String, worker: &WorkerSnapshot, waiting: u64) {
-  let mut counter = |name: &str, help: &str, value: String| {
-    family(out, name, "counter", help);
-    let _ = writeln!(out, "{name} {value}");
-  };
-  counter(
-    "record_similarity_embed_passes_total",
-    "Forward passes of the model. Texts over passes is how many texts share one.",
-    worker.batches.to_string(),
-  );
-  counter(
-    "record_similarity_embed_requests_total",
-    "Requests the embedding thread served.",
-    worker.jobs.to_string(),
-  );
-  counter(
-    "record_similarity_embed_texts_total",
-    "Texts embedded.",
-    worker.texts.to_string(),
-  );
-  counter(
-    "record_similarity_embed_busy_seconds_total",
-    "Time spent inside the model. Its rate is the share of the time the model is busy: at 1 it is the limit.",
-    seconds(worker.busy_ns).to_string(),
-  );
-  counter(
-    "record_similarity_embed_queue_wait_seconds_total",
-    "Time requests waited for the model, summed over the requests served.",
-    seconds(worker.queue_wait_ns).to_string(),
-  );
-  counter(
-    "record_similarity_embed_abandoned_total",
-    "Requests passed over because their caller had gone before the model reached them.",
-    worker.abandoned.to_string(),
-  );
-  family(
-    out,
-    "record_similarity_embed_refused_total",
-    "counter",
-    "Requests refused without being embedded: queue_full is RESOURCE_EXHAUSTED, too_late is DEADLINE_EXCEEDED.",
-  );
-  let _ = writeln!(
-    out,
-    "record_similarity_embed_refused_total{{reason=\"queue_full\"}} {}",
-    worker.overloaded
-  );
-  let _ = writeln!(
-    out,
-    "record_similarity_embed_refused_total{{reason=\"too_late\"}} {}",
-    worker.too_late
-  );
-  family(
-    out,
-    "record_similarity_embed_waiting",
-    "gauge",
-    "Requests waiting for the model right now. model.queue_depth is the most there can be.",
-  );
-  let _ = writeln!(out, "record_similarity_embed_waiting {waiting}");
-}
+const METADATA: Metadata<'static> = Metadata::new(module_path!(), Level::INFO, Some(module_path!()));
 
 /// One request, from its arrival to its answer (see [`Metrics::begin`]).
 #[derive(Debug)]
@@ -736,7 +622,9 @@ impl<S> Measured<S> {
     work: impl Future<Output = Result<T, StoreError>>,
   ) -> Result<T, StoreError> {
     let started = Instant::now();
-    let result = work.await;
+    // A span as well as a count: where a trace is collected, this is the store's part of a request.
+    let span = tracing::debug_span!("store", operation = operation.name());
+    let result = work.instrument(span).await;
     self.metrics.stored(operation, started.elapsed(), result.is_err());
     result
   }
@@ -806,12 +694,13 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
   use similarity_store::MemoryStore;
+  use std::sync::atomic::{AtomicU64, Ordering};
   use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
   use super::*;
 
   fn metrics() -> Arc<Metrics> {
-    Arc::new(Metrics::new("f46e-test"))
+    Arc::new(Metrics::exported("f46e-test").unwrap())
   }
 
   /// The value of the one series that is exactly `series`, or `None` if it is not there.
@@ -850,27 +739,40 @@ mod tests {
     for call in ["Describe", "Evaluate", "FindSimilar", "Match", "Delete", "Import"] {
       let series = format!("record_similarity_requests_total{{call=\"{call}\",code=\"OK\"}}");
       assert_eq!(value(&page, &series).as_deref(), Some("0"), "{call}");
+      let in_flight = format!("record_similarity_requests_in_flight{{call=\"{call}\"}}");
+      assert_eq!(value(&page, &in_flight).as_deref(), Some("0"), "{call}");
     }
-    assert_eq!(lines_of(&page, "record_similarity_request_duration_seconds"), [""; 0]);
-    assert_eq!(lines_of(&page, "record_similarity_store_duration_seconds"), [""; 0]);
-    assert_eq!(lines_of(&page, "record_similarity_evaluations_total").len(), 12);
-    assert_eq!(lines_of(&page, "record_similarity_store_errors_total").len(), 8);
+    for latency in [
+      REQUEST_SECONDS,
+      STORE_SECONDS,
+      LOCK_WAIT,
+      EMBED_WAIT,
+      PASS_SECONDS,
+      PASS_TEXTS,
+    ] {
+      assert_eq!(lines_of(&page, latency), [""; 0], "{latency}");
+    }
+    assert_eq!(lines_of(&page, EVALUATIONS).len(), 12);
+    assert_eq!(lines_of(&page, MATCHES).len(), 3);
+    assert_eq!(lines_of(&page, IMPORT_RECORDS).len(), 3);
+    assert_eq!(lines_of(&page, STORE_ERRORS).len(), 8);
     // Not a thread, so nothing about one.
     assert_eq!(lines_of(&page, "record_similarity_embed_"), [""; 0]);
-    assert_eq!(value(&page, "record_similarity_writes_in_flight").as_deref(), Some("0"));
-    assert_eq!(
-      value(&page, "record_similarity_writes_unanswered_total").as_deref(),
-      Some("0")
-    );
+    assert_eq!(value(&page, WRITES_IN_FLIGHT).as_deref(), Some("0"));
+    assert_eq!(value(&page, WRITES_UNANSWERED).as_deref(), Some("0"));
   }
 
-  /// Every metric is introduced by a HELP and a TYPE line, once, before its first sample, and every sample
-  /// belongs to a metric that was introduced: what a parser of the format requires.
+  /// Every metric is introduced by a HELP and a TYPE line, once, before its samples, and every sample belongs to
+  /// the metric introduced above it: what a parser of the format requires. And every name says what kind of
+  /// thing it is, as the convention has it.
   #[test]
   fn every_sample_follows_the_help_and_type_of_its_metric() {
     let metrics = metrics();
     metrics.begin(Call::Evaluate).finished(Code::Ok);
     metrics.stored(Operation::Get, Duration::from_millis(3), false);
+    metrics.lock_waited(Duration::from_millis(1));
+    metrics.embed_waited(Duration::from_millis(1));
+    metrics.passed(4, Duration::from_millis(2));
     let polled = Polled {
       worker: Some(WorkerSnapshot::default()),
       ..Polled::default()
@@ -878,7 +780,7 @@ mod tests {
     let page = metrics.render(&polled);
     let mut introduced: Vec<(String, String)> = Vec::new();
     let mut helped = None;
-    for line in page.lines() {
+    for line in page.lines().filter(|line| !line.is_empty()) {
       if let Some(rest) = line.strip_prefix("# HELP ") {
         let name = rest.split(' ').next().unwrap();
         assert!(rest.len() > name.len() + 1, "no help text: {line}");
@@ -891,6 +793,8 @@ mod tests {
           introduced.iter().all(|(known, _)| known != name),
           "introduced twice: {name}"
         );
+        assert!(name.starts_with("record_similarity_"), "{name}");
+        assert_eq!(kind == "counter", name.ends_with("_total"), "{line}");
         introduced.push((name.to_owned(), kind.to_owned()));
       } else {
         let name = line.split(['{', ' ']).next().unwrap();
@@ -903,13 +807,13 @@ mod tests {
           name == family
         };
         assert!(belongs, "`{line}` is not a sample of `{family}`");
-        assert_eq!(kind == "counter", name.ends_with("_total"), "{line}");
         let sample = line.rsplit(' ').next().unwrap();
         assert!(sample.parse::<f64>().is_ok(), "not a number: {line}");
       }
     }
-    assert!(page.ends_with('\n'));
-    assert!(introduced.len() > 15, "{introduced:?}");
+    // Everything this file names is there, and nothing it does not name.
+    let named = COUNTERS.len() + 1 + GAUGES.len() + HISTOGRAMS.len();
+    assert_eq!(introduced.len(), named, "{introduced:?}");
   }
 
   /// A request is in flight from its arrival to its answer, and is then counted once, under the status code it
@@ -947,29 +851,15 @@ mod tests {
     assert_eq!(count("Match", "INVALID_ARGUMENT").as_deref(), Some("1"));
     assert_eq!(count("Match", "OK").as_deref(), Some("0"));
     assert_eq!(count("Delete", "INVALID_ARGUMENT"), None, "nothing to say, so not said");
-    assert_eq!(
+    let took = |call: &str| {
       value(
         &page,
-        "record_similarity_request_duration_seconds_count{call=\"Evaluate\"}"
+        &format!("record_similarity_request_duration_seconds_count{{call=\"{call}\"}}"),
       )
-      .as_deref(),
-      Some("2")
-    );
-    assert_eq!(
-      value(
-        &page,
-        "record_similarity_request_duration_seconds_count{call=\"Match\"}"
-      )
-      .as_deref(),
-      Some("1")
-    );
-    assert_eq!(
-      value(
-        &page,
-        "record_similarity_request_duration_seconds_count{call=\"Delete\"}"
-      ),
-      None
-    );
+    };
+    assert_eq!(took("Evaluate").as_deref(), Some("2"));
+    assert_eq!(took("Match").as_deref(), Some("1"));
+    assert_eq!(took("Delete"), None);
   }
 
   /// The transport drops a handler whose caller has gone. That request ended too, and is counted as what the
@@ -979,26 +869,12 @@ mod tests {
     let metrics = metrics();
     drop(metrics.begin(Call::FindSimilar));
     let page = metrics.render(&Polled::default());
-    assert_eq!(
-      value(
-        &page,
-        "record_similarity_requests_total{call=\"FindSimilar\",code=\"CANCELLED\"}"
-      )
-      .as_deref(),
-      Some("1")
-    );
-    assert_eq!(
-      value(&page, "record_similarity_requests_in_flight{call=\"FindSimilar\"}").as_deref(),
-      Some("0")
-    );
-    assert_eq!(
-      value(
-        &page,
-        "record_similarity_request_duration_seconds_count{call=\"FindSimilar\"}"
-      )
-      .as_deref(),
-      Some("1")
-    );
+    let cancelled = "record_similarity_requests_total{call=\"FindSimilar\",code=\"CANCELLED\"}";
+    assert_eq!(value(&page, cancelled).as_deref(), Some("1"));
+    let in_flight = "record_similarity_requests_in_flight{call=\"FindSimilar\"}";
+    assert_eq!(value(&page, in_flight).as_deref(), Some("0"));
+    let took = "record_similarity_request_duration_seconds_count{call=\"FindSimilar\"}";
+    assert_eq!(value(&page, took).as_deref(), Some("1"));
   }
 
   /// Every status code is counted, under its protocol name: the names are in the order of the codes' numbers.
@@ -1037,34 +913,60 @@ mod tests {
   }
 
   /// A latency is counted into every bucket whose bound it does not exceed, the bound itself included, and the
-  /// buckets a parser reads are cumulative and end at the count.
+  /// buckets end at the count. The bounds are this file's, in seconds, and texts have bounds of their own.
   #[test]
-  fn a_latency_at_a_bound_belongs_to_that_bound() {
-    let histogram = Histogram::default();
-    histogram.observe(Duration::from_micros(999));
-    histogram.observe(Duration::from_millis(1));
-    histogram.observe(Duration::from_nanos(1_000_001));
-    histogram.observe(Duration::from_millis(250));
-    histogram.observe(Duration::from_mins(1));
-    let mut page = String::new();
-    histogram.render(&mut page, "latency", "call=\"x\"");
-    let bucket = |le: &str| value(&page, &format!("latency_bucket{{call=\"x\",le=\"{le}\"}}")).unwrap();
+  fn latencies_are_counted_into_the_buckets_this_file_names() {
+    let metrics = metrics();
+    for elapsed in [
+      Duration::from_micros(999),
+      Duration::from_millis(1),
+      Duration::from_nanos(1_000_001),
+      Duration::from_millis(250),
+      Duration::from_mins(1),
+    ] {
+      metrics.stored(Operation::Get, elapsed, false);
+    }
+    metrics.passed(1, Duration::from_millis(2));
+    metrics.passed(32, Duration::from_millis(12));
+    metrics.passed(33, Duration::from_millis(12));
+    let page = metrics.render(&Polled::default());
+    let bucket = |le: &str| {
+      let series = format!("record_similarity_store_duration_seconds_bucket{{operation=\"get\",le=\"{le}\"}}");
+      value(&page, &series).unwrap()
+    };
     assert_eq!(bucket("0.001"), "2");
     assert_eq!(bucket("0.0025"), "3");
     assert_eq!(bucket("0.1"), "3");
     assert_eq!(bucket("0.25"), "4");
     assert_eq!(bucket("2.5"), "4");
     assert_eq!(bucket("+Inf"), "5", "longer than every bound is still counted");
-    assert_eq!(value(&page, "latency_count{call=\"x\"}").as_deref(), Some("5"));
-    let sum: f64 = value(&page, "latency_sum{call=\"x\"}").unwrap().parse().unwrap();
-    assert!((sum - 60.252_999_001).abs() < 1e-9, "{sum}");
-    assert_eq!(page.lines().count(), BUCKETS.len() + 3);
+    let get = lines_of(&page, "record_similarity_store_duration_seconds");
+    assert_eq!(get.len(), SECONDS.len() + 3, "{get:?}");
+    let sum: f64 = value(&page, "record_similarity_store_duration_seconds_sum{operation=\"get\"}")
+      .unwrap()
+      .parse()
+      .unwrap();
+    assert!((sum - 60.252_999_001).abs() < 1e-6, "{sum}");
 
-    // With no labels of its own, a series has only `le`, and its sum and count have no braces at all.
-    let mut bare = String::new();
-    histogram.render(&mut bare, "latency", "");
-    assert_eq!(value(&bare, "latency_bucket{le=\"0.001\"}").as_deref(), Some("2"));
-    assert_eq!(value(&bare, "latency_count").as_deref(), Some("5"));
+    let texts = |le: &str| {
+      value(
+        &page,
+        &format!("record_similarity_embed_pass_texts_bucket{{le=\"{le}\"}}"),
+      )
+      .unwrap()
+    };
+    assert_eq!(
+      (texts("1"), texts("16"), texts("32"), texts("64")),
+      ("1".into(), "1".into(), "2".into(), "3".into())
+    );
+    assert_eq!(
+      value(&page, "record_similarity_embed_pass_texts_sum").as_deref(),
+      Some("66")
+    );
+    assert_eq!(
+      value(&page, "record_similarity_embed_pass_duration_seconds_count").as_deref(),
+      Some("3")
+    );
   }
 
   #[test]
@@ -1128,10 +1030,11 @@ mod tests {
     );
   }
 
-  /// What the embedding thread and the engine count themselves is written as it is read, in seconds where it
-  /// is a time.
+  /// What the embedding thread and the engine count themselves is written as it is read, each time the page is
+  /// asked for: these are totals kept elsewhere, not events counted here, so asking twice does not double them.
   #[test]
   fn what_the_thread_and_the_engine_count_is_written_as_it_is_read() {
+    let metrics = metrics();
     let polled = Polled {
       worker: Some(WorkerSnapshot {
         batches: 4,
@@ -1147,13 +1050,11 @@ mod tests {
       writes_in_flight: 1,
       writes_unanswered: 6,
     };
-    let page = metrics().render(&polled);
+    let first = metrics.render(&polled);
+    let page = metrics.render(&polled);
+    assert_eq!(first.lines().count(), page.lines().count());
     let read = |series: &str| value(&page, series).unwrap();
-    assert_eq!(read("record_similarity_embed_passes_total"), "4");
     assert_eq!(read("record_similarity_embed_requests_total"), "9");
-    assert_eq!(read("record_similarity_embed_texts_total"), "31");
-    assert_eq!(read("record_similarity_embed_busy_seconds_total"), "1.5");
-    assert_eq!(read("record_similarity_embed_queue_wait_seconds_total"), "0.25");
     assert_eq!(read("record_similarity_embed_abandoned_total"), "3");
     assert_eq!(
       read("record_similarity_embed_refused_total{reason=\"queue_full\"}"),
@@ -1165,15 +1066,68 @@ mod tests {
     assert_eq!(read("record_similarity_writes_unanswered_total"), "6");
   }
 
+  /// The waits a request can have besides the store are each counted where they happen: for its record's lock,
+  /// and for the model.
   #[test]
-  fn a_label_value_cannot_break_out_of_its_quotes() {
-    assert_eq!(escaped("plain-1.0"), "plain-1.0");
-    assert_eq!(escaped("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
-    let page = Metrics::new("odd\"one").render(&Polled::default());
+  fn the_waits_for_a_lock_and_for_the_model_are_counted() {
+    let metrics = metrics();
+    metrics.lock_waited(Duration::from_millis(3));
+    metrics.lock_waited(Duration::ZERO);
+    metrics.embed_waited(Duration::from_millis(40));
+    let page = metrics.render(&Polled::default());
     assert_eq!(
-      value(&page, "record_similarity_model_info{fingerprint=\"odd\\\"one\"}").as_deref(),
+      value(&page, "record_similarity_lock_wait_seconds_count").as_deref(),
+      Some("2")
+    );
+    assert_eq!(
+      value(&page, "record_similarity_lock_wait_seconds_sum").as_deref(),
+      Some("0.003")
+    );
+    assert_eq!(
+      value(&page, "record_similarity_embed_wait_seconds_count").as_deref(),
       Some("1")
     );
+    assert_eq!(
+      value(&page, "record_similarity_embed_wait_seconds_bucket{le=\"0.025\"}").as_deref(),
+      Some("0")
+    );
+    assert_eq!(
+      value(&page, "record_similarity_embed_wait_seconds_bucket{le=\"0.05\"}").as_deref(),
+      Some("1")
+    );
+  }
+
+  /// Counts that are kept nowhere cost nothing to make and say nothing when asked. And two servers that each
+  /// keep their own do not count into each other.
+  #[test]
+  fn discarded_counts_say_nothing_and_two_sets_of_counts_stay_apart() {
+    let nowhere = Arc::new(Metrics::discarded());
+    nowhere.begin(Call::Evaluate).finished(Code::Ok);
+    nowhere.stored(Operation::Get, Duration::from_millis(1), true);
+    nowhere.evaluated(Verdict::Created, WriteMode::Enforce);
+    nowhere.passed(3, Duration::from_millis(1));
+    nowhere.upkeep();
+    assert_eq!(nowhere.render(&Polled::default()), "");
+
+    let (one, other) = (metrics(), metrics());
+    one.begin(Call::Evaluate).finished(Code::Ok);
+    one.upkeep();
+    let series = "record_similarity_requests_total{call=\"Evaluate\",code=\"OK\"}";
+    assert_eq!(value(&one.render(&Polled::default()), series).as_deref(), Some("1"));
+    assert_eq!(value(&other.render(&Polled::default()), series).as_deref(), Some("0"));
+  }
+
+  /// A fingerprint is the one label value that is not a word fixed in this file. Whatever it holds, the line it
+  /// is on is still one line with one value.
+  #[test]
+  fn a_label_value_cannot_break_out_of_its_line() {
+    let page = Metrics::exported("odd\"one\nand\\more")
+      .unwrap()
+      .render(&Polled::default());
+    let lines = lines_of(&page, MODEL_INFO);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].ends_with("} 1"), "{lines:?}");
+    assert!(lines[0].contains("odd\\\"one"), "the quote is escaped: {lines:?}");
   }
 
   fn record(id: &str) -> StoredRecord {
@@ -1223,12 +1177,6 @@ mod tests {
     assert!(store.put(&foreign).await.is_err());
 
     let page = metrics.render(&Polled::default());
-    let count = |operation: &str| {
-      value(
-        &page,
-        &format!("record_similarity_store_duration_seconds_count{{operation=\"{operation}\"}}"),
-      )
-    };
     let expected = [
       ("check", 1),
       ("get", 2),
@@ -1240,12 +1188,14 @@ mod tests {
       ("search_vectors", 1),
     ];
     for (operation, times) in expected {
-      assert_eq!(count(operation), Some(times.to_string()), "{operation}");
-      let errors = value(
-        &page,
-        &format!("record_similarity_store_errors_total{{operation=\"{operation}\"}}"),
+      let count = format!("record_similarity_store_duration_seconds_count{{operation=\"{operation}\"}}");
+      assert_eq!(value(&page, &count), Some(times.to_string()), "{operation}");
+      let errors = format!("record_similarity_store_errors_total{{operation=\"{operation}\"}}");
+      assert_eq!(
+        value(&page, &errors),
+        Some(u8::from(operation == "put").to_string()),
+        "{operation}"
       );
-      assert_eq!(errors, Some(u8::from(operation == "put").to_string()), "{operation}");
     }
   }
 

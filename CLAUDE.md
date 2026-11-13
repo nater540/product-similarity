@@ -73,7 +73,7 @@ changing a design. Infer conventions from the existing code first.
   back. It records and lists; it decides nothing.
 - `crates/similarity-server`: config, the embedding worker thread, `Engine` (all behavior), the thin gRPC layer,
   `import_stream` (the loop behind the streaming `Import` call), `metrics` (what the server counts about itself,
-  and the HTTP endpoint that serves it), `span` (where one request's time went),
+  and the HTTP endpoint that serves it),
   `model fetch`, `import`, `compare`/`calibrate`/`calibrate-drift`/`calibrate-match`/`calibrate-sweep` (the `offline` module), `load` (the load
   test), `runs` (reading recorded runs back, comparing and reporting them), `shadow` (a candidate policy judging
   live requests), `registry` (which model was put into service, and the gate), and the `record-similarity`
@@ -108,22 +108,24 @@ changing a design. Infer conventions from the existing code first.
   orchestrator would restart a healthy process because Qdrant is down), and never make a request wait on or be
   refused by readiness: it is advice to whoever routes requests. Stopping is in one order: not ready, the
   notice, the listener, the deadline. A new `VectorStore` needs a `check` that is cheap and reads no record.
-- **Metrics are counts about the process, and their names are an interface** (D39). `metrics.rs` holds them:
-  arrays of atomics, written out by hand in the Prometheus text format at `/metrics` when `metrics.listen` is
-  set. Never make a label value out of anything a request carries: no id, no brand, no text, no score. Every
-  label value is a word fixed in that file, or the model's fingerprint. Add a metric or a label value; never
-  rename one or change what it counts. Counting is always on and must stay an atomic add: nothing in a request
-  may wait on, or fail because of, a metric. A request is counted by the guard its handler makes on its first
-  line (dropped unanswered, it counts as `CANCELLED`), so a new call needs a `Call` and a guard. A store is
-  measured from outside by `Measured`; do not put counting into a store. Do not add a metrics library, a push
-  exporter, or a vendor's client: the text format is what Datadog, OpenTelemetry, and Prometheus all read, and
-  that is the reason for it.
-- **A request accounts for its own time** (D40). Every `.await` on something a request waits for (its record's
-  lock, the store, the model) is inside `span::timed` with a `Stage`, and the gRPC layer puts the times on the
-  request's log line and into `record_similarity_request_stage_seconds_total`. A new wait gets a stage, or it
-  disappears into "the server's own work", which is supposed to be nothing. The log fields and the stage names
-  are interfaces: add, never rename. Before proposing a performance change, read where the time goes
-  (`just load ... --server` against a server logging at `info`); it has been guessed wrong before.
+- **Metrics are counts about the process, and their names are an interface** (D39). They are the `metrics`
+  crate's, rendered by its Prometheus exporter at `/metrics` when `metrics.listen` is set, and not kept at all
+  when it is not. **The owner prefers maintained crates to hand-written infrastructure** (2026-11-12): do not
+  bring back a hand-written counter, histogram, or text format, and reach for the ecosystem's crate first for
+  the next thing of this kind. Call the methods of `Metrics`; do not use the crate's macros or install a
+  process-wide recorder, because `Metrics` having its own recorder is what keeps label values to words fixed in
+  `metrics.rs` and keeps two servers in one process (the tests) apart. Never make a label value out of
+  anything a request carries: no id, no brand, no text, no score. Add a metric or a label value; never rename
+  one or change what it counts. Nothing in a request may wait on, or fail because of, a metric. A request is
+  counted by the guard its handler makes on its first line (dropped unanswered, it counts as `CANCELLED`), so
+  a new call needs a `Call` and a guard. A store is measured from outside by `Measured`; do not put counting
+  into a store. Another way of sending the counts is another exporter of the crate, chosen in
+  `Metrics::exported`.
+- **A request's waits are histograms and spans** (D40). Anything a request waits for (its record's lock, the
+  store, the model) is counted into a histogram and wrapped in a `tracing` span inside the request's span, at
+  `debug`. A new wait gets both, or nobody will know it is there. Nothing exports the spans yet; do not add a
+  tracing exporter without the owner choosing where traces go. Before proposing a performance change, find out
+  where the time goes; it has been guessed wrong before.
 - **A request can be dropped anywhere it waits, and a write never is** (D38). The transport drops a handler
   when its caller's deadline runs out or the caller hangs up, so every `.await` in a request is a place it can
   end. Before the write that is free, and has to stay free: nothing may be left half done there. The write

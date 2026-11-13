@@ -2333,7 +2333,7 @@ it happened or it did not, sending the request again is safe either way
 ### Metrics
 
 The server counts what it is doing, and a monitoring system can read the counts over HTTP. It is off until the
-config gives it an address, because it opens a second port:
+config gives it an address, because it opens a second port, and a server without one keeps no counts at all:
 
 ```toml
 [metrics]
@@ -2351,8 +2351,10 @@ scrape_configs:
       - targets: ["<host>:9464"]
 ```
 
-The page a real server gave was read back with the Prometheus Python client's parser (22 metrics, 172 samples,
-every histogram cumulative and ending at its count). It has not been scraped by Prometheus, a Collector, or a
+The counting is the [`metrics`](https://crates.io/crates/metrics) crate's and the page is its Prometheus
+exporter's; this server only says what is counted and where. The page a real server gave was read back with the
+Prometheus Python client's parser (21 metrics, 213 samples, every histogram cumulative and ending at its
+count). It has not been scraped by Prometheus, a Collector, or a
 Datadog Agent here.
 
 | Metric | What it counts |
@@ -2360,14 +2362,15 @@ Datadog Agent here.
 | `record_similarity_requests_total{call,code}` | Requests that ended, by call (`Evaluate`, `FindSimilar`, `Match`, `Delete`, `Import`, `Describe`) and gRPC status code. `CANCELLED` is a request whose caller gave up. |
 | `record_similarity_request_duration_seconds{call}` | A histogram of how long they took, whatever the answer. |
 | `record_similarity_requests_in_flight{call}` | Requests being served now. An `Import` stream is one for as long as it is open. |
-| `record_similarity_request_stage_seconds_total{call,stage}` | Time answered requests spent waiting, by what for: `lock`, `store_read`, `queue` (for the model), `model` (the forward pass), `store_write`, `search`. Over the duration's sum it is where the time goes ([Where a request's time goes](#where-a-requests-time-goes)). |
 | `record_similarity_evaluations_total{verdict,mode}` | `Evaluate` answers by verdict (`created`, `accepted`, `rejected`, `embedded`) and by the write mode asked for (`enforce`, `dry_run`, `force`). |
 | `record_similarity_matches_total{decision}` | `Match` answers by decision (`matched`, `no_match`, `not_judged`). |
 | `record_similarity_import_records_total{outcome}` | Records of ended `Import` streams: `created`, `exists`, `failed`. |
-| `record_similarity_embed_passes_total`, `_embed_texts_total`, `_embed_requests_total` | Forward passes, texts embedded, and requests the embedding thread served. Texts over passes is how many texts share a pass. |
-| `record_similarity_embed_busy_seconds_total` | Time inside the model. Its rate is the share of the time the model is busy; at 1 the server is at its limit ([Capacity](#capacity)). |
-| `record_similarity_embed_queue_wait_seconds_total` | Time requests waited for the model. Over `_embed_requests_total` it is the mean wait. |
+| `record_similarity_embed_pass_duration_seconds` | A histogram of forward passes of the model. The rate of its sum is the share of the time the model is busy; at 1 the server is at its limit ([Capacity](#capacity)). Its count is the passes. |
+| `record_similarity_embed_pass_texts` | A histogram of how many texts a pass held: how much sharing of passes the load is buying. |
+| `record_similarity_embed_wait_seconds` | A histogram of how long requests waited for the model before a pass took them. |
+| `record_similarity_embed_requests_total` | Requests the embedding thread served. |
 | `record_similarity_embed_waiting` | Requests waiting for the model now; `model.queue_depth` is the most there can be. |
+| `record_similarity_lock_wait_seconds` | A histogram of how long requests waited for their record's lock ([Where a request's time goes](#where-a-requests-time-goes)). |
 | `record_similarity_embed_refused_total{reason}` | Requests refused without being embedded: `queue_full` (`RESOURCE_EXHAUSTED`) and `too_late` (`DEADLINE_EXCEEDED`). |
 | `record_similarity_embed_abandoned_total` | Requests passed over because their caller had gone ([Past what a server can do](#past-what-a-server-can-do)). |
 | `record_similarity_store_duration_seconds{operation}` | A histogram of how long the store took, by operation (`get`, `put_if`, `delete_if`, `search`, `search_vectors`, `check`). |
@@ -2382,14 +2385,16 @@ What a server answered after a short `just load` run, in part:
 ```text
 record_similarity_requests_total{call="Evaluate",code="OK"} 182
 record_similarity_request_duration_seconds_bucket{call="Evaluate",le="0.001"} 50
-record_similarity_request_duration_seconds_bucket{call="Evaluate",le="0.005"} 101
-record_similarity_request_duration_seconds_bucket{call="Evaluate",le="0.025"} 182
-record_similarity_request_duration_seconds_sum{call="Evaluate"} 1.276893375
+record_similarity_request_duration_seconds_bucket{call="Evaluate",le="0.005"} 100
+record_similarity_request_duration_seconds_bucket{call="Evaluate",le="0.025"} 181
+record_similarity_request_duration_seconds_sum{call="Evaluate"} 1.2858326680000003
 record_similarity_request_duration_seconds_count{call="Evaluate"} 182
 record_similarity_evaluations_total{verdict="accepted",mode="enforce"} 100
-record_similarity_embed_passes_total 74
-record_similarity_embed_texts_total 578
-record_similarity_embed_busy_seconds_total 0.459780921
+record_similarity_embed_pass_duration_seconds_sum 0.46119875499999996
+record_similarity_embed_pass_duration_seconds_count 75
+record_similarity_embed_pass_texts_sum 578
+record_similarity_embed_wait_seconds_sum 0.5017706630000001
+record_similarity_lock_wait_seconds_count 332
 record_similarity_store_duration_seconds_count{operation="put_if"} 150
 record_similarity_ready 1
 ```
@@ -2397,11 +2402,12 @@ record_similarity_ready 1
 - **Nothing about a record is in them.** No id, no brand, no text, no score. A label is one of the words in
   the table, or the model's fingerprint. Scores, and what the thresholds make of them, are what `calibrate`
   and a shadow are for.
-- **The counts are kept whether or not anything reads them**, so turning the endpoint on changes nothing about
-  how the server behaves.
+- **Another way of sending them is another exporter.** The `metrics` crate has exporters that push to a
+  Datadog Agent over DogStatsD and to an OpenTelemetry collector; either would take the same counts. Neither
+  is built in: the Prometheus page is what all three systems read today.
 - **A series that says nothing is left out**: a status code no request has ended with, and the latency of a
   call or store operation that has not been used. `OK` is there for every call from the first scrape, at zero
-  if need be. A server that had just started gave 66 series, and 172 after that run; each call or store
+  if need be. A server that had just started gave 62 series, and 213 after that run; each call or store
   operation that comes into use adds its 14. That matters where series are what you pay for.
 - **Latencies are counted into buckets from 1 ms to 2.5 s.** The buckets are how finely a latency can be read
   back, not limits on anything.
@@ -2410,7 +2416,7 @@ record_similarity_ready 1
 - **The names are an interface**, like the event names: a metric or a label value may be added, and none will
   be renamed.
 
-What to look at first: the rate of `_embed_busy_seconds_total` (how close to its limit the model is), the
+What to look at first: the rate of `_embed_pass_duration_seconds_sum` (how close to its limit the model is), the
 share of requests that end in each `code`, `_embed_refused_total` and `_embed_abandoned_total` (callers being
 turned away or giving up), `_store_errors_total` and the store's latency, `_writes_unanswered_total`, and
 `record_similarity_ready`.
@@ -2510,25 +2516,21 @@ text is in any result.
 
 #### Where a request's time goes
 
-Every request accounts for its own time. Its log line carries, beside `elapsed_ms`, what it spent waiting and
-for what, and the same times are summed for the metrics
-(`record_similarity_request_stage_seconds_total`):
+A request waits for four things, and each is measured where it happens: its record's lock
+(`record_similarity_lock_wait_seconds`), the store (`record_similarity_store_duration_seconds`, by operation),
+the model's queue (`record_similarity_embed_wait_seconds`), and the forward pass it is part of
+(`record_similarity_embed_pass_duration_seconds`). Over `record_similarity_request_duration_seconds` they say
+where the time goes on the whole.
 
-```json
-{"message":"evaluate","id":"load-1-1794535793-c4-10","verdict":"Accepted","similarity":0.986988,"anchor_similarity":0.986988,"stored":true,"revision":2,"measure_changed":false,"elapsed_ms":3.46,"lock_ms":0.0,"read_ms":0.003,"queue_ms":1.199,"model_ms":2.231,"pass_texts":3,"write_ms":0.008}
-```
+Each is also a [`tracing`](https://crates.io/crates/tracing) span inside the request's own span (`request`,
+with `lock`, `store`, and `embed` inside it), which is what a tracing backend would draw as one request. They
+are made at `debug`, so a server nobody is tracing makes none, and nothing here exports them: that takes a
+tracing layer such as `tracing-opentelemetry` and somewhere to send to.
 
-| Field | The wait |
-|---|---|
-| `lock_ms` | For the record's lock: another request in this process had it. |
-| `read_ms` | For the store to return the stored record. |
-| `queue_ms` | For the model: from joining the queue to being taken into a forward pass. |
-| `model_ms` | The forward pass, from being put together to the answer. `pass_texts` is how many texts were in it, this request's and everybody else's. |
-| `write_ms` | For the store to take the write. |
-| `search_ms` | For the store to search (`find_similar` and `match`). |
-
-What is left of `elapsed_ms` is the server's own work: validating, scoring, translating. Mean milliseconds per
-`Evaluate`, from the log lines of `just load ... --server` runs of 1,000 records at each level, same machine:
+The table below was measured on an earlier build of the same day that put each request's waits on its own log
+line, which is how a request can be told to be a create, an edit, or a resave. What is left of a request's time
+after its waits is the server's own work: validating, scoring, translating. Mean milliseconds per `Evaluate`,
+from `just load ... --server` runs of 1,000 records at each level, same machine:
 
 | Store | Callers | Phase | Whole | Lock | Read | Wait for model | Forward pass | Write | Texts in the pass |
 |---|---|---|---|---|---|---|---|---|---|
@@ -2630,8 +2632,7 @@ sends the edit again is answered from what was stored, without the model. Nothin
 in flight at once; that is not built.
 
 In service, every `evaluate`, `find_similar`, `match`, and `delete` log line carries `elapsed_ms`: the time from
-the first line of the handler to the log line, and what the request spent that time waiting for
-([Where a request's time goes](#where-a-requests-time-goes)). An `Import` stream writes one `import` line when it ends, with how
+the first line of the handler to the log line. An `Import` stream writes one `import` line when it ends, with how
 many records it created, found stored, and failed, how many batches it made, and how often it waited for the
 model. What the server is doing as a whole, as counts for a monitoring system, is under [Metrics](#metrics).
 

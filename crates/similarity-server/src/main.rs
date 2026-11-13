@@ -590,20 +590,33 @@ async fn serve_metrics<S: VectorStore>(
     .await
     .with_context(|| format!("cannot serve metrics on {address}"))?;
   tracing::info!(address = %listener.local_addr()?, path = similarity_server::metrics::PATH, "serving metrics");
-  let (metrics, engine) = (Arc::clone(metrics), Arc::clone(engine));
+  let (rendered, engine) = (Arc::clone(metrics), Arc::clone(engine));
   let page = move || {
     let writes = engine.writes();
-    metrics.render(&Polled {
+    rendered.render(&Polled {
       worker: Some(worker.stats()),
       waiting: worker.waiting(),
       writes_in_flight: writes.in_flight,
       writes_unanswered: writes.unanswered,
     })
   };
+  // The exporter keeps every observation until it is rendered or tidied, so a server nobody is scraping tidies.
+  let kept = Arc::clone(metrics);
+  let upkeep = async move {
+    loop {
+      tokio::time::sleep(similarity_server::metrics::UPKEEP_EVERY).await;
+      kept.upkeep();
+    }
+  };
   Ok(tokio::spawn(async move {
-    if let Err(error) = similarity_server::metrics::serve(listener, page, std::future::pending()).await {
-      // The server goes on serving its callers: metrics are for watching it, not part of what it does.
-      tracing::error!(error = format!("{error:#}"), "the metrics endpoint has stopped");
+    tokio::select! {
+      served = similarity_server::metrics::serve(listener, page, std::future::pending()) => {
+        if let Err(error) = served {
+          // The server goes on serving its callers: metrics are for watching it, not part of what it does.
+          tracing::error!(error = format!("{error:#}"), "the metrics endpoint has stopped");
+        }
+      }
+      () = upkeep => {}
     }
   }))
 }
@@ -611,6 +624,7 @@ async fn serve_metrics<S: VectorStore>(
 async fn serve_with<S: VectorStore>(
   store: S,
   worker: EmbedWorker,
+  metrics: Arc<Metrics>,
   config: &Config,
   listen: std::net::SocketAddr,
 ) -> anyhow::Result<()> {
@@ -618,11 +632,10 @@ async fn serve_with<S: VectorStore>(
   // A candidate policy, if the configuration names one. It is told about every judged request and decides none
   // (docs/decisions.md, D30).
   let shadow = PolicyShadow::from_config(config, worker.dimension())?.map(Arc::new);
-  // What the server counts about itself (docs/decisions.md, D39). The store is counted from the outside, so
-  // that no store has to know it is being measured.
-  let metrics = Arc::new(Metrics::new(worker.fingerprint()));
+  // The store is counted from the outside, so that no store has to know it is being measured.
   let store = Measured::new(store, Arc::clone(&metrics));
   let mut engine = Engine::new(store, worker.clone(), schema.clone(), policy)
+    .with_metrics(Arc::clone(&metrics))
     .with_matching(config.matching.settings()?)
     .with_import_batch(config.server.import_batch_records);
   let mut summaries = None;
@@ -668,7 +681,14 @@ impl ServeArgs {
     let config = Config::load(&self.config)?;
     let listen = self.listen.unwrap_or(config.server.listen);
     let embedder = load_embedder(&config, Tie::Enforced)?;
-    let worker = EmbedWorker::spawn(embedder, config.model.queue_depth, config.model.batch_size)
+    // What the server counts about itself (docs/decisions.md, D39): kept only if there is an address to serve
+    // it on, and by nothing at all otherwise.
+    let metrics = Arc::new(match config.metrics.listen {
+      Some(_) => Metrics::exported(embedder.fingerprint())?,
+      None => Metrics::discarded(),
+    });
+    let (depth, batch) = (config.model.queue_depth, config.model.batch_size);
+    let worker = EmbedWorker::spawn_measured(embedder, depth, batch, Arc::clone(&metrics))
       .context("cannot start the embedding thread")?;
     let (layout, dimension) = store_layout(&config.schema()?, &worker);
 
@@ -679,7 +699,7 @@ impl ServeArgs {
     runtime.block_on(async {
       if self.in_memory {
         tracing::warn!("--in-memory: vectors are not persisted and are lost when the server stops");
-        serve_with(MemoryStore::new(layout, dimension), worker, &config, listen).await
+        serve_with(MemoryStore::new(layout, dimension), worker, metrics, &config, listen).await
       } else {
         let settings = config.qdrant.settings(self.qdrant_api_key);
         let store = QdrantStore::connect(&settings, layout, dimension)
@@ -691,7 +711,7 @@ impl ServeArgs {
             )
           })?;
         tracing::info!(url = %settings.url, collection = %settings.collection, dimension, "connected to Qdrant");
-        serve_with(store, worker, &config, listen).await
+        serve_with(store, worker, metrics, &config, listen).await
       }
     })
   }

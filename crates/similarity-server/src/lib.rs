@@ -13,7 +13,6 @@
 //! - [`metrics`]: counts about the process, and the HTTP endpoint a monitoring system reads them from.
 //! - [`offline`]: comparing and calibrating from the command line, without a store.
 //! - [`shadow`]: a candidate policy judging live requests without deciding any.
-//! - [`span`]: where one request's time went, stage by stage.
 //! - [`registry`]: the record of which model was put into service, and the gate that lets one in.
 
 // Tests compute expected values with ordinary arithmetic and compare exact floats where exactness is the point.
@@ -34,7 +33,6 @@ mod properties;
 pub mod registry;
 pub mod runs;
 pub mod shadow;
-pub mod span;
 pub mod worker;
 
 use std::future::Future;
@@ -110,8 +108,8 @@ where
     // Kept, and never used again: a sender that is dropped would read as a second request to stop.
     std::future::pending::<()>().await;
   };
-  // Counted like any server's requests, and read by nobody: this caller asked for no endpoint.
-  let metrics = Arc::new(Metrics::new(&engine.describe().model_fingerprint));
+  // This caller asked for no endpoint, so nothing is kept.
+  let metrics = Arc::new(Metrics::discarded());
   tokio::select! {
     served = serve_until(engine, listener, stops, Lifecycle::default(), metrics) => served,
     () = ask => Ok(()),
@@ -1216,7 +1214,7 @@ mod tests {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (stops, asked) = mpsc::channel(4);
-    let metrics = Arc::new(Metrics::new("word-bag-v1"));
+    let metrics = Arc::new(Metrics::exported("word-bag-v1").unwrap());
     let server = tokio::spawn(serve_until(engine, listener, asked, lifecycle, Arc::clone(&metrics)));
     let channel = Channel::from_shared(format!("http://{address}"))
       .unwrap()

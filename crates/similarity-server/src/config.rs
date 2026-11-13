@@ -54,7 +54,7 @@ pub struct Config {
 #[serde(deny_unknown_fields, default)]
 pub struct MetricsConfig {
   /// The address to serve `/metrics` on, in the Prometheus text format. Not set by default: a second open port
-  /// is something a deployment asks for. The counts are kept either way.
+  /// is something a deployment asks for. Without it nothing is counted.
   pub listen: Option<SocketAddr>,
 }
 
