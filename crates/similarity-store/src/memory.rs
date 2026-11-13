@@ -10,7 +10,10 @@ use std::sync::RwLock;
 
 use similarity_core::vector::cosine;
 
-use crate::{Expected, Found, Neighbor, Result, SearchQuery, StoreError, StoredRecord, VectorStore, Version};
+use crate::{
+  Cursor, Entry, Expected, Found, Neighbor, Page, Result, Scan, ScannedRecord, SearchQuery, StoreError, StoredRecord,
+  VectorStore, Version,
+};
 
 /// A [`VectorStore`] that keeps everything in memory.
 #[derive(Debug)]
@@ -167,5 +170,42 @@ impl VectorStore for MemoryStore {
       vectors: record.vectors.clone(),
       quantities: record.quantities.clone(),
     })
+  }
+}
+
+impl Scan for MemoryStore {
+  /// In the order of the records' ids. The map has no order of its own, so every page sorts the ids that are
+  /// left: fine for what this store is for, and it leaves the map the requests use as it was.
+  async fn scan(&self, from: Option<&Cursor>, limit: usize) -> Result<Page> {
+    if limit == 0 {
+      return Err(StoreError::Invalid(
+        "a scan needs a page of at least one entry".to_owned(),
+      ));
+    }
+    let records = self.records.read().map_err(|_| Self::poisoned())?;
+    let mut ids: Vec<&String> = records
+      .keys()
+      .filter(|id| from.is_none_or(|Cursor(first)| *id >= first))
+      .collect();
+    ids.sort_unstable();
+    // The cursor is the id the next page starts at: a record deleted meanwhile is simply not there to start at,
+    // and one created meanwhile is listed if it sorts after it.
+    let next = ids.get(limit).map(|id| Cursor((*id).clone()));
+    let entries = ids
+      .into_iter()
+      .take(limit)
+      .filter_map(|id| records.get(id))
+      .map(|(layout, record)| {
+        if *layout == self.layout {
+          Entry::Record(ScannedRecord::from(record))
+        } else {
+          Entry::OtherLayout {
+            id: record.id.clone(),
+            layout: layout.clone(),
+          }
+        }
+      })
+      .collect();
+    Ok(Page { entries, next })
   }
 }

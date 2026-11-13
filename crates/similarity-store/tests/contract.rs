@@ -25,7 +25,8 @@ use std::time::Duration;
 use similarity_core::vector::{cosine, normalize};
 use similarity_core::{Quantities, Quantity, RecordVectors};
 use similarity_store::{
-  Expected, MemoryStore, QdrantSettings, QdrantStore, SearchQuery, StoreError, StoredRecord, VectorStore, Version,
+  Cursor, Entry, Expected, MemoryStore, Page, QdrantSettings, QdrantStore, Scan, ScannedRecord, SearchQuery,
+  StoreError, StoredRecord, VectorStore, Version,
 };
 
 const DIM: usize = 6;
@@ -525,6 +526,163 @@ async fn conditional<S: VectorStore>(store: &S, other_layout: &S) {
   assert!(store.delete("race").await.unwrap());
 }
 
+/// Everything a scan of `store` lists from `from` on, a page of `limit` at a time.
+async fn scanned_from<S: Scan>(store: &S, mut from: Option<Cursor>, limit: usize) -> Vec<Entry> {
+  let mut entries = Vec::new();
+  loop {
+    let Page { entries: page, next } = store.scan(from.as_ref(), limit).await.unwrap();
+    assert!(page.len() <= limit, "a page of {} for a limit of {limit}", page.len());
+    entries.extend(page);
+    match next {
+      Some(next) => from = Some(next),
+      None => return entries,
+    }
+  }
+}
+
+fn id_of(entry: &Entry) -> &str {
+  match entry {
+    Entry::Record(record) => &record.id,
+    Entry::OtherLayout { id, .. } => id,
+    Entry::Unreadable { id, .. } => id.as_deref().expect("an entry that says which record it is"),
+  }
+}
+
+/// The scan half of the contract: a store lists everything it holds, once, whatever the size of a page.
+/// `store` and `other_layout` are two views of the same underlying data, which must be empty.
+async fn scanning<S: VectorStore + Scan>(store: &S, other_layout: &S) {
+  // Nothing stored is one empty page, and a page of nothing is not a page.
+  assert_eq!(
+    store.scan(None, 10).await.unwrap(),
+    Page {
+      entries: Vec::new(),
+      next: None
+    }
+  );
+  assert!(matches!(store.scan(None, 0).await, Err(StoreError::Invalid(_))));
+
+  // Nine records of this layout, with and without a brand and quantities, and two of another.
+  let mut stored = Vec::new();
+  for index in 0..9_u8 {
+    let mut written = record(
+      &format!("sku-{index}"),
+      (index % 3 != 0).then_some("brand-1"),
+      [1.0, f32::from(index), 0.0, 0.0, 0.0, 0.0],
+    );
+    if index % 2 == 0 {
+      written.quantities = quantities(&[("weight", Quantity::single(f64::from(index) + 1.0, "g"))]);
+      written.anchor_quantities = quantities(&[("weight", Quantity::single(1.0, "g"))]);
+    }
+    written.revision = u64::from(index) + 1;
+    store.put(&written).await.unwrap();
+    stored.push(written);
+  }
+  for id in ["old-0", "old-1"] {
+    other_layout
+      .put(&record(id, Some("brand-2"), [0.0, 1.0, 0.0, 0.0, 0.0, 0.0]))
+      .await
+      .unwrap();
+  }
+  let mut expected: Vec<String> = stored.iter().map(|record| record.id.clone()).collect();
+  expected.extend(["old-0".to_owned(), "old-1".to_owned()]);
+  expected.sort();
+
+  // Every id once and in one order, whether a page holds one entry, exactly all of them, or more.
+  let whole = scanned_from(store, None, 100).await;
+  let order: Vec<String> = whole.iter().map(|entry| id_of(entry).to_owned()).collect();
+  let mut sorted = order.clone();
+  sorted.sort();
+  assert_eq!(sorted, expected);
+  for limit in [1, 2, 3, 4, 9, 11] {
+    assert_eq!(scanned_from(store, None, limit).await, whole, "pages of {limit}");
+  }
+
+  // A record of this layout is listed as it would be read, without its vectors. One of another layout is named
+  // and not read, from whichever side it is looked at.
+  for entry in &whole {
+    match entry {
+      Entry::Record(scanned) => {
+        let read = store.get(&scanned.id).await.unwrap().unwrap();
+        assert_eq!(*scanned, ScannedRecord::from(&read));
+        assert_eq!(scanned.hashes["name"], format!("hash-of-{}", scanned.id));
+      }
+      Entry::OtherLayout { id, layout } => {
+        assert!(id.starts_with("old-"), "{id}");
+        assert_eq!(layout, OTHER_LAYOUT);
+      }
+      Entry::Unreadable { .. } => panic!("everything here can be read: {entry:?}"),
+    }
+  }
+  let even = whole
+    .iter()
+    .find_map(|entry| match entry {
+      Entry::Record(scanned) if scanned.id == "sku-4" => Some(scanned.clone()),
+      _ => None,
+    })
+    .unwrap();
+  assert_eq!(even.brand_id.as_deref(), Some("brand-1"));
+  assert_eq!(even.quantities["weight"], Quantity::single(5.0, "g"));
+  assert_eq!(even.anchor_quantities["weight"], Quantity::single(1.0, "g"));
+  assert_eq!(even.revision, 5);
+  let from_the_other_side = scanned_from(other_layout, None, 4).await;
+  assert_eq!(
+    from_the_other_side
+      .iter()
+      .filter(|entry| matches!(entry, Entry::Record(_)))
+      .count(),
+    2
+  );
+  assert!(from_the_other_side.iter().all(|entry| match entry {
+    Entry::Record(scanned) => scanned.id.starts_with("old-"),
+    Entry::OtherLayout { id, layout } => id.starts_with("sku-") && layout == LAYOUT,
+    Entry::Unreadable { .. } => false,
+  }));
+
+  // A scan is not a snapshot, and the store is written to between its pages. Here: a record already listed is
+  // deleted, the very record the next page starts at is deleted, one further on is rewritten, and one is
+  // created.
+  let first = store.scan(None, 4).await.unwrap();
+  let seen: Vec<String> = first.entries.iter().map(|entry| id_of(entry).to_owned()).collect();
+  assert_eq!(seen, order[..4]);
+  let (gone_seen, gone_unseen) = (order[0].clone(), order[4].clone());
+  assert!(store.delete(&gone_seen).await.unwrap());
+  assert!(store.delete(&gone_unseen).await.unwrap());
+  let rewritten = order[5..]
+    .iter()
+    .find(|id| id.starts_with("sku-"))
+    .cloned()
+    .expect("a record of this layout after the fifth entry");
+  let mut again = store.get(&rewritten).await.unwrap().unwrap();
+  again.revision = 77;
+  again.brand_id = Some("brand-9".to_owned());
+  store.put(&again).await.unwrap();
+  store
+    .put(&record("created", None, [0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+    .await
+    .unwrap();
+
+  let rest = scanned_from(store, first.next, 4).await;
+  let listed: Vec<&str> = seen.iter().map(String::as_str).chain(rest.iter().map(id_of)).collect();
+  let times = |id: &str| listed.iter().filter(|listed| **listed == id).count();
+  for id in &order {
+    if *id == gone_unseen {
+      assert_eq!(times(id), 0, "{id} was deleted before its page was read");
+    } else {
+      assert_eq!(times(id), 1, "{id}");
+    }
+  }
+  assert!(times("created") <= 1);
+  assert_eq!(listed.len(), order.len() - 1 + times("created"), "{listed:?}");
+  let after = rest
+    .iter()
+    .find_map(|entry| match entry {
+      Entry::Record(scanned) if scanned.id == rewritten => Some(scanned),
+      _ => None,
+    })
+    .unwrap();
+  assert_eq!((after.revision, after.brand_id.as_deref()), (77, Some("brand-9")));
+}
+
 /// Two handles onto one map, opened under different layouts.
 #[derive(Debug)]
 struct SharedMemory(std::sync::Arc<tokio::sync::Mutex<Option<MemoryStore>>>, &'static str);
@@ -571,6 +729,22 @@ impl VectorStore for SharedMemory {
   async fn search(&self, query: SearchQuery<'_>) -> similarity_store::Result<Vec<similarity_store::Neighbor>> {
     self.with(async |store| store.search(query).await).await
   }
+}
+
+impl Scan for SharedMemory {
+  async fn scan(&self, from: Option<&Cursor>, limit: usize) -> similarity_store::Result<Page> {
+    self.with(async |store| store.scan(from, limit).await).await
+  }
+}
+
+#[tokio::test]
+async fn the_memory_store_lists_what_it_holds() {
+  let shared = std::sync::Arc::new(tokio::sync::Mutex::new(Some(MemoryStore::new(LAYOUT, DIM))));
+  scanning(
+    &SharedMemory(shared.clone(), LAYOUT),
+    &SharedMemory(shared, OTHER_LAYOUT),
+  )
+  .await;
 }
 
 #[tokio::test]

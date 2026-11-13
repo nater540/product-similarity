@@ -8,10 +8,15 @@
 //!   a faithful reference for what the Qdrant implementation must do.
 //! - [`QdrantStore`]: one Qdrant collection, one point per record.
 //!
+//! [`Scan`] is a second, smaller contract that only an audit of the store needs: list what is held, a page at a
+//! time. It is a trait of its own so that what lists a store cannot write to it, and so that a store wrapped for
+//! a test or for tracing does not have to pass on a call the server never makes.
+//!
 //! Both are constructed with a **layout id** (see `similarity_core::schema`). A record written under one layout is
 //! never handed back, compared, or returned from a search under another: its vector blocks would be sliced at the
 //! wrong offsets or have come from a different model, and the numbers would be wrong without looking wrong.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -235,6 +240,100 @@ pub trait VectorStore: Send + Sync + 'static {
   ///
   /// As [`Self::search`], and [`StoreError::Corrupt`] if a result's vectors cannot be read.
   fn search_vectors(&self, query: SearchQuery<'_>) -> impl Future<Output = Result<Vec<Found>>> + Send;
+}
+
+/// A stored record as a scan lists it: everything but its vectors.
+///
+/// A scan is for comparing what is stored with what should be, by fingerprint and by number. The two composites
+/// are most of a record's size and no part of that comparison, so a scan does not read them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScannedRecord {
+  /// [`StoredRecord::id`].
+  pub id: String,
+  /// [`StoredRecord::brand_id`].
+  pub brand_id: Option<String>,
+  /// The fingerprint of each field's current text ([`RecordVectors::hashes`]).
+  pub hashes: BTreeMap<String, String>,
+  /// [`StoredRecord::quantities`].
+  pub quantities: Quantities,
+  /// [`StoredRecord::anchor_quantities`].
+  pub anchor_quantities: Quantities,
+  /// [`StoredRecord::revision`].
+  pub revision: u64,
+  /// [`StoredRecord::updated_at`].
+  pub updated_at: u64,
+}
+
+impl From<&StoredRecord> for ScannedRecord {
+  fn from(record: &StoredRecord) -> Self {
+    Self {
+      id: record.id.clone(),
+      brand_id: record.brand_id.clone(),
+      hashes: record.vectors.hashes.clone(),
+      quantities: record.quantities.clone(),
+      anchor_quantities: record.anchor_quantities.clone(),
+      revision: record.revision,
+      updated_at: record.updated_at,
+    }
+  }
+}
+
+/// One thing a scan found in the store. A scan lists everything that is there, readable by this store or not:
+/// what cannot be read is exactly what whoever scans needs to hear about, and must not end the scan.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Entry {
+  /// A record of this store's layout.
+  Record(ScannedRecord),
+  /// A record written under another layout. [`VectorStore::get`] refuses it, and so does every request for it.
+  OtherLayout {
+    /// The record's id.
+    id: String,
+    /// The layout it was written under.
+    layout: String,
+  },
+  /// Something in the store that is not a record this store can read at all.
+  Unreadable {
+    /// The id of the record it says it is, where it says.
+    id: Option<String>,
+    /// What is wrong with it.
+    reason: String,
+  },
+}
+
+/// Where a scan goes on from. It means something only to the store that gave it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cursor(pub(crate) String);
+
+/// One page of a scan.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Page {
+  /// What was found, in the store's own order.
+  pub entries: Vec<Entry>,
+  /// Where the next page starts, or `None` if this was the last.
+  pub next: Option<Cursor>,
+}
+
+/// Listing what a store holds, a page at a time.
+///
+/// A scan is not a snapshot: each page is read when it is asked for, and the store may be written to in between.
+/// What it promises is this much. A record that is not written or deleted while the scan runs is listed exactly
+/// once. A record that is rewritten is listed once, whole, as one of the versions it had. A record
+/// that is created or deleted while the scan runs may be listed or not. No record is ever listed twice.
+pub trait Scan: Send + Sync + 'static {
+  /// The next page of at most `limit` entries, from the start of the store (`None`) or from where the last page
+  /// said to go on ([`Page::next`]).
+  ///
+  /// # Errors
+  ///
+  /// [`StoreError::Invalid`] if `limit` is zero, [`StoreError::Unavailable`] if the store cannot be read. A
+  /// single entry that cannot be read is not an error: it is an [`Entry::Unreadable`].
+  fn scan(&self, from: Option<&Cursor>, limit: usize) -> impl Future<Output = Result<Page>> + Send;
+}
+
+impl<S: Scan> Scan for Arc<S> {
+  fn scan(&self, from: Option<&Cursor>, limit: usize) -> impl Future<Output = Result<Page>> + Send {
+    self.as_ref().scan(from, limit)
+  }
 }
 
 /// A shared store is a store: two engines in one process, or a test standing in for two replicas, hold one each.
