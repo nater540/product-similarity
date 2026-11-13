@@ -665,6 +665,18 @@ mod tests {
       (description.match_threshold, description.match_overfetch),
       (Some(0.6), 3)
     );
+
+    // And one string for all of it, which another server started the same way gives too.
+    assert_eq!(description.judging_digest.len(), 16);
+    assert!(
+      description
+        .judging_digest
+        .bytes()
+        .all(|digit| digit.is_ascii_hexdigit())
+    );
+    let mut twin = start().await;
+    let other = twin.client.describe(pb::DescribeRequest {}).await.unwrap().into_inner();
+    assert_eq!(other.judging_digest, description.judging_digest);
   }
 
   /// The stream the import tests send: two new records, one that is stored, the same one under another brand,

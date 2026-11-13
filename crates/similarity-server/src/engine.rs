@@ -23,13 +23,15 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest as _, Sha256};
 use similarity_core::matching::{self, Candidate, Decision, Ranked};
 use similarity_core::quantity::{self, first_values};
+use similarity_core::record::hex_prefix;
 use similarity_core::score::{self, Evaluation, FieldScore};
 use similarity_core::vector::cosine;
 use similarity_core::{
-  FieldChange, Policy, PreparedRecord, Quantities, Quantity, QuantityChange, QuantityScore, Reason, RecordVectors,
-  Schema,
+  FieldChange, FieldSpec, Policy, PreparedRecord, Quantities, Quantity, QuantityChange, QuantityScore, QuantitySpec,
+  Reason, RecordVectors, Schema,
 };
 use similarity_store::{Expected, Neighbor, SearchQuery, StoreError, StoredRecord, VectorStore};
 use tokio::sync::watch;
@@ -447,6 +449,90 @@ pub struct Description {
   pub policy: Policy,
   /// How menu items are matched.
   pub matching: Matching,
+}
+
+impl Description {
+  /// Everything a verdict depends on, written out one value to a line: the model, each field with its weight and
+  /// its floor, the thresholds, each quantity with its limits, and how a match is decided. Numbers are written as
+  /// the bits they are, so that the text does not depend on how a number is printed, and names are quoted, so
+  /// that no name can pass for two.
+  ///
+  /// The order and the wording are fixed: this text is what [`Self::judging_digest`] is a digest of, and servers
+  /// of different versions compare digests. Add a line for a new rule; never change one that is there.
+  fn judging(&self) -> String {
+    use std::fmt::Write as _;
+
+    // Each rule is taken apart by name, with nothing left over, so that a rule added to any of these one day does
+    // not compile until it is written out here: a rule the digest left out would be two servers that judge
+    // differently and say they agree.
+    let Policy {
+      threshold,
+      anchor_threshold,
+      reject_on_measure_change,
+    } = self.policy;
+    let Matching {
+      threshold: match_threshold,
+      overfetch,
+    } = self.matching;
+    let bits = |value: Option<f32>| value.map_or_else(|| "-".to_owned(), |value| format!("{:08x}", value.to_bits()));
+    let mut text = String::new();
+    // Writing to a `String` cannot fail.
+    let _ = writeln!(text, "model {:?}", self.model_fingerprint);
+    let _ = writeln!(
+      text,
+      "policy threshold={} anchor_threshold={} reject_on_measure_change={reject_on_measure_change}",
+      bits(Some(threshold)),
+      bits(anchor_threshold),
+    );
+    let mut fields: Vec<_> = self.schema.fields().iter().collect();
+    fields.sort_by(|left, right| left.name.cmp(&right.name));
+    for field in fields {
+      let FieldSpec {
+        name,
+        weight,
+        required,
+        reject_below,
+      } = field;
+      let _ = writeln!(
+        text,
+        "field {name:?} weight={} required={required} reject_below={}",
+        bits(Some(*weight)),
+        bits(*reject_below)
+      );
+    }
+    let mut quantities: Vec<_> = self.schema.quantities().iter().collect();
+    quantities.sort_by(|left, right| left.name.cmp(&right.name));
+    for quantity in quantities {
+      let QuantitySpec {
+        name,
+        reject_above_factor,
+        reject_incomparable,
+      } = quantity;
+      let factor = reject_above_factor.map_or_else(|| "-".to_owned(), |factor| format!("{:016x}", factor.to_bits()));
+      let _ = writeln!(
+        text,
+        "quantity {name:?} reject_above_factor={factor} reject_incomparable={reject_incomparable}"
+      );
+    }
+    let _ = writeln!(
+      text,
+      "matching threshold={} overfetch={overfetch}",
+      bits(match_threshold)
+    );
+    text
+  }
+
+  /// A digest of everything a verdict depends on: sixteen hexadecimal digits that two servers share exactly when
+  /// they judge by the same rules with the same model.
+  ///
+  /// It is for seeing that replicas agree, and that a change of configuration has reached every one of them:
+  /// during a rolling deploy two requests for one record can be held to two thresholds, and nothing else says
+  /// so. Two digests that differ mean the configurations differ in something, and not necessarily that any
+  /// verdict would: weights that are all doubled judge the same, and are another digest.
+  #[must_use]
+  pub fn judging_digest(&self) -> String {
+    hex_prefix(&Sha256::digest(self.judging().as_bytes()), 8)
+  }
 }
 
 /// The layout id and composite width a store must be opened with to serve `schema` with `embedder`.
@@ -4145,6 +4231,157 @@ mod tests {
       other => panic!("expected the anchor to be refused, got {other:?}"),
     }
     assert_eq!(stored(&engine, "p1").await.unwrap(), imported);
+  }
+
+  /// What is judged by in these tests: the usual fields, two quantities, a drift threshold, and a match threshold.
+  fn described() -> Description {
+    let quantity = |name: &str, factor: Option<f64>, incomparable: bool| QuantitySpec {
+      name: name.to_owned(),
+      reject_above_factor: factor,
+      reject_incomparable: incomparable,
+    };
+    let schema = schema()
+      .with_quantities(vec![quantity("weight", Some(4.0), true), quantity("thc", None, false)])
+      .unwrap();
+    engine_over(schema, Policy::new(0.75, Some(0.5)).unwrap())
+      .with_matching(Matching {
+        threshold: Some(0.6),
+        overfetch: 3,
+      })
+      .describe()
+  }
+
+  #[test]
+  fn what_is_judged_by_is_written_out_one_value_to_a_line_and_its_digest_is_of_that_text() {
+    let description = described();
+    // Pinned to the letter: servers of different versions compare digests of this text. 0.75 is 3f400000,
+    // 0.5 is 3f000000, 0.3 is 3e99999a, 4.0 is 40800000 (and 4010000000000000 as a quantity's factor).
+    assert_eq!(
+      description.judging(),
+      concat!(
+        "model \"word-bag-v1\"\n",
+        "policy threshold=3f400000 anchor_threshold=3f000000 reject_on_measure_change=false\n",
+        "field \"category\" weight=40000000 required=false reject_below=-\n",
+        "field \"description\" weight=3f800000 required=false reject_below=-\n",
+        "field \"name\" weight=40800000 required=true reject_below=3e99999a\n",
+        "quantity \"thc\" reject_above_factor=- reject_incomparable=false\n",
+        "quantity \"weight\" reject_above_factor=4010000000000000 reject_incomparable=true\n",
+        "matching threshold=3f19999a overfetch=3\n",
+      )
+    );
+    let digest = description.judging_digest();
+    assert_eq!(digest, hex_prefix(&Sha256::digest(description.judging().as_bytes()), 8));
+    assert_eq!(digest.len(), 16);
+    assert_eq!(digest, described().judging_digest(), "the same rules, the same digest");
+  }
+
+  #[test]
+  fn any_rule_that_differs_is_another_digest_and_the_order_things_were_configured_in_is_not() {
+    let base = described();
+    let with = |change: &dyn Fn(&mut Description)| {
+      let mut other = base.clone();
+      change(&mut other);
+      other.judging_digest()
+    };
+    let field = |name: &str, weight: f32, required: bool, reject_below: Option<f32>| FieldSpec {
+      name: name.to_owned(),
+      weight,
+      required,
+      reject_below,
+    };
+    let quantity = |name: &str, factor: Option<f64>, incomparable: bool| QuantitySpec {
+      name: name.to_owned(),
+      reject_above_factor: factor,
+      reject_incomparable: incomparable,
+    };
+    let fields = |fields: Vec<FieldSpec>, quantities: Vec<QuantitySpec>| {
+      Schema::new(fields).unwrap().with_quantities(quantities).unwrap()
+    };
+    let usual_fields = || {
+      vec![
+        field("name", 4.0, true, Some(0.3)),
+        field("category", 2.0, false, None),
+        field("description", 1.0, false, None),
+      ]
+    };
+    let usual_quantities = || vec![quantity("weight", Some(4.0), true), quantity("thc", None, false)];
+
+    let digests = [
+      base.judging_digest(),
+      with(&|d| d.model_fingerprint = "word-bag-v2".to_owned()),
+      with(&|d| d.policy.threshold = 0.76),
+      with(&|d| d.policy.anchor_threshold = None),
+      with(&|d| d.policy.anchor_threshold = Some(0.51)),
+      with(&|d| d.policy.reject_on_measure_change = true),
+      with(&|d| d.matching.threshold = None),
+      with(&|d| d.matching.threshold = Some(0.61)),
+      with(&|d| d.matching.overfetch = 4),
+      // A weight, a floor, whether a field is required, and a field more.
+      with(&|d| {
+        let mut changed = usual_fields();
+        changed[1].weight = 2.5;
+        d.schema = fields(changed, usual_quantities());
+      }),
+      with(&|d| {
+        let mut changed = usual_fields();
+        changed[0].reject_below = Some(0.31);
+        d.schema = fields(changed, usual_quantities());
+      }),
+      with(&|d| {
+        let mut changed = usual_fields();
+        changed[1].reject_below = Some(0.3);
+        d.schema = fields(changed, usual_quantities());
+      }),
+      with(&|d| {
+        let mut changed = usual_fields();
+        changed[2].required = true;
+        d.schema = fields(changed, usual_quantities());
+      }),
+      with(&|d| {
+        let mut more = usual_fields();
+        more.push(field("brand", 1.0, false, None));
+        d.schema = fields(more, usual_quantities());
+      }),
+      // A quantity's limit, whether it rejects another unit, a quantity more, and none at all.
+      with(&|d| {
+        d.schema = fields(
+          usual_fields(),
+          vec![quantity("weight", Some(4.5), true), quantity("thc", None, false)],
+        );
+      }),
+      with(&|d| {
+        d.schema = fields(
+          usual_fields(),
+          vec![quantity("weight", None, true), quantity("thc", None, false)],
+        );
+      }),
+      with(&|d| {
+        d.schema = fields(
+          usual_fields(),
+          vec![quantity("weight", Some(4.0), false), quantity("thc", None, false)],
+        );
+      }),
+      with(&|d| {
+        let mut more = usual_quantities();
+        more.push(quantity("volume", None, false));
+        d.schema = fields(usual_fields(), more);
+      }),
+      with(&|d| d.schema = fields(usual_fields(), Vec::new())),
+    ];
+    let distinct: std::collections::BTreeSet<&String> = digests.iter().collect();
+    assert_eq!(distinct.len(), digests.len(), "{digests:?}");
+
+    // The same rules, written in another order in the configuration.
+    let reordered = with(&|d| {
+      let mut fields_reversed = usual_fields();
+      fields_reversed.reverse();
+      let mut quantities_reversed = usual_quantities();
+      quantities_reversed.reverse();
+      d.schema = fields(fields_reversed, quantities_reversed);
+    });
+    assert_eq!(reordered, base.judging_digest());
+    // Nothing that is said by the model's fingerprint already is said again.
+    assert_eq!(with(&|d| d.dimension = 1), base.judging_digest());
   }
 
   #[test]

@@ -464,6 +464,7 @@ impl<S: VectorStore, E: TextEmbedder> GrpcService<S, E> {
   fn described(&self) -> Response<pb::DescribeResponse> {
     let description = self.engine.describe();
     Response::new(pb::DescribeResponse {
+      judging_digest: description.judging_digest(),
       model_fingerprint: description.model_fingerprint,
       dimension: width(description.dimension),
       composite_dimension: width(description.composite_dimension),

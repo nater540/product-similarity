@@ -716,7 +716,12 @@ async fn serve_with<S: VectorStore>(
   let listener = tokio::net::TcpListener::bind(listen)
     .await
     .with_context(|| format!("cannot listen on {listen}"))?;
-  tracing::info!(address = %listener.local_addr()?, "serving gRPC");
+  // What this replica judges by, as one string: the one `Describe` gives, to compare replicas by in their logs.
+  tracing::info!(
+    address = %listener.local_addr()?,
+    judging_digest = engine.describe().judging_digest().as_str(),
+    "serving gRPC"
+  );
   if let Some(endpoint) = &config.telemetry.otlp_endpoint {
     tracing::info!(
       endpoint = endpoint.as_str(),

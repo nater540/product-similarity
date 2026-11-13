@@ -217,6 +217,8 @@ fn print_description(description: pb::DescribeResponse) {
       description.match_overfetch
     ),
   }
+  // One string for everything above: two servers that print the same one judge by the same rules.
+  println!("judging   {}", description.judging_digest);
 }
 
 fn print_match(response: &pb::MatchResponse) {
