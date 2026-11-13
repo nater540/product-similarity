@@ -23,12 +23,23 @@ service RecordSimilarity {
   // a quantity that is not a usable measurement) or a `mode` this server does not know, `FAILED_PRECONDITION` if the stored baseline belongs to a brand the request does not name or was
   // written under a different model or schema layout, `RESOURCE_EXHAUSTED` if the embedding queue is full,
   // `UNAVAILABLE` if the vector store cannot be reached, `ABORTED` if another writer changed the record every
-  // time this request had judged it and gone to write.
+  // time this request had judged it and gone to write, `DEADLINE_EXCEEDED` if the request carried a deadline and
+  // the server could tell that it would not be met.
   //
   // A record is judged against what is stored at the moment it is written. When two requests for one `id` reach
   // two servers at once, one is written and the other is judged again, against the one that was written: each
   // gets the answer it would have got had it simply arrived second. `ABORTED` is what is left when that keeps
   // happening; nothing was written, and the request can be sent again as it is.
+  //
+  // Deadlines and cancelled requests. A request that carries a deadline (`grpc-timeout`) and cannot be served
+  // by then is not worked on: it is answered `DEADLINE_EXCEEDED` as soon as the server can tell, with nothing
+  // embedded and nothing written. A request that is cancelled, or whose deadline runs out, before it has gone
+  // to write leaves nothing behind. One that is cancelled while its write is on its way to the store is
+  // finished: the record is stored exactly as if the request had been answered, and the server logs that it
+  // was. A caller whose request ended that way cannot tell which of the two happened, and does not need to:
+  // sending the same request again is safe. If the write went through, the record is judged against itself and
+  // answered `VERDICT_ACCEPTED` (also a record the first request created), with `stored: false` unless the mode
+  // is `WRITE_MODE_FORCE`; if it did not, the request is judged as it would have been the first time.
   rpc Evaluate(EvaluateRequest) returns (EvaluateResponse);
 
   // Finds stored records similar to a given one, most similar first.
@@ -45,7 +56,8 @@ service RecordSimilarity {
   // delete one record that reach two servers at the same moment may both be answered `deleted: true`.
   //
   // Errors: `FAILED_PRECONDITION` if the record is stored under a brand the request does not name, `ABORTED`
-  // as for `Evaluate`.
+  // as for `Evaluate`. A delete that is cancelled while it is on its way to the store is finished, like a write
+  // of `Evaluate`; sending it again is answered `deleted: false` if it went through.
   rpc Delete(DeleteRequest) returns (DeleteResponse);
 
   // Creates records that are not stored yet, as many as the caller sends, over one call.
@@ -75,8 +87,8 @@ service RecordSimilarity {
   // compared and reported for each candidate and never move a similarity or the decision.
   //
   // Errors: `INVALID_ARGUMENT` for a menu item that does not fit the schema, that carries an `id` or a `brand_id`,
-  // for a `limit` above 100, or for a `threshold` outside [-1, 1]; `RESOURCE_EXHAUSTED` and `UNAVAILABLE` as for
-  // `Evaluate`.
+  // for a `limit` above 100, or for a `threshold` outside [-1, 1]; `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, and
+  // `DEADLINE_EXCEEDED` as for `Evaluate`.
   rpc Match(MatchRequest) returns (MatchResponse);
 
   // Reports the model, schema, and thresholds this server is running with.

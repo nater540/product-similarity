@@ -121,8 +121,10 @@ where
 /// still answers what it is sent: readiness is advice to whoever routes requests, not a gate.
 ///
 /// Stopping, on [`Stop::Drain`]: not ready at once, serving for the notice, then no new requests and up to the
-/// deadline for the ones in flight. A second request to stop during either wait ends that wait. [`Stop::Now`]
-/// has no notice. A channel whose senders are all gone is a request to stop now.
+/// deadline for the ones in flight, and for any write a request left behind when its caller gave up
+/// ([`Engine::settled`]): the process is not to end with a write half way to the store. A second request to stop
+/// during either wait ends that wait. [`Stop::Now`] has no notice. A channel whose senders are all gone is a
+/// request to stop now.
 ///
 /// Taking a bound listener rather than an address lets a caller bind port 0 and learn the port before serving,
 /// which is how the end-to-end tests run.
@@ -152,6 +154,7 @@ where
     .context("cannot build the gRPC reflection service")?;
 
   let (close, closed) = oneshot::channel::<()>();
+  let writing = Arc::clone(&engine);
   let server = Server::builder()
     .add_service(health_service)
     .add_service(reflection)
@@ -197,19 +200,25 @@ where
 
   // No new requests from here: the listener closes, and connections end as their requests do.
   let _ = close.send(());
+  let finished = async {
+    let outcome = (&mut server).await;
+    // A request whose caller gave up while it was writing is gone, and its write is not: that is finished too.
+    writing.settled().await;
+    outcome
+  };
   tokio::select! {
-    outcome = &mut server => outcome.context(stopped_with_an_error),
+    outcome = finished => outcome.context(stopped_with_an_error),
     () = tokio::time::sleep(lifecycle.drain_deadline) => {
       // Returning is all there is to do: the connections are the runtime's, and end when the process does, which
       // for the binary is next.
       tracing::warn!(
         deadline_ms = millis(lifecycle.drain_deadline),
-        "the drain deadline passed with requests still in flight: stopping without them"
+        "the drain deadline passed with requests or writes still in flight: stopping without them"
       );
       Ok(())
     }
     () = asked_again(&mut stops) => {
-      tracing::warn!("asked to stop again with requests still in flight: stopping without them");
+      tracing::warn!("asked to stop again with requests or writes still in flight: stopping without them");
       Ok(())
     }
   }
@@ -1046,11 +1055,24 @@ mod tests {
   const LIVE: &str = "";
   const READY: &str = "recordsimilarity.v1.RecordSimilarity";
 
-  /// A store whose readiness check a test can make fail, or never answer. Everything else is the memory store.
+  /// A store whose readiness check a test can make fail, or never answer, and whose writes a test can hold on
+  /// their way. Everything else is the memory store.
   struct Faulty {
     inner: MemoryStore,
     down: Arc<AtomicBool>,
     silent: Arc<AtomicBool>,
+    /// While true, a write waits here: sent, and neither applied nor refused.
+    writes_held: Arc<tokio::sync::watch::Sender<bool>>,
+    /// How many writes have got that far.
+    writes: Arc<AtomicUsize>,
+  }
+
+  impl Faulty {
+    async fn let_through(&self) {
+      self.writes.fetch_add(1, Ordering::Relaxed);
+      let mut held = self.writes_held.subscribe();
+      let _ = held.wait_for(|held| !*held).await;
+    }
   }
 
   impl VectorStore for Faulty {
@@ -1073,6 +1095,7 @@ mod tests {
     }
 
     async fn put_if(&self, record: &StoredRecord, expected: Expected) -> Result<bool, StoreError> {
+      self.let_through().await;
       self.inner.put_if(record, expected).await
     }
 
@@ -1081,6 +1104,7 @@ mod tests {
     }
 
     async fn delete_if(&self, id: &str, version: Version) -> Result<bool, StoreError> {
+      self.let_through().await;
       self.inner.delete_if(id, version).await
     }
 
@@ -1133,6 +1157,8 @@ mod tests {
     alive: Arc<AtomicBool>,
     gate: Arc<tokio::sync::Semaphore>,
     waiting: Arc<AtomicUsize>,
+    writes_held: Arc<tokio::sync::watch::Sender<bool>>,
+    writes: Arc<AtomicUsize>,
   }
 
   /// A server over a store and an embedder the test controls. `open` says whether the embedder's gate starts
@@ -1154,10 +1180,14 @@ mod tests {
     );
     let gate = Arc::new(tokio::sync::Semaphore::new(if open { 1_000_000 } else { 0 }));
     let waiting = Arc::new(AtomicUsize::new(0));
+    let writes_held = Arc::new(tokio::sync::watch::Sender::new(false));
+    let writes = Arc::new(AtomicUsize::new(0));
     let store = Faulty {
       inner: MemoryStore::new(layout, dimension),
       down: Arc::clone(&down),
       silent: Arc::clone(&silent),
+      writes_held: Arc::clone(&writes_held),
+      writes: Arc::clone(&writes),
     };
     let embedder = Gated {
       inner,
@@ -1185,6 +1215,8 @@ mod tests {
       alive,
       gate,
       waiting,
+      writes_held,
+      writes,
     }
   }
 
@@ -1404,5 +1436,133 @@ mod tests {
       in_flight.abort();
       drop((running.client, running.channel));
     }
+  }
+
+  // ---- Requests that go away (D38) --------------------------------------------------------------------------
+
+  /// Runs `scene` on one thread, server included, and returns the warnings logged meanwhile.
+  fn warnings(scene: impl Future<Output = ()>) -> Vec<serde_json::Value> {
+    let captured = similarity_log::testing::capture("warn", || {
+      tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(scene);
+    });
+    captured
+      .logs
+      .iter()
+      .map(|line| serde_json::from_str(line).unwrap())
+      .collect()
+  }
+
+  /// A request for `p1` whose caller waits `timeout` for it and no longer.
+  fn impatient(name: &str, timeout: Duration) -> tonic::Request<pb::EvaluateRequest> {
+    let mut request = tonic::Request::new(named(name));
+    request.set_timeout(timeout);
+    request
+  }
+
+  /// Sends a request whose write is held on its way to the store, and returns once its caller has given up:
+  /// the write is in flight, and nobody is waiting for it.
+  async fn given_up_mid_write(running: &Lived) {
+    running.writes_held.send_replace(true);
+    let mut client = running.client.clone();
+    let timeout = Duration::from_millis(300);
+    let call = tokio::spawn(async move { client.evaluate(impatient("blueberry gummies", timeout)).await });
+    while running.writes.load(Ordering::Relaxed) == 0 {
+      assert!(!call.is_finished(), "the caller gave up before the write was sent");
+      tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let refused = call.await.unwrap().unwrap_err();
+    // The transport's word for a timeout that ran out, on both sides of the connection.
+    assert_eq!(refused.code(), tonic::Code::Cancelled, "{refused:?}");
+    // The server's own timer was started a moment after the caller's.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+  }
+
+  fn gone(logged: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+    logged
+      .iter()
+      .filter(|line| line["message"] == "a write finished after the request that asked for it had gone")
+      .collect()
+  }
+
+  /// The whole of it over a real connection. The caller's deadline runs out while its write is on its way; the
+  /// transport drops the request; the write lands all the same, the log says so, and the caller's retry of the
+  /// same record is told there is nothing to change.
+  #[test]
+  fn a_write_survives_the_deadline_of_the_request_that_asked_for_it() {
+    let logged = warnings(async {
+      let mut running = live(quick(), true, false).await;
+      given_up_mid_write(&running).await;
+      running.writes_held.send_replace(false);
+
+      let retried = running
+        .client
+        .evaluate(named("blueberry gummies"))
+        .await
+        .unwrap()
+        .into_inner();
+      assert_eq!(
+        (retried.verdict(), retried.stored, retried.revision),
+        (pb::Verdict::Accepted, false, 1),
+        "the record the caller was never told about is there"
+      );
+      running.stops.send(Stop::Now).await.unwrap();
+      drop((running.client, running.channel));
+      stopped(running.server, Duration::from_secs(30)).await;
+    });
+    let gone = gone(&logged);
+    assert_eq!(gone.len(), 1, "{logged:?}");
+    assert_eq!((&gone[0]["call"], &gone[0]["id"]), (&"evaluate".into(), &"p1".into()));
+    assert_eq!((&gone[0]["stored"], &gone[0]["revision"]), (&true.into(), &1.into()));
+  }
+
+  /// Stopping waits for a write that no request is waiting for any more. The connections are all idle, so
+  /// without this the process would end with the write half way to the store.
+  #[test]
+  fn a_server_that_is_stopping_waits_for_a_write_whose_request_has_gone() {
+    let logged = warnings(async {
+      let running = live(quick(), true, false).await;
+      given_up_mid_write(&running).await;
+
+      running.stops.send(Stop::Now).await.unwrap();
+      drop((running.client, running.channel));
+      tokio::time::sleep(Duration::from_millis(150)).await;
+      assert!(!running.server.is_finished(), "a write is still on its way");
+
+      running.writes_held.send_replace(false);
+      stopped(running.server, Duration::from_secs(30)).await;
+    });
+    assert_eq!(gone(&logged).len(), 1, "{logged:?}");
+  }
+
+  /// A request in the queue for the model whose caller's deadline runs out is dropped by the transport, and
+  /// costs nothing more: the server goes on answering.
+  #[tokio::test]
+  async fn a_request_whose_deadline_runs_out_before_it_writes_stores_nothing() {
+    let mut running = live(quick(), false, false).await;
+    let refused = running
+      .client
+      .evaluate(impatient("blueberry gummies", Duration::from_millis(100)))
+      .await
+      .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::Cancelled, "{refused:?}");
+    // The caller's timer ran out first; the server's was started a moment later, and until it runs out too the
+    // request is still there, and would go on if the model were free now.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(running.writes.load(Ordering::Relaxed), 0);
+
+    running.gate.add_permits(1_000_000);
+    let created = running.client.evaluate(named("blueberry gummies")).await.unwrap();
+    assert_eq!(
+      created.into_inner().verdict(),
+      pb::Verdict::Created,
+      "nothing was stored before"
+    );
+    running.stops.send(Stop::Now).await.unwrap();
+    drop((running.client, running.channel));
+    stopped(running.server, Duration::from_secs(30)).await;
   }
 }

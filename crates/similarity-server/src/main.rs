@@ -113,6 +113,11 @@ struct LoadArgs {
   /// Leave the records in the store afterwards.
   #[arg(long)]
   keep: bool,
+  /// How long each caller of the edit and resave phases waits for an answer, in milliseconds, before it gives up
+  /// on that record and takes the next. With more callers than the server can answer in that time, this is a
+  /// server past what it can do.
+  #[arg(long)]
+  deadline_ms: Option<u64>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1177,6 +1182,7 @@ impl LoadArgs {
       seed: self.seed,
       edit_field: self.edit_field,
       keep: self.keep,
+      deadline: self.deadline_ms.map(std::time::Duration::from_millis),
     };
     let connect = |url: String| async move {
       let channel = tonic::transport::Channel::from_shared(url.clone())

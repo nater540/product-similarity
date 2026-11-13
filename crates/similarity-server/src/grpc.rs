@@ -6,7 +6,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use similarity_core::matching::Decision;
 use similarity_core::{FieldChange, FieldScore, Quantity, QuantityChange, QuantityScore, Reason};
@@ -23,7 +23,7 @@ use crate::engine::{
   SimilarTo, Verdict, WriteMode,
 };
 use crate::import_stream::{self, Answer, PATIENCE};
-use crate::worker::TextEmbedder;
+use crate::worker::{self, TextEmbedder};
 
 /// The tonic service wrapping an [`Engine`].
 #[derive(Debug)]
@@ -46,6 +46,7 @@ impl From<EngineError> for Status {
       EngineError::FailedPrecondition(message) => Self::failed_precondition(message),
       EngineError::Conflict(message) => Self::aborted(message),
       EngineError::Overloaded(message) => Self::resource_exhausted(message),
+      EngineError::DeadlineExceeded(message) => Self::deadline_exceeded(message),
       EngineError::Unavailable(message) => {
         tracing::warn!(%message, "dependency unavailable");
         Self::unavailable(message)
@@ -56,6 +57,39 @@ impl From<EngineError> for Status {
       }
     }
   }
+}
+
+/// The header a gRPC client states its deadline in: how long from now it will wait.
+const GRPC_TIMEOUT: &str = "grpc-timeout";
+
+/// Reads a `grpc-timeout` value: up to eight digits and a unit, as the gRPC protocol over HTTP/2 defines it.
+/// `None` for anything else, which is then no deadline, as it is for the transport.
+fn grpc_timeout(value: &str) -> Option<Duration> {
+  let unit = value.chars().last()?;
+  let digits = value.strip_suffix(unit)?;
+  if digits.is_empty() || digits.len() > 8 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+    return None;
+  }
+  let amount: u64 = digits.parse().ok()?;
+  match unit {
+    'H' => Some(Duration::from_secs(amount.saturating_mul(3600))),
+    'M' => Some(Duration::from_secs(amount.saturating_mul(60))),
+    'S' => Some(Duration::from_secs(amount)),
+    'm' => Some(Duration::from_millis(amount)),
+    'u' => Some(Duration::from_micros(amount)),
+    'n' => Some(Duration::from_nanos(amount)),
+    _ => None,
+  }
+}
+
+/// When the caller of `request` stops waiting for it, if it said: `received` plus the timeout it sent.
+///
+/// The transport enforces the same timeout by dropping the handler when it runs out. This is for the one thing
+/// that can be decided earlier than that: whether the request can be served in time at all (see
+/// [`worker::by`]).
+fn deadline<T>(request: &Request<T>, received: Instant) -> Option<Instant> {
+  let timeout = grpc_timeout(request.metadata().get(GRPC_TIMEOUT)?.to_str().ok()?)?;
+  received.checked_add(timeout)
 }
 
 fn record_input(record: pb::Record) -> RecordInput {
@@ -223,6 +257,7 @@ fn width(value: usize) -> u32 {
 impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
   async fn evaluate(&self, request: Request<pb::EvaluateRequest>) -> Result<Response<pb::EvaluateResponse>, Status> {
     let started = Instant::now();
+    let deadline = deadline(&request, started);
     let request = request.into_inner();
     let mode = write_mode(request.mode)?;
     let Some(record) = request.record else {
@@ -230,14 +265,12 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
     };
     let id = record.id.clone();
 
-    let output = self
-      .engine
-      .evaluate(EvaluateInput {
-        record: record_input(record),
-        mode,
-        threshold: request.threshold,
-      })
-      .await?;
+    let evaluated = self.engine.evaluate(EvaluateInput {
+      record: record_input(record),
+      mode,
+      threshold: request.threshold,
+    });
+    let output = worker::by(deadline, evaluated).await?;
     tracing::info!(
       id = id.as_deref().unwrap_or(""),
       verdict = ?output.verdict,
@@ -276,21 +309,20 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
     request: Request<pb::FindSimilarRequest>,
   ) -> Result<Response<pb::FindSimilarResponse>, Status> {
     let started = Instant::now();
+    let deadline = deadline(&request, started);
     let request = request.into_inner();
     let query = match request.query {
       Some(pb::find_similar_request::Query::Id(id)) => SimilarTo::Id(id),
       Some(pb::find_similar_request::Query::Record(record)) => SimilarTo::Record(record_input(record)),
       None => return Err(Status::invalid_argument("one of `id` or `record` is required")),
     };
-    let neighbors = self
-      .engine
-      .find_similar(FindSimilarInput {
-        query,
-        limit: usize::try_from(request.limit).unwrap_or(usize::MAX),
-        brand_id: request.brand_id,
-        min_similarity: request.min_similarity,
-      })
-      .await?;
+    let found = self.engine.find_similar(FindSimilarInput {
+      query,
+      limit: usize::try_from(request.limit).unwrap_or(usize::MAX),
+      brand_id: request.brand_id,
+      min_similarity: request.min_similarity,
+    });
+    let neighbors = worker::by(deadline, found).await?;
     tracing::info!(
       neighbors = neighbors.len(),
       elapsed_ms = milliseconds(started),
@@ -369,19 +401,18 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
 
   async fn r#match(&self, request: Request<pb::MatchRequest>) -> Result<Response<pb::MatchResponse>, Status> {
     let started = Instant::now();
+    let deadline = deadline(&request, started);
     let request = request.into_inner();
     let Some(menu_item) = request.menu_item else {
       return Err(Status::invalid_argument("`menu_item` is required"));
     };
-    let output = self
-      .engine
-      .match_menu_item(MatchInput {
-        menu_item: record_input(menu_item),
-        limit: usize::try_from(request.limit).unwrap_or(usize::MAX),
-        brand_id: request.brand_id,
-        threshold: request.threshold,
-      })
-      .await?;
+    let matched = self.engine.match_menu_item(MatchInput {
+      menu_item: record_input(menu_item),
+      limit: usize::try_from(request.limit).unwrap_or(usize::MAX),
+      brand_id: request.brand_id,
+      threshold: request.threshold,
+    });
+    let output = worker::by(deadline, matched).await?;
     tracing::info!(
       candidates = output.candidates.len(),
       fetched = output.fetched,
@@ -465,6 +496,7 @@ mod tests {
       ),
       (EngineError::Conflict("m".to_owned()), Code::Aborted),
       (EngineError::Overloaded("m".to_owned()), Code::ResourceExhausted),
+      (EngineError::DeadlineExceeded("m".to_owned()), Code::DeadlineExceeded),
       (EngineError::Unavailable("m".to_owned()), Code::Unavailable),
       (EngineError::Internal("m".to_owned()), Code::Internal),
     ];
@@ -472,6 +504,127 @@ mod tests {
       let status = Status::from(error);
       assert_eq!((status.code(), status.message()), (code, "m"));
     }
+  }
+
+  #[test]
+  fn a_grpc_timeout_is_digits_and_a_unit_and_anything_else_is_no_deadline() {
+    let cases = [
+      ("2H", Some(Duration::from_hours(2))),
+      ("3M", Some(Duration::from_mins(3))),
+      ("15S", Some(Duration::from_secs(15))),
+      ("250m", Some(Duration::from_millis(250))),
+      ("7u", Some(Duration::from_micros(7))),
+      ("9n", Some(Duration::from_nanos(9))),
+      ("0m", Some(Duration::ZERO)),
+      ("99999999S", Some(Duration::from_secs(99_999_999))),
+      // Nine digits are more than the protocol allows.
+      ("123456789S", None),
+      ("", None),
+      ("S", None),
+      ("15", None),
+      ("15s", None),
+      ("1.5S", None),
+      ("-1S", None),
+      ("+1S", None),
+      (" 1S", None),
+      ("1 S", None),
+      ("1é", None),
+    ];
+    for (value, expected) in cases {
+      assert_eq!(grpc_timeout(value), expected, "{value:?}");
+    }
+  }
+
+  #[test]
+  fn a_requests_deadline_is_when_it_was_received_plus_the_timeout_it_sent() {
+    let received = Instant::now();
+    let with = |value: &str| {
+      let mut request = Request::new(());
+      request.metadata_mut().insert(GRPC_TIMEOUT, value.parse().unwrap());
+      request
+    };
+    assert_eq!(
+      deadline(&Request::new(()), received),
+      None,
+      "a caller that says nothing waits forever"
+    );
+    assert_eq!(
+      deadline(&with("250m"), received),
+      Some(received + Duration::from_millis(250))
+    );
+    assert_eq!(deadline(&with("soon"), received), None);
+  }
+
+  /// The deadline a caller sends reaches the embedding thread, through the handler and the engine: a request
+  /// whose time is already up is answered `DEADLINE_EXCEEDED` by the service itself, with nothing embedded.
+  #[tokio::test]
+  async fn a_request_that_arrives_with_no_time_left_is_refused_and_not_embedded() {
+    use similarity_core::{FieldSpec, Policy, Schema};
+    use similarity_store::MemoryStore;
+
+    use crate::engine::store_layout;
+    use crate::worker::EmbedWorker;
+
+    let options = similarity_core::EmbedderOptions {
+      max_tokens: 16,
+      batch_size: 8,
+      output_dim: None,
+    };
+    let worker = EmbedWorker::spawn(similarity_core::testing::tiny_embedder(&options), 4, 8).unwrap();
+    let schema = Schema::new(vec![FieldSpec {
+      name: "name".to_owned(),
+      weight: 1.0,
+      required: true,
+      reject_below: None,
+    }])
+    .unwrap();
+    let (layout, dimension) = store_layout(&schema, &worker);
+    let engine = Engine::new(
+      MemoryStore::new(layout, dimension),
+      worker.clone(),
+      schema,
+      Policy::new(0.75, None).unwrap(),
+    );
+    let service = GrpcService::new(Arc::new(engine));
+    let record = || pb::Record {
+      fields: [("name".to_owned(), "blueberry gummies".to_owned())].into(),
+      ..pb::Record::default()
+    };
+    let timed = |timeout: &str| {
+      let mut request = Request::new(pb::EvaluateRequest {
+        record: Some(record()),
+        ..pb::EvaluateRequest::default()
+      });
+      request.metadata_mut().insert(GRPC_TIMEOUT, timeout.parse().unwrap());
+      request
+    };
+
+    let refused = service.evaluate(timed("0m")).await.unwrap_err();
+    assert_eq!(refused.code(), Code::DeadlineExceeded, "{refused:?}");
+    let stats = worker.stats();
+    assert_eq!((stats.too_late, stats.jobs, stats.texts), (1, 0, 0));
+
+    let mut searching = Request::new(pb::FindSimilarRequest {
+      query: Some(pb::find_similar_request::Query::Record(record())),
+      ..pb::FindSimilarRequest::default()
+    });
+    searching.metadata_mut().insert(GRPC_TIMEOUT, "0m".parse().unwrap());
+    let refused = service.find_similar(searching).await.unwrap_err();
+    assert_eq!(refused.code(), Code::DeadlineExceeded, "{refused:?}");
+
+    let mut matching = Request::new(pb::MatchRequest {
+      menu_item: Some(record()),
+      ..pb::MatchRequest::default()
+    });
+    matching.metadata_mut().insert(GRPC_TIMEOUT, "0m".parse().unwrap());
+    let refused = service.r#match(matching).await.unwrap_err();
+    assert_eq!(refused.code(), Code::DeadlineExceeded, "{refused:?}");
+    assert_eq!(worker.stats().too_late, 3);
+
+    // With time to spare it is served like any other.
+    let answered = service.evaluate(timed("1M")).await.unwrap().into_inner();
+    assert_eq!(answered.verdict(), pb::Verdict::Embedded);
+    assert_eq!(worker.stats().jobs, 1);
   }
 
   /// One of each kind of reason, with numbers that are awkward on purpose.

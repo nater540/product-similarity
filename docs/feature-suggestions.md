@@ -73,7 +73,7 @@ and because each would put a Python service in the loop.
 | 19 | Structured reason codes and explanations | Serving | M | No |
 | 20 | Menu-item to brand-product matching | Serving | L | Yes |
 | 21 | Readiness that tells the truth, and a drain on shutdown (built) | Production | S | No |
-| 22 | Deadlines honored, writes that survive a cancelled request | Production | M | No |
+| 22 | Deadlines honored, writes that survive a cancelled request (built) | Production | M | No |
 | 23 | Conditional writes across replicas (built) | Production | M | No |
 | 24 | Audit of the store against the catalog | Production | M | An export |
 | 25 | Anchor backup and restore | Production | M | No |
@@ -619,6 +619,18 @@ the listener closing.
 
 ### 22. Deadlines that are honored, and writes that survive a cancelled request
 
+**Built** (D38). What came out differently: (a) and (b) as written were not enough, and (b) is not what was
+built. With abandoned jobs skipped and hopeless ones refused on arrival, a server at twice its capacity
+answered 400 to 470 edits a second in time, against 14 before and 2,450 unhurried: served in the order they
+came, the requests the thread reached were always the ones nearly out of time. What was built instead: a
+forward pass is made of the requests it can answer before their deadlines, and once a request has been lost
+the thread takes the newest first until it has caught up. "Cannot be answered in time" is judged on the fastest
+the model has been, a lower bound, so nothing is refused that might have been answered, and nothing is refused
+on arrival but a deadline that has passed. (c) is every write the engine makes, not only `Evaluate`'s: a delete
+and an import are finished the same way, and a server that is stopping waits for them. The owner chose
+completing over abandoning. `just load --deadline-ms` is how it was measured, and what it measured against
+Qdrant is the first item under [Things noticed along the way](#things-noticed-along-the-way).
+
 **What.** Three changes on one theme. (a) The embedding worker skips a job whose caller is gone. (b) A request
 whose deadline cannot be met in the queue is refused at once (`DEADLINE_EXCEEDED`), not embedded late. (c) The
 judge-and-write section of `Evaluate` runs to completion even when the request is cancelled, and what happened is
@@ -819,6 +831,15 @@ Not features, but found while preparing this list:
   arrive concurrently" came from the batch throughput measurement, not from a test through the gRPC queue. It has
   been replaced by a measured figure for the bulk import (2,000 four-field records in 19 seconds). Throughput
   through the gRPC queue is still unmeasured, and feature 12 would measure it.
+- **The store is a queue too, and nothing manages it** (measured 2026-11-12, building feature 22). Qdrant in
+  Docker on the development laptop takes about 1,500 edits a second, and the model 2,450, so against it the
+  store is what a server runs out of. Everything feature 22 does decides who gets the model. Past the store's
+  capacity, requests are embedded promptly and then wait on their writes until their callers give up: at a
+  50 ms deadline, 209 of 10,000 edits were answered in time at 128 callers. The writes are finished and logged,
+  and a retry is answered from what was stored, so nothing is lost; but nobody is answered in time either. A
+  limit on writes in flight, with the rule feature 22 uses for the model (let in what can be answered, newest
+  first once behind), would be the fix. Not proposed as a feature yet: whether a production Qdrant is slower
+  than the model is the first thing to find out, and it is one `just load --server` run.
 - **Choosing a checkpoint on the holdout contaminates the holdout.** See the caveat under feature 3.
 - **Very long fields were a CPU cost risk (verified, and fixed).** The tokenizer processed a whole field before
   truncating it to `max_tokens`: one 1 MB field cost about 0.7 s of the single embedding thread, and 3 MB about

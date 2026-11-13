@@ -986,7 +986,7 @@ milliseconds. Nothing is logged per batch: under load that is the volume D15 war
 **What it measured** (12 cores, default model): from one caller to 64, edits per second rise from 177 to 470
 while the median latency rises from 6 ms to 116 ms, with the model busy throughout and the number of texts per
 forward pass rising from 1 to 23. Creating whole records levels off at about 80 a second once a pass is full.
-That was with Burn running the model. The README's table is the same test with ONNX Runtime (D34): 612 to 2,435
+That was with Burn running the model. The README's table is the same test with ONNX Runtime (D34): 627 to 2,448
 edits a second, a median from 1.6 ms to 22 ms, and creates leveling off at about 400.
 
 **The loop is closed, and says so.** Each caller waits for its answer before sending again. That measures latency
@@ -1662,3 +1662,134 @@ server exited 1.60 seconds after `SIGTERM` and 0.09 seconds after Ctrl-C.
 
 **Not done:** a count of the requests left behind at the deadline (that is a metric, proposal 26); taking a
 failing request as a sign that the store is down, sooner than the next check; anything on a cluster.
+
+## D38. A request can be dropped anywhere it waits; a write never is, and the model works only for callers that are waiting
+
+tonic applies a client's `grpc-timeout` to every handler and drops the handler when it runs out, and drops it
+when the client hangs up. Checked in its source (0.14.9, `transport/service/grpc_timeout.rs`): the timer and
+the handler are polled together, and the handler is gone the moment the timer fires. So every `.await` in a
+request is a place where the request can end. Two things followed from that, and neither was handled.
+
+**The model worked for callers that had left.** A request waiting for the embedding thread is a job in a queue
+with a channel to answer on. The thread never asked whether anybody held the other end. Under overload, which
+is when callers give up, it embedded every abandoned request in turn, and by the time it reached one that was
+still wanted, that caller had given up too. Measured, with 256 callers each waiting 50 ms for an edit (twice
+what the model can do): 98 and 105 of 20,000 edits answered in time, 14 a second, from a server that does
+2,450 a second when nobody is in a hurry. At 128 callers, just past its capacity, 2,061 and 2,152.
+
+**A write could be cut in half with nobody knowing.** A handler dropped while `put_if` is on its way to the
+store leaves a write that may or may not have been applied. The caller was told nothing, the observer was told
+nothing, the request's log line was never written, and the baseline may have moved. The README tells the
+caller to keep its database and this service in step, and this was the one case where the caller could not
+know that it had to.
+
+### The model
+
+**A job whose caller has gone is passed over.** The reply channel says so (`is_closed`), and the thread asks
+before every pass, of every job that is waiting. That costs nothing and needs no deadline: it covers a cancel
+as well as a timeout.
+
+**A request that says when its caller stops waiting is held to that.** The gRPC layer reads `grpc-timeout`
+and scopes the handler with `worker::by`, a task-local, which the worker reads where it queues texts. A
+task-local and not an argument, because the deadline is a fact about the request and would otherwise be a
+parameter of every call between the handler and the queue, and of every stand-in embedder in the tests.
+
+**A pass is made of the requests it can answer in time.** A pass answers everybody in it when it ends. The
+thread remembers the least time per text any successful pass has taken; a pass cannot end sooner than its
+texts take at that rate. A request is in a pass only if the pass, with it in, can end before its deadline,
+most time left first, which lets the most in. A request whose deadline has passed, or will have before the
+pass about to run can end, is told `DEADLINE_EXCEEDED` then and not embedded.
+
+**The bound is one-sided on purpose.** It is the fastest the model has been, so a request is refused only for
+a deadline that cannot be met, never for one that merely might not be. An average would refuse requests that
+would have been answered, and a request refused wrongly is a failure this server caused. A request alone in a
+pass is never refused on a guess at its own texts at all: the bound comes from other texts, and with nobody
+else waiting there is nothing to gain. So an idle server only ever answers `DEADLINE_EXCEEDED` for a deadline
+that has passed.
+
+**In order, until a request is lost; then the newest first.** This is the part that was found by measuring.
+With everything above and requests served in the order they came, a server at twice its capacity answered
+1,950 edits a second in time, and the median answer arrived 42 ms into a 50 ms deadline. In order, the request
+being served is the one that has waited longest. Once more arrive than can be served, the queue grows until
+that request is at the very edge of its deadline, and stays there: every pass is made of requests with just
+enough time for the model by the bound, and none for anything a request does next. So the thread serves in
+order only while nobody is being lost. The moment a pass loses a request (gone, out of time, or refused by the
+bound), it is filled from the newest end instead, and so is the next, until a pass is put together with nobody
+lost. The newest have the most time left; the oldest, which cannot all be served anyway, are the ones that are
+lost. The median answer then arrives at 24 to 26 ms. A server that is keeping up never leaves the order they came
+in, and a caller with no deadline cannot make it leave.
+
+**The bound on waiting requests counts requests that are still wanted.** `model.queue_depth` was the length of
+a channel. It is now a count that a request leaves when it is taken into a pass, refused, or dropped by its
+caller, whichever is first. A queue of abandoned requests used to refuse every new one until the thread had
+worked through it (65,000 refusals in seven seconds, in the measurement above); now it refuses nobody.
+
+**Nothing is refused on arrival but a deadline that has passed.** An earlier version refused a request when
+the texts waiting ahead of it could not be embedded in time. Once the newest are served first, "ahead" is not
+where the other requests are, and that test refuses exactly the requests that would have been answered.
+
+**Measured again**, same load, same client, a store in memory: 2,319 and 2,320 edits a second answered in
+time at 256 callers, and 2,364 and 2,374 at 128, of 2,450 unhurried. (Out of 20,000 that is 7,557 and 7,561,
+and 12,780 and 12,788: fewer than in order, where it was 15,000 at 128 callers, because callers that are
+answered in 25 ms come back sooner than callers answered in 40. The rate is the measure.) In an
+in-process run at 256 callers the model embedded 7,859 texts for 7,565 answers in time. Without a deadline
+nothing moved (the README's table was run again: 2,448 edits a second at 64 callers against 2,435 before).
+
+**What it does not do: anything about the store.** All of this decides who gets the model. Against Qdrant in
+Docker on the same laptop the store is the limit, about 1,500 edits a second whatever the number of callers,
+with a median of 64 ms at 128 callers and no deadline at all. At a 50 ms deadline 209 of 10,000 edits were
+answered in time at 128 callers and 80 at 256 (before: 41 and 68). The requests were embedded promptly and
+then waited on the store, where nothing limits how many do or says who goes first. Their writes were finished
+and logged, which is the other half of this decision, and a retry is answered from what was stored. A limit on
+writes in flight, with the same rule for who is let in, would be the same idea one stage later. It is not
+built, and it should be measured against a store that is sized for the job before it is.
+
+**Also not done.** The bound is the fastest pass since the process started, so in a server's first moments,
+before a full pass, it is rough. A request with no deadline that was already waiting when the server fell
+behind waits until it has caught up: newer ones are served first for as long as requests are being lost. And
+`Import` streams carry no deadline: a stream is one long call, and its batches are already paced by the model
+(D33).
+
+### The write
+
+**A write runs to its end on a task of its own** (`Engine::committed`): the store call, then the observer,
+then the making of the answer. The request only waits for it. If the request is dropped, the task goes on, so
+the record is stored exactly as if the request had been answered, and the observer hears what it would have
+heard. Everything before the write stays on the request's own task and is dropped with it, which is what lets
+the model skip it.
+
+**The owner's choice was to complete, not abandon** (2026-11-12). Abandoning is not on offer anyway: a write
+that has been sent cannot be recalled. The choice was between finishing and reporting it, and leaving it to
+chance.
+
+**The result logs itself.** The task's output is a value that writes a `WARN` line when it is dropped without
+having been taken: `a write finished after the request that asked for it had gone`, with the call, the id,
+and the revision. Wherever the request disappears, before the task ends or in the instant after, the value
+is dropped untaken, so there is no gap between "the request was answered" and "the log says what happened". A
+write that lost its race changed nothing and says nothing. A write that failed says so and says that it may
+or may not have been applied, which is the truth.
+
+**The record's lock is held by the write too**, shared between the request and the task. Otherwise a dropped
+request would let the record's next request in while the write was still on its way: it would lose the race
+and be judged again, which is correct and wasteful, and an observer could hear of the two out of order.
+
+**A retry is the caller's whole recovery.** The same request sent again is judged against the record it
+stored (accepted, nothing to write) or against the old one (judged as it would have been). D35 is what makes
+that safe.
+
+**Stopping waits for them** (`Engine::settled`): a write whose request has gone belongs to no connection, so a
+drain that only waited for connections would end the process with it half way. It is inside the same
+deadline, and a second signal still ends the wait (D37).
+
+**Status codes.** `DEADLINE_EXCEEDED` is this server saying early that a deadline will not be met. A deadline
+that actually runs out is answered by tonic as `CANCELLED`, on the server and in a tonic client alike; other
+gRPC clients report their own deadline as `DEADLINE_EXCEEDED` themselves. The load test counts both as one
+thing.
+
+**Checked over a real connection** (`lib.rs`): a caller whose deadline runs out while its write is held on its
+way gets its error, the write lands, the line is logged, the retry is answered "accepted, not stored", and a
+server asked to stop waits for the write.
+
+**Not done:** a limit on writes in flight (above); an open-loop load test (D26 says why the closed one is not
+one); a count of abandoned and refused requests where an operator can see it, which is a metric (proposal 26);
+deadlines on the store's own calls beyond `qdrant.timeout_ms`.

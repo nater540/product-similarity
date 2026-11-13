@@ -648,10 +648,31 @@ record: an accepted one is stored and counts as a revision.
 | `NOT_FOUND` | `FindSimilar` by an id that is not stored. | |
 | `FAILED_PRECONDITION` | The stored record belongs to a brand the request does not name (it names another, or none), or was written under a different model or field set. | Send the record's brand, or see [Re-indexing](#re-indexing). |
 | `RESOURCE_EXHAUSTED` | The embedding queue is full. | Retry with backoff. |
+| `DEADLINE_EXCEEDED` | The request carried a deadline, and the server could tell it would not be met: it ran out while the request waited for the model, or the forward pass about to run could not end before it. Nothing was embedded for it. | Retry with backoff, as for a full queue. |
 | `ABORTED` | Another writer changed the record each of the four times this request had judged it and gone to write. That takes another server working on the same record at the same instant, four times running. | Send the request again as it is. |
 | `UNAVAILABLE` | Qdrant cannot be reached. | Retry with backoff. |
 
 Nothing is written when an error is returned.
+
+**Deadlines and cancelled requests.** Set a deadline on every call. What becomes of a request whose caller has
+stopped waiting, because its deadline ran out or it hung up, depends on how far it had got:
+
+- **Waiting for the model:** it is passed over. The one embedding thread does not compute answers nobody is
+  waiting for, which matters most when the server is overloaded
+  ([Past what a server can do](#past-what-a-server-can-do)).
+- **Reading, or being judged:** it is dropped, and leaves nothing behind.
+- **Writing:** the write is finished. A write that is abandoned half way may or may not have reached the store,
+  and nobody could say which, so the server completes it, exactly as if the request had been answered, and
+  logs a `WARN` line with the record's id (`a write finished after the request that asked for it had gone`).
+
+So a caller whose request timed out does not know whether its edit was stored, and does not need to: **send the
+same request again**. If the write went through, the record is judged against itself and answered
+`VERDICT_ACCEPTED` with `stored: false`; if it did not, the request is judged as it would have been the first
+time. (A forced write is written again, to the same effect.)
+
+A deadline that runs out is reported by the caller's own gRPC library, usually as `DEADLINE_EXCEEDED`; this
+server's transport says `CANCELLED` for the same thing. The `DEADLINE_EXCEEDED` in the table is the earlier
+answer: the server saying, before the deadline, that it will not make it.
 
 ## Integrating it
 
@@ -2007,7 +2028,7 @@ commented starting point.
 | `model.max_tokens` | `256` | Text beyond this many tokens is ignored. Cost grows with its square. |
 | `model.output_dim` | none (native width) | Keep only the first N components of each field vector. Only for models trained for it. The example config sets 256 for the default model. |
 | `model.batch_size` | `32` | The most texts in one forward pass. |
-| `model.queue_depth` | `256` | Requests that may wait for the encoder before new ones get `RESOURCE_EXHAUSTED`. |
+| `model.queue_depth` | `256` | Requests that may wait for the encoder before new ones get `RESOURCE_EXHAUSTED`. A request whose caller has gone no longer counts. |
 | `model.expected_fingerprint` | none | The fingerprint of the model the thresholds were measured with, as on the `model` line of `calibrate`. With it, `serve` and `import` refuse to run with any other model, and `compare` and the `calibrate` commands warn. Without it nothing is checked, and `serve` and `import` say so once. |
 | `qdrant.url` | `http://localhost:6334` | Qdrant's gRPC endpoint (6334, not the REST port 6333). |
 | `qdrant.collection` | `records` | The collection. Created if missing. |
@@ -2296,15 +2317,17 @@ terminationGracePeriodSeconds: 30   # more than drain_notice_ms + drain_deadline
 1. reports not ready, at once, and stays live;
 2. goes on serving for `server.drain_notice_ms` (5 seconds), so that the load balancer can act on that before
    anything is refused;
-3. closes the listener, and gives the requests in flight up to `server.drain_deadline_ms` (20 seconds);
+3. closes the listener, and gives the requests in flight up to `server.drain_deadline_ms` (20 seconds), along
+   with any write a request left behind when its caller gave up;
 4. exits. Requests still running then are cut off, and a `WARN` line says the deadline passed.
 
 A second `SIGTERM`, or Ctrl-C, ends whichever wait it is in. Ctrl-C alone skips the notice: there is a person at
 the keyboard and no load balancer. With the notice set to 1.5 seconds and nothing in flight, the server exited
 1.60 seconds after `SIGTERM` and 0.09 seconds after Ctrl-C.
 
-Nothing is lost by a request that is cut off: a write is one conditional step in the store, so it happened or
-it did not, and an `Import` stream that ends early is sent again.
+Nothing is lost by a request that is cut off at the deadline: a write is one conditional step in the store, so
+it happened or it did not, sending the request again is safe either way
+([Errors](#errors)), and an `Import` stream that ends early is sent again.
 
 ### Capacity
 
@@ -2355,26 +2378,26 @@ On the same machine (12 cores, release build, default model, 300 records per lev
 
 | Callers | Phase | Requests per second | Median | 99th percentile | Texts per forward pass | Mean wait in the queue |
 |---|---|---|---|---|---|---|
-| 1 | create | 210 | 4.9 ms | 5.4 ms | 4.0 | 0.0 ms |
-| 1 | edit | 612 | 1.6 ms | 1.8 ms | 1.0 | 0.0 ms |
-| 1 | resave | 9,993 | 0.1 ms | 0.1 ms | | |
-| 4 | create | 284 | 14.1 ms | 16.0 ms | 8.0 | 5.5 ms |
-| 4 | edit | 989 | 4.0 ms | 4.4 ms | 2.0 | 1.5 ms |
-| 16 | create | 396 | 39.1 ms | 74.7 ms | 29.3 | 18.9 ms |
-| 16 | edit | 1,814 | 8.5 ms | 16.5 ms | 7.5 | 1.6 ms |
-| 64 | create | 401 | 139.8 ms | 304.1 ms | 30.8 | 107.2 ms |
-| 64 | edit | 2,435 | 22.4 ms | 48.0 ms | 23.1 | 9.4 ms |
-| 64 | resave | 26,303 | 2.3 ms | 3.6 ms | | |
-| 1 | stream | 402 | | | 31.6 | 0.0 ms |
+| 1 | create | 216 | 4.8 ms | 5.2 ms | 4.0 | 0.0 ms |
+| 1 | edit | 627 | 1.6 ms | 1.7 ms | 1.0 | 0.0 ms |
+| 1 | resave | 9,937 | 0.1 ms | 0.1 ms | | |
+| 4 | create | 292 | 13.7 ms | 15.5 ms | 7.9 | 5.4 ms |
+| 4 | edit | 1,090 | 3.6 ms | 4.7 ms | 2.0 | 1.5 ms |
+| 16 | create | 402 | 39.0 ms | 58.0 ms | 30.0 | 18.9 ms |
+| 16 | edit | 1,852 | 8.5 ms | 9.4 ms | 7.9 | 2.3 ms |
+| 64 | create | 401 | 139.6 ms | 280.0 ms | 30.8 | 109.0 ms |
+| 64 | edit | 2,448 | 22.4 ms | 47.4 ms | 23.1 | 9.3 ms |
+| 64 | resave | 26,764 | 2.2 ms | 4.1 ms | | |
+| 1 | stream | 406 | | | 31.6 | 0.0 ms |
 
 - **create** sends a new record, so all four fields go to the model. **edit** sends it back with the name
   changed, so one short text does: this is edit-time traffic, the figure a replica is sized by. **resave** sends
   the edited record again unchanged, so nothing reaches the model, and what is left is gRPC, the per-record lock,
   and the store. **stream** creates the same number of new records over one `Import` call.
 - **More callers buy throughput by sharing forward passes, and pay for it in latency.** From 1 caller to 64,
-  edits per second go from 612 to 2,435 while the median goes from 1.6 ms to 22 ms. The model was busy for
+  edits per second go from 627 to 2,448 while the median goes from 1.6 ms to 22 ms. The model was busy for
   nearly all of every create and edit phase (89% of the time with one caller editing, 99% and more from four):
-  one replica's ceiling on this machine is about 2,400 edits a second.
+  one replica's ceiling on this machine is about 2,450 edits a second.
 - **Creating whole records levels off at about 400 a second**, 1,600 texts, once a forward pass is full
   (`model.batch_size` is 32). **One stream reaches that ceiling from a single caller**: it fills forward passes
   on purpose, where 64 callers of `Evaluate` fill them by arriving together and wait 140 ms each to do it. The
@@ -2389,12 +2412,84 @@ the second kind. The store is in memory, so a round trip to Qdrant comes on top.
 stream. The table leaves out two of the resave rows. One line:
 
 ```json
-{"message":"load_phase","run_id":"1-1794500054","concurrency":16,"phase":"edit","requests":300,"ok":300,"overloaded":0,"failed":0,"created":0,"accepted":300,"rejected":0,"seconds":0.165,"per_second":1813.5,"p50_ms":8.54,"p90_ms":8.91,"p99_ms":16.48,"max_ms":17.82,"mean_ms":8.66,"batches":40,"texts":300,"texts_per_batch":7.5,"model_busy":0.997,"queue_wait_ms":1.64}
+{"message":"load_phase","run_id":"1-1794528411","concurrency":16,"phase":"edit","requests":300,"ok":300,"overloaded":0,"expired":0,"failed":0,"created":0,"accepted":300,"rejected":0,"seconds":0.162,"per_second":1852.3,"p50_ms":8.53,"p90_ms":9.0,"p99_ms":9.4,"max_ms":14.89,"mean_ms":8.52,"batches":38,"texts":300,"texts_per_batch":7.89,"model_busy":0.995,"queue_wait_ms":2.26,"abandoned":0,"too_late":0}
 ```
 
 `--server http://host:port` drives a server that is already running, instead of starting one. Its records are
 written under the brand `load-test` and deleted afterwards, and the worker's side (`batches`, `texts_per_batch`,
-`model_busy`, `queue_wait_ms`) is left out, since a client cannot see it. No record text is in any result.
+`model_busy`, `queue_wait_ms`, `abandoned`, `too_late`) is left out, since a client cannot see it. No record
+text is in any result.
+
+#### Past what a server can do
+
+Nothing above asks a server for more than it can do: each caller waits for its answer, however long that takes.
+A real caller has a deadline, and gives up. `--deadline-ms` gives the callers of the edit and resave phases one:
+a caller that is not answered in time counts the record as `expired` and takes the next. With more callers than
+the server can answer in that time, it is being asked for more than it has.
+
+```sh
+just load config.example.toml --concurrency 128,256 --records 20000 --deadline-ms 50
+```
+
+The model can do 2,450 edits a second. A caller that is answered sends its next request at once, so 128
+callers ask for more than that, and 256 for more still. Edits answered in time, of 20,000, on the same
+machine, two runs each, against this server and against the commit before it learned any of this (`0cf6011`),
+each as a process of its own (`--server`) on a store in memory:
+
+| Callers | Deadline | Before: answered in time | Before: a second | Now: answered in time | Now: a second |
+|---|---|---|---|---|---|
+| 128 | 50 ms | 2,061 and 2,152 | 251 and 261 | 12,780 and 12,788 | 2,374 and 2,364 |
+| 256 | 50 ms | 98 and 105 | 14 and 15 | 7,557 and 7,561 | 2,319 and 2,320 |
+
+- **Before, a server that fell behind stopped answering.** The embedding thread took requests in the order
+  they came, whether or not anybody was still waiting. Once the wait passed the deadline, everything it reached
+  had been given up on, so it spent all of its time on answers nobody read, and at twice its capacity it
+  answered one request in two hundred. The queue stayed full of such requests, and refused some 65,000
+  attempts with `RESOURCE_EXHAUSTED` in seven seconds.
+- **Now it answers as many as it has time for**: 2,320 to 2,370 edits a second, about 95% of what it does
+  when nobody is in a hurry. The count out of 20,000 is lower than that share because callers that are
+  answered sooner come back sooner: the median answer took 25 ms, and the callers sent 3,700 requests a second
+  at 128 and 6,100 at 256.
+  Three things do it, and an in-process run at 256 callers counts each (7,565 edits answered in time, for
+  7,859 texts embedded):
+  - The thread passes over a request whose caller has gone, and such a request gives up its place among the
+    waiting at once (`abandoned`, 3,132).
+  - A forward pass is made up of requests it can answer before their deadlines. One that is out of time, or
+    that the pass about to run leaves no time for, is told `DEADLINE_EXCEEDED` then, and not embedded
+    (`too_late`, 9,228).
+  - Requests are served in the order they came until one is lost in either of those ways. From then on the
+    server is behind, and the request at the head of the queue is always the one closest to its deadline: its
+    answer would arrive as its caller gave up. So while it is behind the thread takes the newest requests
+    first, which have the most time left, and it goes back to the order they came in as soon as a pass is put
+    together with nobody lost.
+- **"Cannot be answered in time" is judged on the fastest the model has been**, per text, in any pass since the
+  server started: a lower bound on how long a pass will take. So a request is only refused for a deadline that
+  cannot be met, never for one that merely might not be, and a request alone in a pass is never refused on a
+  guess at its own texts. In a server's first moments, before it has run a full pass, the bound is a rough one.
+- **A caller that gave up while its edit was being written got its edit written** (see [Errors](#errors)), with
+  its `WARN` line: 50 of the 20,000 edits in that run.
+
+A caller spends the whole deadline on a record it gives up on, also when the server refuses it sooner, so a
+server that fails fast is not sent more for it. The create phase has no deadline, because the other two need
+its records to exist; in a run with a deadline the resave phase is no longer only resaves, since an edit that
+expired was not stored. This is still a closed loop.
+
+**All of that is about a server that is short of the model.** When the store is what it is short of, none of
+it helps, because the queue is then in the store, where this server has no say over who goes first. Qdrant in
+Docker on the same laptop is such a store. With no deadline it takes about 1,500 edits a second however many
+callers there are (1,497 with 16 callers at a median of 10 ms, 1,444 with 64 at 36 ms, 1,613 with 128 at
+64 ms), against the 2,450 the model can do. At a 50 ms deadline, of 10,000 edits, one run each:
+
+| Callers | Deadline | Before: answered in time | Now: answered in time |
+|---|---|---|---|
+| 128 | 50 ms | 41 | 209 |
+| 256 | 50 ms | 68 | 80 |
+
+The edits were embedded promptly and then waited on the store until their callers gave up. What is different
+now is what became of them: the writes were finished and each was logged (13,557 lines in that run), where
+before a write whose caller left may or may not have happened and nothing said which. A caller that
+sends the edit again is answered from what was stored, without the model. Nothing limits how many writes are
+in flight at once; that is not built.
 
 In service, every `evaluate`, `find_similar`, `match`, and `delete` log line carries `elapsed_ms`: the time from
 the first line of the handler to the log line. An `Import` stream writes one `import` line when it ends, with how
@@ -2593,6 +2688,8 @@ what that field says.
 | `` invalid record: `...` is a quantity, not a text field `` | A quantity was sent as text in `fields`. Send it in `quantities`, as a number with a unit. |
 | A quantity reports `INCOMPARABLE` for a unit that should convert | The unit is not in the service's table, so it is comparable only with itself. The table is `UNITS` in `crates/similarity-core/src/quantity.rs`; adding a unit is one line. |
 | Many `RESOURCE_EXHAUSTED` | More requests are arriving than the encoder can serve. Back off in the client, add CPU, or add replicas. |
+| Many `DEADLINE_EXCEEDED` | The same, from callers that set deadlines: the server is saying early that it will not answer in time. Back off in the client, add CPU, or add replicas. |
+| `WARN` lines saying `a write finished after the request that asked for it had gone` | Callers are giving up while their edits are being written. Each line names a record whose caller was not told it was stored. Nothing is wrong with the record; a caller that retries is answered. Many of them mean deadlines shorter than a write to the store takes. |
 | Everything is rejected, or nothing is | The thresholds do not suit the model or the data. Run `calibrate`. Thresholds never carry over between models. |
 | The first Docker command fails with `Cannot connect to the Docker daemon` | Docker is not running. Start Docker Desktop, or `orbctl start` for OrbStack. |
 
@@ -2608,6 +2705,10 @@ what that field says.
   which is most visible when searching by a name alone. `Match` scores its candidates exactly, but it can only
   score what the search returned: a record the search ranks below `limit` times `matching.overfetch` is never
   seen. See D5 and D32.
+- **Past the store's capacity, deadlines are missed.** A server that is short of the model serves the requests
+  it has time for ([Past what a server can do](#past-what-a-server-can-do)). One that is short of Qdrant does
+  not: requests are embedded and then wait on the store, and nothing limits how many do. Their writes are
+  finished and logged, and a retry is answered from what was stored, but the callers are not answered in time.
 - **No bulk call for revisions.** `Import` streams new records in and only creates. Judging many *changes* is
   still one `Evaluate` call for each.
 - **English only.** The default model is English. Other languages need another model and a new calibration.

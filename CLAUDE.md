@@ -6,7 +6,7 @@ and trained in [Burn](https://burn.dev), run by ONNX Runtime), compared with the
 rejected against calibrated thresholds. A record's quantities (weight, volume, potency) are compared as numbers
 beside that, never embedded. Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D37) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D38) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -107,6 +107,23 @@ changing a design. Infer conventions from the existing code first.
   orchestrator would restart a healthy process because Qdrant is down), and never make a request wait on or be
   refused by readiness: it is advice to whoever routes requests. Stopping is in one order: not ready, the
   notice, the listener, the deadline. A new `VectorStore` needs a `check` that is cheap and reads no record.
+- **A request can be dropped anywhere it waits, and a write never is** (D38). The transport drops a handler
+  when its caller's deadline runs out or the caller hangs up, so every `.await` in a request is a place it can
+  end. Before the write that is free, and has to stay free: nothing may be left half done there. The write
+  itself goes through `Engine::committed`, which runs the store call, the observer, and the making of the answer
+  on a task of their own with the record's lock, and whose result logs itself if nobody takes it. Never call
+  `put_if` or `delete_if` on the request's own task, never put anything after the write that the detached task
+  does not do, and never log that line for a request that was answered. The embedding thread passes over a job
+  whose reply nobody holds; do not make `EmbedWorker::embed` keep working for a caller that is gone (no
+  spawning it, no holding the receiver elsewhere). A deadline reaches the thread through `worker::by`, a
+  task-local: work moved to another task does not carry it. The thread judges "cannot be answered in time" on
+  the *fastest* rate it has seen, a lower bound on purpose: a request is refused only for a deadline that
+  cannot be met, never for one that might not be, a request alone in a pass is never refused on a guess at its
+  own texts, and nothing but a deadline that has passed is refused on arrival. Do not replace that rate with an
+  average. Requests are served in the order they came until one is lost, and newest first while the thread is
+  behind: do not "simplify" that to one order. Always in order serves requests at the edge of their deadlines
+  once a queue forms, and always newest first starves callers that are being served fine. None of it governs
+  the store: a server short of Qdrant misses deadlines however the model is shared out, and the README says so.
 - **Every write the engine makes is conditional on what it read** (D35). `Engine` never calls `VectorStore::put`
   or `delete`: it calls `put_if` with the version it judged against (or `Expected::Absent` for a record it found
   missing) and `delete_if`, and when one comes back `false` it has written nothing and reads and judges again,

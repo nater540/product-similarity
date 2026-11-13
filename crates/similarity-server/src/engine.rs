@@ -11,6 +11,12 @@
 //! for different ids run concurrently. Across processes, which share no lock, every write is conditional on the
 //! store still holding what was read ([`VectorStore::put_if`]): a writer that finds the record changed under it
 //! has written nothing, and reads and judges again (docs/decisions.md, D10).
+//!
+//! A request can be dropped at any point where it waits: its caller's deadline ran out, or the caller hung up.
+//! Until it goes to write, that costs nothing and leaves nothing behind. A write is different: once the engine
+//! has sent one to the store, nobody can say whether a write that is dropped half way happened. So a write is
+//! never dropped. It runs on a task of its own to its end ([`Engine::committed`]), whoever is told is told, and
+//! if the request is gone by then, the log says what it came to (D38).
 
 use std::fmt;
 use std::hash::{BuildHasher, RandomState};
@@ -25,7 +31,7 @@ use similarity_core::{
   Schema,
 };
 use similarity_store::{Expected, Neighbor, SearchQuery, StoreError, StoredRecord, VectorStore};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard, watch};
 
 use crate::worker::{EmbedError, TextEmbedder};
 
@@ -70,6 +76,9 @@ pub enum EngineError {
   /// The server is saturated. Retry with backoff.
   #[error("{0}")]
   Overloaded(String),
+  /// The request said when its caller stops waiting, and it could not be served by then. Nothing was written.
+  #[error("{0}")]
+  DeadlineExceeded(String),
   /// A dependency is unreachable. Retry with backoff.
   #[error("{0}")]
   Unavailable(String),
@@ -103,6 +112,7 @@ impl From<EmbedError> for EngineError {
       EmbedError::Overloaded => Self::Overloaded(error.to_string()),
       EmbedError::WorkerGone => Self::Unavailable(error.to_string()),
       EmbedError::Failed(_) => Self::Internal(error.to_string()),
+      EmbedError::TooLate => Self::DeadlineExceeded(error.to_string()),
     }
   }
 }
@@ -386,18 +396,104 @@ pub struct Judged<'a> {
   pub evaluation: &'a Evaluation,
 }
 
+/// A record's lock, held by the request that took it and by any write that request has in flight.
+///
+/// Shared, so that a request that is dropped while its write is on its way does not let the next request for the
+/// record in before that write has landed and been reported.
+type Held = Arc<OwnedMutexGuard<()>>;
+
+/// What a write did to the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Change {
+  /// Nothing: the record was no longer what the writer had read.
+  Nothing,
+  /// The record is stored, at this revision.
+  Stored(u64),
+  /// The record is gone.
+  Deleted,
+}
+
+/// The result of a write, on its way to the request that asked for it.
+///
+/// A request can be gone by the time its write is done, and then nobody hears what happened: the response has
+/// nowhere to go and the request's own log line is never written. So the result says it itself. If it is dropped
+/// without having been taken, wherever that happens (the task's output that nobody collected, or collected and
+/// dropped unread), it logs what the write came to.
+struct Delivery<T> {
+  result: Option<Result<(T, Change), EngineError>>,
+  call: &'static str,
+  id: String,
+}
+
+impl<T> Delivery<T> {
+  fn take(mut self) -> Option<Result<(T, Change), EngineError>> {
+    self.result.take()
+  }
+}
+
+impl<T> Drop for Delivery<T> {
+  fn drop(&mut self) {
+    let (call, id) = (self.call, self.id.as_str());
+    match &self.result {
+      // Taken by the request, or a write that lost its race: nothing changed that somebody was not told about.
+      None | Some(Ok((_, Change::Nothing))) => {}
+      Some(Ok((_, Change::Stored(revision)))) => tracing::warn!(
+        call,
+        id,
+        stored = true,
+        deleted = false,
+        revision,
+        "a write finished after the request that asked for it had gone"
+      ),
+      Some(Ok((_, Change::Deleted))) => tracing::warn!(
+        call,
+        id,
+        stored = false,
+        deleted = true,
+        "a write finished after the request that asked for it had gone"
+      ),
+      // The store may or may not hold the write: that is exactly what the caller cannot find out.
+      Some(Err(error)) => tracing::warn!(
+        call,
+        id,
+        %error,
+        "a write failed after the request that asked for it had gone, and may or may not have been applied"
+      ),
+    }
+  }
+}
+
+/// Counts a write as in flight for as long as it exists.
+struct InFlight(watch::Sender<usize>);
+
+impl InFlight {
+  fn begin(writes: &watch::Sender<usize>) -> Self {
+    writes.send_modify(|count| *count = count.saturating_add(1));
+    Self(writes.clone())
+  }
+}
+
+impl Drop for InFlight {
+  fn drop(&mut self) {
+    self.0.send_modify(|count| *count = count.saturating_sub(1));
+  }
+}
+
 /// The service's behavior.
 #[derive(Debug)]
 pub struct Engine<S, E> {
-  store: S,
+  /// Shared with the writes in flight, which outlive the request that started them.
+  store: Arc<S>,
   embedder: E,
   schema: Schema,
   policy: Policy,
   matching: Matching,
   import_batch: usize,
   observer: Option<Arc<dyn Observer>>,
-  locks: Vec<Mutex<()>>,
+  locks: Vec<Arc<Mutex<()>>>,
   lock_hasher: RandomState,
+  /// How many writes are in flight.
+  writes: watch::Sender<usize>,
 }
 
 fn required_text(what: &str, value: Option<String>) -> Result<Option<String>, EngineError> {
@@ -449,15 +545,16 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
   /// Assembles an engine. `store` must have been opened with [`store_layout`] for the same schema and embedder.
   pub fn new(store: S, embedder: E, schema: Schema, policy: Policy) -> Self {
     Self {
-      store,
+      store: Arc::new(store),
       embedder,
       schema,
       policy,
       matching: Matching::default(),
       import_batch: DEFAULT_IMPORT_BATCH,
       observer: None,
-      locks: (0..LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
+      locks: (0..LOCK_STRIPES).map(|_| Arc::new(Mutex::new(()))).collect(),
       lock_hasher: RandomState::new(),
+      writes: watch::Sender::new(0),
     }
   }
 
@@ -515,13 +612,65 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     }
   }
 
-  fn lock_for(&self, id: &str) -> Result<&Mutex<()>, EngineError> {
+  fn lock_for(&self, id: &str) -> Result<&Arc<Mutex<()>>, EngineError> {
     let stripes = u64::try_from(self.locks.len()).unwrap_or(u64::MAX);
     let hash = usize::try_from(self.lock_hasher.hash_one(id).checked_rem(stripes).unwrap_or(0)).unwrap_or(0);
     self
       .locks
       .get(hash)
       .ok_or_else(|| EngineError::Internal("lock stripe out of range".to_owned()))
+  }
+
+  /// Waits for the record's lock.
+  async fn hold(&self, id: &str) -> Result<Held, EngineError> {
+    Ok(Arc::new(Arc::clone(self.lock_for(id)?).lock_owned().await))
+  }
+
+  /// Runs `write` to its end and returns what it returns, whether or not this request is still there to be told.
+  ///
+  /// Everything a request does before it writes can be dropped with the request and leave nothing behind. A
+  /// write cannot: the store may have applied a write whose future was dropped, and then the baseline has moved
+  /// for a caller that was told nothing, with no line anywhere saying so. So `write` runs on a task of its own,
+  /// with the record's lock, and this only waits for it. If the wait is dropped, the write goes on, tells the
+  /// observer what it would have told it, and its result logs itself ([`Delivery`]).
+  ///
+  /// `write` is the store call and everything that has to follow it: it must not wait on anything else.
+  async fn committed<T, W>(&self, held: &Held, call: &'static str, id: &str, write: W) -> Result<T, EngineError>
+  where
+    T: Send + 'static,
+    W: Future<Output = Result<(T, Change), EngineError>> + Send + 'static,
+  {
+    let (held, in_flight) = (Arc::clone(held), InFlight::begin(&self.writes));
+    let delivery_id = id.to_owned();
+    let task = tokio::spawn(async move {
+      let result = write.await;
+      // The lock goes before the count does, and both before the result can be seen: a request that waited for
+      // this one finds the record as this write left it, and a server that waited for writes finds none.
+      drop(held);
+      drop(in_flight);
+      Delivery {
+        result: Some(result),
+        call,
+        id: delivery_id,
+      }
+    });
+    match task.await.map(Delivery::take) {
+      Ok(Some(result)) => result.map(|(value, _)| value),
+      Ok(None) => Err(EngineError::Internal(format!(
+        "the write of record `{id}` finished without a result"
+      ))),
+      Err(stopped) => Err(EngineError::Internal(format!(
+        "the write of record `{id}` did not run to its end, and may or may not have been applied: {stopped}"
+      ))),
+    }
+  }
+
+  /// Resolves when no write is in flight. A server that is stopping waits for this after its last request, so
+  /// that a write whose request has gone is not cut off with the process.
+  pub async fn settled(&self) {
+    let mut writes = self.writes.subscribe();
+    // The sender is this engine's, so the wait cannot fail while the engine is there to be asked.
+    let _ = writes.wait_for(|count| *count == 0).await;
   }
 
   fn prepare(&self, record: &RecordInput) -> Result<PreparedRecord, EngineError> {
@@ -586,10 +735,10 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       ));
     };
 
-    let _serialized = self.lock_for(&id)?.lock().await;
+    let held = self.hold(&id).await?;
     let asked = (input.mode, input.threshold);
     for _ in 0..WRITE_ATTEMPTS {
-      let attempt = self.attempt(&id, brand_id.as_deref(), &prepared, asked, &policy);
+      let attempt = self.attempt(&held, (&id, brand_id.as_deref()), &prepared, asked, &policy);
       if let Some(output) = attempt.await? {
         return Ok(output);
       }
@@ -602,8 +751,8 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
   /// was told, and the whole of this has to be done again against what is stored now.
   async fn attempt(
     &self,
-    id: &str,
-    brand_id: Option<&str>,
+    held: &Held,
+    (id, brand_id): (&str, Option<&str>),
     prepared: &PreparedRecord,
     asked: (WriteMode, Option<f32>),
     policy: &Policy,
@@ -622,8 +771,8 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       quantities: prepared.quantities().clone(),
     };
     match baseline {
-      Some(baseline) => self.revise(revision, asked, policy, baseline).await,
-      None => self.create(revision, asked, policy).await,
+      Some(baseline) => self.revise(held, revision, asked, policy, baseline).await,
+      None => self.create(held, revision, asked, policy).await,
     }
   }
 
@@ -631,6 +780,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
   /// record first.
   async fn create(
     &self,
+    held: &Held,
     first: Revision,
     asked: (WriteMode, Option<f32>),
     policy: &Policy,
@@ -643,40 +793,81 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       quantities,
     } = first;
     let stored = mode != WriteMode::DryRun;
-    if stored {
-      let record = StoredRecord {
-        id: id.clone(),
-        brand_id: brand_id.clone(),
-        anchor: candidate.composite.clone(),
-        vectors: candidate.clone(),
-        // A new record is its own point of reference, for quantities as for text.
-        anchor_quantities: quantities.clone(),
-        quantities,
-        revision: 1,
-        updated_at: now(),
-      };
-      if !self.store.put_if(&record, Expected::Absent).await? {
-        return Ok(None);
+    let record = stored.then(|| StoredRecord {
+      id: id.clone(),
+      brand_id: brand_id.clone(),
+      anchor: candidate.composite.clone(),
+      vectors: candidate.clone(),
+      // A new record is its own point of reference, for quantities as for text.
+      anchor_quantities: quantities.clone(),
+      quantities,
+      revision: 1,
+      updated_at: now(),
+    });
+    let (observer, policy, named) = (self.observer.clone(), *policy, id.clone());
+    // Telling the observer and making the answer: what follows the write, if there is one, and is all there is
+    // to do if there is not.
+    let finish = move || {
+      if let Some(observer) = &observer {
+        observer.observe(&Observation {
+          id: &id,
+          brand_id: brand_id.as_deref(),
+          mode,
+          threshold,
+          policy: &policy,
+          stored,
+          revision: u64::from(stored),
+          judged: None,
+        });
       }
-    }
-    if let Some(observer) = &self.observer {
-      observer.observe(&Observation {
-        id: &id,
-        brand_id: brand_id.as_deref(),
-        mode,
-        threshold,
-        policy,
-        stored,
-        revision: u64::from(stored),
-        judged: None,
-      });
-    }
-    Ok(Some(EvaluateOutput::without_baseline(
-      Verdict::Created,
-      policy,
-      stored,
-      candidate.composite,
-    )))
+      EvaluateOutput::without_baseline(Verdict::Created, &policy, stored, candidate.composite)
+    };
+    let Some(record) = record else {
+      return Ok(Some(finish()));
+    };
+    let store = Arc::clone(&self.store);
+    let write = async move {
+      if !store.put_if(&record, Expected::Absent).await? {
+        return Ok((None, Change::Nothing));
+      }
+      Ok((Some(finish()), Change::Stored(record.revision)))
+    };
+    self.committed(held, "evaluate", &named, write).await
+  }
+
+  /// The record a revision that is to be written leaves stored: `baseline`'s next revision.
+  fn revised(
+    &self,
+    mode: WriteMode,
+    baseline: &StoredRecord,
+    (id, brand_id): (String, Option<String>),
+    candidate: &RecordVectors,
+    quantities: &Quantities,
+  ) -> Result<StoredRecord, EngineError> {
+    // A forced write is a reviewer saying "this is the record now", so it also becomes the point of reference
+    // for drift. Every other write leaves the anchor's values where they were, and only lets it take the first
+    // value of a field it has never had one for.
+    let (anchor, anchor_quantities) = if mode == WriteMode::Force {
+      (candidate.composite.clone(), quantities.clone())
+    } else {
+      let anchor = score::extend_anchor(
+        &self.schema,
+        self.embedder.dimension(),
+        &baseline.anchor,
+        &candidate.composite,
+      )?;
+      (anchor, first_values(&baseline.anchor_quantities, quantities))
+    };
+    Ok(StoredRecord {
+      id,
+      brand_id,
+      anchor,
+      vectors: candidate.clone(),
+      quantities: quantities.clone(),
+      anchor_quantities,
+      revision: baseline.revision.saturating_add(1),
+      updated_at: now(),
+    })
   }
 
   /// Judges `candidate` against `baseline` and writes it back if the policy and the mode allow. `asked` is the
@@ -684,6 +875,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
   /// `None` if there was something to write and `baseline` was no longer what is stored.
   async fn revise(
     &self,
+    held: &Held,
     candidate: Revision,
     asked: (WriteMode, Option<f32>),
     policy: &Policy,
@@ -728,78 +920,65 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       WriteMode::Force => true,
     };
 
-    let mut revision = baseline.revision;
-    if write {
-      revision = revision.saturating_add(1);
-      // A forced write is a reviewer saying "this is the record now", so it also becomes the point of reference
-      // for drift. Every other write leaves the anchor's values where they were, and only lets it take the first
-      // value of a field it has never had one for.
-      let (anchor, anchor_quantities) = if mode == WriteMode::Force {
-        (candidate.composite.clone(), quantities.clone())
-      } else {
-        let anchor = score::extend_anchor(
-          &self.schema,
-          self.embedder.dimension(),
-          &baseline.anchor,
-          &candidate.composite,
-        )?;
-        (anchor, first_values(&baseline.anchor_quantities, &quantities))
-      };
-      let record = StoredRecord {
-        id: id.clone(),
-        brand_id: brand_id.clone(),
-        anchor,
-        vectors: candidate.clone(),
-        quantities: quantities.clone(),
-        anchor_quantities,
-        revision,
-        updated_at: now(),
-      };
-      // The verdict above is about `baseline`. If that is no longer what is stored, the verdict is about
-      // nothing, and writing would replace a record this request never saw: a forced write included, whose
-      // revision number would be wrong.
-      if !self
-        .store
-        .put_if(&record, Expected::Version(baseline.version()))
-        .await?
-      {
-        return Ok(None);
+    let revision = baseline.revision.saturating_add(u64::from(write));
+    let record = if write {
+      let ids = (id.clone(), brand_id.clone());
+      Some(self.revised(mode, &baseline, ids, &candidate, &quantities)?)
+    } else {
+      None
+    };
+
+    let (observer, policy, named) = (self.observer.clone(), *policy, id.clone());
+    let read = baseline.version();
+    // Telling the observer and making the answer. Only after the write, if there is one, is the outcome final:
+    // a write that failed returns its error, a write that lost to another writer is judged again, and neither
+    // is observed.
+    let finish = move || {
+      if let Some(observer) = &observer {
+        observer.observe(&Observation {
+          id: &id,
+          brand_id: brand_id.as_deref(),
+          mode,
+          threshold,
+          policy: &policy,
+          stored: write,
+          revision,
+          judged: Some(Judged {
+            baseline: &baseline,
+            candidate: &candidate,
+            quantities: &quantities,
+            evaluation: &evaluation,
+          }),
+        });
       }
-    }
-
-    // Only now is the outcome final: a write that failed has already returned its error, a write that lost to
-    // another writer is judged again, and neither is observed.
-    if let Some(observer) = &self.observer {
-      observer.observe(&Observation {
-        id: &id,
-        brand_id: brand_id.as_deref(),
-        mode,
-        threshold,
-        policy,
+      EvaluateOutput {
+        verdict: if accepted { Verdict::Accepted } else { Verdict::Rejected },
+        similarity: Some(evaluation.comparison.similarity),
+        threshold: policy.threshold,
+        fields: evaluation.comparison.fields,
+        anchor_similarity: evaluation.anchor_similarity,
         stored: write,
+        reasons: evaluation.reasons,
+        vector: candidate.composite,
         revision,
-        judged: Some(Judged {
-          baseline: &baseline,
-          candidate: &candidate,
-          quantities: &quantities,
-          evaluation: &evaluation,
-        }),
-      });
-    }
-
-    Ok(Some(EvaluateOutput {
-      verdict: if accepted { Verdict::Accepted } else { Verdict::Rejected },
-      similarity: Some(evaluation.comparison.similarity),
-      threshold: policy.threshold,
-      fields: evaluation.comparison.fields,
-      anchor_similarity: evaluation.anchor_similarity,
-      stored: write,
-      reasons: evaluation.reasons,
-      vector: candidate.composite,
-      revision,
-      quantities: evaluation.quantities,
-      measure_changed: evaluation.measure_changed,
-    }))
+        quantities: evaluation.quantities,
+        measure_changed: evaluation.measure_changed,
+      }
+    };
+    let Some(record) = record else {
+      return Ok(Some(finish()));
+    };
+    let store = Arc::clone(&self.store);
+    let write = async move {
+      // The verdict is about the baseline that was read. If that is no longer what is stored, the verdict is
+      // about nothing, and writing would replace a record this request never saw: a forced write included,
+      // whose revision number would be wrong.
+      if !store.put_if(&record, Expected::Version(read)).await? {
+        return Ok((None, Change::Nothing));
+      }
+      Ok((Some(finish()), Change::Stored(revision)))
+    };
+    self.committed(held, "evaluate", &named, write).await
   }
 
   /// Imports records that are not stored yet, embedding all of them in one call to the model.
@@ -976,7 +1155,8 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       updated_at: now(),
     };
 
-    let _serialized = self.lock_for(&record.id)?.lock().await;
+    let held = self.hold(&record.id).await?;
+    let record = Arc::new(record);
     for _ in 0..WRITE_ATTEMPTS {
       if let Some(stored) = self.store.get(&record.id).await? {
         // Naming another brand is the mistake the brand rule exists for, here as anywhere (D14).
@@ -985,7 +1165,19 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       }
       // "Only creates" is the store's to keep, not this process's lock: a record another replica, or the import
       // command beside it, stored a moment ago is left alone like any other (D20).
-      if self.store.put_if(&record, Expected::Absent).await? {
+      let (store, new) = (Arc::clone(&self.store), Arc::clone(&record));
+      let write = async move {
+        let created = store.put_if(&new, Expected::Absent).await?;
+        Ok((
+          created,
+          if created {
+            Change::Stored(new.revision)
+          } else {
+            Change::Nothing
+          },
+        ))
+      };
+      if self.committed(&held, "import", &record.id, write).await? {
         return Ok(Imported::Created);
       }
     }
@@ -1128,7 +1320,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       return Err(EngineError::InvalidArgument("`id` is required".to_owned()));
     };
     let brand_id = required_text("brand_id", brand_id)?;
-    let _serialized = self.lock_for(&id)?.lock().await;
+    let held = self.hold(&id).await?;
     for _ in 0..WRITE_ATTEMPTS {
       let Some(stored) = self.store.get(&id).await? else {
         return Ok(false);
@@ -1136,7 +1328,12 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       same_brand(&stored, brand_id.as_deref())?;
       // The record that is deleted is the one whose brand was just checked. One that another writer has since
       // replaced, and may have given a brand, is looked at again.
-      if self.store.delete_if(&id, stored.version()).await? {
+      let (store, gone, read) = (Arc::clone(&self.store), id.clone(), stored.version());
+      let write = async move {
+        let deleted = store.delete_if(&gone, read).await?;
+        Ok((deleted, if deleted { Change::Deleted } else { Change::Nothing }))
+      };
+      if self.committed(&held, "delete", &id, write).await? {
         return Ok(true);
       }
     }
@@ -1244,6 +1441,7 @@ pub(crate) mod racing {
 
 #[cfg(test)]
 mod tests {
+  use std::pin::Pin;
   use std::sync::Arc;
 
   use similarity_core::{FieldSpec, QuantitySpec};
@@ -2773,7 +2971,12 @@ mod tests {
     let schema = measured_schema((Some(4.0), true));
     let (layout, dimension) = store_layout(&schema, &embedder);
     assert_eq!(layout, store_layout(&self::schema(), &embedder).0);
-    let upgraded = Engine::new(old.store.reopened(layout, dimension), embedder, schema, old.policy);
+    let upgraded = Engine::new(
+      Arc::into_inner(old.store).unwrap().reopened(layout, dimension),
+      embedder,
+      schema,
+      old.policy,
+    );
 
     let output = upgraded.evaluate(measured(&[("weight", grams(3.5))])).await.unwrap();
     assert_eq!(output.verdict, Verdict::Accepted, "{:?}", output.reasons);
@@ -3168,7 +3371,12 @@ mod tests {
 
     let embedder = WordBagEmbedder::new("word-bag-v2");
     let (layout, dimension) = store_layout(&schema(), &embedder);
-    let upgraded = Engine::new(old.store.reopened(layout, dimension), embedder, schema(), old.policy);
+    let upgraded = Engine::new(
+      Arc::into_inner(old.store).unwrap().reopened(layout, dimension),
+      embedder,
+      schema(),
+      old.policy,
+    );
 
     let output = upgraded.evaluate(evaluate_input(Some("p1"), &GUMMIES_EDITED)).await;
     assert!(matches!(output, Err(EngineError::FailedPrecondition(message)) if message.contains("re-index")));
@@ -3176,9 +3384,24 @@ mod tests {
 
   #[tokio::test]
   async fn embedder_failures_keep_their_meaning() {
-    for (failure, expect_overloaded) in [(EmbedError::Overloaded, true), (EmbedError::WorkerGone, false)] {
+    type Kind = fn(&EngineError) -> bool;
+    let cases: [(EmbedError, Kind); 4] = [
+      (EmbedError::Overloaded, |error| {
+        matches!(error, EngineError::Overloaded(_))
+      }),
+      (EmbedError::WorkerGone, |error| {
+        matches!(error, EngineError::Unavailable(_))
+      }),
+      (EmbedError::TooLate, |error| {
+        matches!(error, EngineError::DeadlineExceeded(_))
+      }),
+      (EmbedError::Failed("nan".to_owned()), |error| {
+        matches!(error, EngineError::Internal(_))
+      }),
+    ];
+    for (failure, expected) in cases {
       let embedder = WordBagEmbedder {
-        fail_with: Some(failure),
+        fail_with: Some(failure.clone()),
         ..WordBagEmbedder::new("word-bag-v1")
       };
       let (layout, dimension) = store_layout(&schema(), &embedder);
@@ -3189,16 +3412,7 @@ mod tests {
         Policy::new(0.75, None).unwrap(),
       );
       let error = engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap_err();
-      assert_eq!(
-        matches!(error, EngineError::Overloaded(_)),
-        expect_overloaded,
-        "{error:?}"
-      );
-      assert_eq!(
-        matches!(error, EngineError::Unavailable(_)),
-        !expect_overloaded,
-        "{error:?}"
-      );
+      assert!(expected(&error), "{failure:?} became {error:?}");
       assert_eq!(stored(&engine, "p1").await, None);
     }
   }
@@ -3939,5 +4153,355 @@ mod tests {
     assert_eq!(description.composite_dimension, description.dimension * 3);
     assert_eq!(description.schema, schema());
     assert!((description.policy.threshold - 0.75).abs() < f32::EPSILON);
+  }
+
+  // ---- Requests that go away (D38) --------------------------------------------------------------------------
+
+  /// A store whose writes wait at a gate until the test lets one through. For that while a write is neither done
+  /// nor not done, which is where a request can be dropped and nobody can say what became of it. Reads give way
+  /// once, as a round trip does, so that a request can also be dropped before it has written anything.
+  struct Pausing {
+    inner: Arc<MemoryStore>,
+    gate: tokio::sync::Semaphore,
+    arrived: std::sync::atomic::AtomicUsize,
+    failing: std::sync::atomic::AtomicBool,
+  }
+
+  impl Pausing {
+    /// Lets one write through.
+    fn open(&self) {
+      self.gate.add_permits(1);
+    }
+
+    /// How many writes have reached the gate.
+    fn arrived(&self) -> usize {
+      self.arrived.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// From now on a write that is let through fails, and is not applied.
+    fn fail(&self) {
+      self.failing.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    async fn pass(&self) -> Result<(), StoreError> {
+      self.arrived.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+      self.gate.acquire().await.unwrap().forget();
+      if self.failing.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(StoreError::Unavailable("the connection was reset".to_owned()));
+      }
+      Ok(())
+    }
+  }
+
+  impl VectorStore for Pausing {
+    async fn check(&self) -> Result<(), StoreError> {
+      self.inner.check().await
+    }
+
+    async fn get(&self, id: &str) -> Result<Option<StoredRecord>, StoreError> {
+      let found = self.inner.get(id).await;
+      tokio::task::yield_now().await;
+      found
+    }
+
+    async fn put(&self, record: &StoredRecord) -> Result<(), StoreError> {
+      self.inner.put(record).await
+    }
+
+    async fn put_if(&self, record: &StoredRecord, expected: Expected) -> Result<bool, StoreError> {
+      self.pass().await?;
+      self.inner.put_if(record, expected).await
+    }
+
+    async fn delete(&self, id: &str) -> Result<bool, StoreError> {
+      self.inner.delete(id).await
+    }
+
+    async fn delete_if(&self, id: &str, version: Version) -> Result<bool, StoreError> {
+      self.pass().await?;
+      self.inner.delete_if(id, version).await
+    }
+
+    async fn search(&self, query: SearchQuery<'_>) -> Result<Vec<Neighbor>, StoreError> {
+      self.inner.search(query).await
+    }
+
+    async fn search_vectors(&self, query: SearchQuery<'_>) -> Result<Vec<Found>, StoreError> {
+      self.inner.search_vectors(query).await
+    }
+  }
+
+  type GatedEngine = Engine<Pausing, WordBagEmbedder>;
+
+  fn gated() -> (GatedEngine, Arc<Recorder>) {
+    let embedder = WordBagEmbedder::new("word-bag-v1");
+    let (layout, dimension) = store_layout(&schema(), &embedder);
+    let store = Pausing {
+      inner: Arc::new(MemoryStore::new(layout, dimension)),
+      gate: tokio::sync::Semaphore::new(0),
+      arrived: std::sync::atomic::AtomicUsize::new(0),
+      failing: std::sync::atomic::AtomicBool::new(false),
+    };
+    let recorder = Arc::new(Recorder::default());
+    let engine = Engine::new(store, embedder, schema(), Policy::new(0.75, None).unwrap());
+    (engine.with_observer(recorder.clone()), recorder)
+  }
+
+  /// Runs `scene` on one thread and returns the warnings it logged. A write that outlives its request has
+  /// nothing but the log to speak for it, so the log is what these tests read.
+  fn warnings(scene: impl Future<Output = ()>) -> Vec<serde_json::Value> {
+    let captured = similarity_log::testing::capture("warn", || {
+      tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(scene);
+    });
+    captured
+      .logs
+      .iter()
+      .map(|line| serde_json::from_str(line).unwrap())
+      .collect()
+  }
+
+  /// Whether `waiting` is still not done after other tasks have had every chance to run.
+  async fn still_waiting<T>(waiting: &mut Pin<Box<impl Future<Output = T>>>) -> bool {
+    for _ in 0..50 {
+      tokio::select! {
+        biased;
+        _ = &mut *waiting => return false,
+        () = tokio::task::yield_now() => {}
+      }
+    }
+    true
+  }
+
+  /// Runs `request` until one more write has reached the gate, and drops it there: a caller that hung up, or
+  /// whose deadline ran out, while its write was on its way to the store.
+  async fn dropped_mid_write<T>(store: &Pausing, request: impl Future<Output = T>) {
+    let before = store.arrived();
+    let mut request = std::pin::pin!(request);
+    while store.arrived() == before {
+      tokio::select! {
+        biased;
+        _ = &mut request => panic!("the request was answered before its write reached the store"),
+        () = tokio::task::yield_now() => {}
+      }
+    }
+  }
+
+  const GONE: &str = "a write finished after the request that asked for it had gone";
+
+  /// The case a caller cannot handle by itself. Its request was dropped while the write was on its way, so it
+  /// was told nothing, and the write went through. The engine finishes what it started: the record is stored,
+  /// the observer hears of it, the log says so with the id, and the record's next request waits for all of that
+  /// and is judged against what the write left, so a retry of the same content is answered "unchanged".
+  #[test]
+  fn a_write_whose_request_has_gone_is_finished_observed_and_logged() {
+    let (engine, recorder) = gated();
+    let logged = warnings(async {
+      let store = Arc::clone(&engine.store);
+      store.open();
+      engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
+      engine.settled().await;
+
+      dropped_mid_write(&store, engine.evaluate(evaluate_input(Some("p1"), &GUMMIES_EDITED))).await;
+      assert_eq!(store.inner.get("p1").await.unwrap().unwrap().revision, 1, "not yet");
+      assert_eq!(
+        recorder.told().len(),
+        1,
+        "and nobody has been told of a write that has not happened"
+      );
+
+      let mut retry = Box::pin(engine.evaluate(evaluate_input(Some("p1"), &GUMMIES_EDITED)));
+      assert!(
+        still_waiting(&mut retry).await,
+        "the write in flight still holds the record"
+      );
+      let mut settled = Box::pin(engine.settled());
+      assert!(still_waiting(&mut settled).await, "and it counts as in flight");
+
+      store.open();
+      settled.await;
+      assert_eq!(store.inner.get("p1").await.unwrap().unwrap().revision, 2);
+      let told = recorder.told();
+      assert_eq!(told.len(), 2);
+      assert_eq!((told[1].stored, told[1].revision), (true, 2));
+
+      let retried = retry.await.unwrap();
+      assert_eq!(
+        (retried.verdict, retried.stored, retried.revision),
+        (Verdict::Accepted, false, 2),
+        "the retry finds its own content stored, and has nothing to write"
+      );
+    });
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    let line = &logged[0];
+    assert_eq!(line["message"], GONE);
+    assert_eq!((&line["call"], &line["id"]), (&"evaluate".into(), &"p1".into()));
+    assert_eq!((&line["stored"], &line["deleted"]), (&true.into(), &false.into()));
+    assert_eq!(line["revision"], 2);
+  }
+
+  /// Every kind of write the engine makes is finished the same way: a record's first version, an import, and a
+  /// delete.
+  #[test]
+  fn a_create_an_import_and_a_delete_each_outlive_their_request() {
+    let (engine, recorder) = gated();
+    let logged = warnings(async {
+      let store = Arc::clone(&engine.store);
+      dropped_mid_write(&store, engine.evaluate(evaluate_input(Some("p1"), &GUMMIES))).await;
+      dropped_mid_write(&store, engine.import(vec![import_of("p2", &VAPE, None)])).await;
+      for _ in 0..2 {
+        store.open();
+      }
+      engine.settled().await;
+      assert_eq!(store.inner.get("p1").await.unwrap().unwrap().revision, 1);
+      assert_eq!(store.inner.get("p2").await.unwrap().unwrap().revision, 1);
+      assert_eq!(
+        recorder.told().len(),
+        1,
+        "the evaluate; an import is not a judged request"
+      );
+
+      dropped_mid_write(&store, engine.delete("p1".to_owned(), None)).await;
+      assert!(store.inner.get("p1").await.unwrap().is_some());
+      store.open();
+      engine.settled().await;
+      assert_eq!(store.inner.get("p1").await.unwrap(), None);
+    });
+    let said: Vec<_> = logged
+      .iter()
+      .map(|line| {
+        assert_eq!(line["message"], GONE);
+        (
+          line["call"].as_str().unwrap(),
+          line["id"].as_str().unwrap(),
+          line["stored"].as_bool().unwrap(),
+          line["deleted"].as_bool().unwrap(),
+          line["revision"].as_u64(),
+        )
+      })
+      .collect();
+    assert_eq!(
+      said,
+      [
+        ("evaluate", "p1", true, false, Some(1)),
+        ("import", "p2", true, false, Some(1)),
+        ("delete", "p1", false, true, None),
+      ]
+    );
+  }
+
+  /// A request that is answered says what happened in its answer, and its write logs nothing of its own: the
+  /// line is for the writes nobody was told about, and has to be rare enough to be read.
+  #[test]
+  fn a_write_whose_request_is_still_there_logs_nothing() {
+    let (engine, _) = gated();
+    let logged = warnings(async {
+      for _ in 0..3 {
+        engine.store.open();
+      }
+      engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
+      engine
+        .evaluate(evaluate_input(Some("p1"), &GUMMIES_EDITED))
+        .await
+        .unwrap();
+      assert!(engine.delete("p1".to_owned(), None).await.unwrap());
+      engine.settled().await;
+    });
+    assert_eq!(logged, Vec::<serde_json::Value>::new());
+  }
+
+  /// Until a request goes to write, dropping it is free: nothing was sent to the store, so there is nothing to
+  /// finish, nobody to tell, and nothing to log.
+  #[test]
+  fn a_request_dropped_before_it_writes_leaves_nothing_behind() {
+    let (engine, recorder) = gated();
+    let logged = warnings(async {
+      {
+        let mut reading = Box::pin(engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)));
+        tokio::select! {
+          biased;
+          _ = &mut reading => panic!("answered"),
+          () = std::future::ready(()) => {}
+        }
+      }
+      for _ in 0..50 {
+        tokio::task::yield_now().await;
+      }
+      engine.settled().await;
+      assert_eq!(engine.store.arrived(), 0, "no write was started");
+      assert_eq!(engine.store.inner.get("p1").await.unwrap(), None);
+      assert_eq!(recorder.told(), []);
+
+      // The record's lock went with the request: the next one is not kept waiting.
+      engine.store.open();
+      let output = engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
+      assert_eq!(output.verdict, Verdict::Created);
+    });
+    assert_eq!(logged, Vec::<serde_json::Value>::new());
+  }
+
+  /// The one outcome nobody can know: the write failed on its way after the request had gone. The store may
+  /// hold it or not, and the line says exactly that, so that whoever reads it knows which record to look at.
+  #[test]
+  fn a_write_that_fails_after_its_request_has_gone_is_logged_as_unknown() {
+    let (engine, recorder) = gated();
+    let logged = warnings(async {
+      let store = Arc::clone(&engine.store);
+      store.fail();
+      dropped_mid_write(&store, engine.evaluate(evaluate_input(Some("p1"), &GUMMIES))).await;
+      store.open();
+      engine.settled().await;
+      assert_eq!(recorder.told(), [], "a write that failed is not an outcome");
+    });
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    let line = &logged[0];
+    assert_eq!(
+      line["message"],
+      "a write failed after the request that asked for it had gone, and may or may not have been applied"
+    );
+    assert_eq!((&line["call"], &line["id"]), (&"evaluate".into(), &"p1".into()));
+    assert!(
+      line["error"].as_str().unwrap().contains("the connection was reset"),
+      "{line}"
+    );
+  }
+
+  /// A write that lost its race changed nothing, whether or not anybody was waiting for it: with the request
+  /// gone there is no second attempt, nobody to tell, and nothing worth a line.
+  #[test]
+  fn a_write_that_loses_its_race_after_its_request_has_gone_says_nothing() {
+    let (engine, recorder) = gated();
+    let logged = warnings(async {
+      let store = Arc::clone(&engine.store);
+      store.open();
+      engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
+      dropped_mid_write(&store, engine.evaluate(evaluate_input(Some("p1"), &GUMMIES_EDITED))).await;
+
+      // Another replica writes the record while this one's write is on its way.
+      let mut theirs = store.inner.get("p1").await.unwrap().unwrap();
+      theirs.revision = 7;
+      store.inner.put(&theirs).await.unwrap();
+
+      store.open();
+      engine.settled().await;
+      assert_eq!(store.inner.get("p1").await.unwrap().unwrap(), theirs);
+      assert_eq!(recorder.told().len(), 1, "only the creation");
+    });
+    assert_eq!(logged, Vec::<serde_json::Value>::new());
+  }
+
+  /// A request that is still there when its write fails gets the error, as it always did, and the log has no
+  /// line about a request that had gone.
+  #[tokio::test]
+  async fn a_write_that_fails_is_the_requests_error_while_the_request_is_there() {
+    let (engine, recorder) = gated();
+    engine.store.fail();
+    engine.store.open();
+    let error = engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap_err();
+    assert!(matches!(error, EngineError::Unavailable(_)), "{error:?}");
+    assert_eq!(recorder.told(), []);
+    engine.settled().await;
   }
 }

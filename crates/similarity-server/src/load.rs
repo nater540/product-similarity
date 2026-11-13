@@ -16,6 +16,13 @@
 //! That measures latency at a fixed number of callers. It does not measure latency at a fixed arrival rate, where
 //! a slow server makes a queue grow; no figure from here should be read as one.
 //!
+//! With a deadline ([`Options::deadline`]) a caller of the edit and resave phases waits that long for an answer
+//! and no longer, and then goes on to its next record. That is how a server is driven past what it can do: with
+//! more callers than it can answer in time, requests are given up on, and what is left to measure is how many it
+//! still answers in time. A caller spends the whole deadline on a record it gives up on, also when the server
+//! refuses it sooner, so that what the server is sent does not depend on how it fails. The create phase has no
+//! deadline: the other two need its records to exist.
+//!
 //! No record text appears in any result, only counts and times. Every number in a result is computed in this
 //! module's statistics and nowhere else.
 
@@ -63,6 +70,9 @@ pub struct Options {
   pub edit_field: String,
   /// Leave the records in the store afterwards.
   pub keep: bool,
+  /// How long a caller of the edit and resave phases waits for one answer before it gives up and takes its next
+  /// record. `None` waits for ever.
+  pub deadline: Option<Duration>,
 }
 
 const STRAINS: [&str; 12] = [
@@ -211,6 +221,7 @@ pub fn edited(record: &pb::Record, field: &str, seed: u64) -> pb::Record {
 struct Tally {
   latencies: Vec<Duration>,
   overloaded: u64,
+  expired: u64,
   failed: u64,
   created: u64,
   accepted: u64,
@@ -221,6 +232,7 @@ impl Tally {
   fn merge(&mut self, other: Self) {
     self.latencies.extend(other.latencies);
     self.overloaded = self.overloaded.saturating_add(other.overloaded);
+    self.expired = self.expired.saturating_add(other.expired);
     self.failed = self.failed.saturating_add(other.failed);
     self.created = self.created.saturating_add(other.created);
     self.accepted = self.accepted.saturating_add(other.accepted);
@@ -234,17 +246,22 @@ async fn caller(
   records: Arc<Vec<pb::Record>>,
   next: Arc<AtomicUsize>,
   mode: pb::WriteMode,
+  deadline: Option<Duration>,
 ) -> Tally {
   let mut tally = Tally::default();
   while let Some(record) = records.get(next.fetch_add(1, Ordering::Relaxed)) {
     // Timed from the first attempt: a refusal and a retry are part of what a caller waits for.
     let started = Instant::now();
     loop {
-      let request = pb::EvaluateRequest {
+      let sent = Instant::now();
+      let mut request = tonic::Request::new(pb::EvaluateRequest {
         record: Some(record.clone()),
         mode: mode.into(),
         ..pb::EvaluateRequest::default()
-      };
+      });
+      if let Some(deadline) = deadline {
+        request.set_timeout(deadline);
+      }
       match client.evaluate(request).await {
         Ok(response) => {
           tally.latencies.push(started.elapsed());
@@ -259,6 +276,17 @@ async fn caller(
         Err(status) if status.code() == Code::ResourceExhausted => {
           tally.overloaded = tally.overloaded.saturating_add(1);
           tokio::time::sleep(RETRY).await;
+        }
+        // The caller's own timer, or the server's, ran out (`CANCELLED` is the transport's word for that), or the
+        // server said at once that it would. Either way this caller has stopped waiting for this record.
+        Err(status) if deadline.is_some() && matches!(status.code(), Code::Cancelled | Code::DeadlineExceeded) => {
+          tally.expired = tally.expired.saturating_add(1);
+          // A server that says "too late" at once has not earned itself a faster caller: the record's time is
+          // spent either way, and the load stays what it would have been.
+          if let Some(rest) = deadline.and_then(|deadline| deadline.checked_sub(sent.elapsed())) {
+            tokio::time::sleep(rest).await;
+          }
+          break;
         }
         Err(_) => {
           tally.failed = tally.failed.saturating_add(1);
@@ -275,12 +303,15 @@ async fn send(
   client: &Client,
   records: Vec<pb::Record>,
   concurrency: usize,
-  mode: pb::WriteMode,
+  (mode, deadline): (pb::WriteMode, Option<Duration>),
 ) -> anyhow::Result<(Tally, Duration)> {
   let (records, next) = (Arc::new(records), Arc::new(AtomicUsize::new(0)));
   let started = Instant::now();
   let callers: Vec<_> = (0..concurrency.max(1))
-    .map(|_| tokio::spawn(caller(client.clone(), Arc::clone(&records), Arc::clone(&next), mode)))
+    .map(|_| {
+      let (records, next) = (Arc::clone(&records), Arc::clone(&next));
+      tokio::spawn(caller(client.clone(), records, next, mode, deadline))
+    })
     .collect();
   let mut tally = Tally::default();
   for caller in callers {
@@ -328,6 +359,10 @@ pub struct WorkerShare {
   pub busy: f64,
   /// How long a request waited in the queue before the model took it, on average, in milliseconds.
   pub queue_wait_ms: Option<f64>,
+  /// Requests the thread passed over because their caller had gone before it reached them.
+  pub abandoned: u64,
+  /// Requests refused because their deadline left no time for the model to reach them.
+  pub too_late: u64,
 }
 
 /// One phase at one level of concurrency.
@@ -343,6 +378,8 @@ pub struct PhaseStats {
   pub ok: u64,
   /// Attempts refused as overloaded and sent again. Can exceed `requests`.
   pub overloaded: u64,
+  /// Requests whose caller stopped waiting: its deadline ran out, or the server said at once that it would.
+  pub expired: u64,
   /// Requests that failed for another reason, and were not sent again.
   pub failed: u64,
   /// Verdicts of the answered requests.
@@ -392,6 +429,8 @@ impl PhaseStats {
       },
       queue_wait_ms: (window.jobs > 0)
         .then(|| (number(window.queue_wait_ns) / 1e6 / number(window.jobs) * 100.0).round() / 100.0),
+      abandoned: window.abandoned,
+      too_late: window.too_late,
     });
     Self {
       phase,
@@ -399,6 +438,7 @@ impl PhaseStats {
       requests,
       ok,
       overloaded: tally.overloaded,
+      expired: tally.expired,
       failed: tally.failed,
       verdicts: (tally.created, tally.accepted, tally.rejected),
       seconds: (seconds * 1000.0).round() / 1000.0,
@@ -441,6 +481,7 @@ impl PhaseStats {
       requests = self.requests,
       ok = self.ok,
       overloaded = self.overloaded,
+      expired = self.expired,
       failed = self.failed,
       created = self.verdicts.0,
       accepted = self.verdicts.1,
@@ -457,6 +498,8 @@ impl PhaseStats {
       texts_per_batch = self.worker.and_then(|worker| worker.texts_per_batch),
       model_busy = self.worker.map(|worker| worker.busy),
       queue_wait_ms = self.worker.and_then(|worker| worker.queue_wait_ms),
+      abandoned = self.worker.map(|worker| worker.abandoned),
+      too_late = self.worker.map(|worker| worker.too_late),
       "load_phase"
     );
   }
@@ -510,6 +553,7 @@ pub async fn run(
     records = options.records,
     seed = options.seed,
     edit_field = options.edit_field.as_str(),
+    deadline_ms = options.deadline.map(milliseconds),
     threads = std::thread::available_parallelism().ok().map(std::num::NonZero::get),
     "load_run"
   );
@@ -522,7 +566,7 @@ pub async fn run(
     options.seed,
     &format!("load-{run_id}-warm"),
   )?;
-  send(&client, warm_up, 4, pb::WriteMode::DryRun).await?;
+  send(&client, warm_up, 4, (pb::WriteMode::DryRun, None)).await?;
 
   let mut all = Vec::new();
   for concurrency in &options.concurrency {
@@ -537,7 +581,10 @@ pub async fn run(
     for (phase, records) in PHASES.into_iter().zip(phases) {
       let before = worker.map(|read| read());
       let requests = records.len();
-      let (tally, wall) = send(&client, records, *concurrency, pb::WriteMode::Enforce).await?;
+      // Every record is created, however long that takes: the phases after this one are about records that exist.
+      let deadline = options.deadline.filter(|_| phase != "create");
+      let asked = (pb::WriteMode::Enforce, deadline);
+      let (tally, wall) = send(&client, records, *concurrency, asked).await?;
       let window = worker.zip(before).map(|(read, before)| read().since(&before));
       let stats = PhaseStats::of(phase, *concurrency, requests, tally, wall, window);
       stats.emit(&run_id);
@@ -716,11 +763,14 @@ mod tests {
         Duration::from_millis(20),
       ],
       overloaded: 2,
+      expired: 5,
       failed: 1,
       created: 3,
       ..Tally::default()
     };
     let window = WorkerSnapshot {
+      abandoned: 7,
+      too_late: 4,
       batches: 2,
       jobs: 3,
       texts: 9,
@@ -733,6 +783,10 @@ mod tests {
       (stats.ok, stats.overloaded, stats.failed, stats.verdicts),
       (3, 2, 1, (3, 0, 0))
     );
+    assert_eq!(
+      stats.expired, 5,
+      "a caller that gave up was not answered, and is not a failure"
+    );
     assert!(
       (stats.per_second - 1.5).abs() < 1e-9,
       "three answers in two seconds, not three over their latencies"
@@ -744,6 +798,7 @@ mod tests {
       (2, 9, Some(4.5))
     );
     assert!((worker.busy - 0.25).abs() < 1e-9 && worker.queue_wait_ms == Some(2.0));
+    assert_eq!((worker.abandoned, worker.too_late), (7, 4));
 
     let nothing = PhaseStats::of("edit", 1, 5, Tally::default(), Duration::from_secs(1), None);
     assert_eq!((nothing.ok, nothing.latency_ms, nothing.worker), (0, None, None));
@@ -794,6 +849,7 @@ mod tests {
       seed: 3,
       edit_field: "name".to_owned(),
       keep: false,
+      deadline: None,
     };
     let captured_stats = run(client.clone(), &options, None).await.unwrap();
     let shape: Vec<(&str, usize, u64)> = captured_stats
@@ -849,6 +905,84 @@ mod tests {
     };
     let error = run(client, &wrong, None).await.unwrap_err().to_string();
     assert!(error.contains("`brand`"), "{error}");
+
+    let _ = stop.send(());
+    server.await.unwrap().unwrap();
+  }
+
+  /// An embedder that takes a while, as a model does.
+  struct Unhurried(WordBagEmbedder, Duration);
+
+  impl crate::worker::TextEmbedder for Unhurried {
+    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, crate::worker::EmbedError> {
+      tokio::time::sleep(self.1).await;
+      self.0.embed(texts).await
+    }
+
+    fn dimension(&self) -> usize {
+      self.0.dimension()
+    }
+
+    fn fingerprint(&self) -> &str {
+      self.0.fingerprint()
+    }
+  }
+
+  /// With a deadline, a caller that is not answered in time gives up on that record and takes the next. That is
+  /// counted as what it is: not an answer, not a failure of the server, and not something to send again.
+  #[tokio::test]
+  async fn a_caller_with_a_deadline_gives_up_on_a_record_and_goes_on_to_the_next() {
+    let schema = Schema::new(vec![FieldSpec {
+      name: "name".to_owned(),
+      weight: 1.0,
+      required: true,
+      reject_below: None,
+    }])
+    .unwrap();
+    let embedder = Unhurried(WordBagEmbedder::new("word-bag-v1"), Duration::from_millis(60));
+    let (layout, dimension) = store_layout(&schema, &embedder);
+    let engine = Arc::new(Engine::new(
+      MemoryStore::new(layout, dimension),
+      embedder,
+      schema,
+      Policy::new(0.5, None).unwrap(),
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = oneshot::channel::<()>();
+    let server = tokio::spawn(crate::serve(engine, listener, async {
+      let _ = stopped.await;
+    }));
+    let channel = Channel::from_shared(format!("http://{address}"))
+      .unwrap()
+      .connect()
+      .await
+      .unwrap();
+
+    let options = Options {
+      concurrency: vec![3],
+      records: 9,
+      seed: 3,
+      edit_field: "name".to_owned(),
+      keep: false,
+      deadline: Some(Duration::from_millis(5)),
+    };
+    let phases = run(RecordSimilarityClient::new(channel), &options, None).await.unwrap();
+    for stats in &phases {
+      let answered = match stats.phase {
+        // Creating has no deadline, and the stream is one call: both are waited for.
+        "create" | STREAM_PHASE => (9, 0),
+        _ => (0, 9),
+      };
+      assert_eq!((stats.ok, stats.expired), answered, "{stats:?}");
+      assert_eq!((stats.failed, stats.overloaded), (0, 0), "{stats:?}");
+    }
+    let edit = phases.iter().find(|stats| stats.phase == "edit").unwrap();
+    assert_eq!(edit.latency_ms, None, "nothing was answered, so nothing has a latency");
+    assert!(
+      edit.seconds >= 0.014,
+      "three callers gave three records each their five milliseconds: {edit:?}"
+    );
 
     let _ = stop.send(());
     server.await.unwrap().unwrap();
