@@ -2371,12 +2371,24 @@ exporter's, and the push is the OpenTelemetry SDK's OTLP exporter behind
 [`metrics-exporter-otel`](https://crates.io/crates/metrics-exporter-otel); this server only says what is counted
 and where.
 
-What was checked: the page a real server gave was read back with the Prometheus Python client's parser (21
-metrics, 213 samples, every histogram cumulative and ending at its count). The push was received by a gRPC
-collector written for the purpose (the OTLP `MetricsService`, from the OpenTelemetry project's own protocol
-crate): the server pushed every second as configured, the counts matched the page, it resumed by itself after
-the collector was killed and started again, and it pushed once more on `SIGTERM`. Neither has been read by a
-real Prometheus, OpenTelemetry Collector, or Datadog Agent here.
+**Trying both.** `just observe-up` starts Prometheus and an OpenTelemetry Collector in Docker
+(`compose.yml`, profile `observability`; their two small configs are in `deploy/observability/`). Prometheus
+scrapes the server's page as the job `record-similarity-page`, and scrapes the Collector, which holds what the
+server pushed to it, as `record-similarity-pushed`:
+
+```sh
+just observe-up                      # Prometheus at http://localhost:9090, OTLP gRPC on 127.0.0.1:4317
+# in a copy of the config:  [metrics]  listen = "127.0.0.1:9464"  otlp_endpoint = "http://127.0.0.1:4317"
+just serve-in-memory config.toml
+just load config.toml --server http://127.0.0.1:50051 --concurrency 4 --records 50
+just observe-down
+```
+
+On Linux the page has to listen on `0.0.0.0:9464` for the Prometheus container to reach it. Run that way here
+(Prometheus 3.5.0, Collector 0.130.0), both targets were up, and Prometheus held the same 33 metric names and
+213 series under each job, with the same values: 182 `Evaluate` requests, 578 texts in forward passes, 150
+conditional writes under a millisecond. `promtool check metrics`, run on the page, had nothing to say. A
+Datadog Agent has not been tried.
 
 | Metric | What it counts |
 |---|---|

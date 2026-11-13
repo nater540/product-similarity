@@ -293,6 +293,8 @@ changing a design. Infer conventions from the existing code first.
 - Mutation testing (needs `cargo install cargo-mutants`): `just mutants -j 3`, `just mutants-diff`,
   `just mutants-train`
 - Run: `just serve` (needs Qdrant) or `just serve-in-memory`; then `just client describe`
+- Watch its metrics: `just observe-up` (Prometheus on 9090 and an OpenTelemetry Collector on 4317, in Docker;
+  the server needs `[metrics]` set), `just observe-down`
 - Show it to an audience: `just serve-in-memory config.toml`, then `just demo --pause` (needs `uv`)
 - Load a catalog: `just import export.jsonl config.toml` (`--check` validates only)
 - Measure: `just throughput`, `just load`, `just calibrate`, `just calibrate-drift`, `just calibrate-match`, `just calibrate-sweep`, `just calibrate-diff`, `just verdict-gate old.ndjson pairs.full.jsonl`

@@ -1,0 +1,21 @@
+# An OpenTelemetry Collector for `just observe-up`: it receives what the server pushes over gRPC (OTLP, port
+# 4317) and offers it to Prometheus on port 8889. `debug` also writes a line for each push to the collector's
+# log (`docker compose logs otel-collector`).
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      exporters: [prometheus, debug]

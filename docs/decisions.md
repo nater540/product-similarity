@@ -1901,10 +1901,12 @@ Qdrant under the server showed as not ready and as failed checks; the wrapper th
 change. The push was received by a collector written for the test, the OTLP `MetricsService` from the
 OpenTelemetry project's protocol crate: in a test, and from the real binary, which pushed every second as
 configured with counts that matched its page, resumed by itself after the collector was killed and started
-again, and pushed once more on `SIGTERM`.
+again, and pushed once more on `SIGTERM`. And against the real things (`just observe-up`: Prometheus 3.5.0 and
+an OpenTelemetry Collector 0.130.0 in Docker), with Prometheus scraping the page and scraping the Collector
+that the server pushed to: both targets up, the same 33 names and 213 series by each route, the same values,
+and nothing from `promtool check metrics`.
 
-**Not done:** a scrape by, or a push to, a real Prometheus, OpenTelemetry Collector, or Datadog Agent (none was
-run here); delta temporality, which some backends prefer and the exporter can be told to use; TLS to the
+**Not done:** a Datadog Agent, by either route; delta temporality, which some backends prefer and the exporter can be told to use; TLS to the
 collector; DogStatsD, which is another exporter; process metrics (memory, file
 descriptors), which a platform reports itself; TLS or authentication on the endpoint, which like the gRPC port
 has neither and belongs behind the mesh; and anything per brand, on purpose.
