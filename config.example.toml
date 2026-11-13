@@ -124,13 +124,19 @@ weight = 2.0
 overfetch = 5
 
 # Counts about the server itself (requests, latency, the embedding queue, the store, verdicts), for a monitoring
-# system to read. Optional, and off unless `listen` is set: without it nothing is counted, and with it a second
-# port serves the counts, as plain HTTP at /metrics in the Prometheus text format, which a Datadog agent, an
-# OpenTelemetry collector, and Prometheus all read. Nothing about any record is in them. Use 0.0.0.0 inside a
+# system. Optional, and nothing is counted unless one of these is set. Nothing about any record is in them.
+#
+# `listen` opens a second port that serves the counts as plain HTTP at /metrics in the Prometheus text format,
+# which a Datadog agent, an OpenTelemetry collector, and Prometheus all come and read. Use 0.0.0.0 inside a
 # container; 9464 is the port OpenTelemetry's Prometheus exporters use.
+#
+# `otlp_endpoint` pushes the same counts to an OpenTelemetry collector over gRPC (OTLP), every
+# `otlp_interval_ms`. Plain `http://` only. Either, both, or neither.
 #
 #   [metrics]
 #   listen = "127.0.0.1:9464"
+#   otlp_endpoint = "http://127.0.0.1:4317"
+#   otlp_interval_ms = 60000
 
 # A candidate policy, judged in the shadow of the one above. Optional, and off unless the table is there.
 #

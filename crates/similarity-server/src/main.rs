@@ -579,45 +579,67 @@ async fn stop_signals(asked: tokio::sync::mpsc::Sender<Stop>) {
   }
 }
 
-/// Starts the metrics endpoint on `address`, and returns the task that serves it until it is aborted.
-async fn serve_metrics<S: VectorStore>(
-  address: std::net::SocketAddr,
+/// Keeps the server's counts going wherever the configuration sends them, and returns the task that does it
+/// until it is aborted: the page at `/metrics` if there is an address for one, and, every few seconds, the
+/// counts that are kept elsewhere brought up to date for a collector that is pushed to and never asks.
+async fn keep_metrics<S: VectorStore>(
+  config: &Config,
   metrics: &Arc<Metrics>,
   engine: &Arc<Engine<Measured<S>, EmbedWorker>>,
   worker: EmbedWorker,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-  let listener = tokio::net::TcpListener::bind(address)
-    .await
-    .with_context(|| format!("cannot serve metrics on {address}"))?;
-  tracing::info!(address = %listener.local_addr()?, path = similarity_server::metrics::PATH, "serving metrics");
-  let (rendered, engine) = (Arc::clone(metrics), Arc::clone(engine));
-  let page = move || {
+  let engine = Arc::clone(engine);
+  let polled = move || {
     let writes = engine.writes();
-    rendered.render(&Polled {
+    Polled {
       worker: Some(worker.stats()),
       waiting: worker.waiting(),
       writes_in_flight: writes.in_flight,
       writes_unanswered: writes.unanswered,
-    })
-  };
-  // The exporter keeps every observation until it is rendered or tidied, so a server nobody is scraping tidies.
-  let kept = Arc::clone(metrics);
-  let upkeep = async move {
-    loop {
-      tokio::time::sleep(similarity_server::metrics::UPKEEP_EVERY).await;
-      kept.upkeep();
     }
   };
-  Ok(tokio::spawn(async move {
-    tokio::select! {
-      served = similarity_server::metrics::serve(listener, page, std::future::pending()) => {
-        if let Err(error) = served {
+  let listener = match config.metrics.listen {
+    Some(address) => {
+      let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .with_context(|| format!("cannot serve metrics on {address}"))?;
+      tracing::info!(address = %listener.local_addr()?, path = similarity_server::metrics::PATH, "serving metrics");
+      Some(listener)
+    }
+    None => None,
+  };
+  if let Some(otlp) = config.metrics.otlp() {
+    tracing::info!(
+      endpoint = otlp.endpoint.as_str(),
+      every_ms = config.metrics.otlp_interval_ms,
+      "sending metrics to a collector"
+    );
+  }
+  let (rendered, kept) = (Arc::clone(metrics), Arc::clone(metrics));
+  let asked = polled.clone();
+  // Once now, so that the first push to a collector has every count in it, at zero.
+  kept.poll(&polled());
+  let page = async move {
+    match listener {
+      Some(listener) => {
+        let render = move || rendered.render(&asked());
+        if let Err(error) = similarity_server::metrics::serve(listener, render, std::future::pending()).await {
           // The server goes on serving its callers: metrics are for watching it, not part of what it does.
           tracing::error!(error = format!("{error:#}"), "the metrics endpoint has stopped");
         }
       }
-      () = upkeep => {}
+      None => std::future::pending().await,
     }
+  };
+  let upkeep = async move {
+    loop {
+      tokio::time::sleep(similarity_server::metrics::UPKEEP_EVERY).await;
+      kept.poll(&polled());
+      kept.upkeep();
+    }
+  };
+  Ok(tokio::spawn(async move {
+    tokio::join!(page, upkeep);
   }))
 }
 
@@ -657,15 +679,20 @@ async fn serve_with<S: VectorStore>(
   let signals = tokio::spawn(stop_signals(asked));
   let engine = Arc::new(engine);
   // Up before the first request and until after the last: a scrape during a drain is how a deploy is watched.
-  let endpoint = match config.metrics.listen {
-    Some(address) => Some(serve_metrics(address, &metrics, &engine, worker).await?),
-    None => None,
+  let kept = if metrics.is_kept() {
+    Some(keep_metrics(config, &metrics, &engine, worker).await?)
+  } else {
+    None
   };
+  let last = Arc::clone(&metrics);
   let served = similarity_server::serve_until(engine, listener, stops, config.server.lifecycle(), metrics).await;
   signals.abort();
-  if let Some(endpoint) = endpoint {
-    endpoint.abort();
+  if let Some(kept) = kept {
+    kept.abort();
   }
+  // What was counted since the last push goes to the collector before the process does. It waits for the
+  // collector's answer, so it is off the runtime's own threads.
+  let _ = tokio::task::spawn_blocking(move || last.shutdown()).await;
   if let Some(summaries) = summaries {
     summaries.abort();
   }
@@ -681,21 +708,22 @@ impl ServeArgs {
     let config = Config::load(&self.config)?;
     let listen = self.listen.unwrap_or(config.server.listen);
     let embedder = load_embedder(&config, Tie::Enforced)?;
-    // What the server counts about itself (docs/decisions.md, D39): kept only if there is an address to serve
-    // it on, and by nothing at all otherwise.
-    let metrics = Arc::new(match config.metrics.listen {
-      Some(_) => Metrics::exported(embedder.fingerprint())?,
-      None => Metrics::discarded(),
-    });
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+      .enable_all()
+      .build()
+      .context("cannot start tokio")?;
+    // What the server counts about itself (docs/decisions.md, D39): kept for a page, for a collector, for both,
+    // or, with neither configured, not at all. The connection to a collector lives on the runtime.
+    let metrics = {
+      let _on_the_runtime = runtime.enter();
+      let (page, otlp) = (config.metrics.listen.is_some(), config.metrics.otlp());
+      Arc::new(Metrics::kept(embedder.fingerprint(), page, otlp.as_ref())?)
+    };
     let (depth, batch) = (config.model.queue_depth, config.model.batch_size);
     let worker = EmbedWorker::spawn_measured(embedder, depth, batch, Arc::clone(&metrics))
       .context("cannot start the embedding thread")?;
     let (layout, dimension) = store_layout(&config.schema()?, &worker);
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-      .enable_all()
-      .build()
-      .context("cannot start tokio")?;
     runtime.block_on(async {
       if self.in_memory {
         tracing::warn!("--in-memory: vectors are not persisted and are lost when the server stops");

@@ -27,6 +27,10 @@ tonic-reflection.workspace = true
 axum.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+metrics-exporter-otel.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 
@@ -49,6 +53,7 @@ proptest.workspace = true
 tempfile.workspace = true
 # One test listens for the spans a request makes, with a subscriber of its own.
 tracing-subscriber.workspace = true
+opentelemetry-proto.workspace = true
 # The example client is a single-threaded program; the server itself never uses the current-thread runtime.
 # `io-util`: the metrics endpoint is tested with a hand-written HTTP request over a socket, as a scraper sends one.
 tokio = { workspace = true, features = ["rt", "io-util"] }

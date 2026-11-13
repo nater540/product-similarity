@@ -109,8 +109,10 @@ changing a design. Infer conventions from the existing code first.
   refused by readiness: it is advice to whoever routes requests. Stopping is in one order: not ready, the
   notice, the listener, the deadline. A new `VectorStore` needs a `check` that is cheap and reads no record.
 - **Metrics are counts about the process, and their names are an interface** (D39). They are the `metrics`
-  crate's, rendered by its Prometheus exporter at `/metrics` when `metrics.listen` is set, and not kept at all
-  when it is not. **The owner prefers maintained crates to hand-written infrastructure** (2026-11-12): do not
+  crate's: rendered by its Prometheus exporter at `/metrics` when `metrics.listen` is set, pushed to an
+  OpenTelemetry collector over gRPC when `metrics.otlp_endpoint` is, and not kept at all with neither. The
+  OpenTelemetry crates are all 0.31 because the bridge (`metrics-exporter-otel`) is; move them together or
+  not at all. **The owner prefers maintained crates to hand-written infrastructure** (2026-11-12): do not
   bring back a hand-written counter, histogram, or text format, and reach for the ecosystem's crate first for
   the next thing of this kind. Call the methods of `Metrics`; do not use the crate's macros or install a
   process-wide recorder, because `Metrics` having its own recorder is what keeps label values to words fixed in
@@ -119,8 +121,8 @@ changing a design. Infer conventions from the existing code first.
   one or change what it counts. Nothing in a request may wait on, or fail because of, a metric. A request is
   counted by the guard its handler makes on its first line (dropped unanswered, it counts as `CANCELLED`), so
   a new call needs a `Call` and a guard. A store is measured from outside by `Measured`; do not put counting
-  into a store. Another way of sending the counts is another exporter of the crate, chosen in
-  `Metrics::exported`.
+  into a store. Another way of sending the counts is another recorder in `Metrics::kept`, which has to be
+  called inside the tokio runtime when there is a collector.
 - **A request's waits are histograms and spans** (D40). Anything a request waits for (its record's lock, the
   store, the model) is counted into a histogram and wrapped in a `tracing` span inside the request's span, at
   `debug`. A new wait gets both, or nobody will know it is there. Nothing exports the spans yet; do not add a

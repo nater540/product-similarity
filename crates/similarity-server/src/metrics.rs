@@ -4,11 +4,11 @@
 //! answers and how, how long they take, what the one embedding thread is busy with, how the store behaves, and
 //! what verdicts are going out.
 //!
-//! The counting is the [`metrics`] crate's, and so is the writing out: this module names what is counted and
-//! says where, and the Prometheus exporter keeps the numbers and renders them in the text format that a Datadog
-//! agent, an OpenTelemetry collector, and Prometheus all read ([`serve`]). Another exporter of that crate (one
-//! that pushes to a Datadog agent, say) would take the same counts; nothing outside [`Metrics::exported`] knows
-//! which is in use.
+//! The counting is the [`metrics`] crate's, and so is the sending: this module names what is counted and says
+//! where. The counts can go two ways, either or both ([`Metrics::kept`]). The crate's Prometheus exporter keeps
+//! them and renders the text format that a Datadog agent, an OpenTelemetry collector, and Prometheus all come
+//! and read ([`serve`]). And the OpenTelemetry SDK pushes them to a collector over gRPC (OTLP), through the
+//! bridge from `metrics` to it. Nothing outside [`Metrics::kept`] knows which is in use.
 //!
 //! The rest of the server does not use the crate's macros. It calls the methods of [`Metrics`], which is given
 //! a recorder of its own rather than the process-wide one. That keeps three things true:
@@ -27,8 +27,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use metrics::{Counter, Gauge, Histogram, Key, KeyName, Label, Level, Metadata, NoopRecorder, Recorder, SharedString};
+use metrics::{Counter, Gauge, Histogram, Key, KeyName, Label, Level, Metadata, Recorder, SharedString, Unit};
+use metrics_exporter_otel::OpenTelemetryRecorder;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::MeterProvider as _;
+use opentelemetry_otlp::{MetricExporter, WithExportConfig as _};
+use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use similarity_core::matching::Decision;
 use similarity_store::{Expected, Found, Neighbor, SearchQuery, StoreError, StoredRecord, VectorStore, Version};
 use tokio::net::TcpListener;
@@ -310,19 +316,87 @@ pub struct Polled {
   pub writes_unanswered: u64,
 }
 
+/// The name this server gives itself to a collector: OpenTelemetry's `service.name`.
+pub const SERVICE: &str = "record-similarity";
+
+/// A collector to push the counts to, over gRPC (OTLP).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Otlp {
+  /// The collector's OTLP gRPC endpoint, `http://host:4317`.
+  pub endpoint: String,
+  /// How often the counts are sent.
+  pub every: Duration,
+}
+
 /// What a server counts about itself, and where the counts go.
 pub struct Metrics {
-  recorder: Box<dyn Recorder + Send + Sync>,
-  /// The exporter's other half, which renders what the recorder holds. `None` when nothing is kept.
-  exporter: Option<PrometheusHandle>,
+  /// Every place the counts are kept: none, the Prometheus exporter, the OpenTelemetry SDK, or both.
+  recorders: Vec<Box<dyn Recorder + Send + Sync>>,
+  /// The Prometheus exporter's other half, which renders what its recorder holds.
+  page: Option<PrometheusHandle>,
+  /// The OpenTelemetry SDK's side, which sends what its recorder holds.
+  otlp: Option<SdkMeterProvider>,
 }
 
 impl std::fmt::Debug for Metrics {
   fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     formatter
       .debug_struct("Metrics")
-      .field("exported", &self.exporter.is_some())
+      .field("page", &self.page.is_some())
+      .field("otlp", &self.otlp.is_some())
       .finish_non_exhaustive()
+  }
+}
+
+/// One counter in every place the counts are kept.
+struct Counters(Vec<Counter>);
+
+impl Counters {
+  fn increment(&self, amount: u64) {
+    for counter in &self.0 {
+      counter.increment(amount);
+    }
+  }
+
+  /// Sets the count to a total that is kept elsewhere.
+  fn absolute(&self, total: u64) {
+    for counter in &self.0 {
+      counter.absolute(total);
+    }
+  }
+}
+
+/// One gauge in every place the counts are kept.
+struct Gauges(Vec<Gauge>);
+
+impl Gauges {
+  fn set(&self, value: f64) {
+    for gauge in &self.0 {
+      gauge.set(value);
+    }
+  }
+
+  fn increment(&self, by: f64) {
+    for gauge in &self.0 {
+      gauge.increment(by);
+    }
+  }
+
+  fn decrement(&self, by: f64) {
+    for gauge in &self.0 {
+      gauge.decrement(by);
+    }
+  }
+}
+
+/// One histogram in every place the counts are kept.
+struct Histograms(Vec<Histogram>);
+
+impl Histograms {
+  fn record(&self, value: f64) {
+    for histogram in &self.0 {
+      histogram.record(value);
+    }
   }
 }
 
@@ -330,48 +404,94 @@ impl Metrics {
   /// Counts that are kept nowhere: for a server nobody asks, a command, a test of something else. Every method
   /// works and costs next to nothing.
   #[must_use]
-  pub fn discarded() -> Self {
+  pub const fn discarded() -> Self {
     Self {
-      recorder: Box::new(NoopRecorder),
-      exporter: None,
+      recorders: Vec::new(),
+      page: None,
+      otlp: None,
     }
   }
 
   /// Counts for a server running the model with this fingerprint, kept by the Prometheus exporter and written
-  /// out by [`Self::render`].
+  /// out by [`Self::render`]: [`Self::kept`] with a page and no collector.
+  ///
+  /// # Errors
+  ///
+  /// As [`Self::kept`].
+  pub fn exported(fingerprint: &str) -> anyhow::Result<Self> {
+    Self::kept(fingerprint, true, None)
+  }
+
+  /// Counts for a server running the model with this fingerprint, kept for a `page` to be read from
+  /// ([`Self::render`]), for a collector to be sent to (`otlp`), for both, or, with neither, not at all.
   ///
   /// Every metric is described, and every series whose zero means something is there from the start: `OK` for
   /// each call, so that a rate over it exists from the first scrape, and the verdicts, decisions, import
   /// outcomes, and store errors. A status code no request has ended with, and the latency of anything that has
   /// not happened, appear when they first do.
   ///
+  /// With a collector, this has to be called inside a tokio runtime: the connection to it lives there.
+  ///
   /// # Errors
   ///
-  /// Returns an error if the exporter refuses the buckets, which are fixed in this file.
-  pub fn exported(fingerprint: &str) -> anyhow::Result<Self> {
-    let recorder = PrometheusBuilder::new()
-      .set_buckets(&SECONDS)
-      .and_then(|builder| builder.set_buckets_for_metric(Matcher::Full(PASS_TEXTS.to_owned()), &TEXTS))
-      .context("the metrics exporter refused its buckets")?
-      .build_recorder();
-    let metrics = Self {
-      exporter: Some(recorder.handle()),
-      recorder: Box::new(recorder),
-    };
-    for (name, help) in COUNTERS.into_iter().chain([(
-      WRITES_UNANSWERED,
-      "Writes that finished, or failed, after the request that asked for them had gone. Each has a log line.",
-    )]) {
-      let (name, help) = (KeyName::from_const_str(name), SharedString::const_str(help));
-      metrics.recorder.describe_counter(name, None, help);
+  /// Returns an error if an exporter refuses the buckets, which are fixed in this file, or if the collector's
+  /// address is not one. A collector that is not there is not an error here: the counts are sent when it is.
+  pub fn kept(fingerprint: &str, page: bool, otlp: Option<&Otlp>) -> anyhow::Result<Self> {
+    let mut metrics = Self::discarded();
+    if page {
+      let recorder = PrometheusBuilder::new()
+        .set_buckets(&SECONDS)
+        .and_then(|builder| builder.set_buckets_for_metric(Matcher::Full(PASS_TEXTS.to_owned()), &TEXTS))
+        .context("the metrics exporter refused its buckets")?
+        .build_recorder();
+      metrics.page = Some(recorder.handle());
+      metrics.recorders.push(Box::new(recorder));
     }
-    for (name, help) in GAUGES {
-      let (name, help) = (KeyName::from_const_str(name), SharedString::const_str(help));
-      metrics.recorder.describe_gauge(name, None, help);
+    if let Some(otlp) = otlp {
+      let exporter = MetricExporter::builder()
+        .with_tonic()
+        .with_endpoint(otlp.endpoint.clone())
+        .build()
+        .with_context(|| format!("cannot send metrics to `{}`", otlp.endpoint))?;
+      let reader = PeriodicReader::builder(exporter).with_interval(otlp.every).build();
+      let resource = Resource::builder()
+        .with_service_name(SERVICE)
+        .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
+        .build();
+      let provider = SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_reader(reader)
+        .build();
+      let recorder = OpenTelemetryRecorder::new(provider.meter(SERVICE));
+      for (name, _) in HISTOGRAMS {
+        let bounds = if name == PASS_TEXTS {
+          TEXTS.to_vec()
+        } else {
+          SECONDS.to_vec()
+        };
+        recorder.set_histogram_bounds(&KeyName::from_const_str(name), bounds);
+      }
+      metrics.otlp = Some(provider);
+      metrics.recorders.push(Box::new(recorder));
     }
-    for (name, help) in HISTOGRAMS {
-      let (name, help) = (KeyName::from_const_str(name), SharedString::const_str(help));
-      metrics.recorder.describe_histogram(name, None, help);
+    if metrics.recorders.is_empty() {
+      return Ok(metrics);
+    }
+
+    for recorder in &metrics.recorders {
+      for (name, help) in COUNTERS.into_iter().chain([(
+        WRITES_UNANSWERED,
+        "Writes that finished, or failed, after the request that asked for them had gone. Each has a log line.",
+      )]) {
+        recorder.describe_counter(KeyName::from_const_str(name), None, SharedString::const_str(help));
+      }
+      for (name, help) in GAUGES {
+        recorder.describe_gauge(KeyName::from_const_str(name), None, SharedString::const_str(help));
+      }
+      for (name, help) in HISTOGRAMS {
+        let unit = (name != PASS_TEXTS).then_some(Unit::Seconds);
+        recorder.describe_histogram(KeyName::from_const_str(name), unit, SharedString::const_str(help));
+      }
     }
     metrics
       .gauge(BUILD_INFO, vec![label("version", env!("CARGO_PKG_VERSION"))])
@@ -404,43 +524,66 @@ impl Metrics {
     Ok(metrics)
   }
 
-  fn counter(&self, name: &'static str, labels: Vec<Label>) -> Counter {
-    self
-      .recorder
-      .register_counter(&Key::from_parts(name, labels), &METADATA)
+  /// Whether the counts are kept anywhere.
+  #[must_use]
+  pub fn is_kept(&self) -> bool {
+    !self.recorders.is_empty()
   }
 
-  fn gauge(&self, name: &'static str, labels: Vec<Label>) -> Gauge {
-    self.recorder.register_gauge(&Key::from_parts(name, labels), &METADATA)
+  fn counter(&self, name: &'static str, labels: Vec<Label>) -> Counters {
+    let key = Key::from_parts(name, labels);
+    Counters(
+      self
+        .recorders
+        .iter()
+        .map(|recorder| recorder.register_counter(&key, &METADATA))
+        .collect(),
+    )
   }
 
-  fn histogram(&self, name: &'static str, labels: Vec<Label>) -> Histogram {
-    self
-      .recorder
-      .register_histogram(&Key::from_parts(name, labels), &METADATA)
+  fn gauge(&self, name: &'static str, labels: Vec<Label>) -> Gauges {
+    let key = Key::from_parts(name, labels);
+    Gauges(
+      self
+        .recorders
+        .iter()
+        .map(|recorder| recorder.register_gauge(&key, &METADATA))
+        .collect(),
+    )
+  }
+
+  fn histogram(&self, name: &'static str, labels: Vec<Label>) -> Histograms {
+    let key = Key::from_parts(name, labels);
+    Histograms(
+      self
+        .recorders
+        .iter()
+        .map(|recorder| recorder.register_histogram(&key, &METADATA))
+        .collect(),
+    )
   }
 
   /// The count of requests of `call` that ended with the status code numbered `code`.
-  fn requests(&self, call: Call, code: usize) -> Counter {
+  fn requests(&self, call: Call, code: usize) -> Counters {
     // A number with no name in the table is counted as what it is to a caller: unknown.
     let code = CODES.get(code).copied().unwrap_or("UNKNOWN");
     self.counter(REQUESTS, vec![label("call", call.name()), label("code", code)])
   }
 
-  fn in_flight(&self, call: Call) -> Gauge {
+  fn in_flight(&self, call: Call) -> Gauges {
     self.gauge(IN_FLIGHT, vec![label("call", call.name())])
   }
 
-  fn evaluations(&self, verdict: Verdict, mode: WriteMode) -> Counter {
+  fn evaluations(&self, verdict: Verdict, mode: WriteMode) -> Counters {
     let labels = vec![label("verdict", verdict_name(verdict)), label("mode", mode_name(mode))];
     self.counter(EVALUATIONS, labels)
   }
 
-  fn matches(&self, decision: Decision) -> Counter {
+  fn matches(&self, decision: Decision) -> Counters {
     self.counter(MATCHES, vec![label("decision", decision_name(decision))])
   }
 
-  fn store_errors(&self, operation: Operation) -> Counter {
+  fn store_errors(&self, operation: Operation) -> Counters {
     self.counter(STORE_ERRORS, vec![label("operation", operation.name())])
   }
 
@@ -518,13 +661,14 @@ impl Metrics {
       .record(elapsed.as_secs_f64());
   }
 
-  /// Everything, in the Prometheus text format, with `polled` brought up to date first. Nothing at all for
-  /// counts that are not kept.
-  #[must_use]
-  pub fn render(&self, polled: &Polled) -> String {
-    let Some(exporter) = &self.exporter else {
-      return String::new();
-    };
+  /// Brings up to date the counts that are kept elsewhere and only read here: what the embedding thread has
+  /// refused and passed over, how many requests are waiting for it, and the engine's writes. A page is brought
+  /// up to date as it is asked for ([`Self::render`]); a server that sends its counts has to call this now and
+  /// then, with [`Self::upkeep`].
+  pub fn poll(&self, polled: &Polled) {
+    if !self.is_kept() {
+      return;
+    }
     if let Some(worker) = &polled.worker {
       self.counter(EMBED_REQUESTS, Vec::new()).absolute(worker.jobs);
       self.counter(EMBED_ABANDONED, Vec::new()).absolute(worker.abandoned);
@@ -542,15 +686,37 @@ impl Metrics {
     self
       .counter(WRITES_UNANSWERED, Vec::new())
       .absolute(polled.writes_unanswered);
-    exporter.render()
   }
 
-  /// Folds what has been observed since the last time into the exporter's buckets. The exporter holds every
+  /// Everything, in the Prometheus text format, with `polled` brought up to date first. Nothing at all for
+  /// counts that are not kept for a page.
+  #[must_use]
+  pub fn render(&self, polled: &Polled) -> String {
+    self.poll(polled);
+    self.page.as_ref().map_or_else(String::new, PrometheusHandle::render)
+  }
+
+  /// Folds what has been observed since the last time into the Prometheus exporter's buckets. It holds every
   /// observation until it is rendered or this is called, so a server that nobody scrapes has to call it now and
   /// then ([`UPKEEP_EVERY`]).
   pub fn upkeep(&self) {
-    if let Some(exporter) = &self.exporter {
-      exporter.run_upkeep();
+    if let Some(page) = &self.page {
+      page.run_upkeep();
+    }
+  }
+
+  /// Sends the counts to the collector now, and says whether it took them. Nothing to do, and `true`, without
+  /// one. Blocks until the collector has answered or timed out: for a server that is stopping, and for tests.
+  pub fn flush(&self) -> bool {
+    self.otlp.as_ref().is_none_or(|provider| provider.force_flush().is_ok())
+  }
+
+  /// Sends the counts one last time and stops sending. Blocks like [`Self::flush`].
+  pub fn shutdown(&self) {
+    if let Some(provider) = &self.otlp
+      && let Err(error) = provider.shutdown()
+    {
+      tracing::warn!(%error, "the last metrics were not sent to the collector");
     }
   }
 }
@@ -1246,5 +1412,243 @@ mod tests {
 
     stop.send(()).unwrap();
     server.await.unwrap().unwrap();
+  }
+
+  // ---- Pushed to a collector (OTLP over gRPC) -----------------------------------------------------------------
+
+  use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::{
+    MetricsService, MetricsServiceServer,
+  };
+  use opentelemetry_proto::tonic::collector::metrics::v1::{ExportMetricsServiceRequest, ExportMetricsServiceResponse};
+  use opentelemetry_proto::tonic::common::v1::any_value::Value as Any;
+  use opentelemetry_proto::tonic::metrics::v1::metric::Data;
+  use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as Number;
+
+  /// A collector, as far as a sender can tell: it takes what it is sent over gRPC and keeps it for the test.
+  #[derive(Clone, Default)]
+  struct Collector(Arc<std::sync::Mutex<Vec<ExportMetricsServiceRequest>>>);
+
+  #[tonic::async_trait]
+  impl MetricsService for Collector {
+    async fn export(
+      &self,
+      request: tonic::Request<ExportMetricsServiceRequest>,
+    ) -> Result<tonic::Response<ExportMetricsServiceResponse>, Status> {
+      self.0.lock().unwrap().push(request.into_inner());
+      Ok(tonic::Response::new(ExportMetricsServiceResponse {
+        partial_success: None,
+      }))
+    }
+  }
+
+  /// A collector listening on a port of its own, and where to send to it.
+  async fn collector() -> (Collector, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let collector = Collector::default();
+    let service = MetricsServiceServer::new(collector.clone());
+    tokio::spawn(
+      tonic::transport::Server::builder()
+        .add_service(service)
+        .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener)),
+    );
+    (collector, endpoint)
+  }
+
+  fn labels_of(attributes: &[opentelemetry_proto::tonic::common::v1::KeyValue]) -> Vec<(String, String)> {
+    let mut labels: Vec<_> = attributes
+      .iter()
+      .map(|attribute| {
+        let value = match attribute.value.as_ref().and_then(|value| value.value.as_ref()) {
+          Some(Any::StringValue(text)) => text.clone(),
+          other => format!("{other:?}"),
+        };
+        (attribute.key.clone(), value)
+      })
+      .collect();
+    labels.sort();
+    labels
+  }
+
+  /// The counts reach a collector over gRPC as OpenTelemetry metrics: the same names, the same label values as
+  /// attributes, counters as sums that only grow, latencies as histograms with the buckets this file names and
+  /// seconds as their unit, and the server named as the service they came from. A server that also has a page
+  /// shows the same counts there.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn the_counts_are_pushed_to_a_collector_as_they_are_served_on_the_page() {
+    let (collector, endpoint) = collector().await;
+    let otlp = Otlp {
+      endpoint,
+      // Never, as far as this test goes: it sends when it is told to.
+      every: Duration::from_hours(1),
+    };
+    let metrics = Arc::new(Metrics::kept("f46e-test", true, Some(&otlp)).unwrap());
+    metrics.begin(Call::Evaluate).finished(Code::Ok);
+    metrics.begin(Call::Evaluate).finished(Code::Ok);
+    metrics.begin(Call::Match).finished(Code::InvalidArgument);
+    metrics.stored(Operation::Get, Duration::from_millis(3), false);
+    metrics.passed(4, Duration::from_millis(12));
+    metrics.set_ready(true);
+    metrics.poll(&Polled {
+      worker: Some(WorkerSnapshot {
+        jobs: 9,
+        ..WorkerSnapshot::default()
+      }),
+      waiting: 2,
+      ..Polled::default()
+    });
+
+    let sending = Arc::clone(&metrics);
+    assert!(tokio::task::spawn_blocking(move || sending.flush()).await.unwrap());
+    let received = collector.0.lock().unwrap().clone();
+    assert_eq!(received.len(), 1, "one push");
+    let resource = &received[0].resource_metrics[0];
+    let service = labels_of(&resource.resource.as_ref().unwrap().attributes);
+    assert!(
+      service.contains(&("service.name".to_owned(), SERVICE.to_owned())),
+      "{service:?}"
+    );
+    let sent: Vec<_> = resource.scope_metrics.iter().flat_map(|scope| &scope.metrics).collect();
+    let named = |name: &str| *sent.iter().find(|metric| metric.name == name).unwrap();
+
+    let requests = named(REQUESTS);
+    assert!(requests.description.starts_with("Requests that ended"), "{requests:?}");
+    let Some(Data::Sum(sum)) = &requests.data else {
+      panic!("{requests:?}")
+    };
+    assert!(sum.is_monotonic);
+    let counted = |call: &str, code: &str| {
+      let wanted = vec![
+        ("call".to_owned(), call.to_owned()),
+        ("code".to_owned(), code.to_owned()),
+      ];
+      sum
+        .data_points
+        .iter()
+        .find(|point| labels_of(&point.attributes) == wanted)
+        .map(|point| point.value)
+    };
+    assert_eq!(counted("Evaluate", "OK"), Some(Some(Number::AsInt(2))));
+    assert_eq!(counted("Match", "INVALID_ARGUMENT"), Some(Some(Number::AsInt(1))));
+    assert_eq!(
+      counted("Delete", "OK"),
+      Some(Some(Number::AsInt(0))),
+      "there from the start"
+    );
+    assert_eq!(counted("Delete", "INVALID_ARGUMENT"), None);
+
+    let Some(Data::Sum(served)) = &named(EMBED_REQUESTS).data else {
+      panic!()
+    };
+    assert_eq!(
+      served.data_points[0].value,
+      Some(Number::AsInt(9)),
+      "a total kept elsewhere"
+    );
+    let Some(Data::Gauge(ready)) = &named(READY).data else {
+      panic!()
+    };
+    assert_eq!(ready.data_points[0].value, Some(Number::AsDouble(1.0)));
+    let Some(Data::Gauge(waiting)) = &named(EMBED_WAITING).data else {
+      panic!()
+    };
+    assert_eq!(waiting.data_points[0].value, Some(Number::AsDouble(2.0)));
+
+    let store = named(STORE_SECONDS);
+    assert_eq!(store.unit, "s");
+    let Some(Data::Histogram(latency)) = &store.data else {
+      panic!("{store:?}")
+    };
+    let get = &latency.data_points[0];
+    assert_eq!(labels_of(&get.attributes), [("operation".to_owned(), "get".to_owned())]);
+    assert_eq!(get.explicit_bounds, SECONDS);
+    assert_eq!((get.count, get.bucket_counts.iter().sum::<u64>()), (1, 1));
+    assert_eq!(
+      get.bucket_counts[2], 1,
+      "three milliseconds is in the bucket up to five"
+    );
+    assert!((get.sum.unwrap() - 0.003).abs() < 1e-9);
+    let Some(Data::Histogram(texts)) = &named(PASS_TEXTS).data else {
+      panic!()
+    };
+    assert_eq!(texts.data_points[0].explicit_bounds, TEXTS);
+    assert!((texts.data_points[0].sum.unwrap() - 4.0).abs() < 1e-9);
+    assert_eq!(named(PASS_TEXTS).unit, "", "a count of texts has no unit");
+
+    // And the page says the same.
+    let page = metrics.render(&Polled::default());
+    let ok = "record_similarity_requests_total{call=\"Evaluate\",code=\"OK\"}";
+    assert_eq!(value(&page, ok).as_deref(), Some("2"));
+    let took = "record_similarity_store_duration_seconds_count{operation=\"get\"}";
+    assert_eq!(value(&page, took).as_deref(), Some("1"));
+  }
+
+  /// A server that is stopping sends what it has counted since the last push. What a push carries is the total
+  /// so far and not the difference since the one before, which is what a collector expects unless told otherwise.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn stopping_sends_the_totals_once_more() {
+    let (collector, endpoint) = collector().await;
+    let otlp = Otlp {
+      endpoint,
+      every: Duration::from_hours(1),
+    };
+    let metrics = Arc::new(Metrics::kept("f46e-test", false, Some(&otlp)).unwrap());
+    let evaluate_ok = vec![
+      ("call".to_owned(), "Evaluate".to_owned()),
+      ("code".to_owned(), "OK".to_owned()),
+    ];
+    let counted = |request: &ExportMetricsServiceRequest| {
+      let requests = request.resource_metrics[0]
+        .scope_metrics
+        .iter()
+        .flat_map(|scope| &scope.metrics)
+        .find(|metric| metric.name == REQUESTS)
+        .unwrap();
+      let Some(Data::Sum(sum)) = &requests.data else {
+        panic!("{requests:?}")
+      };
+      sum
+        .data_points
+        .iter()
+        .find(|point| labels_of(&point.attributes) == evaluate_ok)
+        .and_then(|point| point.value)
+    };
+
+    metrics.begin(Call::Evaluate).finished(Code::Ok);
+    metrics.begin(Call::Evaluate).finished(Code::Ok);
+    let sending = Arc::clone(&metrics);
+    assert!(tokio::task::spawn_blocking(move || sending.flush()).await.unwrap());
+    metrics.begin(Call::Evaluate).finished(Code::Ok);
+    let stopping = Arc::clone(&metrics);
+    tokio::task::spawn_blocking(move || stopping.shutdown()).await.unwrap();
+
+    let received = collector.0.lock().unwrap().clone();
+    assert_eq!(received.len(), 2, "one when asked, one on stopping");
+    assert_eq!(counted(&received[0]), Some(Number::AsInt(2)));
+    assert_eq!(counted(&received[1]), Some(Number::AsInt(3)));
+  }
+
+  /// A collector that is not there costs the server nothing but the push: the counts are made all the same, the
+  /// page still has them, and a push says that it failed.
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn a_collector_that_is_not_there_does_not_stop_the_counting() {
+    // A port nothing is listening on: bound, read, and let go.
+    let nowhere = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+    let otlp = Otlp {
+      endpoint: format!("http://{nowhere}"),
+      every: Duration::from_hours(1),
+    };
+    let metrics = Arc::new(Metrics::kept("f46e-test", true, Some(&otlp)).unwrap());
+    metrics.begin(Call::Evaluate).finished(Code::Ok);
+    let sending = Arc::clone(&metrics);
+    assert!(!tokio::task::spawn_blocking(move || sending.flush()).await.unwrap());
+    let ok = "record_similarity_requests_total{call=\"Evaluate\",code=\"OK\"}";
+    assert_eq!(value(&metrics.render(&Polled::default()), ok).as_deref(), Some("1"));
+
+    // With a collector and no page, there is nothing to render and still something kept.
+    let pushed_only = Metrics::kept("f46e-test", false, Some(&otlp)).unwrap();
+    assert!(pushed_only.is_kept());
+    assert_eq!(pushed_only.render(&Polled::default()), "");
+    assert!(!Metrics::kept("f46e-test", false, None).unwrap().is_kept());
   }
 }

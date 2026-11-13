@@ -49,13 +49,41 @@ pub struct Config {
   pub metrics: MetricsConfig,
 }
 
-/// `[metrics]`: the HTTP endpoint a monitoring system reads the server's counts from (docs/decisions.md, D39).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+/// `[metrics]`: where the server's counts about itself go (docs/decisions.md, D39). Two ways, either or both; with
+/// neither, nothing is counted.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct MetricsConfig {
-  /// The address to serve `/metrics` on, in the Prometheus text format. Not set by default: a second open port
-  /// is something a deployment asks for. Without it nothing is counted.
+  /// The address to serve `/metrics` on, in the Prometheus text format, for whatever comes and reads it. Not
+  /// set by default: a second open port is something a deployment asks for.
   pub listen: Option<SocketAddr>,
+  /// An OpenTelemetry collector to push the counts to over gRPC (OTLP), as `http://host:4317`. Not set by
+  /// default.
+  pub otlp_endpoint: Option<String>,
+  /// How often the counts are pushed to it, in milliseconds.
+  pub otlp_interval_ms: u64,
+}
+
+impl Default for MetricsConfig {
+  fn default() -> Self {
+    Self {
+      listen: None,
+      otlp_endpoint: None,
+      // What an OpenTelemetry SDK does when it is not told: once a minute.
+      otlp_interval_ms: 60_000,
+    }
+  }
+}
+
+impl MetricsConfig {
+  /// The collector to push to, if one is configured.
+  #[must_use]
+  pub fn otlp(&self) -> Option<crate::metrics::Otlp> {
+    self.otlp_endpoint.as_ref().map(|endpoint| crate::metrics::Otlp {
+      endpoint: endpoint.clone(),
+      every: Duration::from_millis(self.otlp_interval_ms),
+    })
+  }
 }
 
 /// `[matching]`. The table is not called `match` because that is a keyword of the language this is written in.
@@ -480,6 +508,21 @@ impl Config {
     }
     if config.server.import_batch_records == 0 {
       bail!("`server.import_batch_records` must be at least 1");
+    }
+    if let Some(endpoint) = &config.metrics.otlp_endpoint {
+      // The gRPC client is built without TLS, like the server: both sit behind the platform's mesh.
+      let Some(authority) = endpoint.strip_prefix("http://") else {
+        bail!(
+          "`metrics.otlp_endpoint` is `{endpoint}`; it has to be `http://host:port`, a collector's OTLP gRPC \
+           address (usually port 4317). TLS is not built in"
+        );
+      };
+      if authority.is_empty() || authority.contains(char::is_whitespace) {
+        bail!("`metrics.otlp_endpoint` is `{endpoint}`, which names no host");
+      }
+      if config.metrics.otlp_interval_ms == 0 {
+        bail!("`metrics.otlp_interval_ms` must be positive: the counts are sent that often");
+      }
     }
     if config.metrics.listen == Some(config.server.listen) {
       bail!(
@@ -1035,6 +1078,48 @@ mod tests {
       "{error}"
     );
     assert!(Config::parse(&format!("[metrics]\nlistn = \"0.0.0.0:9464\"\n{MINIMAL}")).is_err());
+  }
+
+  /// A collector to push to is an `http://` address and an interval. Neither is set unless asked for, and an
+  /// address this build cannot reach (TLS, or no host) is refused when the file is read, not when the first
+  /// push fails.
+  #[test]
+  fn a_collector_to_push_metrics_to_is_an_http_address_and_an_interval() {
+    assert_eq!(Config::parse(MINIMAL).unwrap().metrics.otlp(), None);
+    let shipped = Config::parse(include_str!("../../../config.example.toml")).unwrap();
+    assert_eq!(shipped.metrics.otlp(), None, "the example pushes nowhere");
+
+    let on = Config::parse(&format!(
+      "[metrics]\notlp_endpoint = \"http://collector:4317\"\n{MINIMAL}"
+    ))
+    .unwrap();
+    assert_eq!(
+      on.metrics.otlp(),
+      Some(crate::metrics::Otlp {
+        endpoint: "http://collector:4317".to_owned(),
+        every: Duration::from_mins(1),
+      })
+    );
+    let both =
+      "[metrics]\nlisten = \"0.0.0.0:9464\"\notlp_endpoint = \"http://collector:4317\"\notlp_interval_ms = 10000\n";
+    let both = Config::parse(&format!("{both}{MINIMAL}")).unwrap();
+    assert!(both.metrics.listen.is_some());
+    assert_eq!(both.metrics.otlp().unwrap().every, Duration::from_secs(10));
+
+    for (wrong, says) in [
+      ("otlp_endpoint = \"https://collector:4317\"", "TLS"),
+      ("otlp_endpoint = \"collector:4317\"", "http://host:port"),
+      ("otlp_endpoint = \"http://\"", "no host"),
+      (
+        "otlp_endpoint = \"http://collector:4317\"\notlp_interval_ms = 0",
+        "otlp_interval_ms",
+      ),
+    ] {
+      let error = Config::parse(&format!("[metrics]\n{wrong}\n{MINIMAL}"))
+        .unwrap_err()
+        .to_string();
+      assert!(error.contains(says), "{wrong}: {error}");
+    }
   }
 
   #[test]

@@ -1822,8 +1822,24 @@ day, was written by hand: arrays of atomics, a histogram, and the text format, a
 worked, and the owner's judgment was that it was also five hundred lines somebody has to maintain, where the
 `metrics` crate and its exporter are maintained by somebody else and are what the rest of the ecosystem uses.
 That is the decision (2026-11-12). It also buys the thing the hand-written one could not: sending the same
-counts another way is another exporter of that crate (DogStatsD to a Datadog Agent, OTLP to a collector), not
-a second implementation.
+counts another way is another exporter of that crate, not a second implementation, and the first of those was
+added the same day (below).
+
+**Pushed as well, over gRPC, to an OpenTelemetry collector** (`metrics.otlp_endpoint`). The owner asked for it,
+and it is where the company is going. The counts go to two recorders at once, the Prometheus exporter's and
+`metrics-exporter-otel`'s, which hands them to the OpenTelemetry SDK; its periodic reader pushes them through
+the project's own OTLP exporter, whose gRPC client is the `tonic` already in the build. The same names, the
+same label values as attributes, the same buckets, cumulative sums. Three things to know about it:
+
+- *The bridge is the thin part.* `metrics` and the OpenTelemetry SDK are each well kept. The crate between
+  them is one person's, four hundred lines, and built against OpenTelemetry 0.31 when 0.33 is current, so all
+  three OpenTelemetry crates here are 0.31. If it falls further behind, the alternative is to record into the
+  OpenTelemetry API directly from `Metrics`, which is the one type that would change.
+- *A push that fails is quiet.* The exporter logs it at `debug`. The server does not notice and does not need
+  to: the next push carries the totals. Only the last push, on stopping, is this server's to report, and it
+  does, at `WARN`.
+- *The totals kept elsewhere are brought up to date on a timer* (every five seconds), since a collector that is
+  pushed to never asks, where a page is brought up to date as it is read.
 
 **Behind a typed front, with a recorder of its own.** The rest of the server does not use the crate's macros.
 It calls methods of `Metrics` (`begin`, `evaluated`, `stored`, `passed`), and `Metrics` holds its own recorder
@@ -1833,7 +1849,7 @@ is a property of the types and not a habit. Two servers in one process, which is
 count into each other. And a server with no `metrics.listen` is given a recorder that keeps nothing.
 
 **Off until it is given an address** (`metrics.listen`), because it opens a second port, and a second port is
-something a deployment asks for. Without it nothing is counted at all. The port is HTTP/1.1 and not the gRPC
+something a deployment asks for. With no address and no collector nothing is counted at all. The port is HTTP/1.1 and not the gRPC
 port, which speaks HTTP/2 only and which scrapers do not. The endpoint is one `axum` route that asks the
 exporter for the page; `axum` was in the tree through `tonic`. The exporter's own listener is not used: it
 would not know when to read the counts that are kept elsewhere (below).
@@ -1882,10 +1898,14 @@ was read back by the Prometheus Python client's parser (21 metrics, 213 samples,
 and ending at its count); and on `SIGTERM` the next scrape said not ready while the server was still serving.
 With the hand-written version, against Qdrant, the store's own time showed up where it was spent and stopping
 Qdrant under the server showed as not ready and as failed checks; the wrapper that measures the store did not
-change.
+change. The push was received by a collector written for the test, the OTLP `MetricsService` from the
+OpenTelemetry project's protocol crate: in a test, and from the real binary, which pushed every second as
+configured with counts that matched its page, resumed by itself after the collector was killed and started
+again, and pushed once more on `SIGTERM`.
 
-**Not done:** a scrape by Prometheus, an OpenTelemetry Collector, or a Datadog Agent (none was run here); a
-second exporter (DogStatsD, OTLP), which is now a matter of choosing one; process metrics (memory, file
+**Not done:** a scrape by, or a push to, a real Prometheus, OpenTelemetry Collector, or Datadog Agent (none was
+run here); delta temporality, which some backends prefer and the exporter can be told to use; TLS to the
+collector; DogStatsD, which is another exporter; process metrics (memory, file
 descriptors), which a platform reports itself; TLS or authentication on the endpoint, which like the gRPC port
 has neither and belongs behind the mesh; and anything per brand, on purpose.
 

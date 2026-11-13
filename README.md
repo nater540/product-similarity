@@ -2024,6 +2024,8 @@ commented starting point.
 | `server.drain_notice_ms` | `5000` | On `SIGTERM`, how long the server goes on serving after it starts reporting not ready. |
 | `server.drain_deadline_ms` | `20000` | After that, how long requests in flight are given before the server stops anyway. |
 | `metrics.listen` | none (no endpoint) | Where `/metrics` is served, in the Prometheus text format. See [Metrics](#metrics). |
+| `metrics.otlp_endpoint` | none (no push) | An OpenTelemetry collector to push the same counts to over gRPC, as `http://host:4317`. |
+| `metrics.otlp_interval_ms` | `60000` | How often they are pushed. |
 | `server.import_batch_records` | `8` | The most records of an `Import` stream embedded as one batch. Larger loads a catalog faster and makes every other request wait longer while a stream runs; see [Creating records over a stream](#creating-records-over-a-stream). At least 1. |
 | `model.dir` | `models/mdbr-leaf-mt` | The model directory: what `model fetch` or the trainer wrote, with the `onnx/model.onnx` that `just export-onnx` adds. There is no setting for what runs the model or where: ONNX Runtime does, on the CPU. |
 | `model.max_tokens` | `256` | Text beyond this many tokens is ignored. Cost grows with its square. |
@@ -2332,13 +2334,17 @@ it happened or it did not, sending the request again is safe either way
 
 ### Metrics
 
-The server counts what it is doing, and a monitoring system can read the counts over HTTP. It is off until the
-config gives it an address, because it opens a second port, and a server without one keeps no counts at all:
+The server counts what it is doing, and the counts can go to a monitoring system two ways. Both are off until
+the config asks, and a server that is asked for neither keeps no counts at all:
 
 ```toml
 [metrics]
-listen = "0.0.0.0:9464"
+listen = "0.0.0.0:9464"                   # a page to be read: GET /metrics, Prometheus text format
+otlp_endpoint = "http://collector:4317"   # or pushed: OpenTelemetry (OTLP) over gRPC
+otlp_interval_ms = 60000                  # how often it is pushed
 ```
+
+**Read.** `listen` opens a second port, for whatever comes and asks.
 
 `GET /metrics` on that port answers in the Prometheus text format, which is what a Datadog Agent (its
 OpenMetrics check), an OpenTelemetry Collector (its Prometheus receiver), and Prometheus itself all read: point
@@ -2351,11 +2357,26 @@ scrape_configs:
       - targets: ["<host>:9464"]
 ```
 
-The counting is the [`metrics`](https://crates.io/crates/metrics) crate's and the page is its Prometheus
-exporter's; this server only says what is counted and where. The page a real server gave was read back with the
-Prometheus Python client's parser (21 metrics, 213 samples, every histogram cumulative and ending at its
-count). It has not been scraped by Prometheus, a Collector, or a
-Datadog Agent here.
+**Pushed.** `otlp_endpoint` sends the same counts to an OpenTelemetry collector over gRPC, every
+`otlp_interval_ms` and once more as the server stops. They arrive as OpenTelemetry metrics under the same
+names: counters as cumulative sums, latencies as histograms with the same buckets and seconds as their unit,
+label values as attributes, and `service.name` `record-similarity`. Plain `http://` only: like the server's own
+port, the client is built without TLS. A collector that cannot be reached costs the server nothing but the
+push, and it sends again when the collector is back. A failed push is logged at `debug` by the OpenTelemetry
+exporter (`RUST_LOG=info,opentelemetry-otlp=debug` shows each one), and at `WARN` here only for the last one,
+on stopping.
+
+The counting is the [`metrics`](https://crates.io/crates/metrics) crate's. The page is its Prometheus
+exporter's, and the push is the OpenTelemetry SDK's OTLP exporter behind
+[`metrics-exporter-otel`](https://crates.io/crates/metrics-exporter-otel); this server only says what is counted
+and where.
+
+What was checked: the page a real server gave was read back with the Prometheus Python client's parser (21
+metrics, 213 samples, every histogram cumulative and ending at its count). The push was received by a gRPC
+collector written for the purpose (the OTLP `MetricsService`, from the OpenTelemetry project's own protocol
+crate): the server pushed every second as configured, the counts matched the page, it resumed by itself after
+the collector was killed and started again, and it pushed once more on `SIGTERM`. Neither has been read by a
+real Prometheus, OpenTelemetry Collector, or Datadog Agent here.
 
 | Metric | What it counts |
 |---|---|
@@ -2402,9 +2423,9 @@ record_similarity_ready 1
 - **Nothing about a record is in them.** No id, no brand, no text, no score. A label is one of the words in
   the table, or the model's fingerprint. Scores, and what the thresholds make of them, are what `calibrate`
   and a shadow are for.
-- **Another way of sending them is another exporter.** The `metrics` crate has exporters that push to a
-  Datadog Agent over DogStatsD and to an OpenTelemetry collector; either would take the same counts. Neither
-  is built in: the Prometheus page is what all three systems read today.
+- **Another way of sending them is another exporter.** The `metrics` crate also has one that pushes to a
+  Datadog Agent over DogStatsD, which would take the same counts. It is not built in: a Datadog Agent reads
+  the page, and can be sent OTLP.
 - **A series that says nothing is left out**: a status code no request has ended with, and the latency of a
   call or store operation that has not been used. `OK` is there for every call from the first scrape, at zero
   if need be. A server that had just started gave 62 series, and 213 after that run; each call or store
@@ -2437,7 +2458,8 @@ a write one more small read: about 0.2 ms on an edit of 3 ms.
 The server speaks plaintext gRPC and has no authentication. Run it on a private network or behind a mesh or proxy
 that provides both. The Qdrant API key is taken from the environment, never from the config file. The metrics
 endpoint, when it is on, is plain HTTP with no authentication either, on a port of its own; it can be read and
-cannot change anything, and it carries nothing about any record.
+cannot change anything, and it carries nothing about any record. Metrics pushed to a collector go over plain
+gRPC, and carry the same and no more.
 
 ## Performance
 

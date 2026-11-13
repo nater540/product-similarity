@@ -707,8 +707,9 @@ stay words fixed in one file. (A first version was written by hand and replaced 
 rather depend on a maintained crate than maintain one.) It is off, and nothing is counted, until
 `metrics.listen` is set. Verdicts are counted with the write mode asked for, and requests that were dropped
 because their caller gave up are counted as `CANCELLED`. A request's waits (D40) are histograms and `tracing`
-spans. It was read back with the Prometheus Python client's parser and has not been scraped by Prometheus, a
-Collector, or a Datadog Agent; DogStatsD or OTLP would be another exporter of the same crate.
+spans. The same counts can be pushed to an OpenTelemetry collector over gRPC (`metrics.otlp_endpoint`). The page
+was read back with the Prometheus Python client's parser and the push was received by a collector written for
+the test; neither has met a real Prometheus, Collector, or Datadog Agent.
 
 **What.** A small HTTP endpoint in Prometheus text format: request counts and latency by call and status, the
 embedding queue's depth and wait, texts per forward pass, the share of time the model is busy, refusals for

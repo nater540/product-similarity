@@ -59,6 +59,16 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 # (docs/decisions.md, D39). No default features: the exporter's own HTTP listener and push gateway are not used.
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
+# The same counts pushed to an OpenTelemetry collector over gRPC (OTLP), for a deployment that has one. The bridge
+# from `metrics` is built against OpenTelemetry 0.31, so that is the version of all three; its gRPC client is the
+# `tonic` already here.
+# `internal-logs`: a collector that cannot be reached is said through `tracing`, like everything else here.
+metrics-exporter-otel = "0.3"
+opentelemetry = { version = "0.31", default-features = false, features = ["metrics", "internal-logs"] }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["metrics", "internal-logs"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["metrics", "grpc-tonic", "internal-logs"] }
+# The collector's side of OTLP, for the test that receives what the server sends.
+opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "metrics"] }
 
 # The default features pull in `reqwest` for snapshot downloads, which this service never does.
 qdrant-client = { version = "1.20", default-features = false }
