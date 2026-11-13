@@ -1075,10 +1075,11 @@ mod tests {
   #[tokio::test]
   async fn on_arrival_only_a_deadline_that_has_passed_is_refused() {
     let (worker, _jobs) = stalled(8);
-    assert_eq!(
-      by(Some(Instant::now()), worker.embed(texts(1))).await,
-      Err(EmbedError::TooLate)
-    );
+    // Polled once and not awaited, here and below: nothing serves this worker, so a request that is let in
+    // when it should not be would wait for ever.
+    let passed = by(Some(Instant::now()), worker.embed(texts(1)));
+    tokio::pin!(passed);
+    assert_eq!(futures_poll_once(passed.as_mut()).await, Some(Err(EmbedError::TooLate)));
     assert_eq!(worker.stats().too_late, 1);
     assert_eq!(waiting_in(&worker.stats), 0, "it never took a place");
 
@@ -1106,7 +1107,12 @@ mod tests {
       assert!(futures_poll_once(first.as_mut()).await.is_none());
       assert!(futures_poll_once(second.as_mut()).await.is_none());
       assert_eq!(waiting_in(&worker.stats), 2);
-      assert_eq!(worker.embed(texts(1)).await, Err(EmbedError::Overloaded));
+      let third = worker.embed(texts(1));
+      tokio::pin!(third);
+      assert_eq!(
+        futures_poll_once(third.as_mut()).await,
+        Some(Err(EmbedError::Overloaded))
+      );
       assert_eq!(
         waiting_in(&worker.stats),
         2,
@@ -1303,8 +1309,12 @@ mod tests {
     tokio::pin!(waiting);
     // Polled once, the first request is in the queue and waiting for an answer that will not come.
     assert!(futures_poll_once(waiting.as_mut()).await.is_none());
-    let refused = worker.embed(vec!["second".to_owned()]).await;
-    assert_eq!(refused, Err(EmbedError::Overloaded));
+    let second = worker.embed(vec!["second".to_owned()]);
+    tokio::pin!(second);
+    assert_eq!(
+      futures_poll_once(second.as_mut()).await,
+      Some(Err(EmbedError::Overloaded))
+    );
     assert_eq!(worker.stats().overloaded, 1);
     assert_eq!(worker.stats().jobs, 0, "nothing was served");
   }

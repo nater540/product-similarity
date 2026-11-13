@@ -4173,6 +4173,11 @@ mod tests {
       self.gate.add_permits(1);
     }
 
+    /// Lets every write through from now on, for a test that is not about when they land.
+    fn open_wide(&self) {
+      self.gate.add_permits(1 << 20);
+    }
+
     /// How many writes have reached the gate.
     fn arrived(&self) -> usize {
       self.arrived.load(std::sync::atomic::Ordering::Relaxed)
@@ -4275,6 +4280,19 @@ mod tests {
     true
   }
 
+  /// What `waiting` comes to, once other tasks have had every chance to run. One that never ends fails the test,
+  /// and does not hang it.
+  async fn ended<T>(waiting: &mut Pin<Box<impl Future<Output = T>>>) -> T {
+    for _ in 0..50 {
+      tokio::select! {
+        biased;
+        output = &mut *waiting => return output,
+        () = tokio::task::yield_now() => {}
+      }
+    }
+    panic!("it never ended");
+  }
+
   /// Runs `request` until one more write has reached the gate, and drops it there: a caller that hung up, or
   /// whose deadline ran out, while its write was on its way to the store. A request that never gets that far
   /// fails the test, and does not hang it.
@@ -4338,7 +4356,7 @@ mod tests {
       assert_eq!(told.len(), 2);
       assert_eq!((told[1].stored, told[1].revision), (true, 2));
 
-      let retried = retry.await.unwrap();
+      let retried = ended(&mut retry).await.unwrap();
       assert_eq!(
         (retried.verdict, retried.stored, retried.revision),
         (Verdict::Accepted, false, 2),
@@ -4409,9 +4427,7 @@ mod tests {
   fn a_write_whose_request_is_still_there_logs_nothing() {
     let (engine, _) = gated();
     let logged = warnings(async {
-      for _ in 0..3 {
-        engine.store.open();
-      }
+      engine.store.open_wide();
       engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
       engine
         .evaluate(evaluate_input(Some("p1"), &GUMMIES_EDITED))
@@ -4446,8 +4462,9 @@ mod tests {
       assert_eq!(recorder.told(), []);
 
       // The record's lock went with the request: the next one is not kept waiting.
-      engine.store.open();
-      let output = engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap();
+      engine.store.open_wide();
+      let mut next = Box::pin(engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)));
+      let output = ended(&mut next).await.unwrap();
       assert_eq!(output.verdict, Verdict::Created);
     });
     assert_eq!(logged, Vec::<serde_json::Value>::new());
@@ -4509,7 +4526,7 @@ mod tests {
   async fn a_write_that_fails_is_the_requests_error_while_the_request_is_there() {
     let (engine, recorder) = gated();
     engine.store.fail();
-    engine.store.open();
+    engine.store.open_wide();
     let error = engine.evaluate(evaluate_input(Some("p1"), &GUMMIES)).await.unwrap_err();
     assert!(matches!(error, EngineError::Unavailable(_)), "{error:?}");
     assert_eq!(recorder.told(), []);

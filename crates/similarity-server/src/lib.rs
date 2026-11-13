@@ -1267,10 +1267,10 @@ mod tests {
     }
   }
 
-  /// Waits until a request is held at the embedder's gate. Ten seconds is a bound on a broken server: a request
-  /// that never gets there fails the test, and does not hang it.
+  /// Waits until a request is held at the embedder's gate. It takes milliseconds; three seconds is a bound on
+  /// a broken server: a request that never gets there fails the test, and does not hang it.
   async fn held_at_the_gate(running: &Lived) {
-    for _ in 0..5000 {
+    for _ in 0..1500 {
       if running.waiting.load(Ordering::Relaxed) > 0 {
         return;
       }
@@ -1278,6 +1278,10 @@ mod tests {
     }
     panic!("no request reached the embedder");
   }
+
+  /// How long a test gives a server to stop once nothing keeps it. It takes milliseconds; this is a bound on a
+  /// broken one, short enough that a server that never stops fails its test promptly.
+  const STOPS_WITHIN: Duration = Duration::from_secs(8);
 
   /// The server's result once it has stopped, which it must do well within `within`.
   async fn stopped(server: tokio::task::JoinHandle<anyhow::Result<()>>, within: Duration) {
@@ -1313,7 +1317,7 @@ mod tests {
 
     running.stops.send(Stop::Now).await.unwrap();
     drop((running.client, running.channel));
-    stopped(running.server, Duration::from_secs(30)).await;
+    stopped(running.server, STOPS_WITHIN).await;
   }
 
   /// The first answer is found out, not assumed: a server that starts with its store down has never said ready.
@@ -1329,7 +1333,7 @@ mod tests {
     drop(running.stops);
     drop((running.client, running.channel));
     // Nobody left to ask it to stop is a request to stop.
-    stopped(running.server, Duration::from_secs(30)).await;
+    stopped(running.server, STOPS_WITHIN).await;
   }
 
   #[tokio::test]
@@ -1341,7 +1345,7 @@ mod tests {
     assert_eq!(health(&running.channel, LIVE).await, ServingStatus::Serving);
     running.stops.send(Stop::Now).await.unwrap();
     drop((running.client, running.channel));
-    stopped(running.server, Duration::from_secs(30)).await;
+    stopped(running.server, STOPS_WITHIN).await;
   }
 
   /// What an orchestrator's `SIGTERM` gets: out of the rotation at once, still serving while the notice lasts,
@@ -1364,7 +1368,7 @@ mod tests {
     assert_eq!(created.into_inner().verdict(), pb::Verdict::Created);
 
     drop((running.client, running.channel));
-    stopped(running.server, Duration::from_secs(30)).await;
+    stopped(running.server, STOPS_WITHIN).await;
     assert!(
       asked.elapsed() >= Duration::from_millis(400),
       "it stopped after {:?}, before the notice was over",
@@ -1379,7 +1383,7 @@ mod tests {
     let running = live(quick(), true, false).await;
     running.stops.send(Stop::Now).await.unwrap();
     drop((running.client, running.channel));
-    stopped(running.server, Duration::from_secs(30)).await;
+    stopped(running.server, STOPS_WITHIN).await;
 
     let running = live(quick(), true, false).await;
     running.stops.send(Stop::Drain).await.unwrap();
@@ -1387,7 +1391,7 @@ mod tests {
     assert!(!running.server.is_finished(), "the notice is ten minutes long");
     running.stops.send(Stop::Drain).await.unwrap();
     drop((running.client, running.channel));
-    stopped(running.server, Duration::from_secs(30)).await;
+    stopped(running.server, STOPS_WITHIN).await;
   }
 
   /// Stopping does not cut off a request that is being answered: the listener closes, and the server waits.
@@ -1407,7 +1411,7 @@ mod tests {
     let answered = in_flight.await.unwrap().unwrap();
     assert_eq!(answered.into_inner().verdict(), pb::Verdict::Created);
     drop((running.client, running.channel));
-    stopped(running.server, Duration::from_secs(30)).await;
+    stopped(running.server, STOPS_WITHIN).await;
   }
 
   /// A request that never finishes does not keep the server for ever: the deadline ends the wait, and so does
@@ -1434,7 +1438,7 @@ mod tests {
         assert!(!running.server.is_finished(), "the deadline is ten minutes away");
         running.stops.send(Stop::Now).await.unwrap();
       }
-      stopped(running.server, Duration::from_secs(30)).await;
+      stopped(running.server, STOPS_WITHIN).await;
       if !asked_twice {
         assert!(asked.elapsed() >= Duration::from_millis(200), "{:?}", asked.elapsed());
       }
@@ -1519,7 +1523,7 @@ mod tests {
       );
       running.stops.send(Stop::Now).await.unwrap();
       drop((running.client, running.channel));
-      stopped(running.server, Duration::from_secs(30)).await;
+      stopped(running.server, STOPS_WITHIN).await;
     });
     let gone = gone(&logged);
     assert_eq!(gone.len(), 1, "{logged:?}");
@@ -1541,7 +1545,7 @@ mod tests {
       assert!(!running.server.is_finished(), "a write is still on its way");
 
       running.writes_held.send_replace(false);
-      stopped(running.server, Duration::from_secs(30)).await;
+      stopped(running.server, STOPS_WITHIN).await;
     });
     assert_eq!(gone(&logged).len(), 1, "{logged:?}");
   }
@@ -1571,6 +1575,6 @@ mod tests {
     );
     running.stops.send(Stop::Now).await.unwrap();
     drop((running.client, running.channel));
-    stopped(running.server, Duration::from_secs(30)).await;
+    stopped(running.server, STOPS_WITHIN).await;
   }
 }
