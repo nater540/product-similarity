@@ -25,9 +25,10 @@ use similarity_log::Init;
 use similarity_proto::v1::record_similarity_client::RecordSimilarityClient;
 use similarity_runs::{Input, ModelRef, Spec, Status};
 use similarity_server::Stop;
+use similarity_server::anchors;
 use similarity_server::audit::{self, report::Audited, report::Shown};
 use similarity_server::config::Config;
-use similarity_server::engine::{Engine, store_layout};
+use similarity_server::engine::{Engine, Restored, store_layout};
 use similarity_server::fetch::{self, FetchRequest};
 use similarity_server::import::{self, Failure, Summary};
 use similarity_server::load;
@@ -84,6 +85,10 @@ enum Command {
   /// Check the store against a catalog: which records of an export are not stored, which stored records the
   /// export does not have, and which differ in brand, text, or quantities. Embeds nothing and writes nothing.
   Audit(AuditArgs),
+  /// Keep a copy of every record's anchor, the one thing a lost store cannot be given back from your own
+  /// database, and put anchors back after one was lost.
+  #[command(subcommand)]
+  Anchors(AnchorsCommand),
   /// Look at the runs that were recorded.
   #[command(subcommand)]
   Runs(RunsCommand),
@@ -389,6 +394,56 @@ struct CalibrateDriftArgs {
   /// Fixes the resampling behind the intervals, so that a run can be reproduced.
   #[arg(long, default_value_t = 0)]
   seed: u64,
+}
+
+#[derive(Debug, Subcommand)]
+enum AnchorsCommand {
+  /// Write the anchor of every stored record to a file. Reads the collection and changes nothing.
+  Export(AnchorsExportArgs),
+  /// Read a backup from its first line to its last and say what it is of and whether it is whole. Needs no
+  /// configuration, no model, and no store.
+  Check(AnchorsCheckArgs),
+  /// Give records the anchors a backup kept of them, after the collection was lost and the catalog imported
+  /// again. Only a record that has not been written since it was imported, and is what it was when the backup
+  /// was taken, is given one; every other is left as it is and named.
+  Restore(AnchorsRestoreArgs),
+}
+
+#[derive(Debug, Args)]
+struct AnchorsExportArgs {
+  /// The configuration file (for the model, schema, and collection to back up).
+  #[arg(long, short, default_value = "config.toml")]
+  config: PathBuf,
+  /// The file to write. It must not exist: a backup is never written over another.
+  #[arg(long)]
+  out: PathBuf,
+  /// How many records are read from the store at a time, each with a vector.
+  #[arg(long, default_value_t = 1000)]
+  page_records: usize,
+  /// The Qdrant API key.
+  #[arg(long, env = "QDRANT_API_KEY", hide_env_values = true)]
+  qdrant_api_key: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct AnchorsCheckArgs {
+  /// The backup.
+  backup: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct AnchorsRestoreArgs {
+  /// The configuration file (for the model, schema, and collection to restore into).
+  #[arg(long, short, default_value = "config.toml")]
+  config: PathBuf,
+  /// The backup, as `anchors export` wrote it.
+  backup: PathBuf,
+  /// Write nothing: say what a restore would do with each record.
+  #[arg(long)]
+  dry_run: bool,
+  /// The Qdrant API key.
+  #[arg(long, env = "QDRANT_API_KEY", hide_env_values = true)]
+  qdrant_api_key: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1506,6 +1561,200 @@ impl ImportArgs {
   }
 }
 
+/// The path a backup is written under until it is whole: beside the one it will have, so that giving it its name
+/// is a rename within one directory.
+fn partial(out: &Path) -> PathBuf {
+  let mut name = out.file_name().unwrap_or_default().to_os_string();
+  name.push(".partial");
+  out.with_file_name(name)
+}
+
+impl AnchorsExportArgs {
+  fn run(self) -> anyhow::Result<()> {
+    let config = Config::load(&self.config)?;
+    let schema = config.schema()?;
+    anyhow::ensure!(
+      !self.out.exists(),
+      "{} exists; a backup is not written over another, so name a new file",
+      self.out.display()
+    );
+    let started = std::time::Instant::now();
+
+    // Nothing is embedded. The model is loaded for its fingerprint, as for an audit: it is half of the layout,
+    // and a backup has to say which layout its vectors belong to.
+    let embedder = DirectEmbedder(load_embedder(&config, Tie::Enforced)?);
+    let (layout, dimension) = store_layout(&schema, &embedder);
+    let settings = config.qdrant.settings(self.qdrant_api_key.clone());
+    let header = anchors::file::Header {
+      format: anchors::file::FORMAT,
+      fingerprint: embedder.fingerprint().to_owned(),
+      layout: layout.clone(),
+      dimension,
+      collection: settings.collection.clone(),
+      taken_at: std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs()),
+    };
+
+    // Written under another name and given its own only when its last line is in it and on the disk: a file with
+    // the name asked for is a whole backup, whatever happened to this process.
+    let partial = partial(&self.out);
+    let file = std::fs::OpenOptions::new()
+      .write(true)
+      .create_new(true)
+      .open(&partial)
+      .with_context(|| format!("cannot create {}", partial.display()))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .context("cannot start tokio")?;
+    let written = runtime.block_on(async {
+      let store = QdrantStore::open(&settings, layout.as_str(), dimension)
+        .await
+        .with_context(|| {
+          format!(
+            "cannot look at Qdrant collection `{}` at {}",
+            settings.collection, settings.url
+          )
+        })?;
+      tracing::info!(url = %settings.url, collection = %settings.collection, "opened the Qdrant collection");
+      let skipped = |id: Option<&str>, reason: &str| tracing::warn!(id, reason, "anchor not kept");
+      let progress = |exported: &anchors::Exported| {
+        tracing::info!(
+          points = exported.points,
+          records = exported.records,
+          elapsed_s = tenths(started.elapsed()),
+          "exporting"
+        );
+      };
+      let out = std::io::BufWriter::new(file);
+      let (out, exported) = anchors::export(&store, &header, out, self.page_records, skipped, progress).await?;
+      let file = out
+        .into_inner()
+        .map_err(std::io::IntoInnerError::into_error)
+        .context("cannot write the backup")?;
+      file.sync_all().context("cannot write the backup to the disk")?;
+      anyhow::Ok(exported)
+    });
+    let exported = match written {
+      Ok(exported) => exported,
+      Err(error) => {
+        // What was written is not a backup, and its name would stop the next attempt.
+        let _ = std::fs::remove_file(&partial);
+        return Err(error);
+      }
+    };
+    std::fs::rename(&partial, &self.out)
+      .with_context(|| format!("cannot give {} its name, {}", partial.display(), self.out.display()))?;
+
+    tracing::info!(
+      target: similarity_log::RESULT,
+      out = %self.out.display(),
+      collection = settings.collection.as_str(),
+      layout = layout.as_str(),
+      points = exported.points,
+      records = exported.records,
+      other_layout = exported.other_layout,
+      unreadable = exported.unreadable,
+      elapsed_s = tenths(started.elapsed()),
+      "finished"
+    );
+    Ok(())
+  }
+}
+
+impl AnchorsCheckArgs {
+  fn run(self) -> anyhow::Result<()> {
+    let file = std::fs::File::open(&self.backup).with_context(|| format!("cannot read {}", self.backup.display()))?;
+    let whole = anchors::file::check(std::io::BufReader::new(file))
+      .with_context(|| format!("{} is not a whole backup of anchors", self.backup.display()))?;
+    tracing::info!(
+      target: similarity_log::RESULT,
+      backup = %self.backup.display(),
+      format = whole.header.format,
+      fingerprint = whole.header.fingerprint.as_str(),
+      layout = whole.header.layout.as_str(),
+      dimension = whole.header.dimension,
+      collection = whole.header.collection.as_str(),
+      taken_at = whole.header.taken_at,
+      records = whole.records,
+      "whole"
+    );
+    Ok(())
+  }
+}
+
+impl AnchorsRestoreArgs {
+  fn run(self) -> anyhow::Result<()> {
+    let config = Config::load(&self.config)?;
+    let schema = config.schema()?;
+    let open = || -> anyhow::Result<std::io::BufReader<std::fs::File>> {
+      let file = std::fs::File::open(&self.backup).with_context(|| format!("cannot read {}", self.backup.display()))?;
+      Ok(std::io::BufReader::new(file))
+    };
+    let started = std::time::Instant::now();
+
+    let embedder = DirectEmbedder(load_embedder(&config, Tie::Enforced)?);
+    let (layout, dimension) = store_layout(&schema, &embedder);
+    let settings = config.qdrant.settings(self.qdrant_api_key.clone());
+    let told = |id: &str, outcome: &Result<Restored, similarity_server::engine::EngineError>| match outcome {
+      Ok(Restored::Restored | Restored::Already) => {}
+      Ok(left_alone) => tracing::warn!(id, outcome = left_alone.code(), "anchor not restored"),
+      Err(error) => tracing::warn!(id, %error, "anchor not restored"),
+    };
+    let progress = |summary: &anchors::Summary| {
+      tracing::info!(
+        records = summary.records,
+        restored = summary.count(Restored::Restored),
+        failed = summary.failed,
+        elapsed_s = tenths(started.elapsed()),
+        "restoring"
+      );
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .context("cannot start tokio")?;
+    let summary = runtime.block_on(async {
+      // Opened, not connected to: anchors are restored to records that are stored, and a collection that is not
+      // there has none.
+      let store = QdrantStore::open(&settings, layout.as_str(), dimension)
+        .await
+        .with_context(|| {
+          format!(
+            "cannot use Qdrant collection `{}` at {}",
+            settings.collection, settings.url
+          )
+        })?;
+      tracing::info!(url = %settings.url, collection = %settings.collection, "opened the Qdrant collection");
+      let engine = Engine::new(store, embedder, schema, config.policy()?);
+      anchors::restore(&engine, (&layout, dimension), open, !self.dry_run, told, progress).await
+    })?;
+
+    tracing::info!(
+      target: similarity_log::RESULT,
+      dry_run = self.dry_run,
+      records = summary.records,
+      restored = summary.count(Restored::Restored),
+      already = summary.count(Restored::Already),
+      not_stored = summary.count(Restored::NotStored),
+      other_brand = summary.count(Restored::OtherBrand),
+      has_history = summary.count(Restored::HasHistory),
+      changed = summary.count(Restored::Changed),
+      failed = summary.failed,
+      elapsed_s = tenths(started.elapsed()),
+      "finished"
+    );
+    anyhow::ensure!(
+      summary.failed == 0,
+      "{} of {} record(s) could not be looked at; each is reported above",
+      summary.failed,
+      summary.records
+    );
+    Ok(())
+  }
+}
+
 impl AuditArgs {
   fn run(self) -> anyhow::Result<()> {
     let config = Config::load(&self.config)?;
@@ -1716,6 +1965,9 @@ fn main() -> ExitCode {
     Command::CalibrateSweep(args) => args.run(),
     Command::Import(args) => args.run(),
     Command::Audit(args) => args.run(),
+    Command::Anchors(AnchorsCommand::Export(args)) => args.run(),
+    Command::Anchors(AnchorsCommand::Check(args)) => args.run(),
+    Command::Anchors(AnchorsCommand::Restore(args)) => args.run(),
     Command::Runs(RunsCommand::List(args)) => args.run(),
     Command::Runs(RunsCommand::Compare(args)) => args.run(),
     Command::Runs(RunsCommand::Report(args)) => args.run(),
@@ -1866,6 +2118,41 @@ mod tests {
       Cli::try_parse_from(["record-similarity", "import"]).is_err(),
       "an export is required"
     );
+  }
+
+  #[test]
+  fn a_backup_of_anchors_needs_a_file_to_write_and_a_restore_writes_unless_told_not_to() {
+    let cli = Cli::parse_from(["record-similarity", "anchors", "export", "--out", "anchors.ndjson"]);
+    let Command::Anchors(AnchorsCommand::Export(args)) = cli.command else {
+      panic!("expected anchors export")
+    };
+    assert_eq!(
+      (args.config, args.out, args.page_records),
+      (PathBuf::from("config.toml"), PathBuf::from("anchors.ndjson"), 1000)
+    );
+    assert!(
+      Cli::try_parse_from(["record-similarity", "anchors", "export"]).is_err(),
+      "where to write is required"
+    );
+
+    let cli = Cli::parse_from(["record-similarity", "anchors", "restore", "anchors.ndjson"]);
+    let Command::Anchors(AnchorsCommand::Restore(args)) = cli.command else {
+      panic!("expected anchors restore")
+    };
+    assert_eq!((args.backup, args.dry_run), (PathBuf::from("anchors.ndjson"), false));
+    let cli = Cli::parse_from(["record-similarity", "anchors", "restore", "anchors.ndjson", "--dry-run"]);
+    assert!(matches!(
+      cli.command,
+      Command::Anchors(AnchorsCommand::Restore(AnchorsRestoreArgs { dry_run: true, .. }))
+    ));
+    assert!(Cli::try_parse_from(["record-similarity", "anchors", "check"]).is_err());
+
+    // Until it is whole a backup has another name, beside the one it was asked for.
+    assert_eq!(
+      partial(Path::new("backups/anchors.ndjson")),
+      PathBuf::from("backups/anchors.ndjson.partial")
+    );
+    assert_eq!(partial(Path::new("anchors")), PathBuf::from("anchors.partial"));
   }
 
   #[test]

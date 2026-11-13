@@ -208,6 +208,12 @@ import export config="config.example.toml" *flags:
 audit export config="config.example.toml" *flags:
     RUST_LOG=warn cargo run --release -q -p similarity-server -- audit --config {{ config }} {{ export }} {{ flags }}
 
+# Keep a copy of every record's anchor, or put anchors back after a collection was lost:
+# `just anchors export --config config.toml --out anchors.ndjson`, `just anchors check anchors.ndjson`,
+# `just anchors restore --config config.toml anchors.ndjson --dry-run`
+anchors *args:
+    cargo run --release -q -p similarity-server -- anchors {{ args }}
+
 # Run the server with no Qdrant at all; nothing is persisted
 serve-in-memory config="config.example.toml":
     cargo run --release -p similarity-server -- serve --config {{ config }} --in-memory
