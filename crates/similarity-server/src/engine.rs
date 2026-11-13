@@ -18,13 +18,15 @@
 //! never dropped. It runs on a task of its own to its end ([`Engine::committed`]), whoever is told is told, and
 //! if the request is gone by then, the log says what it came to (D38).
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use similarity_core::matching::{self, Candidate, Decision, Ranked};
-use similarity_core::quantity::first_values;
+use similarity_core::quantity::{self, first_values};
 use similarity_core::score::{self, Evaluation, FieldScore};
+use similarity_core::vector::cosine;
 use similarity_core::{
   FieldChange, Policy, PreparedRecord, Quantities, Quantity, QuantityChange, QuantityScore, Reason, RecordVectors,
   Schema,
@@ -238,6 +240,128 @@ pub enum Imported {
   Created,
   /// The id was already stored, and was left exactly as it was.
   Skipped,
+}
+
+/// A record's anchor as a backup kept it, and what the record was when the backup was taken.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeptAnchor {
+  /// The record's id.
+  pub id: String,
+  /// The key of the brand the record was stored under.
+  pub brand_id: Option<String>,
+  /// The anchor: the composite of the record as first stored.
+  pub anchor: Vec<f32>,
+  /// The first value the record had for each quantity.
+  pub anchor_quantities: Quantities,
+  /// The fingerprint of each field's text when the backup was taken.
+  pub hashes: BTreeMap<String, String>,
+  /// The record's quantities when the backup was taken.
+  pub quantities: Quantities,
+}
+
+/// What a backup keeps of a record that is stored.
+impl From<&StoredRecord> for KeptAnchor {
+  fn from(record: &StoredRecord) -> Self {
+    Self {
+      id: record.id.clone(),
+      brand_id: record.brand_id.clone(),
+      anchor: record.anchor.clone(),
+      anchor_quantities: record.anchor_quantities.clone(),
+      hashes: record.vectors.hashes.clone(),
+      quantities: record.quantities.clone(),
+    }
+  }
+}
+
+/// What restoring one record's anchor did, or would do. The codes are an interface: add one, never rename one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Restored {
+  /// The record has the anchor the backup kept: it was stored again since, has not been written since that, and
+  /// is what it was when the backup was taken.
+  Restored,
+  /// The record's anchor already is the one the backup kept. Nothing was written.
+  Already,
+  /// No record with that id is stored. Nothing was created: an anchor is not a record.
+  NotStored,
+  /// The record is stored under another brand than the backup has it under, and was left alone.
+  OtherBrand,
+  /// The record has an anchor that is not simply itself, or has been written since it was created. Whatever that
+  /// history is, it is the record's own, and it was left alone.
+  HasHistory,
+  /// The record is not what it was when the backup was taken, and was left alone: whether the anchor that was
+  /// kept still belongs to it is not something its text can say.
+  Changed,
+}
+
+impl Restored {
+  /// Every outcome, in the order a report lists them.
+  pub const ALL: [Self; 6] = [
+    Self::Restored,
+    Self::Already,
+    Self::NotStored,
+    Self::OtherBrand,
+    Self::HasHistory,
+    Self::Changed,
+  ];
+
+  /// The outcome's name in an event.
+  #[must_use]
+  pub const fn code(self) -> &'static str {
+    match self {
+      Self::Restored => "restored",
+      Self::Already => "already",
+      Self::NotStored => "not_stored",
+      Self::OtherBrand => "other_brand",
+      Self::HasHistory => "has_history",
+      Self::Changed => "changed",
+    }
+  }
+}
+
+/// The least cosine at which two composites are one vector. A vector that has been through a store comes back
+/// as itself to within rounding (Qdrant keeps a cosine vector at unit length), and any edit that moves a word
+/// moves a composite much further than this.
+const SAME_VECTOR: f32 = 0.999_999;
+
+const fn same_vector_at(cosine: f32) -> bool {
+  cosine >= SAME_VECTOR
+}
+
+fn same_vector(left: &[f32], right: &[f32]) -> bool {
+  cosine(left, right).is_ok_and(same_vector_at)
+}
+
+/// Whether two sets of quantities are the same amounts, as the server compares amounts: `1 g` is `1000 mg`.
+fn same_amounts(left: &Quantities, right: &Quantities) -> bool {
+  left.keys().chain(right.keys()).all(|name| {
+    quantity::compare(name, left.get(name), None, right.get(name))
+      .is_none_or(|score| score.change == QuantityChange::Unchanged)
+  })
+}
+
+/// What a restore may do with `stored`, given what a backup `kept` of the record with its id.
+///
+/// An anchor is the one thing an accepted write must never replace (D8), and a restore is no accepted write. So
+/// it gives a record an anchor only where nothing can be lost by it and nothing has to be judged: the record is
+/// its own anchor and has never been written since it was created, which is what a record is when it has just
+/// been imported again after the store was lost; and it is, field for field and amount for amount, the record
+/// the backup was taken of.
+fn restorable(stored: &StoredRecord, kept: &KeptAnchor) -> Restored {
+  if stored.brand_id != kept.brand_id {
+    return Restored::OtherBrand;
+  }
+  if same_vector(&stored.anchor, &kept.anchor) && same_amounts(&stored.anchor_quantities, &kept.anchor_quantities) {
+    return Restored::Already;
+  }
+  let its_own_anchor = same_vector(&stored.anchor, &stored.vectors.composite)
+    && same_amounts(&stored.anchor_quantities, &stored.quantities);
+  if stored.revision != 1 || !its_own_anchor {
+    return Restored::HasHistory;
+  }
+  if stored.vectors.hashes != kept.hashes || !same_amounts(&stored.quantities, &kept.quantities) {
+    return Restored::Changed;
+  }
+  Restored::Restored
 }
 
 /// What to search around.
@@ -1188,6 +1312,65 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       }
     }
     Err(contended(&record.id))
+  }
+
+  /// Gives a record the anchor a backup kept of it, if a restore may ([`Restored`] says when), and says what was
+  /// done. With `write` off nothing is written, and the answer is what would be done.
+  ///
+  /// This is for a store that was lost and loaded again from the caller's database: the records are back, and
+  /// each is its own anchor, because the server keeps no text to make the original from. Like an import it
+  /// judges nothing and embeds nothing. Unlike one it changes a record that is stored, so it is held to the rule
+  /// every write is (D35): it writes over the version it read or not at all, and looks again when it lost.
+  ///
+  /// The anchor written holds what the backup kept, and the record's own value for anything the backup's lacks,
+  /// as an anchor does for a field it never had (D8).
+  ///
+  /// # Errors
+  ///
+  /// [`EngineError::InvalidArgument`] if the anchor that was kept is not a composite of this server's layout,
+  /// and otherwise as any request that reads and writes a record.
+  pub async fn restore_anchor(&self, kept: &KeptAnchor, write: bool) -> Result<Restored, EngineError> {
+    let dimension = self.embedder.dimension();
+    self.schema.blocks(dimension, &kept.anchor).map_err(|error| {
+      EngineError::InvalidArgument(format!(
+        "the anchor kept for record `{}` is not one of this layout: {error}",
+        kept.id
+      ))
+    })?;
+
+    let held = self.hold(&kept.id).await;
+    for _ in 0..WRITE_ATTEMPTS {
+      let Some(stored) = self.store.get(&kept.id).await? else {
+        return Ok(Restored::NotStored);
+      };
+      let outcome = restorable(&stored, kept);
+      if outcome != Restored::Restored || !write {
+        return Ok(outcome);
+      }
+      let record = Arc::new(StoredRecord {
+        anchor: score::extend_anchor(&self.schema, dimension, &kept.anchor, &stored.vectors.composite)?,
+        anchor_quantities: first_values(&kept.anchor_quantities, &stored.quantities),
+        revision: stored.revision.saturating_add(1),
+        updated_at: now(),
+        ..stored.clone()
+      });
+      let (store, new, read) = (Arc::clone(&self.store), Arc::clone(&record), stored.version());
+      let write = async move {
+        let written = store.put_if(&new, Expected::Version(read)).await?;
+        Ok((
+          written,
+          if written {
+            Change::Stored(new.revision)
+          } else {
+            Change::Nothing
+          },
+        ))
+      };
+      if self.committed(&held, "restore", &kept.id, write).await? {
+        return Ok(Restored::Restored);
+      }
+    }
+    Err(contended(&kept.id))
   }
 
   /// Finds stored records similar to a stored or ad hoc record, most similar first.
@@ -3710,6 +3893,305 @@ mod tests {
     assert!(
       matches!(outcomes.as_slice(), [Err(EngineError::FailedPrecondition(message))] if message.contains("brand-1")),
       "{outcomes:?}"
+    );
+  }
+
+  /// What a backup kept of `p1`: the record as it is today (the fourth step of [`DRIFT`]), which was created as
+  /// the first step.
+  async fn kept_drifted() -> KeptAnchor {
+    let before = engine_with(Policy::new(0.75, Some(0.5)).unwrap());
+    let outcomes = before
+      .import(vec![import_of("p1", &DRIFTED, Some(&[("name", DRIFT[0])]))])
+      .await
+      .unwrap();
+    assert_eq!(outcomes, [Ok(Imported::Created)]);
+    KeptAnchor::from(&stored(&before, "p1").await.unwrap())
+  }
+
+  const DRIFTED: [(&str, &str); 2] = [("name", DRIFT[3]), ("category", "Vape Pens")];
+
+  /// The store is lost, the catalog is imported again, and the anchors are restored: drift is measured from
+  /// where each record really began, as it was before.
+  #[tokio::test]
+  async fn a_record_imported_again_gets_back_the_anchor_a_backup_kept() {
+    let kept = kept_drifted().await;
+    let engine = engine_with(Policy::new(0.75, Some(0.5)).unwrap());
+    engine.import(vec![import_of("p1", &DRIFTED, None)]).await.unwrap();
+    let imported = stored(&engine, "p1").await.unwrap();
+    assert_eq!(
+      imported.anchor, imported.vectors.composite,
+      "imported, it is its own anchor"
+    );
+
+    assert_eq!(engine.restore_anchor(&kept, true).await.unwrap(), Restored::Restored);
+    let restored = stored(&engine, "p1").await.unwrap();
+    assert_eq!(restored.anchor, kept.anchor);
+    assert_eq!(
+      restored.revision, 2,
+      "a restore is a write of the record, and is counted as one"
+    );
+    assert_eq!(
+      StoredRecord {
+        anchor: imported.anchor.clone(),
+        revision: 1,
+        updated_at: imported.updated_at,
+        ..restored.clone()
+      },
+      imported,
+      "and nothing else about the record has changed"
+    );
+
+    // The history is back: the record is where it was, and one more step the same way is too far from where it
+    // began. Before the restore the same step was measured from today and accepted.
+    let same = engine.evaluate(evaluate_input(Some("p1"), &DRIFTED)).await.unwrap();
+    assert!(same.anchor_similarity.unwrap() < 0.9, "{:?}", same.anchor_similarity);
+    let next = [("name", DRIFT[5]), ("category", "Vape Pens")];
+    let step = engine.evaluate(evaluate_input(Some("p1"), &next)).await.unwrap();
+    assert!(
+      step
+        .reasons
+        .iter()
+        .any(|reason| matches!(reason, Reason::AnchorDrift { .. })),
+      "{:?}",
+      step.reasons
+    );
+
+    // Restoring again finds nothing to do, and does nothing.
+    assert_eq!(engine.restore_anchor(&kept, true).await.unwrap(), Restored::Already);
+    assert_eq!(stored(&engine, "p1").await.unwrap(), restored);
+  }
+
+  /// The time of a record's last write is half of what the next writer names to say "still this one" (D35),
+  /// and what an audit sets an edit aside by. A restore is a write, and says when it was made.
+  #[tokio::test]
+  async fn a_restore_is_a_write_made_now_and_not_when_the_record_was_imported() {
+    let kept = kept_drifted().await;
+    let engine = engine();
+    engine.import(vec![import_of("p1", &DRIFTED, None)]).await.unwrap();
+    // As if the import had been long ago.
+    let long_ago = StoredRecord {
+      updated_at: 1_000,
+      ..stored(&engine, "p1").await.unwrap()
+    };
+    engine.store.put(&long_ago).await.unwrap();
+
+    assert_eq!(engine.restore_anchor(&kept, true).await.unwrap(), Restored::Restored);
+    let restored = stored(&engine, "p1").await.unwrap();
+    assert!(
+      restored.updated_at >= now().saturating_sub(60),
+      "{}",
+      restored.updated_at
+    );
+  }
+
+  #[tokio::test]
+  async fn a_restore_that_is_only_asked_what_it_would_do_writes_nothing() {
+    let kept = kept_drifted().await;
+    let engine = engine();
+    engine.import(vec![import_of("p1", &DRIFTED, None)]).await.unwrap();
+    let imported = stored(&engine, "p1").await.unwrap();
+
+    assert_eq!(engine.restore_anchor(&kept, false).await.unwrap(), Restored::Restored);
+    assert_eq!(stored(&engine, "p1").await.unwrap(), imported);
+  }
+
+  /// An anchor is replaced by nothing but a forced write (D8). A restore gives one only to a record that has no
+  /// history of its own to lose.
+  #[tokio::test]
+  async fn a_restore_leaves_alone_a_record_that_has_a_history_of_its_own() {
+    let kept = kept_drifted().await;
+    let left_alone = async |engine: &TestEngine| {
+      let before = stored(engine, "p1").await.unwrap();
+      assert_eq!(engine.restore_anchor(&kept, true).await.unwrap(), Restored::HasHistory);
+      assert_eq!(stored(engine, "p1").await.unwrap(), before);
+    };
+
+    // Imported with the original version the caller's database still had: that is its anchor.
+    let with_original = engine();
+    let original = [("name", DRIFT[1])];
+    with_original
+      .import(vec![import_of("p1", &DRIFTED, Some(&original))])
+      .await
+      .unwrap();
+    left_alone(&with_original).await;
+
+    // Imported, then edited: its anchor is where it was imported, and its revision says it has been written.
+    let edited = engine();
+    let engine = &edited;
+    engine.import(vec![import_of("p1", &DRIFTED, None)]).await.unwrap();
+    let edit = [("name", DRIFT[4]), ("category", "Vape Pens")];
+    assert!(engine.evaluate(evaluate_input(Some("p1"), &edit)).await.unwrap().stored);
+    left_alone(engine).await;
+
+    // Edited and then put back as it was by a reviewer: it is what the backup was taken of and it is its own
+    // anchor again, and it is so because somebody decided it should be.
+    let forced = EvaluateInput {
+      mode: WriteMode::Force,
+      ..evaluate_input(Some("p1"), &DRIFTED)
+    };
+    engine.evaluate(forced).await.unwrap();
+    let reset = stored(engine, "p1").await.unwrap();
+    assert_eq!((reset.revision, &reset.anchor), (3, &reset.vectors.composite));
+    left_alone(engine).await;
+  }
+
+  #[tokio::test]
+  async fn a_restore_leaves_alone_a_record_that_is_not_the_one_the_backup_was_taken_of() {
+    let kept = kept_drifted().await;
+    let engine = measuring_engine();
+
+    // Nothing stored under the id: an anchor is not a record, and none is made of it.
+    assert_eq!(engine.restore_anchor(&kept, true).await.unwrap(), Restored::NotStored);
+    assert_eq!(stored(&engine, "p1").await, None);
+
+    // Other text than when the backup was taken.
+    let other = [("name", DRIFT[4]), ("category", "Vape Pens")];
+    engine.import(vec![import_of("p1", &other, None)]).await.unwrap();
+    let imported = stored(&engine, "p1").await.unwrap();
+    assert_eq!(engine.restore_anchor(&kept, true).await.unwrap(), Restored::Changed);
+
+    // The same text and another amount, and the same amount in another unit, which is no change.
+    let weighing = |weight: Quantity| KeptAnchor {
+      hashes: imported.vectors.hashes.clone(),
+      quantities: [("weight".to_owned(), weight)].into(),
+      ..kept.clone()
+    };
+    engine.delete("p1".to_owned(), None).await.unwrap();
+    let mut with_weight = import_of("p1", &other, None);
+    with_weight.record.quantities = vec![("weight".to_owned(), grams(1.0))];
+    engine.import(vec![with_weight]).await.unwrap();
+    let imported = stored(&engine, "p1").await.unwrap();
+    assert_eq!(
+      engine.restore_anchor(&weighing(grams(2.0)), true).await.unwrap(),
+      Restored::Changed
+    );
+    assert_eq!(stored(&engine, "p1").await.unwrap(), imported);
+    assert_eq!(
+      engine
+        .restore_anchor(&weighing(Quantity::single(1000.0, "mg")), false)
+        .await
+        .unwrap(),
+      Restored::Restored
+    );
+
+    // The same record under another brand, or under none where the backup has one.
+    let branded = KeptAnchor {
+      brand_id: Some("brand-1".to_owned()),
+      ..weighing(grams(1.0))
+    };
+    assert_eq!(
+      engine.restore_anchor(&branded, true).await.unwrap(),
+      Restored::OtherBrand
+    );
+    assert_eq!(stored(&engine, "p1").await.unwrap(), imported);
+  }
+
+  #[tokio::test]
+  async fn a_restored_anchor_takes_the_records_own_value_for_what_the_backup_lacks() {
+    // The backup kept an anchor with a name and a weight. The record has a category and a potency as well:
+    // it cannot be the record the backup was taken of unless its fingerprints say so, so they are made to.
+    let engine = measuring_engine();
+    let mut today = import_of("p1", &DRIFTED, None);
+    today.record.quantities = vec![
+      ("weight".to_owned(), grams(2.0)),
+      ("thc".to_owned(), percent(18.0, 22.0)),
+    ];
+    engine.import(vec![today]).await.unwrap();
+    let imported = stored(&engine, "p1").await.unwrap();
+
+    let before = measuring_engine();
+    let mut original = import_of("p0", &[("name", DRIFT[0])], None);
+    original.record.quantities = vec![("weight".to_owned(), grams(1.0))];
+    before.import(vec![original]).await.unwrap();
+    let first = stored(&before, "p0").await.unwrap();
+    let kept = KeptAnchor {
+      id: "p1".to_owned(),
+      anchor: first.anchor.clone(),
+      anchor_quantities: first.anchor_quantities.clone(),
+      ..KeptAnchor::from(&imported)
+    };
+
+    assert_eq!(engine.restore_anchor(&kept, true).await.unwrap(), Restored::Restored);
+    let restored = stored(&engine, "p1").await.unwrap();
+    let schema = measured_schema((None, false));
+    let anchor = schema.blocks(64, &restored.anchor).unwrap();
+    let current = schema.blocks(64, &restored.vectors.composite).unwrap();
+    let original = schema.blocks(64, &first.anchor).unwrap();
+    // Schema order: category, description, name.
+    // A block's length depends on which other fields its composite has; what a field says is its direction.
+    assert!(
+      same_vector(anchor[0].unwrap(), current[0].unwrap()),
+      "the category the backup's anchor lacks is the record's own"
+    );
+    assert!(
+      same_vector(anchor[2].unwrap(), original[2].unwrap()),
+      "the name is the one that was kept"
+    );
+    assert!(!same_vector(anchor[2].unwrap(), current[2].unwrap()));
+    assert_eq!(restored.anchor_quantities["weight"], grams(1.0));
+    assert_eq!(restored.anchor_quantities["thc"], percent(18.0, 22.0));
+  }
+
+  #[tokio::test]
+  async fn an_anchor_that_is_not_of_this_layout_is_refused_and_nothing_is_written() {
+    let engine = engine();
+    engine.import(vec![import_of("p1", &DRIFTED, None)]).await.unwrap();
+    let imported = stored(&engine, "p1").await.unwrap();
+    let mut kept = kept_drifted().await;
+    kept.anchor.pop();
+    match engine.restore_anchor(&kept, true).await {
+      Err(EngineError::InvalidArgument(message)) => assert!(message.contains("`p1`"), "{message}"),
+      other => panic!("expected the anchor to be refused, got {other:?}"),
+    }
+    assert_eq!(stored(&engine, "p1").await.unwrap(), imported);
+  }
+
+  #[test]
+  fn two_composites_are_one_vector_from_a_cosine_of_six_nines_up() {
+    assert!(same_vector_at(1.0) && same_vector_at(SAME_VECTOR));
+    assert!(!same_vector_at(0.999_998) && !same_vector_at(0.99));
+    assert!(same_vector(&[0.6, 0.8], &[0.6, 0.8]) && same_vector(&[0.6, 0.8], &[3.0, 4.0]));
+    assert!(!same_vector(&[0.6, 0.8], &[0.8, 0.6]));
+    // Vectors that cannot be compared are not the same vector.
+    assert!(!same_vector(&[0.6, 0.8], &[0.6, 0.8, 0.0]));
+    assert!(!same_vector(&[0.0, 0.0], &[0.0, 0.0]));
+  }
+
+  #[test]
+  fn every_outcome_of_a_restore_has_its_own_code() {
+    assert_eq!(
+      Restored::ALL.map(Restored::code),
+      [
+        "restored",
+        "already",
+        "not_stored",
+        "other_brand",
+        "has_history",
+        "changed"
+      ]
+    );
+  }
+
+  /// A restore writes over the record it read, or not at all (D35): a record another replica wrote in between
+  /// has a history now, and keeps it.
+  #[tokio::test]
+  async fn a_restore_never_writes_over_what_another_replica_stored_a_moment_before() {
+    let kept = kept_drifted().await;
+    let (here, there) = replicas();
+    there.import(vec![import_of("p1", &DRIFTED, None)]).await.unwrap();
+    let edit = [("name", DRIFT[4]), ("category", "Vape Pens")];
+    here
+      .store
+      .after_read(0, rival(&there, evaluate_input(Some("p1"), &edit)));
+
+    assert_eq!(here.restore_anchor(&kept, true).await.unwrap(), Restored::HasHistory);
+    let edited = here.store.shared().get("p1").await.unwrap().unwrap();
+    assert_eq!(edited.revision, 2, "the other replica's edit, and no write after it");
+    assert_ne!(edited.anchor, kept.anchor);
+    assert_eq!(
+      here.store.reads(),
+      2,
+      "it read again when its write lost, and judged what it found"
     );
   }
 

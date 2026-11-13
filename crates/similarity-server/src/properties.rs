@@ -18,6 +18,9 @@
 //! - within one process, a record is held by one request at a time, the one that came first, a request never
 //!   waits for a request for another record, and a record has a lock only while somebody is at it (D41).
 //!
+//! - a restore of anchors from a backup changes a record only if it has no history of its own and is what the
+//!   backup was taken of, and a store that is lost, imported again, and restored has every anchor it had (D43);
+//!
 //! And the audit, which vouches for what the store holds, is held to what an import and the engine really do:
 //!
 //! - an export that was just imported audits clean, whatever is wrong with its lines;
@@ -43,8 +46,8 @@ use crate::locks::testing::Asking;
 use crate::audit::{self, Difference, Finding, Kind};
 use crate::config::ShadowEvents;
 use crate::engine::{
-  Engine, EngineError, EvaluateInput, EvaluateOutput, FindSimilarInput, ImportInput, Imported, MatchInput, Original,
-  RecordInput, SimilarTo, Verdict, WriteMode, store_layout,
+  Engine, EngineError, EvaluateInput, EvaluateOutput, FindSimilarInput, ImportInput, Imported, KeptAnchor, MatchInput,
+  Original, RecordInput, Restored, SimilarTo, Verdict, WriteMode, store_layout,
 };
 use crate::offline::calibrate::suggest_threshold;
 use crate::offline::pairs::Label;
@@ -1726,5 +1729,152 @@ proptest! {
       summary.differences(),
       summary.differ + summary.not_stored + summary.not_in_export + summary.not_compared - set_aside
     );
+  }
+}
+
+/// The record a request asks to be stored, if it asks for one.
+fn asked_to_store(request: &Request) -> Option<RecordInput> {
+  evaluate_input(request)
+    .map(|input| input.record)
+    .or_else(|| import_input(request).map(|input| input.record))
+}
+
+/// Runs `requests` and keeps, for each record that is stored at the end, the request content it was last written
+/// from: what the caller's own database would say the record is.
+async fn catalog_after(engine: &TestEngine, requests: &[Request]) -> Result<Vec<Option<RecordInput>>, TestCaseError> {
+  let mut catalog: Vec<Option<RecordInput>> = vec![None; IDS.len()];
+  for request in requests {
+    let before = stored(engine).await;
+    step(engine, request).await?;
+    let after = stored(engine).await;
+    for (index, (was, is)) in before.iter().zip(&after).enumerate() {
+      match is {
+        None => catalog[index] = None,
+        Some(record) if was.as_ref() != Some(record) => {
+          // The request that wrote it, under the brand the record ended up with.
+          catalog[index] = asked_to_store(request).map(|content| RecordInput {
+            brand_id: record.brand_id.clone(),
+            ..content
+          });
+        }
+        Some(_) => {}
+      }
+    }
+  }
+  Ok(catalog)
+}
+
+/// A cosine of six nines: one vector, as far as rounding lets two computations of it agree.
+fn one_vector(left: &[f32], right: &[f32]) -> bool {
+  cosine(left, right).is_ok_and(|cosine| cosine >= 0.999_999)
+}
+
+fn same_amounts(left: &similarity_core::Quantities, right: &similarity_core::Quantities) -> bool {
+  left.len() == right.len()
+    && left.iter().all(|(name, amount)| {
+      similarity_core::quantity::compare(name, right.get(name), None, Some(amount))
+        .is_some_and(|score| score.change == similarity_core::QuantityChange::Unchanged)
+    })
+}
+
+proptest! {
+  #![proptest_config(cases())]
+
+  /// D8 against a restore: whatever was done to a store before a backup of its anchors was taken, and whatever
+  /// was done to it afterwards, restoring the backup writes to a record only if that record has never been
+  /// written since it was created, is its own anchor, and is what the backup was taken of. Everything else it
+  /// leaves exactly as it was.
+  #[test]
+  fn a_restore_changes_only_a_record_with_no_history_that_is_what_was_backed_up(
+    before in proptest::collection::vec(request(), 0..25),
+    after in proptest::collection::vec(request(), 0..15),
+    anchor_threshold in proptest::option::of(Just(0.5_f32)),
+  ) {
+    let engine = engine(anchor_threshold, false);
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    runtime.block_on(async {
+      catalog_after(&engine, &before).await?;
+      let backup: Vec<KeptAnchor> = stored(&engine).await.iter().flatten().map(KeptAnchor::from).collect();
+      catalog_after(&engine, &after).await?;
+
+      for kept in &backup {
+        let everything = stored(&engine).await;
+        let was = engine.store().get(&kept.id).await.unwrap();
+        let outcome = sound_engine(engine.restore_anchor(kept, true).await)?;
+        let is = engine.store().get(&kept.id).await.unwrap();
+        for (other_was, other_is) in everything.iter().zip(&stored(&engine).await) {
+          if other_was.as_ref().map(|record| &record.id) != Some(&kept.id) {
+            prop_assert_eq!(other_was, other_is, "restoring `{}` changed another record", &kept.id);
+          }
+        }
+        match (outcome, was, is) {
+          (Restored::NotStored, None, None) => {}
+          (Restored::Restored, Some(was), Some(is)) => {
+            prop_assert_eq!(was.revision, 1, "it had been written since it was created");
+            prop_assert!(one_vector(&was.anchor, &was.vectors.composite), "it had an anchor that was not itself");
+            prop_assert!(same_amounts(&was.anchor_quantities, &was.quantities));
+            prop_assert_eq!(&was.vectors.hashes, &kept.hashes, "it was not the text that was backed up");
+            prop_assert!(same_amounts(&was.quantities, &kept.quantities));
+            prop_assert_eq!(&was.brand_id, &kept.brand_id);
+            // What changed is the anchor and the count of writes, and nothing the next revision is compared with.
+            prop_assert!(one_vector(&is.anchor, &kept.anchor));
+            prop_assert!(same_amounts(&is.anchor_quantities, &kept.anchor_quantities));
+            prop_assert_eq!(is.revision, 2);
+            prop_assert_eq!(
+              StoredRecord { anchor: was.anchor.clone(), anchor_quantities: was.anchor_quantities.clone(), revision: 1, updated_at: was.updated_at, ..is },
+              was
+            );
+          }
+          (Restored::Already, Some(was), Some(is)) => {
+            prop_assert!(one_vector(&was.anchor, &kept.anchor));
+            prop_assert_eq!(was, is);
+          }
+          (Restored::OtherBrand | Restored::HasHistory | Restored::Changed, Some(was), Some(is)) => {
+            prop_assert_eq!(was, is, "a record that may not be restored was written");
+          }
+          (outcome, was, is) => prop_assert!(false, "{:?} of {:?}, which became {:?}", outcome, was, is),
+        }
+      }
+      Ok::<(), TestCaseError>(())
+    })?;
+  }
+
+  /// What the backup is for. A store is lost with whatever history its records had. The catalog is imported
+  /// again from the caller's database, as it stood, and the anchors are restored: every record then has the
+  /// anchor it had, and restoring a second time finds nothing to do.
+  #[test]
+  fn a_store_that_is_lost_imported_again_and_restored_has_every_anchor_it_had(
+    requests in proptest::collection::vec(request(), 1..40),
+    anchor_threshold in proptest::option::of(Just(0.5_f32)),
+  ) {
+    let lost = engine(anchor_threshold, false);
+    let again = engine(anchor_threshold, false);
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    runtime.block_on(async {
+      let catalog = catalog_after(&lost, &requests).await?;
+      let had = stored(&lost).await;
+
+      for (content, had) in catalog.iter().zip(&had) {
+        prop_assert_eq!(content.is_some(), had.is_some());
+        let (Some(content), Some(had)) = (content, had) else { continue };
+        let imported = sound_engine(again.import(vec![ImportInput { record: content.clone(), anchor: None }]).await)?;
+        prop_assert_eq!(&imported, &[Ok(Imported::Created)], "{:?}", content);
+
+        let kept = KeptAnchor::from(had);
+        let outcome = sound_engine(again.restore_anchor(&kept, true).await)?;
+        // A record that was its own anchor when the store was lost is its own anchor again, with nothing to do.
+        let own = one_vector(&had.anchor, &had.vectors.composite) && same_amounts(&had.anchor_quantities, &had.quantities);
+        prop_assert_eq!(outcome, if own { Restored::Already } else { Restored::Restored }, "{:?}", had);
+
+        let has = again.store().get(&had.id).await.unwrap().unwrap();
+        prop_assert!(one_vector(&has.anchor, &had.anchor), "the anchor of `{}`", &had.id);
+        prop_assert!(same_amounts(&has.anchor_quantities, &had.anchor_quantities));
+        prop_assert!(one_vector(&has.vectors.composite, &had.vectors.composite));
+        prop_assert_eq!((&has.vectors.hashes, &has.brand_id), (&had.vectors.hashes, &had.brand_id));
+        prop_assert_eq!(sound_engine(again.restore_anchor(&kept, true).await)?, Restored::Already);
+        prop_assert_eq!(again.store().get(&had.id).await.unwrap().unwrap(), has);
+      }
+      Ok::<(), TestCaseError>(())
+    })?;
   }
 }
