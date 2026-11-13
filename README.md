@@ -243,6 +243,7 @@ The binary is `record-similarity` (`target/release/record-similarity` after `jus
 | `record-similarity serve [--config config.toml] [--listen ADDR] [--in-memory]` | Runs the gRPC server. |
 | `record-similarity model fetch [--repo R] [--revision REV] [--dir DIR]` | Downloads and verifies a model directory. `--dir` defaults to `models/<repository name>`, so two models never share a directory. |
 | `record-similarity import [--config config.toml] EXPORT.jsonl [--check]` | Loads a whole catalog into the store. See [Importing a catalog](#importing-a-catalog). |
+| `record-similarity audit [--config config.toml] EXPORT.jsonl [--exported-at SECONDS] [--ndjson] [--fail-on-differences]` | Checks the store against an export of the catalog, and changes nothing. See [Auditing the store against the catalog](#auditing-the-store-against-the-catalog). |
 | `record-similarity compare [--config config.toml] BEFORE.json AFTER.json` | Scores one before/after pair offline. |
 | `record-similarity calibrate [--config config.toml] PAIRS.jsonl [--full] [--split S] [--model DIR] [--ndjson]` | Scores labeled pairs and suggests a threshold. See [Choosing thresholds](#choosing-thresholds). |
 | `record-similarity calibrate-diff OLD.ndjson (NEW.ndjson \| --config-b CONFIG) [--fail-on WHAT]` | Compares two calibrations, or one under a second configuration. See [Comparing two calibrations](#comparing-two-calibrations). |
@@ -695,7 +696,9 @@ after, and what never to do.
 
 The service's stored baseline and your own database must agree, so make step 2 and your own save succeed or fail
 together as far as you can: if your save fails after an `ACCEPTED`, re-submit the previous content with
-`WRITE_MODE_FORCE` to put the baseline back (which also resets that record's drift anchor).
+`WRITE_MODE_FORCE` to put the baseline back (which also resets that record's drift anchor). Whether the two still
+agree is something to check and not to assume: `record-similarity audit` compares an export of your database
+with what the service holds ([Auditing the store against the catalog](#auditing-the-store-against-the-catalog)).
 
 **Rolling it out.** Run it in `DRY_RUN` on real traffic first and log the responses. That costs nothing, shows what
 would have been rejected, and produces exactly the data the next two sections need.
@@ -2129,6 +2132,134 @@ overall   1.000 against a threshold of 0.900
 drift     0.963 similarity to the original record
 ```
 
+### Auditing the store against the catalog
+
+The service's baselines and your own database have to agree, and they can part without either side noticing: your
+save failed after an `ACCEPTED`, a write was finished for a caller that had hung up, one side was restored from a
+backup. A baseline that is stale means the next edit is judged against a record that no longer exists.
+`record-similarity audit` reads an export of your catalog, in [the format an import reads](#importing-a-catalog),
+and the collection, and says where they disagree.
+
+```sh
+date +%s > exported-at                                                  # note when the export is taken
+just audit export.jsonl config.toml                                     # the report
+just audit export.jsonl config.toml --exported-at $(cat exported-at)    # set aside what was edited since
+just audit export.jsonl config.toml --ndjson > audit.ndjson             # every finding, as events
+just audit export.jsonl config.toml --fail-on-differences               # a non-zero exit status if anything differs
+```
+
+This is the report for a collection of 21 synthetic products that had been imported from an export and then
+changed through the API: one product edited, one forced into being another product, one deleted, and one created.
+The export was given three more lines: a product that was never stored, one with its weight written as text, and
+a line that repeats an id.
+
+```text
+export      export.jsonl
+collection  audit_demo
+layout      f46e48ee0ea2dd02-d256-t256|brand,category,description,name
+exported at 1794591798
+
+export      24 lines: 22 records, 1 invalid, 1 with an id an earlier line has
+store       21 points: 21 records of this layout, 0 of another, 0 unreadable
+
+       18  agree
+        2  differ: 0 in brand, 0 stored without a brand, 2 in text, 2 in quantities
+        2  in the export and not stored
+        1  stored and not in the export
+        1  could not be compared
+        3  of those were written since the export was taken, and are not counted below
+        3  differences
+
+lines of the export an import would refuse (1, `invalid_line`)
+  line 23 `p902` invalid record: `weight_per_item` is a quantity, not a text field; give it as a number with a unit
+
+lines whose id an earlier line has (an import skips them) (1, `duplicate_id`)
+  line 24 `p4` first on line 4
+
+in the export and not stored (2, `not_stored`)
+  line 3 `p3` brand `brand-1`
+  line 22 `p901` brand `brand-1`
+
+stored and not in the export (1, `not_in_export`)
+  `p900` brand `brand-9` (revision 1, written 1794591890) written since the export
+
+text that is not the stored text (5 fields of 2 records, `text_differs`)
+  line 1 `p1` `name` differs (revision 2, written 1794591890) written since the export
+  line 2 `p2` `brand` differs (revision 2, written 1794591890) written since the export
+  line 2 `p2` `category` differs (revision 2, written 1794591890) written since the export
+  and 2 more: `--ndjson` writes every one, `--limit` shows more here
+
+quantities that are not the stored amount (3 quantities of 2 records, `quantity_differs`)
+  line 1 `p1` `weight_per_item` differs by a factor of 1.12 (revision 2, written 1794591890) written since the export
+  line 2 `p2` `thc_per_item` in units that cannot be compared (`mg` in the export, `%` stored) (revision 2, written 1794591890) written since the export
+  line 2 `p2` `weight_per_item` differs by a factor of 40.00 (revision 2, written 1794591890) written since the export
+
+A record's anchor is not compared: the store keeps a vector of it and no fingerprint of its text.
+The store was listed while it could be written to. Audit again before acting on a record that is missing on one side.
+```
+
+What each kind of finding means, and what there is to do about it. The codes are what `--ndjson` writes:
+
+| Finding | What it means | What to do |
+|---|---|---|
+| `not_stored` | The export has the record and the store does not. | [Import](#importing-a-catalog) the same export: it creates what is missing and leaves the rest alone. |
+| `not_in_export` | The store has a record the export does not. | If the product is gone from your database, `Delete` it. If it is there, the export is incomplete. |
+| `text_differs`, `quantity_differs` | A field's text, or a quantity's amount, is not what is stored: one finding for each. Text that differs only in whitespace is the same text, and `1 g` and `1000 mg` are the same amount, as they are for the server. | Find out which side is right. If your database is, send the record with `WRITE_MODE_FORCE`, which also resets its drift anchor; that is a decision, and the audit will not make it. |
+| `brand_differs` | The record is stored under another brand than the export gives it, or the export gives it none. The server refuses every request for it that names the export's brand. | As above, by whoever knows which brand is right. |
+| `brand_not_stored` | The export gives the record a brand and it is stored without one. Such a record takes any request, from any brand. | The next accepted `Evaluate` that names the brand gives it one. |
+| `other_layout` | The record was stored by another model or with another set of fields. The server cannot read it and refuses every request for it. | [Re-index](#re-indexing): the collection holds records from before a change of model. |
+| `unreadable` | Something in the collection is not a record this service can read: a point from before a rename, or one something else wrote. | Read the reason. For a point from before `brand_id`, import into a new collection. |
+| `invalid_line`, `duplicate_id` | A line of the export an import would refuse, or one whose id an earlier line has. The first line an import would have taken for an id is the one compared. | Fix the export. A record whose only lines are invalid was not compared, and is counted under "could not be compared". |
+
+What it does, and what it will not do:
+
+- **It reads, and changes nothing.** It opens the collection without creating it or its indexes (a collection that
+  is not there is an error), and it has no mode that repairs. It needs the config, the model directory, and a
+  route to Qdrant, like `import`, and not the server.
+- **It embeds nothing.** The store keeps a fingerprint of each field's text beside the vectors, and the export's
+  text is fingerprinted the same way. The model is loaded only to ask which model it is: that is half of the
+  layout the records are stored under.
+- **It cannot see a record's anchor.** The anchor is a vector with no fingerprints, so whether a record's drift is
+  still measured from the right original is not something an audit can say. An export's `anchor` is checked as an
+  import would check it, and compared with nothing.
+- **Neither side is a snapshot.** The store is listed a page at a time (`--page-records`, 1,000 by default) while
+  the server may be writing to it, and the export was taken earlier still. A record edited in between differs
+  without anything being wrong. Give `--exported-at` the time the export was taken, in seconds since 1970, and a
+  record written at or after it is still listed, marked "written since the export", and not counted as a
+  difference. A record created or deleted while the store is being listed can be reported as missing on one
+  side: audit again before acting on one.
+- **It vouches only for what it compared.** `differences` counts everything that does not agree, including what
+  could not be compared, less what was written since the export. `--fail-on-differences` turns a count above
+  zero into a non-zero exit status, which is what a nightly job wants. A store that cannot be listed to its end
+  ends the audit with an error and no report, because every record on a page that was not read would have been
+  called missing.
+- **The export is held in memory while the store is listed.** On a laptop CPU, with Qdrant in Docker on the same
+  machine, a collection of 100,000 synthetic records (four text fields and two quantities each) was audited
+  against its export in 1.8 seconds. The process peaked at 490 MB, against 300 MB for the same audit with an
+  export of one line (most of that is the model), so the export costs about 2 KB a record for as long as the
+  audit runs.
+
+With `--ndjson` every finding is an `audit_finding` event and the counts are an `audit_summary` event, which is
+the last line of an audit that reached its end. An output without one is of an audit that did not. Each line
+carries ids and brands, and never a record's text. Seven of the fourteen lines of the audit above, with the
+envelope fields removed:
+
+```json
+{"message":"audit_finding","kind":"invalid_line","id":"p902","line":23,"reason":"invalid record: `weight_per_item` is a quantity, not a text field; give it as a number with a unit"}
+{"message":"audit_finding","kind":"duplicate_id","id":"p4","line":24,"first_line":4,"brand_id":"brand-1"}
+{"message":"audit_finding","kind":"not_in_export","id":"p900","stored_brand_id":"brand-9","revision":1,"updated_at":1794591890,"after_export":true}
+{"message":"audit_finding","kind":"text_differs","id":"p1","line":1,"brand_id":"brand-1","stored_brand_id":"brand-1","field":"name","difference":"differs","revision":2,"updated_at":1794591890,"after_export":true}
+{"message":"audit_finding","kind":"quantity_differs","id":"p1","line":1,"brand_id":"brand-1","stored_brand_id":"brand-1","quantity":"weight_per_item","difference":"differs","factor":1.125,"unit":"g","stored_unit":"g","revision":2,"updated_at":1794591890,"after_export":true}
+{"message":"audit_finding","kind":"not_stored","id":"p3","line":3,"brand_id":"brand-1"}
+{"message":"audit_summary","export":"export.jsonl","collection":"audit_demo","layout":"f46e48ee0ea2dd02-d256-t256|brand,category,description,name","exported_at":1794591798,"lines":24,"invalid_lines":1,"duplicate_ids":1,"export_records":22,"points":21,"stored_records":21,"other_layout":0,"unreadable":0,"agree":18,"differ":2,"not_stored":2,"not_in_export":1,"not_compared":1,"brand_differs":0,"brand_not_stored":0,"text_differs":2,"quantity_differs":2,"after_export":3,"findings":13,"differences":3,"elapsed_s":0.6}
+```
+
+A finding has `kind`, and whichever of these apply to it: `id`, `line` (in the export), `first_line` (of a
+repeated id), `brand_id` (the export's) and `stored_brand_id`, `field` or `quantity`, `difference` (`differs`,
+`only_in_export`, `only_in_store`, `incomparable`), `factor`, `unit` and `stored_unit`, `layout`, `reason`,
+`revision` and `updated_at` (of the stored record), and `after_export`. An `audit_layout` line before the summary
+names each other layout the collection holds records of, and how many.
+
 ### A candidate policy in the shadow
 
 `calibrate`, `calibrate-diff`, and `calibrate-sweep` say what another threshold, weight, floor, or limit makes of
@@ -2274,7 +2405,9 @@ start-up.
 1. Point `qdrant.collection` at a new, empty collection ([`model promote`](#5-promote-it) names one).
 2. Export every record from your own database and [import](#importing-a-catalog) it. The service stores vectors
    and never the text, so the text has to come from you.
-3. Restart the server on the new collection, and drop the old one when you are satisfied.
+3. [Audit](#auditing-the-store-against-the-catalog) the new collection against the same export: every record
+   should agree, and none should be under another layout.
+4. Restart the server on the new collection, and drop the old one when you are satisfied.
 
 **Drift history survives a re-index only if the export carries it.** Give each record's original version as
 `anchor` and its drift is measured from there, as before. Leave it out and each record's anchor becomes its
@@ -2845,8 +2978,8 @@ crates/
   similarity-log/       logging for both binaries: one JSON object per line, nothing else
   similarity-proto/     the .proto file and generated gRPC code
   similarity-core/      the encoder (Burn), tokenization, composite vectors, quantities, scoring, policy. No network, no async.
-  similarity-store/     the VectorStore trait, an in-memory implementation, and the Qdrant one
-  similarity-server/    config, embedding worker thread, engine, gRPC service, import, calibration, telemetry, and the `record-similarity` binary
+  similarity-store/     the VectorStore trait, the Scan trait (listing a store), an in-memory implementation, and the Qdrant one
+  similarity-server/    config, embedding worker thread, engine, gRPC service, import, audit, calibration, telemetry, and the `record-similarity` binary
   similarity-train/     fine-tuning: data, losses, the training loop, and the `record-similarity-train` binary
 data/
   calibration.sample.jsonl        synthetic labeled pairs, in the strict format
@@ -2857,7 +2990,7 @@ data/
   regression.snapshot.ndjson      what the pinned model and the example config make of them
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D41)
+  decisions.md               why things are the way they are (D1 to D42)
   data-request-prompt.md     a brief for collecting labeled production data
   import-prompt.md           a brief for loading the real catalog into a running service
   feature-suggestions.md     features that could be added, built and not, the last twelve about production
@@ -2899,6 +3032,7 @@ what that field says.
 | ``the key `owner` is now `brand_id` ``, or ``the key `listings` is now `menu_items` `` | A pairs, history, or group file from before 2026-11-12, when a record's brand was its `owner` and a menu item was a `listing`. Rename the key in the file. An import export with `tenant` is refused as an unknown field for the same reason: it is `brand_id`. |
 | ``it was stored when a record's brand was kept under `tenant` `` | The Qdrant collection was written before that rename. Use a new `qdrant.collection` and import the catalog again: read as they are, the old points would belong to no brand. |
 | `` `menu_item` is required `` from `Match` | The request has no `menu_item`. The record to match goes under that key (it was `listing` before 2026-11-12), not under `record`, and a client that drops keys it does not know sends an empty request for any other shape. |
+| `cannot look at Qdrant collection ...: ... it does not exist` (`audit`) | The config names a collection that is not there. An audit creates nothing, so check `qdrant.collection` and `qdrant.url`; `import` and `serve` are what create a collection. |
 | `INVALID_ARGUMENT: invalid record: unknown field ...` | The request used a field name the schema does not define. `Describe` lists the valid ones. |
 | `INVALID_ARGUMENT: invalid record: unknown quantity ...` | The request used a quantity the schema does not define. Add a `[quantities.<name>]` table to the config, or drop it from the request. |
 | `` invalid record: `...` is a quantity, not a text field `` | A quantity was sent as text in `fields`. Send it in `quantities`, as a number with a unit. |

@@ -6,7 +6,7 @@ and trained in [Burn](https://burn.dev), run by ONNX Runtime), compared with the
 rejected against calibrated thresholds. A record's quantities (weight, volume, potency) are compared as numbers
 beside that, never embedded. Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D41) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D42) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -45,8 +45,8 @@ changing a design. Infer conventions from the existing code first.
   anchor, or the scoring, run `PROPTEST_CASES=5000 just test` once. When a property fails, fix the code or the
   rule, keep the shrunk case as an ordinary named test, and commit the `proptest-regressions/` file it wrote.
 - **The tests of the verdict-deciding files are themselves tested** (D25). After changing the scoring, the
-  quantity comparison, the schema, the engine's write path, the calibration statistics, the match ranking, or
-  the promotion gate, run `just mutants -j 3`
+  quantity comparison, the schema, the engine's write path, the calibration statistics, the match ranking, the
+  promotion gate, or the audit's comparison, run `just mutants -j 3`
   (25 minutes; `just mutants-diff` for a quick look) from a clean checkout, never from a tree being
   edited. A surviving mutant gets a test that states the boundary. Exclude one in `.cargo/mutants.toml` only if
   the change cannot alter behavior, with the reason, and never because it is hard to kill.
@@ -68,14 +68,16 @@ changing a design. Infer conventions from the existing code first.
   code.
 - `crates/similarity-core`: encoder, strict weight loading and saving, tokenization, composite vectors, quantities,
   scoring, policy, and scoring a menu item against stored records (`matching`). Synchronous, no I/O beyond reading and writing a model directory, no network code ever (D11).
-- `crates/similarity-store`: the `VectorStore` trait, `MemoryStore`, `QdrantStore`.
+- `crates/similarity-store`: the `VectorStore` trait, the `Scan` trait (listing what a store holds, which only the
+  audit does), `MemoryStore`, `QdrantStore`.
 - `crates/similarity-runs`: the local record of runs (D23): the manifest, starting and ending a run, reading runs
   back. It records and lists; it decides nothing.
 - `crates/similarity-server`: config, the embedding worker thread, `Engine` (all behavior), the thin gRPC layer,
   `import_stream` (the loop behind the streaming `Import` call), `locks` (one lock for each record a request is
   at), `metrics` (the few numbers the server keeps
   about itself), `telemetry` (where its traces and metrics go: the exporters, the page, the traced store),
-  `model fetch`, `import`, `compare`/`calibrate`/`calibrate-drift`/`calibrate-match`/`calibrate-sweep` (the `offline` module), `load` (the load
+  `model fetch`, `import`, `audit` (the store checked against an export: `compare.rs` for one record and the counts,
+  `mod.rs` for the run, `report.rs` for the report and the events), `compare`/`calibrate`/`calibrate-drift`/`calibrate-match`/`calibrate-sweep` (the `offline` module), `load` (the load
   test), `runs` (reading recorded runs back, comparing and reporting them), `shadow` (a candidate policy judging
   live requests), `registry` (which model was put into service, and the gate), and the `record-similarity`
   binary. Keep `grpc.rs` free of decisions.
@@ -198,6 +200,21 @@ changing a design. Infer conventions from the existing code first.
   trades a stream's speed against how long every other request waits; the README's table was measured with
   `just load`. Do not make the stream wait for a batch to fill, and do not buffer more than one batch on either
   side of the loop in `import_stream.rs`: back-pressure on the sender is the transport's job.
+- **An audit reads, and vouches only for what it compared** (D42). `audit` is written against `Scan`, which has
+  no write, and opens its collection with `QdrantStore::open`, never `connect` (which creates a collection and
+  its indexes). Do not give it a repair mode or a write path: a record the store lacks is created by `import`,
+  and replacing a baseline is a forced write that is the caller's to decide. Keep `Scan` a trait of its own and
+  not a method of `VectorStore`: the engine never scans. A scan lists every point whatever its layout, names
+  what it cannot read instead of failing, and reads no vector; a store's `scan` must pass the `scanning` half of
+  the contract test. A record is `not_stored` only once the whole store has been listed: never conclude anything
+  from part of a scan. What a valid line of an export is lives in `import::prepared`, for `import --check` and
+  the audit alike, and the line compared is the first one an import would have taken. Text is compared by
+  fingerprint (`PreparedRecord::hashes`, which `Plan::finish` stores) and quantities by `quantity::compare`: do
+  not compare either another way. The anchor has no fingerprints and is not audited; the report says so, and
+  nothing may approximate it. Every count comes from `audit::Summary`, and everything looked at ends as exactly
+  one of agree, differ, not stored, not in the export, not compared (a property holds that). The `audit_*`
+  event names and fields, and the codes of `Kind` and `Difference`, are an interface like the calibration ones.
+  A line carries ids and brands, never a record's text or a fingerprint of it.
 - **A brand, once stored, must be named by every later request for that id**, including `Delete` (D14).
 - **What a supported model directory is lives in one place**, `similarity_core::model::Pipeline`. The loader and
   `model fetch` both use it; never parse `modules.json` anywhere else.
@@ -313,6 +330,8 @@ changing a design. Infer conventions from the existing code first.
   Prometheus on 9090, in Docker; the server needs `[telemetry]` set), `just observe-down`
 - Show it to an audience: `just serve-in-memory config.toml`, then `just demo --pause` (needs `uv`)
 - Load a catalog: `just import export.jsonl config.toml` (`--check` validates only)
+- Check the store against the catalog: `just audit export.jsonl config.toml` (`--ndjson` for every finding as an
+  event, `--exported-at SECONDS` to set aside what was written since, `--fail-on-differences` for an exit status)
 - Measure: `just throughput`, `just load`, `just calibrate`, `just calibrate-drift`, `just calibrate-match`, `just calibrate-sweep`, `just calibrate-diff`, `just verdict-gate old.ndjson pairs.full.jsonl`
 - Read a shadowed server's stdout: `just shadow-report shadow.ndjson --ids to-label.jsonl`
 - Put a model into service: `just promote --config candidate.toml --calibration holdout.ndjson`; then

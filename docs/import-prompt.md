@@ -205,6 +205,19 @@ that changes a product's history, and it is my decision.
 - The counts add up: created plus already stored plus failed is the number of lines, and failed is what
   `--check` predicted.
 - Load the same file once more. Everything is now "already stored", nothing is created, and it takes seconds.
+- Audit the store against the file. This needs the configuration file and a route to Qdrant, like
+  `record-similarity import`; if you loaded over the server's stream and have neither, say so and skip it.
+
+  ```sh
+  record-similarity audit --config CONFIG.toml export.jsonl --exported-at SECONDS
+  ```
+
+  `SECONDS` is when you took the export, as `date +%s` prints it. The audit reads the file and the collection,
+  embeds nothing, and writes nothing. Right after a load it should say that every product agrees:
+  `0  differences`. A product that was edited through the service since you took the export is listed and not
+  counted. Anything else it lists (in the export and not stored, stored and not in the export, stored under
+  another brand, text or quantities that differ, stored under another layout, not readable) send to me with
+  the whole report. Do not repair any of it: no `Delete`, no `WRITE_MODE_FORCE`.
 - Repeat the dry-run check on twenty products you did not check before, from as many brands, including some with
   an `anchor`, some with every quantity, and some with none.
 - `describe` still prints the fingerprint it printed at the start.
@@ -221,6 +234,7 @@ that changes a product's history, and it is my decision.
   comparable only with itself.
 - How long the load took, how it was run, and what an edit's latency was meanwhile if anyone was editing.
 - The result of every dry-run check, and anything that was not `Unchanged`.
+- The audit's report, whole, if you could run it.
 - What you could not do, and the decisions you need from me.
 
 ## Handling

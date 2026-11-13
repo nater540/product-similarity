@@ -3,12 +3,12 @@
 Features that could be added to this project, with what each is, why it matters here, how it would fit the
 code, and what it would cost. **Of the first twenty, all are built or half built (6 and 18) except 10, 14, and
 17, which the owner deferred on 2026-11-11.** Features 21 to 32 (section E) are about running the service in
-production and are proposals only: none is built. They were proposed in November 2026 from a read of the
-repository as it stood then (`README.md`, `docs/decisions.md`, and the crates); check a suggestion against the
-code before starting on it, since the code will have moved. It has moved once already: records now carry
-quantities, compared as numbers (D16), and the features that touch a verdict or a report say below what that
-means for them. `docs/plan-features.md` plans the five listed under "What to build first" against the code as it
-is now.
+production: 21, 22, 23, 24, and 26 are built, 28 is half built, and the rest are proposals. They were proposed
+in November 2026 from a read of the repository as it stood then (`README.md`, `docs/decisions.md`, and the
+crates); check a suggestion against the code before starting on it, since the code will have moved. It has
+moved once already: records now carry quantities, compared as numbers (D16), and the features that touch a
+verdict or a report say below what that means for them. `docs/plan-features.md` plans the five listed under
+"What to build first" against the code as it is now.
 
 Effort is **S** (a day or less), **M** (a few days), or **L** (a week or more). "Needs real data" says whether a
 feature is only meaningful once real labeled pairs exist. Real data never enters this repository (see
@@ -75,7 +75,7 @@ and because each would put a Python service in the loop.
 | 21 | Readiness that tells the truth, and a drain on shutdown (built) | Production | S | No |
 | 22 | Deadlines honored, writes that survive a cancelled request (built) | Production | M | No |
 | 23 | Conditional writes across replicas (built) | Production | M | No |
-| 24 | Audit of the store against the catalog | Production | M | An export |
+| 24 | Audit of the store against the catalog (built) | Production | M | An export |
 | 25 | Anchor backup and restore | Production | M | No |
 | 26 | Operational metrics (built) | Production | M | No |
 | 27 | Fair admission between brands | Production | M | No |
@@ -672,6 +672,15 @@ it removes a limitation and costs one extra read on a write.
 
 ### 24. Audit: is the store what the catalog says it is?
 
+**Built** (D42), as `record-similarity audit`. What came out differently: the scan is a trait of its own
+(`Scan`), not a method of the store trait, so that what lists a store cannot write to it; it lists every point
+whatever its layout and names what it cannot read, so records left under another model and points that still
+keep their brand under `tenant` are findings and not errors; a record stored without a brand is told apart from
+one stored under another; the audit loads the model, as `import` does, for the fingerprint that is half of the
+layout, and embeds nothing; an edit made since the export was taken can be set aside (`--exported-at`); and it
+only reports. It cannot see anchors: the store keeps a vector of an anchor and no fingerprint of its text. The
+scan reads no vectors, so feature 25 will have to add them to it.
+
 **What.** `record-similarity audit export.jsonl`: reads an export of the caller's own database (the format
 `import` reads) and the collection, and reports ids the store lacks, ids the store has that the export does not,
 records whose text or quantities differ, and records stored under another brand. No model: the store keeps a
@@ -822,7 +831,8 @@ part that puts them in order. It is also most of the model half of feature 18.
 3. **23, conditional writes.** It removes the first limitation in the README, and the store turns out to
    support it.
 4. **24 and 25, audit and anchor backup,** together: they share a scan of the store, and between them they are
-   the answer to "what if the collection and the catalog disagree, or the collection is gone".
+   the answer to "what if the collection and the catalog disagree, or the collection is gone". 24 is built; 25
+   is next, and needs the scan to read vectors.
 
 Then 26 if a metrics endpoint is wanted, and 27 before the first large integration. 28 to 31 wait on
 who the callers turn out to be; 32 waits for a model change.

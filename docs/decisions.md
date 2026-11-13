@@ -2005,3 +2005,113 @@ changes at any number of callers, were the same on both builds.
 
 **Not done:** anything about the order in which requests for *different* records reach the model, which is the
 embedding thread's (D38) and is where the remaining wait is.
+
+## D42. The store is audited against the catalog by a command that only reads
+
+The service's baseline for a record and the caller's own database have to say the same thing, and nothing could
+check that they did. They part quietly: the caller's save fails after an `ACCEPTED`, a write is finished for a
+caller that had hung up (D38), one side is restored from a backup. A stale baseline is not a cosmetic fault. The
+next edit of that record is judged against something that is no longer the record.
+
+`record-similarity audit` reads an export of the catalog, in the format an import reads (D20), lists the
+collection, and reports where they disagree: a record the store lacks, one the export lacks, one whose brand,
+text, or quantities differ, one stored under another layout, a point that cannot be read.
+
+**It needs no embedding, because the store already keeps what is compared.** Beside its vectors a stored record
+has the fingerprint of each field's normalized text, which is how the engine knows a field did not change, and
+its quantities as numbers (D16). An export's text is fingerprinted the same way, by the one function the engine
+stores them from (`PreparedRecord::hashes`, which `Plan::finish` now takes them from, held together by a
+property). Text that differs only in whitespace is therefore the same text to an audit, as it is to the server,
+and quantities are compared by `quantity::compare`, so `1 g` and `1000 mg` are one amount.
+
+**What it cannot see is the anchor,** which is a composite vector with no fingerprints. Whether a record's drift
+is still measured from the right original would take the model and the original text to say, and a comparison of
+vectors with a tolerance somebody chose. That is not an audit, so the report says the anchor is not compared and
+nothing approximates it. Storing the anchor's fingerprints would change that; it has not been needed yet.
+
+**Listing a store is a trait of its own.** `Scan` has one method, a page of what the store holds from a cursor.
+It could have been a ninth method of `VectorStore`. But the engine never scans, so the eight stores that tests
+wrap around `MemoryStore` and the one that tracing wraps around any store would each have passed on a call
+nobody makes; and code written against `Scan` cannot write, which is a stronger promise for a command that must
+change nothing than a comment would be. Both stores implement it and pass a `scanning` half of the contract
+test, and the Qdrant store has `open` beside `connect`: `connect` creates a missing collection and puts its
+payload indexes back on every start, which is right for a server and wrong for a command that looks. `open`
+refuses a collection that is not there and creates nothing.
+
+**A scan lists everything, and reads no vectors.** Every point in the collection is listed whatever its layout,
+each as what `get` would make of it: a record, a record of another layout, or something unreadable (a point that
+still keeps its brand under `tenant`, one that does not say which record it is). Those are exactly what an
+audit exists to report, so none of them ends a scan. An unreadable point names a record only if it sits where
+that record is kept: anything can be written into a payload, and taking a stray point for the record it names
+would report a readable record as unreadable. Vectors are left out because two composites are most of a
+record's size and no part of the comparison. Feature 25 (a backup of the anchors) will need them and will have
+to add them to the scan.
+
+**A scan is not a snapshot, and the contract says what it promises anyway.** Qdrant's scroll reads each page
+when it is asked for, in the order of the point ids. So: a record nobody writes during the scan is listed
+exactly once; one that is rewritten is listed once, whole, as one of its versions; one created or deleted
+meanwhile may be listed or not; and none is listed twice. Run against Qdrant 1.20.0, which showed what the
+client's documentation leaves unsaid: a page starts at the point the last one named, a scan whose next page
+starts at a point that has since been deleted goes on from the one after it, a number of points that is a whole
+number of pages ends without an empty page, and a point under a number pages like one under a UUID. On a
+replicated cluster a replica that lags could hide a point; the scroll's `read_consistency` is left unset, and
+this was not tested, there being one node here.
+
+**Rules that keep an audit from saying what it does not know:**
+
+- *A record is not stored only when the whole store has been listed.* A store that cannot be listed to its end
+  ends the audit with an error and no report. Every record on the page that was not read would otherwise be
+  reported missing.
+- *The line compared is the first one an import would have taken for that id,* because that is the line an
+  import stored (it skips an id it has created). Later lines are `duplicate_id`. What a valid line is lives in
+  one function, `import::prepared`, for `import --check` and the audit alike; writing it found that `--check`
+  passed a blank `brand_id` that the import refuses, which is fixed.
+- *A record the export names only on an invalid line is in the export.* It is not reported as missing from it;
+  it is counted as not compared. The id is recovered even from a line that is refused for a key it may not
+  have.
+- *A record stored without a brand is not a record stored under another brand.* The first takes any request
+  (D14), the second refuses them, and they are different findings.
+- *An edit made since the export was taken is not a disagreement.* With `--exported-at`, a finding on a record
+  written at or after that time says so and is not counted as a difference. The time is seconds since 1970,
+  because every time this project keeps is, and it has no crate for dates. A record written in the very second
+  the export was taken counts as written since: calling a difference that is not one costs more than setting
+  one aside.
+- *Everything looked at is counted once.* Each record either side has, and each line or point that names none,
+  ends as exactly one of agree, differ, not stored, not in the export, or not compared. `differences` is all
+  but the first, less what was written since the export, and `--fail-on-differences` fails on anything above
+  zero: an audit vouches for nothing it could not compare.
+
+Three properties (D19) hold it to what an import and the engine really do: an export that was just imported
+audits clean, whatever is wrong with its lines; one change to the store or to the export is found as the kind
+of change it is, and nothing else is; and the counts add up whatever the size of a page. A test under
+`just test-real` does the same on the real model and a real Qdrant.
+
+**It reports, and repairs nothing.** A record the store lacks is created by running the import on the same
+export, which is all an import can do (D20). A record that differs is a question of which side is right, and
+putting the caller's version in is a forced write that resets the record's anchor (D8): a decision, and the
+caller's.
+
+**The model is loaded, for its name.** The layout a server reads is the model's fingerprint and the field names
+(D12), and an audit has to look for that layout: a collection whose every record is under an older model would
+otherwise audit clean while every request for it failed. The fingerprint could be computed from the directory's
+files without building the model, but only by a second implementation of what the loader hashes and in which
+order, and a disagreement between the two would be an audit looking for the wrong layout. So the audit loads
+the model exactly as `import` does, refuses what `serve` would refuse, embeds nothing, and pays for it in
+memory: about 300 MB of a process that would otherwise need very little.
+
+**The output is a report, or events** (D15, D17): text with the counts and the first few findings of each kind,
+or with `--ndjson` one flat `audit_finding` for each finding, an `audit_layout` for each other layout, and an
+`audit_summary` last, so that an output without a summary is known to be of an audit that did not finish. Every
+count in either comes from one `Summary`. Lines carry ids and brands (the owner allowed brands in output lines
+on 2026-11-11) and never a record's text or a fingerprint of it. The names and codes are an interface from
+here on. An audit is not recorded as a run (D23): its arguments can hold the Qdrant API key.
+
+**Measured,** on a laptop CPU with Qdrant in Docker on the same machine: a collection of 100,000 synthetic
+records, four text fields and two quantities each, audited against its export in 1.8 seconds (three runs: 2.7,
+1.8, 1.8), with the store listed at 1,000 points a page. The process peaked at 490 MB against 300 MB for the
+same audit with a one-line export, so holding the export costs about 2 KB a record. Where that goes was not
+measured. Each record keeps its fingerprints and its quantities in two small maps, and keeping them as arrays
+in the schema's order is the first thing to try if an export ever does not fit; nothing has needed it.
+
+**Not built:** a repair mode; an audit of anchors; an audit through the server, for a caller that cannot reach
+Qdrant (the import got a streaming call for that reason, D33, and an audit could); a time given as a date.
