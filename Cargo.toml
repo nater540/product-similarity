@@ -52,6 +52,9 @@ tokio = { version = "1.54", features = ["rt-multi-thread", "net", "sync", "time"
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-rustls", "api-22"] }
 # The response half of a streaming call is a `Stream`. Already in the tree through `tonic`.
 tokio-stream = { version = "0.1", default-features = false }
+# The metrics endpoint is one HTTP/1.1 route (docs/decisions.md, D39). Already in the tree through `tonic`, which
+# routes with it; these two features are the listener and the protocol a scraper speaks.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 
 # The default features pull in `reqwest` for snapshot downloads, which this service never does.
 qdrant-client = { version = "1.20", default-features = false }

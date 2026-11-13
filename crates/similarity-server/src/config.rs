@@ -44,6 +44,18 @@ pub struct Config {
   /// How `Match` decides and how far it looks.
   #[serde(default)]
   pub matching: MatchingConfig,
+  /// Where a monitoring system reads the server's counts. Optional; with no address there is no endpoint.
+  #[serde(default)]
+  pub metrics: MetricsConfig,
+}
+
+/// `[metrics]`: the HTTP endpoint a monitoring system reads the server's counts from (docs/decisions.md, D39).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MetricsConfig {
+  /// The address to serve `/metrics` on, in the Prometheus text format. Not set by default: a second open port
+  /// is something a deployment asks for. The counts are kept either way.
+  pub listen: Option<SocketAddr>,
 }
 
 /// `[matching]`. The table is not called `match` because that is a keyword of the language this is written in.
@@ -468,6 +480,12 @@ impl Config {
     }
     if config.server.import_batch_records == 0 {
       bail!("`server.import_batch_records` must be at least 1");
+    }
+    if config.metrics.listen == Some(config.server.listen) {
+      bail!(
+        "`metrics.listen` is `server.listen` ({}): the metrics are plain HTTP and need an address of their own",
+        config.server.listen
+      );
     }
     if let Some(shadow) = &config.shadow {
       if shadow.name.trim().is_empty() {
@@ -997,6 +1015,26 @@ mod tests {
     assert!(format!("{error:#}").contains("reject_bellow"), "{error:#}");
 
     assert!(Config::parse(&format!("{MINIMAL}\n[modle]\ndir = \"x\"")).is_err());
+  }
+
+  /// The metrics endpoint is off until it is given an address, and the address cannot be the gRPC one: the two
+  /// speak different protocols.
+  #[test]
+  fn the_metrics_endpoint_is_off_unless_it_is_given_an_address_of_its_own() {
+    assert_eq!(Config::parse(MINIMAL).unwrap().metrics.listen, None);
+    let shipped = Config::parse(include_str!("../../../config.example.toml")).unwrap();
+    assert_eq!(shipped.metrics.listen, None, "the example opens no second port");
+
+    let on = Config::parse(&format!("[metrics]\nlisten = \"0.0.0.0:9464\"\n{MINIMAL}")).unwrap();
+    assert_eq!(on.metrics.listen, Some(SocketAddr::from(([0, 0, 0, 0], 9464))));
+
+    let same = format!("[server]\nlisten = \"127.0.0.1:7000\"\n[metrics]\nlisten = \"127.0.0.1:7000\"\n{MINIMAL}");
+    let error = Config::parse(&same).unwrap_err().to_string();
+    assert!(
+      error.contains("metrics.listen") && error.contains("127.0.0.1:7000"),
+      "{error}"
+    );
+    assert!(Config::parse(&format!("[metrics]\nlistn = \"0.0.0.0:9464\"\n{MINIMAL}")).is_err());
   }
 
   #[test]

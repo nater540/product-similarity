@@ -21,6 +21,7 @@
 use std::fmt;
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use similarity_core::matching::{self, Candidate, Decision, Ranked};
@@ -423,6 +424,8 @@ struct Delivery<T> {
   result: Option<Result<(T, Change), EngineError>>,
   call: &'static str,
   id: String,
+  /// Counts every line this writes, for a monitoring system that does not read logs.
+  unanswered: Arc<AtomicU64>,
 }
 
 impl<T> Delivery<T> {
@@ -436,7 +439,7 @@ impl<T> Drop for Delivery<T> {
     let (call, id) = (self.call, self.id.as_str());
     match &self.result {
       // Taken by the request, or a write that lost its race: nothing changed that somebody was not told about.
-      None | Some(Ok((_, Change::Nothing))) => {}
+      None | Some(Ok((_, Change::Nothing))) => return,
       Some(Ok((_, Change::Stored(revision)))) => tracing::warn!(
         call,
         id,
@@ -460,7 +463,18 @@ impl<T> Drop for Delivery<T> {
         "a write failed after the request that asked for it had gone, and may or may not have been applied"
       ),
     }
+    self.unanswered.fetch_add(1, Ordering::Relaxed);
   }
+}
+
+/// The engine's writes, as a monitoring system is told about them ([`Engine::writes`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Writes {
+  /// On their way to the store right now.
+  pub in_flight: u64,
+  /// Finished, or failed, after the request that asked for them had gone, since the engine was made. Each has a
+  /// log line.
+  pub unanswered: u64,
 }
 
 /// Counts a write as in flight for as long as it exists.
@@ -494,6 +508,8 @@ pub struct Engine<S, E> {
   lock_hasher: RandomState,
   /// How many writes are in flight.
   writes: watch::Sender<usize>,
+  /// How many writes ended with nobody to tell.
+  unanswered: Arc<AtomicU64>,
 }
 
 fn required_text(what: &str, value: Option<String>) -> Result<Option<String>, EngineError> {
@@ -555,6 +571,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       locks: (0..LOCK_STRIPES).map(|_| Arc::new(Mutex::new(()))).collect(),
       lock_hasher: RandomState::new(),
       writes: watch::Sender::new(0),
+      unanswered: Arc::default(),
     }
   }
 
@@ -641,7 +658,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
     W: Future<Output = Result<(T, Change), EngineError>> + Send + 'static,
   {
     let (held, in_flight) = (Arc::clone(held), InFlight::begin(&self.writes));
-    let delivery_id = id.to_owned();
+    let (delivery_id, unanswered) = (id.to_owned(), Arc::clone(&self.unanswered));
     let task = tokio::spawn(async move {
       let result = write.await;
       // The lock goes before the count does, and both before the result can be seen: a request that waited for
@@ -652,6 +669,7 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
         result: Some(result),
         call,
         id: delivery_id,
+        unanswered,
       }
     });
     match task.await.map(Delivery::take) {
@@ -662,6 +680,14 @@ impl<S: VectorStore, E: TextEmbedder> Engine<S, E> {
       Err(stopped) => Err(EngineError::Internal(format!(
         "the write of record `{id}` did not run to its end, and may or may not have been applied: {stopped}"
       ))),
+    }
+  }
+
+  /// How many writes are in flight, and how many have ended with nobody to tell.
+  pub fn writes(&self) -> Writes {
+    Writes {
+      in_flight: u64::try_from(*self.writes.borrow()).unwrap_or(u64::MAX),
+      unanswered: self.unanswered.load(Ordering::Relaxed),
     }
   }
 
@@ -4348,6 +4374,13 @@ mod tests {
       );
       let mut settled = Box::pin(engine.settled());
       assert!(still_waiting(&mut settled).await, "and it counts as in flight");
+      assert_eq!(
+        engine.writes(),
+        Writes {
+          in_flight: 1,
+          unanswered: 0
+        }
+      );
 
       store.open();
       assert!(!still_waiting(&mut settled).await, "the write never ended");
@@ -4356,6 +4389,14 @@ mod tests {
       assert_eq!(told.len(), 2);
       assert_eq!((told[1].stored, told[1].revision), (true, 2));
 
+      assert_eq!(
+        engine.writes(),
+        Writes {
+          in_flight: 0,
+          unanswered: 1
+        },
+        "counted where the line is written"
+      );
       let retried = ended(&mut retry).await.unwrap();
       assert_eq!(
         (retried.verdict, retried.stored, retried.revision),
@@ -4397,6 +4438,7 @@ mod tests {
       store.open();
       all_written(&engine).await;
       assert_eq!(store.inner.get("p1").await.unwrap(), None);
+      assert_eq!(engine.writes().unanswered, 3);
     });
     let said: Vec<_> = logged
       .iter()
@@ -4435,6 +4477,13 @@ mod tests {
         .unwrap();
       assert!(engine.delete("p1".to_owned(), None).await.unwrap());
       all_written(&engine).await;
+      assert_eq!(
+        engine.writes(),
+        Writes {
+          in_flight: 0,
+          unanswered: 0
+        }
+      );
     });
     assert_eq!(logged, Vec::<serde_json::Value>::new());
   }
@@ -4482,6 +4531,7 @@ mod tests {
       store.open();
       all_written(&engine).await;
       assert_eq!(recorder.told(), [], "a write that failed is not an outcome");
+      assert_eq!(engine.writes().unanswered, 1, "nobody was told of this one either");
     });
     assert_eq!(logged.len(), 1, "{logged:?}");
     let line = &logged[0];
@@ -4516,6 +4566,11 @@ mod tests {
       all_written(&engine).await;
       assert_eq!(store.inner.get("p1").await.unwrap().unwrap(), theirs);
       assert_eq!(recorder.told().len(), 1, "only the creation");
+      assert_eq!(
+        engine.writes().unanswered,
+        0,
+        "nothing changed, so there was nothing to tell"
+      );
     });
     assert_eq!(logged, Vec::<serde_json::Value>::new());
   }

@@ -30,6 +30,7 @@ use similarity_server::engine::{Engine, store_layout};
 use similarity_server::fetch::{self, FetchRequest};
 use similarity_server::import::{self, Failure, Summary};
 use similarity_server::load;
+use similarity_server::metrics::{Measured, Metrics, Polled};
 use similarity_server::offline::events::{self, Run};
 use similarity_server::offline::{self, Confidence, Offline, RecordFields, Selection, diff};
 use similarity_server::registry::{self, Registry};
@@ -578,6 +579,35 @@ async fn stop_signals(asked: tokio::sync::mpsc::Sender<Stop>) {
   }
 }
 
+/// Starts the metrics endpoint on `address`, and returns the task that serves it until it is aborted.
+async fn serve_metrics<S: VectorStore>(
+  address: std::net::SocketAddr,
+  metrics: &Arc<Metrics>,
+  engine: &Arc<Engine<Measured<S>, EmbedWorker>>,
+  worker: EmbedWorker,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+  let listener = tokio::net::TcpListener::bind(address)
+    .await
+    .with_context(|| format!("cannot serve metrics on {address}"))?;
+  tracing::info!(address = %listener.local_addr()?, path = similarity_server::metrics::PATH, "serving metrics");
+  let (metrics, engine) = (Arc::clone(metrics), Arc::clone(engine));
+  let page = move || {
+    let writes = engine.writes();
+    metrics.render(&Polled {
+      worker: Some(worker.stats()),
+      waiting: worker.waiting(),
+      writes_in_flight: writes.in_flight,
+      writes_unanswered: writes.unanswered,
+    })
+  };
+  Ok(tokio::spawn(async move {
+    if let Err(error) = similarity_server::metrics::serve(listener, page, std::future::pending()).await {
+      // The server goes on serving its callers: metrics are for watching it, not part of what it does.
+      tracing::error!(error = format!("{error:#}"), "the metrics endpoint has stopped");
+    }
+  }))
+}
+
 async fn serve_with<S: VectorStore>(
   store: S,
   worker: EmbedWorker,
@@ -588,7 +618,11 @@ async fn serve_with<S: VectorStore>(
   // A candidate policy, if the configuration names one. It is told about every judged request and decides none
   // (docs/decisions.md, D30).
   let shadow = PolicyShadow::from_config(config, worker.dimension())?.map(Arc::new);
-  let mut engine = Engine::new(store, worker, schema.clone(), policy)
+  // What the server counts about itself (docs/decisions.md, D39). The store is counted from the outside, so
+  // that no store has to know it is being measured.
+  let metrics = Arc::new(Metrics::new(worker.fingerprint()));
+  let store = Measured::new(store, Arc::clone(&metrics));
+  let mut engine = Engine::new(store, worker.clone(), schema.clone(), policy)
     .with_matching(config.matching.settings()?)
     .with_import_batch(config.server.import_batch_records);
   let mut summaries = None;
@@ -608,8 +642,17 @@ async fn serve_with<S: VectorStore>(
   tracing::info!(address = %listener.local_addr()?, "serving gRPC");
   let (asked, stops) = tokio::sync::mpsc::channel(4);
   let signals = tokio::spawn(stop_signals(asked));
-  let served = similarity_server::serve_until(Arc::new(engine), listener, stops, config.server.lifecycle()).await;
+  let engine = Arc::new(engine);
+  // Up before the first request and until after the last: a scrape during a drain is how a deploy is watched.
+  let endpoint = match config.metrics.listen {
+    Some(address) => Some(serve_metrics(address, &metrics, &engine, worker).await?),
+    None => None,
+  };
+  let served = similarity_server::serve_until(engine, listener, stops, config.server.lifecycle(), metrics).await;
   signals.abort();
+  if let Some(endpoint) = endpoint {
+    endpoint.abort();
+  }
   if let Some(summaries) = summaries {
     summaries.abort();
   }

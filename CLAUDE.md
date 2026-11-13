@@ -6,7 +6,7 @@ and trained in [Burn](https://burn.dev), run by ONNX Runtime), compared with the
 rejected against calibrated thresholds. A record's quantities (weight, volume, potency) are compared as numbers
 beside that, never embedded. Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D38) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D39) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -72,7 +72,8 @@ changing a design. Infer conventions from the existing code first.
 - `crates/similarity-runs`: the local record of runs (D23): the manifest, starting and ending a run, reading runs
   back. It records and lists; it decides nothing.
 - `crates/similarity-server`: config, the embedding worker thread, `Engine` (all behavior), the thin gRPC layer,
-  `import_stream` (the loop behind the streaming `Import` call),
+  `import_stream` (the loop behind the streaming `Import` call), `metrics` (what the server counts about itself,
+  and the HTTP endpoint that serves it),
   `model fetch`, `import`, `compare`/`calibrate`/`calibrate-drift`/`calibrate-match`/`calibrate-sweep` (the `offline` module), `load` (the load
   test), `runs` (reading recorded runs back, comparing and reporting them), `shadow` (a candidate policy judging
   live requests), `registry` (which model was put into service, and the gate), and the `record-similarity`
@@ -107,6 +108,16 @@ changing a design. Infer conventions from the existing code first.
   orchestrator would restart a healthy process because Qdrant is down), and never make a request wait on or be
   refused by readiness: it is advice to whoever routes requests. Stopping is in one order: not ready, the
   notice, the listener, the deadline. A new `VectorStore` needs a `check` that is cheap and reads no record.
+- **Metrics are counts about the process, and their names are an interface** (D39). `metrics.rs` holds them:
+  arrays of atomics, written out by hand in the Prometheus text format at `/metrics` when `metrics.listen` is
+  set. Never make a label value out of anything a request carries: no id, no brand, no text, no score. Every
+  label value is a word fixed in that file, or the model's fingerprint. Add a metric or a label value; never
+  rename one or change what it counts. Counting is always on and must stay an atomic add: nothing in a request
+  may wait on, or fail because of, a metric. A request is counted by the guard its handler makes on its first
+  line (dropped unanswered, it counts as `CANCELLED`), so a new call needs a `Call` and a guard. A store is
+  measured from outside by `Measured`; do not put counting into a store. Do not add a metrics library, a push
+  exporter, or a vendor's client: the text format is what Datadog, OpenTelemetry, and Prometheus all read, and
+  that is the reason for it.
 - **A request can be dropped anywhere it waits, and a write never is** (D38). The transport drops a handler
   when its caller's deadline runs out or the caller hangs up, so every `.await` in a request is a place it can
   end. Before the write that is free, and has to stay free: nothing may be left half done there. The write

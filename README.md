@@ -2023,6 +2023,7 @@ commented starting point.
 | `server.store_check_every_ms` | `2000` | How often the store is asked whether it still answers; readiness is that old at most. See [Health and shutdown](#health-and-shutdown). |
 | `server.drain_notice_ms` | `5000` | On `SIGTERM`, how long the server goes on serving after it starts reporting not ready. |
 | `server.drain_deadline_ms` | `20000` | After that, how long requests in flight are given before the server stops anyway. |
+| `metrics.listen` | none (no endpoint) | Where `/metrics` is served, in the Prometheus text format. See [Metrics](#metrics). |
 | `server.import_batch_records` | `8` | The most records of an `Import` stream embedded as one batch. Larger loads a catalog faster and makes every other request wait longer while a stream runs; see [Creating records over a stream](#creating-records-over-a-stream). At least 1. |
 | `model.dir` | `models/mdbr-leaf-mt` | The model directory: what `model fetch` or the trainer wrote, with the `onnx/model.onnx` that `just export-onnx` adds. There is no setting for what runs the model or where: ONNX Runtime does, on the CPU. |
 | `model.max_tokens` | `256` | Text beyond this many tokens is ignored. Cost grows with its square. |
@@ -2329,6 +2330,90 @@ Nothing is lost by a request that is cut off at the deadline: a write is one con
 it happened or it did not, sending the request again is safe either way
 ([Errors](#errors)), and an `Import` stream that ends early is sent again.
 
+### Metrics
+
+The server counts what it is doing, and a monitoring system can read the counts over HTTP. It is off until the
+config gives it an address, because it opens a second port:
+
+```toml
+[metrics]
+listen = "0.0.0.0:9464"
+```
+
+`GET /metrics` on that port answers in the Prometheus text format, which is what a Datadog Agent (its
+OpenMetrics check), an OpenTelemetry Collector (its Prometheus receiver), and Prometheus itself all read: point
+whichever you run at `http://<host>:9464/metrics`. For Prometheus that is:
+
+```yaml
+scrape_configs:
+  - job_name: record-similarity
+    static_configs:
+      - targets: ["<host>:9464"]
+```
+
+The page a real server gave was read back with the Prometheus Python client's parser (21 metrics, 164 samples,
+every histogram cumulative and ending at its count). It has not been scraped by Prometheus, a Collector, or a
+Datadog Agent here.
+
+| Metric | What it counts |
+|---|---|
+| `record_similarity_requests_total{call,code}` | Requests that ended, by call (`Evaluate`, `FindSimilar`, `Match`, `Delete`, `Import`, `Describe`) and gRPC status code. `CANCELLED` is a request whose caller gave up. |
+| `record_similarity_request_duration_seconds{call}` | A histogram of how long they took, whatever the answer. |
+| `record_similarity_requests_in_flight{call}` | Requests being served now. An `Import` stream is one for as long as it is open. |
+| `record_similarity_evaluations_total{verdict,mode}` | `Evaluate` answers by verdict (`created`, `accepted`, `rejected`, `embedded`) and by the write mode asked for (`enforce`, `dry_run`, `force`). |
+| `record_similarity_matches_total{decision}` | `Match` answers by decision (`matched`, `no_match`, `not_judged`). |
+| `record_similarity_import_records_total{outcome}` | Records of ended `Import` streams: `created`, `exists`, `failed`. |
+| `record_similarity_embed_passes_total`, `_embed_texts_total`, `_embed_requests_total` | Forward passes, texts embedded, and requests the embedding thread served. Texts over passes is how many texts share a pass. |
+| `record_similarity_embed_busy_seconds_total` | Time inside the model. Its rate is the share of the time the model is busy; at 1 the server is at its limit ([Capacity](#capacity)). |
+| `record_similarity_embed_queue_wait_seconds_total` | Time requests waited for the model. Over `_embed_requests_total` it is the mean wait. |
+| `record_similarity_embed_waiting` | Requests waiting for the model now; `model.queue_depth` is the most there can be. |
+| `record_similarity_embed_refused_total{reason}` | Requests refused without being embedded: `queue_full` (`RESOURCE_EXHAUSTED`) and `too_late` (`DEADLINE_EXCEEDED`). |
+| `record_similarity_embed_abandoned_total` | Requests passed over because their caller had gone ([Past what a server can do](#past-what-a-server-can-do)). |
+| `record_similarity_store_duration_seconds{operation}` | A histogram of how long the store took, by operation (`get`, `put_if`, `delete_if`, `search`, `search_vectors`, `check`). |
+| `record_similarity_store_errors_total{operation}` | Store operations that ended in an error. |
+| `record_similarity_writes_in_flight` | Writes on their way to the store now. |
+| `record_similarity_writes_unanswered_total` | Writes that finished, or failed, after their caller had gone. Each has a `WARN` line ([Errors](#errors)). |
+| `record_similarity_ready` | 1 while the readiness check passes, 0 otherwise ([Health and shutdown](#health-and-shutdown)). |
+| `record_similarity_model_info{fingerprint}`, `record_similarity_build_info{version}` | Always 1; the label is the point. |
+
+What a server answered after a short `just load` run, in part:
+
+```text
+record_similarity_requests_total{call="Evaluate",code="OK"} 182
+record_similarity_request_duration_seconds_bucket{call="Evaluate",le="0.001"} 50
+record_similarity_request_duration_seconds_bucket{call="Evaluate",le="0.005"} 101
+record_similarity_request_duration_seconds_bucket{call="Evaluate",le="0.025"} 182
+record_similarity_request_duration_seconds_sum{call="Evaluate"} 1.276893375
+record_similarity_request_duration_seconds_count{call="Evaluate"} 182
+record_similarity_evaluations_total{verdict="accepted",mode="enforce"} 100
+record_similarity_embed_passes_total 74
+record_similarity_embed_texts_total 578
+record_similarity_embed_busy_seconds_total 0.459780921
+record_similarity_store_duration_seconds_count{operation="put_if"} 150
+record_similarity_ready 1
+```
+
+- **Nothing about a record is in them.** No id, no brand, no text, no score. A label is one of the words in
+  the table, or the model's fingerprint. Scores, and what the thresholds make of them, are what `calibrate`
+  and a shadow are for.
+- **The counts are kept whether or not anything reads them**, so turning the endpoint on changes nothing about
+  how the server behaves.
+- **A series that says nothing is left out**: a status code no request has ended with, and the latency of a
+  call or store operation that has not been used. `OK` is there for every call from the first scrape, at zero
+  if need be. A server that had just started gave 66 series, and 164 after that run; each call or store
+  operation that comes into use adds its 14. That matters where series are what you pay for.
+- **Latencies are counted into buckets from 1 ms to 2.5 s.** The buckets are how finely a latency can be read
+  back, not limits on anything.
+- **The endpoint is up from before the first request until the server has stopped**, so a drain can be watched:
+  after `SIGTERM`, `record_similarity_ready` was 0 on the next scrape, with the server still serving.
+- **The names are an interface**, like the event names: a metric or a label value may be added, and none will
+  be renamed.
+
+What to look at first: the rate of `_embed_busy_seconds_total` (how close to its limit the model is), the
+share of requests that end in each `code`, `_embed_refused_total` and `_embed_abandoned_total` (callers being
+turned away or giving up), `_store_errors_total` and the store's latency, `_writes_unanswered_total`, and
+`record_similarity_ready`.
+
 ### Capacity
 
 One thread runs the model, and the backend spreads each forward pass across the machine's cores, so a server scales
@@ -2343,7 +2428,9 @@ a write one more small read: about 0.2 ms on an edit of 3 ms.
 ### Security
 
 The server speaks plaintext gRPC and has no authentication. Run it on a private network or behind a mesh or proxy
-that provides both. The Qdrant API key is taken from the environment, never from the config file.
+that provides both. The Qdrant API key is taken from the environment, never from the config file. The metrics
+endpoint, when it is on, is plain HTTP with no authentication either, on a port of its own; it can be read and
+cannot change anything, and it carries nothing about any record.
 
 ## Performance
 
@@ -2494,7 +2581,7 @@ in flight at once; that is not built.
 In service, every `evaluate`, `find_similar`, `match`, and `delete` log line carries `elapsed_ms`: the time from
 the first line of the handler to the log line. An `Import` stream writes one `import` line when it ends, with how
 many records it created, found stored, and failed, how many batches it made, and how often it waited for the
-model.
+model. What the server is doing as a whole, as counts for a monitoring system, is under [Metrics](#metrics).
 
 ### The ONNX engine
 

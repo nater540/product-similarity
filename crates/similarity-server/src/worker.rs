@@ -299,6 +299,11 @@ impl EmbedWorker {
     Ok(handle)
   }
 
+  /// How many requests are waiting for the model right now.
+  pub fn waiting(&self) -> u64 {
+    self.stats.waiting.load(Ordering::Relaxed)
+  }
+
   /// What the embedding thread has done so far.
   pub fn stats(&self) -> WorkerSnapshot {
     let read = |counter: &AtomicU64| counter.load(Ordering::Relaxed);

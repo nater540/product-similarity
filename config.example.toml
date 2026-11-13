@@ -123,6 +123,15 @@ weight = 2.0
 # right one may not be among the first few. `calibrate-match` reports what a given value loses.
 overfetch = 5
 
+# Counts about the server itself (requests, latency, the embedding queue, the store, verdicts), for a monitoring
+# system to read. Optional, and off unless `listen` is set: the counts are kept either way, and this opens a
+# second port to serve them on, as plain HTTP at /metrics in the Prometheus text format, which a Datadog agent,
+# an OpenTelemetry collector, and Prometheus all read. Nothing about any record is in them. Use 0.0.0.0 inside a
+# container; 9464 is the port OpenTelemetry's Prometheus exporters use.
+#
+#   [metrics]
+#   listen = "127.0.0.1:9464"
+
 # A candidate policy, judged in the shadow of the one above. Optional, and off unless the table is there.
 #
 # With it, the server judges every revision a second time under the candidate (the same vectors, against the same

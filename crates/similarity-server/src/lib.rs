@@ -10,6 +10,7 @@
 //! - [`fetch`]: downloading and verifying a model directory.
 //! - [`import`]: loading a whole catalog into the store, a batch at a time.
 //! - [`import_stream`]: the same over a streaming call, sharing the model with live requests.
+//! - [`metrics`]: counts about the process, and the HTTP endpoint a monitoring system reads them from.
 //! - [`offline`]: comparing and calibrating from the command line, without a store.
 //! - [`shadow`]: a candidate policy judging live requests without deciding any.
 //! - [`registry`]: the record of which model was put into service, and the gate that lets one in.
@@ -25,6 +26,7 @@ pub mod grpc;
 pub mod import;
 pub mod import_stream;
 pub mod load;
+pub mod metrics;
 pub mod offline;
 #[cfg(test)]
 mod properties;
@@ -47,6 +49,7 @@ use tonic::transport::server::TcpIncoming;
 
 use crate::engine::Engine;
 use crate::grpc::GrpcService;
+use crate::metrics::Metrics;
 use crate::worker::TextEmbedder;
 
 /// How the server reports its health, and how it stops (docs/decisions.md, D37).
@@ -105,8 +108,10 @@ where
     // Kept, and never used again: a sender that is dropped would read as a second request to stop.
     std::future::pending::<()>().await;
   };
+  // Counted like any server's requests, and read by nobody: this caller asked for no endpoint.
+  let metrics = Arc::new(Metrics::new(&engine.describe().model_fingerprint));
   tokio::select! {
-    served = serve_until(engine, listener, stops, Lifecycle::default()) => served,
+    served = serve_until(engine, listener, stops, Lifecycle::default(), metrics) => served,
     () = ask => Ok(()),
   }
 }
@@ -129,6 +134,9 @@ where
 /// Taking a bound listener rather than an address lets a caller bind port 0 and learn the port before serving,
 /// which is how the end-to-end tests run.
 ///
+/// Every request is counted into `metrics`, and so is the readiness answer; serving them to a monitoring system
+/// is the caller's to do or not ([`metrics::serve`]).
+///
 /// # Errors
 ///
 /// Returns an error if the reflection descriptor cannot be loaded or the transport fails.
@@ -137,6 +145,7 @@ pub async fn serve_until<S, E>(
   listener: TcpListener,
   mut stops: mpsc::Receiver<Stop>,
   lifecycle: Lifecycle,
+  metrics: Arc<Metrics>,
 ) -> anyhow::Result<()>
 where
   S: VectorStore,
@@ -144,8 +153,9 @@ where
 {
   let (health_reporter, health_service) = tonic_health::server::health_reporter();
   // The first answer is found out before the listener can be asked for it, so that it is never a guess.
-  let ready = report::<S, E>(&health_reporter, None, checked(&engine, lifecycle).await).await;
-  let watch = tokio::spawn(watch(Arc::clone(&engine), health_reporter.clone(), lifecycle, ready));
+  let told = (health_reporter.clone(), Arc::clone(&metrics));
+  let ready = report::<S, E>(&told, None, checked(&engine, lifecycle).await).await;
+  let watch = tokio::spawn(watch(Arc::clone(&engine), told, lifecycle, ready));
   let reflection = tonic_reflection::server::Builder::configure()
     .register_encoded_file_descriptor_set(similarity_proto::FILE_DESCRIPTOR_SET)
     // Without this the health service still answers, but reflection-driven tools such as `grpcurl` cannot find it.
@@ -158,7 +168,10 @@ where
   let server = Server::builder()
     .add_service(health_service)
     .add_service(reflection)
-    .add_service(RecordSimilarityServer::new(GrpcService::new(engine)))
+    .add_service(RecordSimilarityServer::new(GrpcService::new(
+      engine,
+      Arc::clone(&metrics),
+    )))
     // `TcpIncoming` rather than a bare stream of connections: only it applies `TCP_NODELAY`, without which Nagle's
     // algorithm can hold a small unary response back for tens of milliseconds, several times the cost of
     // computing it.
@@ -181,6 +194,7 @@ where
   health_reporter
     .set_not_serving::<RecordSimilarityServer<GrpcService<S, E>>>()
     .await;
+  metrics.set_ready(false);
   let notice = match stop {
     Stop::Now => Duration::ZERO,
     Stop::Drain => lifecycle.drain_notice,
@@ -251,14 +265,18 @@ where
   }
 }
 
+/// Who is told the server's readiness: the health service, which callers ask, and the metrics.
+type Told = (tonic_health::server::HealthReporter, Arc<Metrics>);
+
 /// Makes the readiness answer what was just found, and says so when that is a change. `was` is the answer before
 /// (`None` before the first), and the answer now is returned.
-async fn report<S, E>(reporter: &tonic_health::server::HealthReporter, was: Option<bool>, found: Option<String>) -> bool
+async fn report<S, E>((reporter, metrics): &Told, was: Option<bool>, found: Option<String>) -> bool
 where
   S: VectorStore,
   E: TextEmbedder,
 {
   let ready = found.is_none();
+  metrics.set_ready(ready);
   if was == Some(ready) {
     return ready;
   }
@@ -283,18 +301,14 @@ where
 }
 
 /// Keeps the readiness answer true for as long as the server serves.
-async fn watch<S, E>(
-  engine: Arc<Engine<S, E>>,
-  reporter: tonic_health::server::HealthReporter,
-  lifecycle: Lifecycle,
-  mut ready: bool,
-) where
+async fn watch<S, E>(engine: Arc<Engine<S, E>>, told: Told, lifecycle: Lifecycle, mut ready: bool)
+where
   S: VectorStore,
   E: TextEmbedder,
 {
   loop {
     tokio::time::sleep(lifecycle.store_check_every).await;
-    ready = report::<S, E>(&reporter, Some(ready), checked(&engine, lifecycle).await).await;
+    ready = report::<S, E>(&told, Some(ready), checked(&engine, lifecycle).await).await;
   }
 }
 
@@ -1159,6 +1173,7 @@ mod tests {
     waiting: Arc<AtomicUsize>,
     writes_held: Arc<tokio::sync::watch::Sender<bool>>,
     writes: Arc<AtomicUsize>,
+    metrics: Arc<Metrics>,
   }
 
   /// A server over a store and an embedder the test controls. `open` says whether the embedder's gate starts
@@ -1199,7 +1214,8 @@ mod tests {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (stops, asked) = mpsc::channel(4);
-    let server = tokio::spawn(serve_until(engine, listener, asked, lifecycle));
+    let metrics = Arc::new(Metrics::new("word-bag-v1"));
+    let server = tokio::spawn(serve_until(engine, listener, asked, lifecycle, Arc::clone(&metrics)));
     let channel = Channel::from_shared(format!("http://{address}"))
       .unwrap()
       .connect()
@@ -1217,6 +1233,7 @@ mod tests {
       waiting,
       writes_held,
       writes,
+      metrics,
     }
   }
 
@@ -1300,14 +1317,21 @@ mod tests {
     assert_eq!(health(&running.channel, LIVE).await, ServingStatus::Serving);
     assert_eq!(health(&running.channel, READY).await, ServingStatus::Serving);
 
+    assert_eq!(counted(&running.metrics, "record_similarity_ready"), Some(1));
     running.down.store(true, Ordering::Relaxed);
     becomes(&running.channel, ServingStatus::NotServing).await;
     assert_eq!(health(&running.channel, LIVE).await, ServingStatus::Serving);
+    assert_eq!(
+      counted(&running.metrics, "record_similarity_ready"),
+      Some(0),
+      "the metrics say what the health service says"
+    );
     // Not ready is advice to whoever routes requests, not a gate: what arrives is still answered.
     running.client.describe(pb::DescribeRequest {}).await.unwrap();
 
     running.down.store(false, Ordering::Relaxed);
     becomes(&running.channel, ServingStatus::Serving).await;
+    assert_eq!(counted(&running.metrics, "record_similarity_ready"), Some(1));
 
     // A check that gets no answer at all is no answer: the watch does not wait on it for ever.
     running.silent.store(true, Ordering::Relaxed);
@@ -1575,6 +1599,146 @@ mod tests {
     );
     running.stops.send(Stop::Now).await.unwrap();
     drop((running.client, running.channel));
+    stopped(running.server, STOPS_WITHIN).await;
+  }
+
+  // ---- What the server counts about itself (D39) -------------------------------------------------------------
+
+  /// The value of the series that is exactly `series`, in what the server has counted so far.
+  fn counted(metrics: &Metrics, series: &str) -> Option<u64> {
+    metrics
+      .render(&crate::metrics::Polled::default())
+      .lines()
+      .find_map(|line| line.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
+  }
+
+  /// Through a real connection: every request is counted once, as the call it was and under the status code its
+  /// caller was given, and a verdict is counted for each one that got one.
+  #[tokio::test]
+  async fn what_the_server_counts_is_what_its_callers_were_told() {
+    let running = live(quick(), true, false).await;
+    let requests = |call: &str, code: &str| {
+      let series = format!("record_similarity_requests_total{{call=\"{call}\",code=\"{code}\"}}");
+      counted(&running.metrics, &series)
+    };
+    let evaluations = |verdict: &str, mode: &str| {
+      let series = format!("record_similarity_evaluations_total{{verdict=\"{verdict}\",mode=\"{mode}\"}}");
+      counted(&running.metrics, &series)
+    };
+    assert_eq!(requests("Evaluate", "OK"), Some(0), "there from the start");
+
+    let mut client = running.client.clone();
+    client.evaluate(named("blueberry gummies")).await.unwrap();
+    client.evaluate(named("blueberry gummies 100mg")).await.unwrap();
+    client.evaluate(named("sour diesel vape cartridge")).await.unwrap();
+    let preview = pb::EvaluateRequest {
+      mode: pb::WriteMode::DryRun.into(),
+      ..named("sour diesel vape cartridge")
+    };
+    client.evaluate(preview).await.unwrap();
+    let unknown_field = pb::EvaluateRequest {
+      record: Some(pb::Record {
+        fields: HashMap::from([("colour".to_owned(), "blue".to_owned())]),
+        ..pb::Record::default()
+      }),
+      ..pb::EvaluateRequest::default()
+    };
+    client.evaluate(unknown_field).await.unwrap_err();
+    client.describe(pb::DescribeRequest {}).await.unwrap();
+    let nobody = pb::FindSimilarRequest {
+      query: Some(pb::find_similar_request::Query::Id("nope".to_owned())),
+      ..pb::FindSimilarRequest::default()
+    };
+    client.find_similar(nobody).await.unwrap_err();
+    let menu_item = pb::MatchRequest {
+      menu_item: Some(pb::Record {
+        fields: HashMap::from([("name".to_owned(), "blueberry gummies".to_owned())]),
+        ..pb::Record::default()
+      }),
+      ..pb::MatchRequest::default()
+    };
+    client.r#match(menu_item).await.unwrap();
+    let gone = pb::DeleteRequest {
+      id: "p1".to_owned(),
+      brand_id: None,
+    };
+    client.delete(gone).await.unwrap();
+
+    assert_eq!(requests("Evaluate", "OK"), Some(4));
+    assert_eq!(requests("Evaluate", "INVALID_ARGUMENT"), Some(1));
+    assert_eq!(requests("Describe", "OK"), Some(1));
+    assert_eq!(requests("FindSimilar", "NOT_FOUND"), Some(1));
+    assert_eq!(requests("FindSimilar", "OK"), Some(0));
+    assert_eq!(requests("Match", "OK"), Some(1));
+    assert_eq!(requests("Delete", "OK"), Some(1));
+    assert_eq!(evaluations("created", "enforce"), Some(1));
+    assert_eq!(evaluations("accepted", "enforce"), Some(1));
+    assert_eq!(evaluations("rejected", "enforce"), Some(1));
+    assert_eq!(evaluations("rejected", "dry_run"), Some(1));
+    let not_judged = "record_similarity_matches_total{decision=\"not_judged\"}";
+    assert_eq!(counted(&running.metrics, not_judged), Some(1));
+    let durations = "record_similarity_request_duration_seconds_count{call=\"Evaluate\"}";
+    assert_eq!(
+      counted(&running.metrics, durations),
+      Some(5),
+      "every one of them took some time"
+    );
+
+    running.stops.send(Stop::Now).await.unwrap();
+    drop((running.client, running.channel, client));
+    stopped(running.server, STOPS_WITHIN).await;
+  }
+
+  /// Waits for a count to become `wanted`: what a handler counts as it ends is counted a moment after its caller
+  /// has the answer. A count that never gets there fails the assertion that follows.
+  async fn becomes_counted(metrics: &Metrics, series: &str, wanted: u64) {
+    for _ in 0..1000 {
+      if counted(metrics, series) == Some(wanted) {
+        return;
+      }
+      tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+  }
+
+  /// One stream is one call, open for as long as it runs, and its records are counted by what became of them.
+  /// And a request whose caller gave up is counted as the transport reports it, with nothing left in flight.
+  #[tokio::test]
+  async fn a_stream_and_a_caller_that_gave_up_are_counted_too() {
+    let running = live(quick(), true, false).await;
+    let mut client = running.client.clone();
+    let streamed = [1, 2, 3].map(|number| pb::ImportRequest {
+      record: Some(pb::Record {
+        id: Some(format!("import-{number}")),
+        fields: HashMap::from([("name".to_owned(), format!("peach rings {number}"))]),
+        ..pb::Record::default()
+      }),
+      anchor: None,
+    });
+    let mut answers = client.import(tokio_stream::iter(streamed)).await.unwrap().into_inner();
+    while answers.message().await.unwrap().is_some() {}
+    let streams = "record_similarity_requests_total{call=\"Import\",code=\"OK\"}";
+    becomes_counted(&running.metrics, streams, 1).await;
+    assert_eq!(counted(&running.metrics, streams), Some(1));
+    let created = "record_similarity_import_records_total{outcome=\"created\"}";
+    assert_eq!(counted(&running.metrics, created), Some(3));
+
+    // A caller that gives up: the embedder is held, and the deadline runs out.
+    assert!(running.gate.forget_permits(usize::MAX) > 0);
+    let refused = client
+      .evaluate(impatient("blueberry gummies", Duration::from_millis(100)))
+      .await
+      .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::Cancelled);
+    let cancelled = "record_similarity_requests_total{call=\"Evaluate\",code=\"CANCELLED\"}";
+    becomes_counted(&running.metrics, cancelled, 1).await;
+    assert_eq!(counted(&running.metrics, cancelled), Some(1));
+    for call in ["Describe", "Evaluate", "FindSimilar", "Match", "Delete", "Import"] {
+      let series = format!("record_similarity_requests_in_flight{{call=\"{call}\"}}");
+      assert_eq!(counted(&running.metrics, &series), Some(0), "{call}");
+    }
+
+    running.stops.send(Stop::Now).await.unwrap();
+    drop((running.client, running.channel, client));
     stopped(running.server, STOPS_WITHIN).await;
   }
 }

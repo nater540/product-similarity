@@ -23,20 +23,25 @@ use crate::engine::{
   SimilarTo, Verdict, WriteMode,
 };
 use crate::import_stream::{self, Answer, PATIENCE};
+use crate::metrics::{self, Call, Metrics};
 use crate::worker::{self, TextEmbedder};
 
 /// The tonic service wrapping an [`Engine`].
 #[derive(Debug)]
 pub struct GrpcService<S, E> {
   engine: Arc<Engine<S, E>>,
+  metrics: Arc<Metrics>,
 }
 
 impl<S, E> GrpcService<S, E> {
-  /// Wraps an engine.
-  pub fn new(engine: Arc<Engine<S, E>>) -> Self {
-    Self { engine }
+  /// Wraps an engine, counting every request into `metrics`.
+  pub fn new(engine: Arc<Engine<S, E>>, metrics: Arc<Metrics>) -> Self {
+    Self { engine, metrics }
   }
 }
+
+/// The response half of an `Import` call.
+type ImportStream = Pin<Box<dyn Stream<Item = Result<pb::ImportResponse, Status>> + Send>>;
 
 impl From<EngineError> for Status {
   fn from(error: EngineError) -> Self {
@@ -253,9 +258,9 @@ fn width(value: usize) -> u32 {
   u32::try_from(value).unwrap_or(u32::MAX)
 }
 
-#[tonic::async_trait]
-impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
-  async fn evaluate(&self, request: Request<pb::EvaluateRequest>) -> Result<Response<pb::EvaluateResponse>, Status> {
+/// Each call, from its request to its answer. The trait implementation below is these, counted.
+impl<S: VectorStore, E: TextEmbedder> GrpcService<S, E> {
+  async fn evaluated(&self, request: Request<pb::EvaluateRequest>) -> Result<Response<pb::EvaluateResponse>, Status> {
     let started = Instant::now();
     let deadline = deadline(&request, started);
     let request = request.into_inner();
@@ -271,6 +276,7 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
       threshold: request.threshold,
     });
     let output = worker::by(deadline, evaluated).await?;
+    self.metrics.evaluated(output.verdict, mode);
     tracing::info!(
       id = id.as_deref().unwrap_or(""),
       verdict = ?output.verdict,
@@ -304,7 +310,7 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
     }))
   }
 
-  async fn find_similar(
+  async fn found_similar(
     &self,
     request: Request<pb::FindSimilarRequest>,
   ) -> Result<Response<pb::FindSimilarResponse>, Status> {
@@ -341,7 +347,7 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
     }))
   }
 
-  async fn delete(&self, request: Request<pb::DeleteRequest>) -> Result<Response<pb::DeleteResponse>, Status> {
+  async fn deleted(&self, request: Request<pb::DeleteRequest>) -> Result<Response<pb::DeleteResponse>, Status> {
     let started = Instant::now();
     let pb::DeleteRequest { id, brand_id } = request.into_inner();
     let deleted = self.engine.delete(id.clone(), brand_id).await?;
@@ -349,12 +355,9 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
     Ok(Response::new(pb::DeleteResponse { deleted }))
   }
 
-  type ImportStream = Pin<Box<dyn Stream<Item = Result<pb::ImportResponse, Status>> + Send>>;
-
-  async fn import(
-    &self,
-    request: Request<Streaming<pb::ImportRequest>>,
-  ) -> Result<Response<Self::ImportStream>, Status> {
+  /// Starts an import stream. `call` is the stream's place in the metrics: it is open for as long as records are
+  /// being imported, which is long after this has returned.
+  fn imported(&self, request: Request<Streaming<pb::ImportRequest>>, call: metrics::Request) -> Response<ImportStream> {
     let started = Instant::now();
     let mut requests = request.into_inner();
     // Both channels hold one batch: a caller that sends faster than records are imported, or reads answers
@@ -380,9 +383,12 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
         }
       }
     });
-    let engine = Arc::clone(&self.engine);
+    let (engine, metrics) = (Arc::clone(&self.engine), Arc::clone(&self.metrics));
     tokio::spawn(async move {
       let totals = import_stream::run(&engine, incoming, answers, PATIENCE).await;
+      metrics.imported(totals.created, totals.existing, totals.failed);
+      // The stream ran to its end, whatever became of each record: that is in each record's answer.
+      call.finished(tonic::Code::Ok);
       tracing::info!(
         records = totals.records,
         created = totals.created,
@@ -396,10 +402,10 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
     });
 
     let responses = ReceiverStream::new(answered).map(|answer| Ok(import_response(answer)));
-    Ok(Response::new(Box::pin(responses)))
+    Response::new(Box::pin(responses))
   }
 
-  async fn r#match(&self, request: Request<pb::MatchRequest>) -> Result<Response<pb::MatchResponse>, Status> {
+  async fn matched(&self, request: Request<pb::MatchRequest>) -> Result<Response<pb::MatchResponse>, Status> {
     let started = Instant::now();
     let deadline = deadline(&request, started);
     let request = request.into_inner();
@@ -413,6 +419,7 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
       threshold: request.threshold,
     });
     let output = worker::by(deadline, matched).await?;
+    self.metrics.matched(output.decision);
     tracing::info!(
       candidates = output.candidates.len(),
       fetched = output.fetched,
@@ -443,9 +450,9 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
     }))
   }
 
-  async fn describe(&self, _: Request<pb::DescribeRequest>) -> Result<Response<pb::DescribeResponse>, Status> {
+  fn described(&self) -> Response<pb::DescribeResponse> {
     let description = self.engine.describe();
-    Ok(Response::new(pb::DescribeResponse {
+    Response::new(pb::DescribeResponse {
       model_fingerprint: description.model_fingerprint,
       dimension: width(description.dimension),
       composite_dimension: width(description.composite_dimension),
@@ -475,7 +482,50 @@ impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
       reject_on_measure_change: description.policy.reject_on_measure_change,
       match_threshold: description.matching.threshold,
       match_overfetch: width(description.matching.overfetch),
-    }))
+    })
+  }
+}
+
+/// The API: each call counted from its arrival to its answer (docs/decisions.md, D39), and otherwise exactly the
+/// method above that it names. A handler that is dropped, because its caller's deadline ran out or the caller
+/// hung up, drops its count with it, and that is counted too.
+#[tonic::async_trait]
+impl<S: VectorStore, E: TextEmbedder> RecordSimilarity for GrpcService<S, E> {
+  async fn evaluate(&self, request: Request<pb::EvaluateRequest>) -> Result<Response<pb::EvaluateResponse>, Status> {
+    let call = self.metrics.begin(Call::Evaluate);
+    call.answered(self.evaluated(request).await)
+  }
+
+  async fn find_similar(
+    &self,
+    request: Request<pb::FindSimilarRequest>,
+  ) -> Result<Response<pb::FindSimilarResponse>, Status> {
+    let call = self.metrics.begin(Call::FindSimilar);
+    call.answered(self.found_similar(request).await)
+  }
+
+  async fn delete(&self, request: Request<pb::DeleteRequest>) -> Result<Response<pb::DeleteResponse>, Status> {
+    let call = self.metrics.begin(Call::Delete);
+    call.answered(self.deleted(request).await)
+  }
+
+  type ImportStream = ImportStream;
+
+  async fn import(
+    &self,
+    request: Request<Streaming<pb::ImportRequest>>,
+  ) -> Result<Response<Self::ImportStream>, Status> {
+    Ok(self.imported(request, self.metrics.begin(Call::Import)))
+  }
+
+  async fn r#match(&self, request: Request<pb::MatchRequest>) -> Result<Response<pb::MatchResponse>, Status> {
+    let call = self.metrics.begin(Call::Match);
+    call.answered(self.matched(request).await)
+  }
+
+  async fn describe(&self, _: Request<pb::DescribeRequest>) -> Result<Response<pb::DescribeResponse>, Status> {
+    let call = self.metrics.begin(Call::Describe);
+    call.answered(Ok(self.described()))
   }
 }
 
@@ -595,7 +645,8 @@ mod tests {
       schema,
       Policy::new(0.75, None).unwrap(),
     );
-    let service = GrpcService::new(Arc::new(engine));
+    let counted = Arc::new(Metrics::new("tiny"));
+    let service = GrpcService::new(Arc::new(engine), Arc::clone(&counted));
     let record = || pb::Record {
       fields: [("name".to_owned(), "blueberry gummies".to_owned())].into(),
       ..pb::Record::default()
@@ -635,6 +686,25 @@ mod tests {
     let answered = service.evaluate(timed("1M")).await.unwrap().into_inner();
     assert_eq!(answered.verdict(), pb::Verdict::Embedded);
     assert_eq!(worker.stats().jobs, 1);
+
+    // Each of the four was counted, as the call it was and under the status code it was answered with, and only
+    // the one that was answered has a verdict.
+    let page = counted.render(&crate::metrics::Polled::default());
+    for series in [
+      "record_similarity_requests_total{call=\"Evaluate\",code=\"DEADLINE_EXCEEDED\"} 1",
+      "record_similarity_requests_total{call=\"Evaluate\",code=\"OK\"} 1",
+      "record_similarity_requests_total{call=\"FindSimilar\",code=\"DEADLINE_EXCEEDED\"} 1",
+      "record_similarity_requests_total{call=\"Match\",code=\"DEADLINE_EXCEEDED\"} 1",
+      "record_similarity_requests_total{call=\"Match\",code=\"OK\"} 0",
+      "record_similarity_evaluations_total{verdict=\"embedded\",mode=\"enforce\"} 1",
+      "record_similarity_matches_total{decision=\"not_judged\"} 0",
+      "record_similarity_requests_in_flight{call=\"Evaluate\"} 0",
+    ] {
+      assert!(
+        page.lines().any(|line| line == series),
+        "missing `{series}` in:\n{page}"
+      );
+    }
   }
 
   /// One of each kind of reason, with numbers that are awkward on purpose.

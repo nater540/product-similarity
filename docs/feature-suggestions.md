@@ -77,7 +77,7 @@ and because each would put a Python service in the loop.
 | 23 | Conditional writes across replicas (built) | Production | M | No |
 | 24 | Audit of the store against the catalog | Production | M | An export |
 | 25 | Anchor backup and restore | Production | M | No |
-| 26 | Operational metrics | Production | M | No |
+| 26 | Operational metrics (built) | Production | M | No |
 | 27 | Fair admission between brands | Production | M | No |
 | 28 | A batch call | Production | M | No |
 | 29 | Policy reload, and a configuration digest | Production | S to M | No |
@@ -701,6 +701,13 @@ no longer applies.
 holds vectors and fingerprints, no text, and brand ids.
 
 ### 26. Operational metrics
+
+**Built** (D39). What came out differently: no library; the format is written by hand over counts that are
+arrays of atomics, and the endpoint is a route on the HTTP server `tonic` already brought. It is off until
+`metrics.listen` is set. Verdicts are counted with the write mode asked for, and requests that were dropped
+because their caller gave up are counted as `CANCELLED`. The wait for the model and texts per pass are sums to
+divide, not histograms. It was read back with the Prometheus Python client's parser and has not been scraped by
+Prometheus, a Collector, or a Datadog Agent.
 
 **What.** A small HTTP endpoint in Prometheus text format: request counts and latency by call and status, the
 embedding queue's depth and wait, texts per forward pass, the share of time the model is busy, refusals for

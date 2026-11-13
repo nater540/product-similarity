@@ -1805,3 +1805,74 @@ server asked to stop waits for the write.
 **Not done:** a limit on writes in flight (above); an open-loop load test (D26 says why the closed one is not
 one); a count of abandoned and refused requests where an operator can see it, which is a metric (proposal 26);
 deadlines on the store's own calls beyond `qdrant.timeout_ms`.
+
+## D39. The server counts what it is doing, and serves the counts in the one format everything reads
+
+The numbers existed and went nowhere. The embedding thread counted its passes, its texts, its busy time, and
+its refusals, and only the load test read them. In service the one signal was a log line per request. Nobody
+could be paged on "the model is at its limit" or "the store has started failing" without parsing logs.
+
+**One format, pulled.** `GET /metrics` in the Prometheus text format. The owner's company runs Datadog today
+and is moving toward OpenTelemetry and Prometheus (2026-11-12). The text format is what all three read: the
+Datadog Agent's OpenMetrics check, the OpenTelemetry Collector's Prometheus receiver, and Prometheus. So the
+server does not know which of them is asking, and the migration changes a scrape target and nothing here. The
+alternatives each pick a side: a Datadog client speaks only to Datadog, and OTLP push needs the OpenTelemetry
+SDK in the build and a collector address in the config, to send what a collector can as well come and get.
+
+**Written by hand, on the HTTP server already in the build.** The format is a few lines of text per metric, and
+what is counted is a fixed set known when the program is compiled: every label value is one of a handful of
+words in `metrics.rs`. So the counts are arrays of atomics indexed by an enum, with no map, no lock, and no
+registry, and the page is a `String`. A metrics library would add a registry to hold what is already held and
+a dependency to audit. The endpoint is one `axum` route; `axum` was in the tree through `tonic`.
+
+**Off until it is given an address** (`metrics.listen`), because it opens a second port, and a second port is
+something a deployment asks for. The counting itself is always on: it is an atomic add per event, and a server
+that behaved differently with metrics on would be a server whose metrics could not be trusted. The port is
+HTTP/1.1 and not the gRPC port, which speaks HTTP/2 only and which scrapers do not.
+
+**Nothing about a record is a label.** No id, no brand, no text, no score. A brand as a label would be a time
+series per brand per metric, in a system billed by the series, about something a monitoring system has no
+business knowing; the proposal said so and this holds it. Scores are a different question with a different
+answer: that is proposal 10, one line per request for judging thresholds, and it is still deferred. These are
+counts about the process, for paging someone.
+
+**Where each count is made:**
+
+- *Requests* in the gRPC layer, by a guard made on the first line of each handler. It counts the request as
+  answered with the handler's result, and as `CANCELLED` if it is dropped unanswered, which is what the
+  transport does to a handler whose caller gave up (D38) and what it tells that caller. So the counts add up
+  to the requests that arrived, and a deadline that runs out is visible. An `Import` stream is one call, open
+  until the stream ends on the server.
+- *Verdicts, decisions, and imported records* in the same layer, when an answer is made. A verdict is counted
+  with the write mode the request asked for, because a rejection of a dry run is a preview and a rejection
+  under `enforce` is a refusal, and a rate of "rejected" that mixes them means nothing.
+- *The store* from the outside, by a wrapper around whatever store the server was given (`Measured`). No store
+  knows it is measured, and the contract test is not involved. An operation is counted when it ends.
+- *The embedding thread* and *the engine's writes* are not counted again: the thread's own counters and the
+  engine's are read each time the page is asked for. The writes nobody was told about (D38) are counted where
+  their log line is written, so the two cannot disagree.
+
+**A series that says nothing is left out**, except `OK`, which is there for every call from the first scrape
+so that a rate over it exists. A fresh server gave 66 series, and 164 after a load run. That is a choice made
+for where series cost money, and its price is the usual one: the first occurrence of an error code appears as
+a new series and not as an increase from zero.
+
+**The buckets** run from 1 ms to 2.5 s (1, 2.5, 5, 10, 25, 50, 100, 250, 500 ms, 1 s, 2.5 s). They are a
+resolution, not a threshold: nothing is decided by them, and they were chosen to straddle what was measured
+(a save with no changes under a millisecond, an edit at 1.6 ms alone and 22 ms at 64 callers, a create at
+140 ms there).
+
+**The names are an interface**, as the event names are (D17): add a metric or a label value, never rename
+one or change what it counts.
+
+**Checked against the real thing.** A server started with the endpoint on served the page; after a load run it
+was read back by the Prometheus Python client's parser (21 metrics, 164 samples, every histogram cumulative
+and ending at its count); on `SIGTERM` the next scrape said not ready while the server was still serving; and
+with the server gone the port was closed. Against Qdrant the store's own time showed up where it was spent
+(150 conditional writes in 0.28 s, 382 reads in 0.09 s), and with Qdrant stopped under the server the page said
+not ready and counted three failed checks within five seconds.
+
+**Not done:** a scrape by Prometheus, an OpenTelemetry Collector, or a Datadog Agent (none was run here);
+OTLP; a histogram of the wait for the model, which today is a sum to divide by a count; the same for texts per
+pass; process metrics (memory, file descriptors), which a platform reports itself; TLS or authentication on the
+endpoint, which like the gRPC port has neither and belongs behind the mesh; and anything per brand, on purpose.
