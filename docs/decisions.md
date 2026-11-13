@@ -949,6 +949,12 @@ same is believed, and a comparison that was dropped is an audit that passes. A r
 mutants in 36 minutes: 624 caught, 133 that do not compile, none surviving, and none at the time limit. Of the
 37 in the new file, 35 are caught and 2 do not compile.
 
+After the backup of anchors (D43), the restore's rule is in `engine.rs`, which was already one of the files,
+and `anchors/file.rs` joined them: what a backup reads back is written into records. A run at `65742af` tested
+811 mutants in 40 minutes: 663 caught, 148 that do not compile, none surviving, and none at the time limit. One
+had survived a run over the change alone while it was being written: a restore that kept the record's old time
+of writing, which now has a test.
+
 **Why an allowlist of files.** The alternative, excluding what should not be mutated, grows a list of everything
 whose only tests need the model or Qdrant, and a new file is mutated by default whether or not its tests can run.
 The files listed are where a mutant that survives means a wrong decision.

@@ -3029,21 +3029,23 @@ crate's `proptest-regressions/`, which is checked in, so the case is replayed fi
 **Mutation testing.** `just mutants` changes the code a little at a time (a `<` to a `<=`, a function's body to
 a constant) and runs the tests against each change. A change the tests do not notice is a boundary nothing
 holds. It covers the files whose boundaries are decisions: scoring, quantities, the schema, the engine, the
-calibration statistics, the match ranking, the promotion gate, and the audit's comparison. It needs `cargo install --locked cargo-mutants@27.1.0`, which is a tool on the
+calibration statistics, the match ranking, the promotion gate, the audit's comparison, and the file a backup of
+anchors is kept in. It needs `cargo install --locked cargo-mutants@27.1.0`, which is a tool on the
 machine and not a dependency of the project.
 
 ```sh
-just mutants -j 3          # every mutant; about 35 minutes
+just mutants -j 3          # every mutant; about 40 minutes
 just mutants-diff          # only the mutants in what changed since the last commit
 just mutants --list        # what would be tested, without building anything
 just mutants-train -j 3    # the trainer's checkpoint rules, a set of its own; four minutes
 ```
 
-The last full run tested 757 mutants in 36 minutes at three jobs: 624 were caught, 133 did not compile, none
+The last full run tested 811 mutants in 40 minutes at three jobs: 663 were caught, 148 did not compile, none
 survived, and none had to be stopped by the tool's time limit. The trainer's set is 58 more, 39 caught and 19
 that did not compile.
 It is not part of `just ci`. Run it after changing the scoring, the quantity comparison, the engine's write
-path, the calibration statistics, the match ranking, the promotion gate, or the audit's comparison.
+path, the calibration statistics, the match ranking, the promotion gate, the audit's comparison, or the file a
+backup of anchors is kept in.
 
 - **A survivor is answered with a test,** an example that states the boundary as a sentence, or a property if
   the rule holds for every input. It is excluded in `.cargo/mutants.toml` only when the change cannot alter any
