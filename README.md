@@ -2605,8 +2605,11 @@ just mutants --list        # what would be tested, without building anything
 just mutants-train -j 3    # the trainer's checkpoint rules, a set of its own; four minutes
 ```
 
-The last full run tested 689 mutants in 28 minutes at three jobs: 575 were caught, 113 did not compile, and 1
-survived, which then got a test; the trainer's set is 58 more, 39 caught and 19 that did not compile.
+The last full run tested 701 mutants in 31 minutes at three jobs: 581 were caught, 118 did not compile, none
+survived, and 2 were caught only by the tool's time limit (both make a stopping server wait for a write that
+is not there; the tests that say so fail in eight seconds, and others then wait out the drain). Eleven more
+ended that way at first, in tests whose waits had no bound, and were caught once the waits had one. The
+trainer's set is 58 more, 39 caught and 19 that did not compile.
 It is not part of `just ci`. Run it after changing the scoring, the quantity comparison, the engine's write
 path, the calibration statistics, the match ranking, or the promotion gate.
 

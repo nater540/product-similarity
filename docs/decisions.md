@@ -931,6 +931,18 @@ What the lock still does is keep a process from racing itself, and that is what 
 requests for one record each read it once, and thirty-two forced writes to one record all succeed with one read
 apiece. The mutation, applied by hand, fails both.
 
+After writes that outlive their request (D38), a run at `b1fc465` tested 701 mutants in 31 minutes: 570 caught,
+118 that do not compile, none surviving, and 13 that ended at the tool's time limit, where there had been none.
+A time limit is a catch, and a bad one: it means a test hung, and a test that hangs on a mistake hangs in CI
+too. Eleven of the 13 hung in waits with no bound: the lifecycle tests' wait for a request to reach the
+embedder (D37), and the new tests' waits for a write to reach the store, for every write to end, and for a
+retry to be answered. Each wait now gives up with a sentence, and those eleven, run again at `315ce6f`, fail a
+test. The other two make "no write is in flight" never true, so a stopping server never finishes: the tests
+that say so fail in eight seconds, and the tests that only stop a server wait out its twenty-second drain,
+which is longer than the tool waits. The embedding thread (`worker.rs`) is not one of the files, since it
+decides no verdict, but it was run once for this change: of 100 mutants, nothing in the new queueing survived,
+and five end at the time limit because they make the thread or the choice of a pass loop for ever.
+
 **Why an allowlist of files.** The alternative, excluding what should not be mutated, grows a list of everything
 whose only tests need the model or Qdrant, and a new file is mutated by default whether or not its tests can run.
 The files listed are where a mutant that survives means a wrong decision.
