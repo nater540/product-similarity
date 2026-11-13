@@ -6,7 +6,7 @@ and trained in [Burn](https://burn.dev), run by ONNX Runtime), compared with the
 rejected against calibrated thresholds. A record's quantities (weight, volume, potency) are compared as numbers
 beside that, never embedded. Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D43) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D44) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -231,6 +231,13 @@ changing a design. Infer conventions from the existing code first.
   under a `.partial` name and renames, and never writes over a file. A backup holds no text and must not gain
   any; a scan reads an anchor only when asked (`Read::Anchor`) and never a current composite. The file's line
   names and fields, and the codes of `Restored`, are an interface: add, never rename.
+- **The judging digest covers everything a verdict depends on, and its text is an interface** (D44).
+  `Description::judging` writes the rules out one to a line and `judging_digest` is its hash: what `Describe`
+  and the `serving gRPC` line give so that replicas can be seen to agree. Servers of different versions compare
+  digests, so add a line for a new rule and never reword, reorder, or drop one. It takes `Policy`, `Matching`,
+  `FieldSpec`, and `QuantitySpec` apart by name with nothing left over on purpose: do not add `..` to make a new
+  field compile, write the field out. Numbers go in as their bits, never formatted. Nothing that is not a
+  rule of judging belongs in it (an address, a batch size, the shadow).
 - **A brand, once stored, must be named by every later request for that id**, including `Delete` (D14).
 - **What a supported model directory is lives in one place**, `similarity_core::model::Pipeline`. The loader and
   `model fetch` both use it; never parse `modules.json` anywhere else.

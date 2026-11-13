@@ -305,7 +305,7 @@ The API is defined, with full documentation of every field, in
 | `Import` | Streaming. Creates every record of a stream that is not stored yet and answers each one; a record that is stored is left exactly alone. |
 | `Match` | Returns the stored records a menu item from elsewhere describes, best first, each scored over the fields both sides have, and says whether the best is a match. Stores nothing. |
 | `Delete` | Forgets a record. |
-| `Describe` | Reports the model fingerprint, schema, and thresholds in force. |
+| `Describe` | Reports the model fingerprint, schema, and thresholds in force, and one digest of them all ([Replicas that judge alike](#replicas-that-judge-alike)). |
 
 A record is an optional `id`, an optional `brand_id`, a map of field name to text, and a map of quantity name to
 quantity. The names must be ones the server's schema defines; `Describe` lists both kinds.
@@ -2554,6 +2554,35 @@ Nothing is lost by a request that is cut off at the deadline: a write is one con
 it happened or it did not, sending the request again is safe either way
 ([Errors](#errors)), and an `Import` stream that ends early is sent again.
 
+### Replicas that judge alike
+
+Two replicas with two configurations give two verdicts on one edit, depending on which of them the request
+reaches, and during a rolling deploy that is the normal state for a while. `Describe` lists everything a server
+judges by, and also gives one string for all of it, `judging_digest`: the model's fingerprint, the thresholds,
+every field with its weight and floor, every quantity with its limits, and how a match is decided. Two servers
+with the same digest judge by the same rules. The bundled client prints it last:
+
+```text
+$ just client describe
+...
+matching  no threshold: menu items are ranked, not judged; 5 records are scored for each one returned
+judging   7f0f0943d564b1b1
+```
+
+A server also logs it when it starts, so replicas can be compared without calling them. Two servers started on
+one configuration, and a third with `threshold = 0.91` where the others have `0.90` (envelope fields removed):
+
+```json
+{"level":"INFO","message":"serving gRPC","address":"127.0.0.1:50081","judging_digest":"7f0f0943d564b1b1"}
+{"level":"INFO","message":"serving gRPC","address":"127.0.0.1:50082","judging_digest":"7f0f0943d564b1b1"}
+{"level":"INFO","message":"serving gRPC","address":"127.0.0.1:50083","judging_digest":"211f6271a48d4974"}
+```
+
+The order things are written in the configuration does not change the digest. Anything that could change a
+verdict does, and so do a few things that could not: weights that are all doubled judge exactly as before and
+are another digest. A difference means the configurations differ, which is the thing to look at. Changing a
+threshold still takes a restart of each replica; the digest is how to see when the last one has it.
+
 ### Telemetry
 
 Two things leave the server for whoever watches it, both as [OpenTelemetry](https://opentelemetry.io) and both
@@ -3078,7 +3107,7 @@ data/
   regression.snapshot.ndjson      what the pinned model and the example config make of them
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D43)
+  decisions.md               why things are the way they are (D1 to D44)
   data-request-prompt.md     a brief for collecting labeled production data
   import-prompt.md           a brief for loading the real catalog into a running service
   feature-suggestions.md     features that could be added, built and not, the last twelve about production

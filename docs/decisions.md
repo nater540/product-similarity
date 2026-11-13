@@ -2228,3 +2228,46 @@ that found every anchor already in place, which is one read of each record, took
 **Not built:** a restore for records that changed (above); a backup of records under another layout (their
 vectors are another model's, and the server cannot read them either); compression of the file, which any
 tool does; a backup taken through the server for a caller that cannot reach Qdrant.
+
+## D44. One string says what a server judges by
+
+`Describe` has always listed what a server judges by: the model, the thresholds, each field's weight and
+floor, each quantity's limits. Nobody compares a dozen values across replicas, and the moment they matter is a
+rolling deploy, when two requests for one record can be held to two thresholds for as long as the rollout
+takes. The conditional write (D35) keeps two replicas from both writing; it does nothing about two replicas
+that disagree on what to accept.
+
+`DescribeResponse.judging_digest` is one string for all of it, and a server logs the same string on its
+`serving gRPC` line, so replicas can be compared in their logs without being called.
+
+**What is in it** is everything a verdict or a match decision depends on, and nothing else: the model's
+fingerprint (two replicas with one policy and two models do not judge alike), the threshold, the drift
+threshold, whether a change of measure rejects, every field's name, weight, whether it is required, and its
+floor, every quantity's name and limits, and the match threshold and over-fetch. Not the address, not a batch
+size, not the shadow, which decides nothing (D30).
+
+**It is a digest of a text, and the text is pinned.** The rules are written out one to a line, in an order that
+does not depend on the order the configuration lists them in, with names quoted so that no name can pass for
+two, and numbers as the bits they are, so that nothing depends on how a number prints. The digest is the first
+eight bytes of the SHA-256 of that text, in hexadecimal, which is how the model's own digest is written.
+Servers of different versions compare digests, so the text is an interface: a test holds it to the letter, and
+a new rule is a new line, never a change to one that is there.
+
+**A rule cannot be left out by forgetting.** The function takes `Policy`, `Matching`, `FieldSpec`, and
+`QuantitySpec` apart by name with nothing left over. A field added to any of them does not compile until it is
+written into the text. The failure this prevents is the worst one a digest can have: two servers that judge
+differently and say they agree.
+
+**What a difference means, and does not.** The same digest means the same rules. A different one means the
+configurations differ in something, and not that any verdict would: weights that are all doubled give the same
+scores and another digest. Making the digest blind to that would mean deciding which differences matter, and a
+digest that has opinions is one more thing to get wrong.
+
+**The other half of the suggestion is not built:** reloading the policy without a restart. A threshold is the
+setting most likely to be changed in a hurry, and today that is a restart of every replica, each loading the
+model again. But a server whose rules can change while it runs is a different thing to operate than one whose
+rules are what it started with, and that is the owner's to choose. If it is wanted, three things are already
+clear. Only what needs no re-index may be reloaded (D12): thresholds, weights, floors, limits, and never the
+model or the set of fields. A reload that does not parse, or that would change the layout, should leave the
+old policy in force and say so loudly, since a server that stops on a typo turns a mistake into an outage. And
+the digest is what tells whoever sent the signal that every replica took it.

@@ -3,7 +3,7 @@
 Features that could be added to this project, with what each is, why it matters here, how it would fit the
 code, and what it would cost. **Of the first twenty, all are built or half built (6 and 18) except 10, 14, and
 17, which the owner deferred on 2026-11-11.** Features 21 to 32 (section E) are about running the service in
-production: 21 to 26 are built, 28 is half built, and the rest are proposals. They were proposed
+production: 21 to 26 are built, 28 and 29 are half built, and the rest are proposals. They were proposed
 in November 2026 from a read of the repository as it stood then (`README.md`, `docs/decisions.md`, and the
 crates); check a suggestion against the code before starting on it, since the code will have moved. It has
 moved once already: records now carry quantities, compared as numbers (D16), and the features that touch a
@@ -80,7 +80,7 @@ and because each would put a Python service in the loop.
 | 26 | Operational metrics (built) | Production | M | No |
 | 27 | Fair admission between brands | Production | M | No |
 | 28 | A batch call | Production | M | No |
-| 29 | Policy reload, and a configuration digest | Production | S to M | No |
+| 29 | Policy reload, and a configuration digest (the digest is built) | Production | S to M | No |
 | 30 | Who forced or deleted, and why | Production | S | No |
 | 31 | TLS and a caller identity | Production | M | No |
 | 32 | Model cutover without stopping | Production | L | A candidate model |
@@ -770,6 +770,13 @@ creates, and is not something an application can call.
 batch that writes needs every per-record rule of `Evaluate`, including the brand check.
 
 ### 29. Change a threshold without a restart, and know every replica agrees
+
+**Half built** (D44): the digest. `Describe` gives `judging_digest`, and a server logs it when it starts. What
+came out differently: it covers the model's fingerprint too, since two replicas with one policy and two models
+do not judge alike; and a rule that is added later cannot be left out of it, because the code that writes it
+does not compile until the rule is there. The reload is not built. It changes how a running server behaves
+(what it judges by stops being what it started with), which is the owner's call, with one decision already
+named below.
 
 **What.** Reload `[policy]`, floors, and limits on `SIGHUP` (nothing that changes a vector), and report a digest
 of the judging configuration in `Describe` and on the start-up log line.
