@@ -18,6 +18,12 @@
 //! - within one process, a record is held by one request at a time, the one that came first, a request never
 //!   waits for a request for another record, and a record has a lock only while somebody is at it (D41).
 //!
+//! And the audit, which vouches for what the store holds, is held to what an import and the engine really do:
+//!
+//! - an export that was just imported audits clean, whatever is wrong with its lines;
+//! - one change to the store or to the export is found, as the kind of change it is, and nothing else is;
+//! - everything an audit looks at is counted once, whatever the size of a page.
+//!
 //! It runs on the in-memory store and the bag-of-words embedder, so it needs no model and no Qdrant. See
 //! `similarity-core`'s `properties` module for the scoring properties and for how failures are saved.
 
@@ -28,12 +34,13 @@ use similarity_core::score::Evaluation;
 use similarity_core::testing::{WORDS, tiny_embedder};
 use similarity_core::vector::cosine;
 use similarity_core::{EmbedderOptions, FieldSpec, Policy, Quantity, QuantitySpec, Reason, Schema};
-use similarity_store::{MemoryStore, StoredRecord, VectorStore};
+use similarity_store::{Entry, MemoryStore, Scan, StoredRecord, VectorStore};
 
 use crate::engine::racing::Raced;
 use crate::locks::Locks;
 use crate::locks::testing::Asking;
 
+use crate::audit::{self, Difference, Finding, Kind};
 use crate::config::ShadowEvents;
 use crate::engine::{
   Engine, EngineError, EvaluateInput, EvaluateOutput, FindSimilarInput, ImportInput, Imported, MatchInput, Original,
@@ -1304,5 +1311,420 @@ proptest! {
     }
     drop(there);
     prop_assert_eq!(locks.in_use(), 0);
+  }
+}
+
+/// The ids an audited catalog is made of. A few, so that exports repeat an id and a store and an export overlap.
+const AUDIT_IDS: [&str; 6] = ["a", "b", "c", "d", "e", "f"];
+
+/// One line of a generated export, as indexes into the lists above.
+#[derive(Debug, Clone)]
+struct ExportLine {
+  id: usize,
+  brand_id: Option<usize>,
+  name: usize,
+  category: Option<usize>,
+  weight: Option<(f64, &'static str)>,
+  flaw: Flaw,
+}
+
+/// What is wrong with a line beyond what its values make wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flaw {
+  None,
+  /// A key an export line may not have. The line still says which record it is about.
+  StrayKey,
+  /// Not JSON, and so about no record anyone can name.
+  NotJson,
+}
+
+impl ExportLine {
+  fn json(&self) -> String {
+    if self.flaw == Flaw::NotJson {
+      return "{ this is not a record".to_owned();
+    }
+    let mut record = serde_json::json!({"name": NAMES[self.name]});
+    if let Some(category) = self.category {
+      record["category"] = CATEGORIES[category].into();
+    }
+    if let Some((value, unit)) = self.weight {
+      record["weight"] = serde_json::json!({"value": value, "unit": unit});
+    }
+    let mut line = serde_json::json!({"id": AUDIT_IDS[self.id], "record": record});
+    if let Some(brand_id) = self.brand_id {
+      line["brand_id"] = BRAND_IDS[brand_id].into();
+    }
+    if self.flaw == Flaw::StrayKey {
+      line["tenant"] = "brand-1".into();
+    }
+    line.to_string()
+  }
+}
+
+fn export_text(lines: &[ExportLine]) -> String {
+  lines.iter().map(|line| line.json() + "\n").collect()
+}
+
+/// Any line: mostly a record, sometimes one an import refuses (a blank name, an amount below zero, a blank unit,
+/// a stray key, no JSON at all).
+fn export_line() -> impl Strategy<Value = ExportLine> {
+  (
+    0..AUDIT_IDS.len(),
+    proptest::option::of(0..BRAND_IDS.len()),
+    prop_oneof![9 => 0..NAMES.len() - 1, 1 => Just(NAMES.len() - 1)],
+    proptest::option::of(0..CATEGORIES.len()),
+    proptest::option::of(quantity()),
+    prop_oneof![10 => Just(Flaw::None), 1 => Just(Flaw::StrayKey), 1 => Just(Flaw::NotJson)],
+  )
+    .prop_map(|(id, brand_id, name, category, weight, flaw)| ExportLine {
+      id,
+      brand_id,
+      name,
+      category,
+      weight,
+      flaw,
+    })
+}
+
+/// A catalog of distinct records, every one of which an import takes.
+fn catalog() -> impl Strategy<Value = Vec<ExportLine>> {
+  let record = (
+    proptest::option::of(0..BRAND_IDS.len()),
+    0..NAMES.len() - 1,
+    proptest::option::of(0..CATEGORIES.len()),
+    proptest::option::of((
+      prop_oneof![Just(1.0), Just(3.5), Just(28.0)],
+      prop_oneof![Just("g"), Just("mg")],
+    )),
+  );
+  proptest::collection::vec(record, 2..AUDIT_IDS.len()).prop_map(|records| {
+    records
+      .into_iter()
+      .enumerate()
+      .map(|(id, (brand_id, name, category, weight))| ExportLine {
+        id,
+        brand_id,
+        name,
+        category,
+        weight,
+        flaw: Flaw::None,
+      })
+      .collect()
+  })
+}
+
+async fn import_export<S: VectorStore>(engine: &Engine<S, WordBagEmbedder>, export: &str) -> crate::import::Summary {
+  let options = crate::import::Options {
+    batch_records: 3,
+    stop_on_error: false,
+  };
+  crate::import::run(engine, export.as_bytes(), options, |_| {}, |_| {})
+    .await
+    .unwrap()
+}
+
+async fn audited<S: Scan>(store: &S, export: &str, options: audit::Options) -> (audit::Summary, Vec<Finding>) {
+  let mut findings = Vec::new();
+  let summary = audit::run(
+    store,
+    &schema(),
+    export.as_bytes(),
+    options,
+    |finding| findings.push(finding.clone()),
+    |_| {},
+  )
+  .await
+  .unwrap();
+  (summary, findings)
+}
+
+const WHOLE_STORE: audit::Options = audit::Options {
+  page_records: 1000,
+  exported_at: None,
+};
+
+/// One thing done to a catalog that was imported, or to the export it was imported from.
+#[derive(Debug, Clone, Copy)]
+enum Change {
+  /// The record is deleted from the store.
+  Deleted,
+  /// The stored record is given another name by a forced write.
+  Renamed { to: usize },
+  /// The stored record is given another amount by a forced write: twice what it weighed, or a gram if it weighed
+  /// nothing.
+  Reweighed,
+  /// The stored record is put under another brand, or under none, behind the engine's back.
+  Rebranded { to: Option<usize> },
+  /// A record the export does not have is stored.
+  Extra,
+  /// The record's line is taken out of the export.
+  Unlisted,
+  /// The record's line is written another way: other whitespace, and its amount in another unit.
+  Rewritten,
+}
+
+fn change() -> impl Strategy<Value = Change> {
+  prop_oneof![
+    Just(Change::Deleted),
+    (0..NAMES.len() - 1).prop_map(|to| Change::Renamed { to }),
+    Just(Change::Reweighed),
+    proptest::option::of(0..BRAND_IDS.len()).prop_map(|to| Change::Rebranded { to }),
+    Just(Change::Extra),
+    Just(Change::Unlisted),
+    Just(Change::Rewritten),
+  ]
+}
+
+/// What a finding says, without where and when: its kind, the record, and what about the record.
+type Told = (Kind, Option<String>, Option<String>, Option<Difference>);
+
+fn told(findings: &[Finding]) -> Vec<Told> {
+  findings
+    .iter()
+    .map(|finding| {
+      (
+        finding.kind,
+        finding.id.clone(),
+        finding.field.clone().or_else(|| finding.quantity.clone()),
+        finding.difference,
+      )
+    })
+    .collect()
+}
+
+proptest! {
+  #![proptest_config(cases())]
+
+  /// What an import stores is what an audit expects to find. The two read an export by one rule (`prepared`) and
+  /// the engine by its own, and this is what holds the three together: whatever the lines of an export are, valid
+  /// or not, repeated or not, importing it into an empty store leaves nothing for an audit to find but the lines
+  /// themselves.
+  #[test]
+  fn an_export_audits_clean_against_what_importing_it_stored(
+    lines in proptest::collection::vec(export_line(), 0..14),
+    page_records in 1..5_usize,
+  ) {
+    let export = export_text(&lines);
+    let engine = engine(None, false);
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let (imported, (summary, findings)) = runtime.block_on(async {
+      let imported = import_export(&engine, &export).await;
+      let options = audit::Options { page_records, exported_at: None };
+      (imported, audited(engine.store(), &export, options).await)
+    });
+
+    for finding in &findings {
+      prop_assert!(matches!(finding.kind, Kind::InvalidLine | Kind::DuplicateId), "{finding:?}");
+    }
+    prop_assert_eq!(summary.export_records, imported.imported);
+    prop_assert_eq!(summary.invalid_lines + summary.duplicate_ids, imported.failed + imported.skipped);
+    prop_assert_eq!(summary.agree, imported.imported);
+    prop_assert_eq!(
+      (summary.differ, summary.not_stored, summary.not_in_export, summary.stored_records),
+      (0, 0, 0, imported.imported)
+    );
+  }
+
+  /// One change, one finding of the kind the change is, about the record that was changed: and a line written
+  /// another way is no change at all.
+  #[test]
+  fn one_change_to_the_store_or_the_export_is_found_as_that_kind_and_nothing_else_is(
+    records in catalog(),
+    at in any::<proptest::sample::Index>(),
+    change in change(),
+  ) {
+    let chosen = at.index(records.len());
+    let record = records[chosen].clone();
+    let id = AUDIT_IDS[record.id].to_owned();
+    let engine = engine(None, false);
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+
+    let mut export_lines = records.clone();
+    let expected: Vec<Told> = runtime.block_on(async {
+      import_export(&engine, &export_text(&records)).await;
+      let rewrite = |name: usize, weight: Option<(f64, &'static str)>| {
+        let mut fields = vec![("name".to_owned(), NAMES[name].to_owned())];
+        fields.extend(record.category.map(|index| ("category".to_owned(), CATEGORIES[index].to_owned())));
+        EvaluateInput {
+          record: RecordInput {
+            id: Some(id.clone()),
+            brand_id: record.brand_id.map(|index| BRAND_IDS[index].to_owned()),
+            fields,
+            quantities: weight
+              .map(|(value, unit)| ("weight".to_owned(), Quantity::single(value, unit)))
+              .into_iter()
+              .collect(),
+          },
+          mode: WriteMode::Force,
+          threshold: None,
+        }
+      };
+      match change {
+        Change::Deleted => {
+          let brand_id = record.brand_id.map(|index| BRAND_IDS[index].to_owned());
+          engine.delete(id.clone(), brand_id).await.unwrap();
+          vec![(Kind::NotStored, Some(id.clone()), None, None)]
+        }
+        Change::Renamed { to } => {
+          engine.evaluate(rewrite(to, record.weight)).await.unwrap();
+          if to == record.name {
+            Vec::new()
+          } else {
+            vec![(Kind::TextDiffers, Some(id.clone()), Some("name".to_owned()), Some(Difference::Differs))]
+          }
+        }
+        Change::Reweighed => {
+          let (weight, difference) = match record.weight {
+            Some((value, unit)) => ((value * 2.0, unit), Difference::Differs),
+            None => ((1.0, "g"), Difference::OnlyInStore),
+          };
+          engine.evaluate(rewrite(record.name, Some(weight))).await.unwrap();
+          vec![(Kind::QuantityDiffers, Some(id.clone()), Some("weight".to_owned()), Some(difference))]
+        }
+        Change::Rebranded { to } => {
+          let mut stored = engine.store().get(&id).await.unwrap().unwrap();
+          stored.brand_id = to.map(|index| BRAND_IDS[index].to_owned());
+          engine.store().put(&stored).await.unwrap();
+          match (record.brand_id, to) {
+            (given, kept) if given == kept => Vec::new(),
+            (Some(_), None) => vec![(Kind::BrandNotStored, Some(id.clone()), None, None)],
+            _ => vec![(Kind::BrandDiffers, Some(id.clone()), None, None)],
+          }
+        }
+        Change::Extra => {
+          import_export(&engine, r#"{"id": "extra", "record": {"name": "live resin"}}"#).await;
+          vec![(Kind::NotInExport, Some("extra".to_owned()), None, None)]
+        }
+        Change::Unlisted => {
+          export_lines.remove(chosen);
+          vec![(Kind::NotInExport, Some(id.clone()), None, None)]
+        }
+        Change::Rewritten => Vec::new(),
+      }
+    });
+
+    let mut export = export_text(&export_lines);
+    if matches!(change, Change::Rewritten) {
+      let mut line = serde_json::json!({
+        "record": {"name": format!("  {} \n", NAMES[record.name].replace(' ', " \t "))},
+        "id": id,
+      });
+      if let Some(category) = record.category {
+        line["record"]["category"] = format!("{}   ", CATEGORIES[category]).into();
+      }
+      match record.weight {
+        Some((value, "g")) => line["record"]["weight"] = serde_json::json!({"min": value * 1000.0, "max": value * 1000.0, "unit": " MG"}),
+        Some((value, _)) => line["record"]["weight"] = serde_json::json!({"value": value / 1000.0, "unit": "g"}),
+        None => {}
+      }
+      if let Some(brand_id) = record.brand_id {
+        line["brand_id"] = BRAND_IDS[brand_id].into();
+      }
+      export_lines[chosen] = record.clone();
+      export = export_lines
+        .iter()
+        .enumerate()
+        .map(|(index, other)| if index == chosen { line.to_string() + "\n" } else { other.json() + "\n" })
+        .collect();
+    }
+
+    let (summary, findings) = runtime.block_on(audited(engine.store(), &export, WHOLE_STORE));
+    prop_assert_eq!(told(&findings), expected.clone(), "{:?} of {:?}", change, record);
+    // Every other record agrees. The chosen one agrees if it is still on both sides and nothing was found about
+    // it: an extra record is about no record of the catalog.
+    let chosen_agrees = match change {
+      Change::Deleted | Change::Unlisted => false,
+      Change::Extra => true,
+      Change::Renamed { .. } | Change::Reweighed | Change::Rebranded { .. } | Change::Rewritten => expected.is_empty(),
+    };
+    prop_assert_eq!(summary.agree, records.len() - 1 + usize::from(chosen_agrees));
+    prop_assert_eq!(summary.differences(), usize::from(!expected.is_empty()));
+  }
+
+  /// Whatever a store holds and whatever an export says, an audit counts everything it looks at once: each line,
+  /// each point, and each record, which ends as agreeing, differing, missing on one side, or not compared. And
+  /// it finds the same whatever the size of the pages it reads the store in.
+  #[test]
+  fn the_counts_of_an_audit_add_up(
+    stored_lines in proptest::collection::vec(export_line(), 0..10),
+    export_lines in proptest::collection::vec(export_line(), 0..10),
+    other_layout in proptest::collection::btree_set(0..AUDIT_IDS.len(), 0..3),
+    page_records in 1..4_usize,
+    exported_at in proptest::option::of(prop_oneof![Just(0_u64), Just(u64::MAX)]),
+  ) {
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let (layout, dimension) = store_layout(&schema(), &WordBagEmbedder::new("word-bag-v1"));
+    let export = export_text(&export_lines);
+
+    let (engine, ids_stored) = runtime.block_on(async {
+      // What a collection that outlived a change of model looks like: some of its records under the old layout.
+      let old = MemoryStore::new("another-model|category,description,name", dimension);
+      for id in &other_layout {
+        // Embedded by an engine of its own, so that what is put under the old layout is a whole record.
+        let scratch = engine_on(empty_store(), None);
+        let line = format!(r#"{{"id": "{}", "record": {{"name": "an older record"}}}}"#, AUDIT_IDS[*id]);
+        import_export(&scratch, &line).await;
+        let record = scratch.store().get(AUDIT_IDS[*id]).await.unwrap().unwrap();
+        old.put(&record).await.unwrap();
+      }
+      let engine = engine_on(old.reopened(layout.clone(), dimension), None);
+      import_export(&engine, &export_text(&stored_lines)).await;
+      let ids: Vec<String> = engine
+        .store()
+        .scan(None, 1000)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .map(|entry| match entry {
+          Entry::Record(record) => record.id,
+          Entry::OtherLayout { id, .. } => id,
+          Entry::Unreadable { .. } => unreachable!("the in-memory store reads everything it holds"),
+        })
+        .collect();
+      (engine, ids)
+    });
+
+    let options = audit::Options { page_records, exported_at };
+    let (summary, findings) = runtime.block_on(audited(engine.store(), &export, options));
+    let (whole, mut whole_findings) =
+      runtime.block_on(audited(engine.store(), &export, audit::Options { page_records: 1000, exported_at }));
+    prop_assert_eq!(&summary, &whole, "pages of {}", page_records);
+    let mut paged_findings = findings.clone();
+    let order = |finding: &Finding| (finding.line, finding.id.clone(), finding.kind, finding.field.clone(), finding.quantity.clone());
+    paged_findings.sort_by_key(order);
+    whole_findings.sort_by_key(order);
+    prop_assert_eq!(paged_findings, whole_findings);
+
+    prop_assert_eq!(summary.findings, findings.len());
+    prop_assert_eq!(summary.lines, export_lines.len());
+    prop_assert_eq!(summary.lines, summary.invalid_lines + summary.duplicate_ids + summary.export_records);
+    prop_assert_eq!(summary.points, ids_stored.len());
+    prop_assert_eq!(summary.points, summary.stored_records + summary.other_layout + summary.unreadable);
+    prop_assert_eq!(summary.other_layout, other_layout.len());
+    prop_assert_eq!(summary.other_layouts.values().sum::<usize>(), summary.other_layout);
+
+    // Everything looked at: each record either side names, and each line that names none.
+    let mut records: std::collections::BTreeSet<&str> = ids_stored.iter().map(String::as_str).collect();
+    records.extend(export_lines.iter().filter(|line| line.flaw != Flaw::NotJson).map(|line| AUDIT_IDS[line.id]));
+    let nameless = export_lines.iter().filter(|line| line.flaw == Flaw::NotJson).count();
+    prop_assert_eq!(
+      summary.agree + summary.differ + summary.not_stored + summary.not_in_export + summary.not_compared,
+      records.len() + nameless,
+      "{:?}", summary
+    );
+    for of_the_differing in [summary.brand_differs, summary.brand_not_stored, summary.text_differs, summary.quantity_differs] {
+      prop_assert!(of_the_differing <= summary.differ);
+    }
+    // Everything stored was written after the year 1970 and before the end of time.
+    let set_aside = match exported_at {
+      Some(0) => summary.differ + summary.not_in_export,
+      _ => 0,
+    };
+    prop_assert_eq!(summary.after_export, set_aside);
+    prop_assert_eq!(
+      summary.differences(),
+      summary.differ + summary.not_stored + summary.not_in_export + summary.not_compared - set_aside
+    );
   }
 }

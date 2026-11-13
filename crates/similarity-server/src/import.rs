@@ -97,9 +97,9 @@ pub struct Failure {
   pub reason: String,
 }
 
-/// The lines of an export that hold a record, parsed, with their one-based line numbers. Blank lines and lines
+/// The lines of an export that hold something, as text, with their one-based line numbers. Blank lines and lines
 /// starting with `#` are passed over, as in every other file these tools read.
-pub(crate) fn lines(reader: impl BufRead) -> impl Iterator<Item = (usize, anyhow::Result<ImportLine>)> {
+pub(crate) fn numbered(reader: impl BufRead) -> impl Iterator<Item = (usize, std::io::Result<String>)> {
   reader
     .lines()
     .enumerate()
@@ -109,12 +109,18 @@ pub(crate) fn lines(reader: impl BufRead) -> impl Iterator<Item = (usize, anyhow
         !line.trim().is_empty() && !line.trim_start().starts_with('#')
       })
     })
-    .map(|(number, line)| {
-      let parsed = line
-        .context("cannot read the line")
-        .and_then(|line| serde_json::from_str::<ImportLine>(&line).context("not a record to import"));
-      (number, parsed)
-    })
+}
+
+/// One line of an export, parsed.
+pub(crate) fn parse(line: std::io::Result<String>) -> anyhow::Result<ImportLine> {
+  line
+    .context("cannot read the line")
+    .and_then(|line| serde_json::from_str::<ImportLine>(&line).context("not a record to import"))
+}
+
+/// The lines of an export that hold a record, parsed, with their one-based line numbers.
+fn lines(reader: impl BufRead) -> impl Iterator<Item = (usize, anyhow::Result<ImportLine>)> {
+  numbered(reader).map(|(number, line)| (number, parse(line)))
 }
 
 /// Imports every record of `export` that is not stored yet.
