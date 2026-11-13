@@ -244,6 +244,7 @@ The binary is `record-similarity` (`target/release/record-similarity` after `jus
 | `record-similarity model fetch [--repo R] [--revision REV] [--dir DIR]` | Downloads and verifies a model directory. `--dir` defaults to `models/<repository name>`, so two models never share a directory. |
 | `record-similarity import [--config config.toml] EXPORT.jsonl [--check]` | Loads a whole catalog into the store. See [Importing a catalog](#importing-a-catalog). |
 | `record-similarity audit [--config config.toml] EXPORT.jsonl [--exported-at SECONDS] [--ndjson] [--fail-on-differences]` | Checks the store against an export of the catalog, and changes nothing. See [Auditing the store against the catalog](#auditing-the-store-against-the-catalog). |
+| `record-similarity anchors export --out FILE`, `anchors check FILE`, `anchors restore FILE [--dry-run]` | Keeps a copy of every record's anchor, and puts anchors back after a collection was lost. See [Backing up the anchors](#backing-up-the-anchors). |
 | `record-similarity compare [--config config.toml] BEFORE.json AFTER.json` | Scores one before/after pair offline. |
 | `record-similarity calibrate [--config config.toml] PAIRS.jsonl [--full] [--split S] [--model DIR] [--ndjson]` | Scores labeled pairs and suggests a threshold. See [Choosing thresholds](#choosing-thresholds). |
 | `record-similarity calibrate-diff OLD.ndjson (NEW.ndjson \| --config-b CONFIG) [--fail-on WHAT]` | Compares two calibrations, or one under a second configuration. See [Comparing two calibrations](#comparing-two-calibrations). |
@@ -2221,7 +2222,9 @@ What it does, and what it will not do:
   layout the records are stored under.
 - **It cannot see a record's anchor.** The anchor is a vector with no fingerprints, so whether a record's drift is
   still measured from the right original is not something an audit can say. An export's `anchor` is checked as an
-  import would check it, and compared with nothing.
+  import would check it, and compared with nothing. What can be compared with is a
+  [backup of the anchors](#backing-up-the-anchors): `anchors restore --dry-run` says which records have the
+  anchor a backup kept.
 - **Neither side is a snapshot.** The store is listed a page at a time (`--page-records`, 1,000 by default) while
   the server may be writing to it, and the export was taken earlier still. A record edited in between differs
   without anything being wrong. Give `--exported-at` the time the export was taken, in seconds since 1970, and a
@@ -2259,6 +2262,90 @@ repeated id), `brand_id` (the export's) and `stored_brand_id`, `field` or `quant
 `only_in_export`, `only_in_store`, `incomparable`), `factor`, `unit` and `stored_unit`, `layout`, `reason`,
 `revision` and `updated_at` (of the stored record), and `after_export`. An `audit_layout` line before the summary
 names each other layout the collection holds records of, and how many.
+
+### Backing up the anchors
+
+If the collection is lost, your own database can give back every record as it is now: an
+[import](#importing-a-catalog) makes a baseline of each. It cannot give back the anchors. An anchor is what a
+record said when it was first stored, the service keeps vectors and never text, and your database has most
+likely forgotten. A catalog loaded again without its anchors has every record's drift measured from the day of
+the import, and nothing says so. `record-similarity anchors` keeps a copy of the anchors in a file, and puts
+them back.
+
+```sh
+just anchors export --config config.toml --out anchors.ndjson    # every record's anchor, to a file that must not exist
+just anchors check anchors.ndjson                                # is the file whole, and what is it a backup of
+
+# After the collection was lost: import the catalog again, and then
+just anchors restore --config config.toml anchors.ndjson --dry-run    # what a restore would do, writing nothing
+just anchors restore --config config.toml anchors.ndjson
+```
+
+`export` and `check` each end with one result line on stdout. These are from a collection of 21 synthetic
+products, three of which had been imported with the version they were created as, with the envelope fields
+removed:
+
+```json
+{"level":"INFO","message":"finished","out":"anchors.ndjson","collection":"anchors_demo","layout":"f46e48ee0ea2dd02-d256-t256|brand,category,description,name","points":21,"records":21,"other_layout":0,"unreadable":0,"elapsed_s":0.4}
+{"level":"INFO","message":"whole","backup":"anchors.ndjson","format":1,"fingerprint":"f46e48ee0ea2dd02-d256-t256","layout":"f46e48ee0ea2dd02-d256-t256|brand,category,description,name","dimension":1024,"collection":"anchors_demo","taken_at":1794597082,"records":21}
+```
+
+Then the collection was deleted, as a lost one is, and the catalog imported again from an export without the
+original versions: 20 products, one of them edited since the backup and one gone from the catalog. The restore,
+which names each record it leaves alone:
+
+```json
+{"level":"WARN","message":"anchor not restored","id":"p9","outcome":"not_stored"}
+{"level":"WARN","message":"anchor not restored","id":"p7","outcome":"changed"}
+{"level":"INFO","message":"finished","dry_run":false,"records":21,"restored":3,"already":16,"not_stored":1,"other_brand":0,"has_history":0,"changed":1,"failed":0,"elapsed_s":0.7}
+```
+
+`--dry-run` had printed the same lines with `"dry_run":true` and written nothing. Run a second time, the
+restore finds nothing left to do: `"restored":0,"already":19`.
+
+| Outcome | What it means |
+|---|---|
+| `restored` | The record has the anchor the backup kept. Its drift is measured from where it began, as before the loss. |
+| `already` | Its anchor already is the one that was kept: a record that was its own anchor when the backup was taken, or one restored by an earlier run. Nothing was written. |
+| `not_stored` | No record with that id is stored. None is created: import it, and restore again. |
+| `other_brand` | It is stored under another brand than the backup has it under, and was left alone. |
+| `has_history` | It has an anchor that is not simply itself, or it has been written since it was created: it was imported with its original version, edited since the import, or reset by a forced write. That history is its own, and it was left alone. |
+| `changed` | It is not the record the backup was taken of: its text or its quantities differ. It was left alone, with the anchor the import gave it. |
+
+What it does, and what it will not do:
+
+- **A backup is a file of vectors, and holds no text.** One line for each record: its id, its brand, its anchor,
+  the first values of its quantities, and the fingerprints and quantities of the record as it was. It holds a
+  vector made from the text each record was created with, so give it the care you give the collection. It is
+  about 6 KB a record at 1,024 components: 100,000 records are 600 MB.
+- **`export` reads, and changes nothing.** It opens the collection without creating it, writes under another
+  name until the last line is on the disk, and never writes over a file that exists, so a file with the name
+  you asked for is a whole backup. The store is listed while the server may be writing to it. That is fine for
+  an anchor, which changes only when a record is created or a write is forced.
+- **A backup belongs to one model and one set of fields.** An anchor is a vector, and means nothing under
+  another layout: `restore` refuses a backup of another layout whole, having written nothing. After a change of
+  model, history survives the way it always has, through the `anchor` an export gives a record
+  ([Re-indexing](#re-indexing)).
+- **A restore never replaces an anchor that has a history.** It gives a record the anchor that was kept only if
+  the record has not been written since it was imported, is its own anchor, is stored under the same brand,
+  and is, fingerprint for fingerprint and amount for amount, what it was when the backup was taken. So restore
+  right after the import and before the server takes edits: a record edited in between has a history and is
+  left alone.
+- **A record that changed between the backup and the loss keeps the anchor the import gave it,** which is the
+  record as it is now. Whether the anchor that was kept still belongs to it is not something its text can say,
+  so nothing decides it here; the records are named, and the backup still has their anchors. How many there are
+  depends on how old the backup is, which is the reason to take one often.
+- **It is for a collection that was lost.** Against one that never was, a restore finds almost every anchor
+  `already` in place. The exception is a record that was deleted and created again with the same content since
+  the backup: it looks exactly like a record imported after a loss, and gets the anchor of its earlier life.
+- **A Qdrant snapshot is the other way to survive a loss,** and the two fit together. A snapshot brings back
+  everything as it was when it was taken, anchors included, and every baseline is then as old as the snapshot:
+  the [audit](#auditing-the-store-against-the-catalog) says which. An import brings the baselines up to today
+  and has no anchors, which is what this file is for.
+
+On a laptop CPU, with Qdrant in Docker on the same machine, the anchors of 100,000 synthetic records were
+exported in 2.5 seconds and the file was checked in half a second. A restore that found every anchor already in
+place, which is one read of each record, took 20 seconds.
 
 ### A candidate policy in the shadow
 
@@ -2411,7 +2498,8 @@ start-up.
 
 **Drift history survives a re-index only if the export carries it.** Give each record's original version as
 `anchor` and its drift is measured from there, as before. Leave it out and each record's anchor becomes its
-content at the time of the import.
+content at the time of the import. A [backup of the anchors](#backing-up-the-anchors) does not help here: its
+vectors are the old model's.
 
 ### Health and shutdown
 
@@ -2977,7 +3065,7 @@ crates/
   similarity-proto/     the .proto file and generated gRPC code
   similarity-core/      the encoder (Burn), tokenization, composite vectors, quantities, scoring, policy. No network, no async.
   similarity-store/     the VectorStore trait, the Scan trait (listing a store), an in-memory implementation, and the Qdrant one
-  similarity-server/    config, embedding worker thread, engine, gRPC service, import, audit, calibration, telemetry, and the `record-similarity` binary
+  similarity-server/    config, embedding worker thread, engine, gRPC service, import, audit, anchor backup, calibration, telemetry, and the `record-similarity` binary
   similarity-train/     fine-tuning: data, losses, the training loop, and the `record-similarity-train` binary
 data/
   calibration.sample.jsonl        synthetic labeled pairs, in the strict format
@@ -2988,7 +3076,7 @@ data/
   regression.snapshot.ndjson      what the pinned model and the example config make of them
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D42)
+  decisions.md               why things are the way they are (D1 to D43)
   data-request-prompt.md     a brief for collecting labeled production data
   import-prompt.md           a brief for loading the real catalog into a running service
   feature-suggestions.md     features that could be added, built and not, the last twelve about production

@@ -319,8 +319,9 @@ impl Restored {
 }
 
 /// The least cosine at which two composites are one vector. A vector that has been through a store comes back
-/// as itself to within rounding (Qdrant keeps a cosine vector at unit length), and any edit that moves a word
-/// moves a composite much further than this.
+/// as itself only to within rounding (Qdrant keeps a cosine vector at unit length). This is a tolerance for
+/// telling a vector from itself, not a threshold on similarity: two anchors this close differ by nothing a
+/// threshold could see, so taking one for the other changes no verdict.
 const SAME_VECTOR: f32 = 0.999_999;
 
 const fn same_vector_at(cosine: f32) -> bool {

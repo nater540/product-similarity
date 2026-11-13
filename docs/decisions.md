@@ -2120,3 +2120,105 @@ in the schema's order is the first thing to try if an export ever does not fit; 
 
 **Not built:** a repair mode; an audit of anchors; an audit through the server, for a caller that cannot reach
 Qdrant (the import got a streaming call for that reason, D33, and an audit could); a time given as a date.
+
+## D43. Anchors are backed up to a file, and restored only to a record with nothing to lose
+
+If a collection is lost, the caller's database gives back every record as it is now: an import makes a baseline
+of each (D20). It cannot give back the anchors. An anchor is the first value each field of a record ever had
+(D8), the server keeps vectors and never text, and the caller's database has usually forgotten what a record
+said when it was created. A catalog loaded again without its anchors has every record's drift history reset to
+the day of the import, and nothing says so. That is the state somebody walking a record away from what it was
+would ask for.
+
+`record-similarity anchors export` writes every record's anchor to a file, `anchors check` says whether a file
+is a whole backup, and `anchors restore` puts anchors back after a collection was lost and the catalog imported
+again.
+
+**The backup is read by the scan, which now reads anchors when asked** (`Read::Anchor`, D42). It still reads
+no current composite, which can be made again from the record's text. The collection is opened and never
+created, the store is listed while it may be written to, and so the backup is of no single moment: each record
+is in it once, with the anchor it had when its page was read. An anchor changes only when a record is created
+or a write is forced, which is as much of a moment as an anchor has.
+
+**The file is lines of JSON with a vector as bytes.** A header that names the model's fingerprint, the layout,
+and the width; a line for each record with its id, its brand, its anchor, the first values of its quantities,
+and the fingerprints and quantities of the record as it was; and a last line with the number of records. A
+vector is its components as little-endian bytes in base64, and not a list of numbers: a backup has to give back
+exactly what was stored, which bytes do by construction, and they are half the size. `base64` is the crate, at
+the version `tonic` already has in the build. The last line is how a file that was cut short is known to be
+one. `export` writes under another name and renames when the last line is on the disk, and never writes over a
+file that exists, so a file with the name that was asked for is whole.
+
+**A backup belongs to a layout.** An anchor is a vector of one model over one set of fields (D12). A restore
+reads the whole file first and refuses, having written nothing, one that is not whole or is of another layout
+than the server's. After a change of model a backup is of no use, and what carries history across is still the
+`anchor` an export gives a record when it is imported (D20).
+
+**A restore gives a record an anchor only when nothing can be lost by it and nothing has to be judged.** An
+anchor is the one thing an accepted write may never replace (D8), and a restore is no accepted write. So the
+rule (`engine::restorable`) is the narrowest one that still does what the backup is for:
+
+- the record is stored under the brand the backup has it under;
+- it has never been written since it was created (revision 1) and is its own anchor, which is what a record is
+  when it has just been imported again;
+- it is, fingerprint for fingerprint and amount for amount, the record the backup was taken of.
+
+Then it gets the anchor that was kept, extended with its own value for anything that anchor lacks, as an anchor
+is for a field it never had. Every other record is left exactly as it is and named with the reason:
+
+| Outcome | What it means |
+|---|---|
+| `restored` | The record has the anchor the backup kept. |
+| `already` | Its anchor already is that one. Nothing was written. |
+| `not_stored` | No record with that id is stored. None is created: an anchor is not a record. |
+| `other_brand` | It is stored under another brand than the backup has it under. |
+| `has_history` | It has an anchor that is not itself, or has been written since it was created: it was imported with its original version, edited since the import, or reset by a forced write. That history is its own. |
+| `changed` | It is not what it was when the backup was taken. |
+
+A record whose anchor a reviewer reset by a forced write since the backup is therefore never given the old one
+back (it has been written), and neither is one that was imported with the original version the caller still
+had (the caller's is the better source). A restore is a write like any other (D35): over the version it read
+or not at all, on a task of its own, with the record's lock (D38, D41), and it counts as a write of the record.
+Run twice, the second finds every anchor `already` where it should be. `--dry-run` asks the same questions and
+writes nothing.
+
+**Two vectors are one vector from a cosine of 0.999999.** Qdrant keeps a cosine vector at unit length, so an
+anchor that went into it comes back as itself only to within rounding, and "is this record its own anchor" and
+"is this already the anchor that was kept" are questions about vectors that have been through it. This is a
+tolerance for telling a vector from itself and not a threshold on similarity: two anchors that close differ by
+nothing a threshold could see, so taking one for the other changes no verdict. It was run against the real
+model and Qdrant 1.20.0 (`just test-real`), where anchors that had not moved were told from the one that had.
+
+**Held to its rule by two properties** (D19). Whatever is done to a store before a backup is taken and after,
+restoring the backup writes only to a record that meets the rule, and leaves every other exactly as it was.
+And a store that is lost with whatever history its records had, imported again from what the caller's database
+would say, and restored, has every anchor it had. The rule and the file's reading are among the files whose
+tests are tested (D25).
+
+**For the owner to decide.** Three things here are not only technical, and were built to the most careful
+answer so that nothing waits on them:
+
+1. *Where a backup may be kept.* It holds no text. It holds ids, brands, quantities, fingerprints of text, and
+   a vector made from the text each record was created with, and what a vector gives away about the text it
+   was made from is not nothing. The command writes where it is told and nowhere else. The README says to give the file the care
+   the collection gets; whether that is enough is a question about the owner's data and not about this code.
+2. *Records that changed between the backup and the loss.* They are `changed` and are left with the anchor the
+   import gave them, which is the record as it is now: the drift they had come before the loss is forgotten.
+   How many there are depends on how old the backup is. Giving them the kept anchor would be right for an
+   honest edit and wrong for an id that now holds another product, and the text cannot say which. One rule
+   that could: restore where the record as it is now is still within `anchor_threshold` of the anchor that was
+   kept, which is what the server would have required of every edit in between. That is a threshold deciding a
+   write nobody judged, so it is not built, and the records are listed for whoever decides.
+3. *A record deleted and created again with the same content* since the backup is indistinguishable from one
+   that was imported again after a loss, and a restore gives it the anchor of its earlier life. Run only after
+   a loss, as it is meant to be, that is the point of it. Run against a collection that was never lost, it
+   would undo a delete-and-create that somebody may have meant.
+
+**Measured,** on a laptop CPU with Qdrant in Docker on the same machine, on a collection of 100,000 synthetic
+records with anchors of 1,024 components: the export took 2.5 seconds at 1,000 records a page (4.0 at 200, 2.6
+at 5,000) and wrote 600 MB, about 6 KB a record; `anchors check` read that file in half a second; and a restore
+that found every anchor already in place, which is one read of each record, took 20 seconds.
+
+**Not built:** a restore for records that changed (above); a backup of records under another layout (their
+vectors are another model's, and the server cannot read them either); compression of the file, which any
+tool does; a backup taken through the server for a caller that cannot reach Qdrant.

@@ -6,7 +6,7 @@ and trained in [Burn](https://burn.dev), run by ONNX Runtime), compared with the
 rejected against calibrated thresholds. A record's quantities (weight, volume, potency) are compared as numbers
 beside that, never embedded. Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D42) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D43) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -46,7 +46,7 @@ changing a design. Infer conventions from the existing code first.
   rule, keep the shrunk case as an ordinary named test, and commit the `proptest-regressions/` file it wrote.
 - **The tests of the verdict-deciding files are themselves tested** (D25). After changing the scoring, the
   quantity comparison, the schema, the engine's write path, the calibration statistics, the match ranking, the
-  promotion gate, or the audit's comparison, run `just mutants -j 3`
+  promotion gate, the audit's comparison, or the file a backup of anchors is kept in, run `just mutants -j 3`
   (35 minutes; `just mutants-diff` for a quick look) from a clean checkout, never from a tree being
   edited. A surviving mutant gets a test that states the boundary. Exclude one in `.cargo/mutants.toml` only if
   the change cannot alter behavior, with the reason, and never because it is hard to kill.
@@ -69,7 +69,7 @@ changing a design. Infer conventions from the existing code first.
 - `crates/similarity-core`: encoder, strict weight loading and saving, tokenization, composite vectors, quantities,
   scoring, policy, and scoring a menu item against stored records (`matching`). Synchronous, no I/O beyond reading and writing a model directory, no network code ever (D11).
 - `crates/similarity-store`: the `VectorStore` trait, the `Scan` trait (listing what a store holds, which only the
-  audit does), `MemoryStore`, `QdrantStore`.
+  audit and the anchor backup do), `MemoryStore`, `QdrantStore`.
 - `crates/similarity-runs`: the local record of runs (D23): the manifest, starting and ending a run, reading runs
   back. It records and lists; it decides nothing.
 - `crates/similarity-server`: config, the embedding worker thread, `Engine` (all behavior), the thin gRPC layer,
@@ -77,7 +77,8 @@ changing a design. Infer conventions from the existing code first.
   at), `metrics` (the few numbers the server keeps
   about itself), `telemetry` (where its traces and metrics go: the exporters, the page, the traced store),
   `model fetch`, `import`, `audit` (the store checked against an export: `compare.rs` for one record and the counts,
-  `mod.rs` for the run, `report.rs` for the report and the events), `compare`/`calibrate`/`calibrate-drift`/`calibrate-match`/`calibrate-sweep` (the `offline` module), `load` (the load
+  `mod.rs` for the run, `report.rs` for the report and the events), `anchors` (a backup of every record's anchor:
+  `file.rs` for the file, `mod.rs` for the export and the restore), `compare`/`calibrate`/`calibrate-drift`/`calibrate-match`/`calibrate-sweep` (the `offline` module), `load` (the load
   test), `runs` (reading recorded runs back, comparing and reporting them), `shadow` (a candidate policy judging
   live requests), `registry` (which model was put into service, and the gate), and the `record-similarity`
   binary. Keep `grpc.rs` free of decisions.
@@ -215,6 +216,21 @@ changing a design. Infer conventions from the existing code first.
   one of agree, differ, not stored, not in the export, not compared (a property holds that). The `audit_*`
   event names and fields, and the codes of `Kind` and `Difference`, are an interface like the calibration ones.
   A line carries ids and brands, never a record's text or a fingerprint of it.
+- **A restore gives an anchor only to a record with nothing to lose** (D43). `Engine::restore_anchor` is the one
+  write besides a forced one that changes an anchor, and `engine::restorable` is its whole rule: the record is
+  stored under the backup's brand, has never been written since it was created (revision 1), is its own anchor,
+  and is fingerprint for fingerprint and amount for amount what the backup was taken of. Do not widen it: a
+  record that changed since the backup, has a history, or was reset by a forced write is left alone and named,
+  and whether a `changed` record may ever get its kept anchor is the owner's decision (D43 says what the
+  choices are), not a default to pick. It is a write like any other: conditional on the version read, through
+  `committed`, counted as a revision. `SAME_VECTOR` is a tolerance for telling a vector from itself after
+  Qdrant has kept it at unit length, not a similarity threshold: do not tune it, and do not use it to judge
+  anything. A backup belongs to its layout: `anchors::restore` reads the whole file first and refuses, having
+  written nothing, one that is cut short (no last line) or of another layout. Keep vectors in the file as
+  bytes in base64, never as numbers. `anchors export` opens the collection with `QdrantStore::open`, writes
+  under a `.partial` name and renames, and never writes over a file. A backup holds no text and must not gain
+  any; a scan reads an anchor only when asked (`Read::Anchor`) and never a current composite. The file's line
+  names and fields, and the codes of `Restored`, are an interface: add, never rename.
 - **A brand, once stored, must be named by every later request for that id**, including `Delete` (D14).
 - **What a supported model directory is lives in one place**, `similarity_core::model::Pipeline`. The loader and
   `model fetch` both use it; never parse `modules.json` anywhere else.
@@ -332,6 +348,9 @@ changing a design. Infer conventions from the existing code first.
 - Load a catalog: `just import export.jsonl config.toml` (`--check` validates only)
 - Check the store against the catalog: `just audit export.jsonl config.toml` (`--ndjson` for every finding as an
   event, `--exported-at SECONDS` to set aside what was written since, `--fail-on-differences` for an exit status)
+- Back up the anchors, and put them back after a collection was lost and imported again:
+  `just anchors export --config config.toml --out anchors.ndjson`, `just anchors check anchors.ndjson`,
+  `just anchors restore --config config.toml anchors.ndjson` (`--dry-run` writes nothing)
 - Measure: `just throughput`, `just load`, `just calibrate`, `just calibrate-drift`, `just calibrate-match`, `just calibrate-sweep`, `just calibrate-diff`, `just verdict-gate old.ndjson pairs.full.jsonl`
 - Read a shadowed server's stdout: `just shadow-report shadow.ndjson --ids to-label.jsonl`
 - Put a model into service: `just promote --config candidate.toml --calibration holdout.ndjson`; then

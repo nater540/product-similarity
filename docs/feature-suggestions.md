@@ -3,7 +3,7 @@
 Features that could be added to this project, with what each is, why it matters here, how it would fit the
 code, and what it would cost. **Of the first twenty, all are built or half built (6 and 18) except 10, 14, and
 17, which the owner deferred on 2026-11-11.** Features 21 to 32 (section E) are about running the service in
-production: 21, 22, 23, 24, and 26 are built, 28 is half built, and the rest are proposals. They were proposed
+production: 21 to 26 are built, 28 is half built, and the rest are proposals. They were proposed
 in November 2026 from a read of the repository as it stood then (`README.md`, `docs/decisions.md`, and the
 crates); check a suggestion against the code before starting on it, since the code will have moved. It has
 moved once already: records now carry quantities, compared as numbers (D16), and the features that touch a
@@ -76,7 +76,7 @@ and because each would put a Python service in the loop.
 | 22 | Deadlines honored, writes that survive a cancelled request (built) | Production | M | No |
 | 23 | Conditional writes across replicas (built) | Production | M | No |
 | 24 | Audit of the store against the catalog (built) | Production | M | An export |
-| 25 | Anchor backup and restore | Production | M | No |
+| 25 | Anchor backup and restore (built) | Production | M | No |
 | 26 | Operational metrics (built) | Production | M | No |
 | 27 | Fair admission between brands | Production | M | No |
 | 28 | A batch call | Production | M | No |
@@ -679,7 +679,7 @@ keep their brand under `tenant` are findings and not errors; a record stored wit
 one stored under another; the audit loads the model, as `import` does, for the fingerprint that is half of the
 layout, and embeds nothing; an edit made since the export was taken can be set aside (`--exported-at`); and it
 only reports. It cannot see anchors: the store keeps a vector of an anchor and no fingerprint of its text. The
-scan reads no vectors, so feature 25 will have to add them to it.
+scan read no vectors until feature 25 had it read anchors when asked.
 
 **What.** `record-similarity audit export.jsonl`: reads an export of the caller's own database (the format
 `import` reads) and the collection, and reports ids the store lacks, ids the store has that the export does not,
@@ -695,6 +695,15 @@ no longer exists. The store trait has no way to list what it holds, so it needs 
 repair. An import only creates (D20), and replacing a baseline is a `FORCE`, which resets the anchor.
 
 ### 25. Anchors are the one thing that cannot be rebuilt: back them up
+
+**Built** (D43), as `record-similarity anchors export`, `check`, and `restore`. What came out differently: the
+file keeps each vector as bytes in base64, so that what comes back is exactly what was stored; it has a last
+line, so a file that was cut short is known to be; a restore is far narrower than "put the anchors back": it
+gives an anchor only to a record that has not been written since it was imported, is its own anchor, and is
+what it was when the backup was taken, and it leaves every other record alone and names it; and it can be
+asked what it would do. **Three things are the owner's to decide** and are written up in D43: where a backup
+may be kept, whether a record that changed between the backup and the loss may ever be given its kept anchor
+(it is not, today), and what a restore should make of a record that was deleted and created again.
 
 **What.** `record-similarity anchors export` and `anchors restore`: every record's anchor vector, its text
 fingerprints, and its first quantities, with the model fingerprint and layout they belong to, to and from a file.
@@ -831,8 +840,8 @@ part that puts them in order. It is also most of the model half of feature 18.
 3. **23, conditional writes.** It removes the first limitation in the README, and the store turns out to
    support it.
 4. **24 and 25, audit and anchor backup,** together: they share a scan of the store, and between them they are
-   the answer to "what if the collection and the catalog disagree, or the collection is gone". 24 is built; 25
-   is next, and needs the scan to read vectors.
+   the answer to "what if the collection and the catalog disagree, or the collection is gone". Both are built
+   (D42, D43).
 
 Then 26 if a metrics endpoint is wanted, and 27 before the first large integration. 28 to 31 wait on
 who the callers turn out to be; 32 waits for a model change.
