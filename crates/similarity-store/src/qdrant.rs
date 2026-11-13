@@ -14,6 +14,9 @@
 //! answer is `completed` either way), so each conditional write carries a mark of its own in the payload and the
 //! point is read back to see whose mark it holds.
 //!
+//! A scan is Qdrant's scroll: pages in the order of the point ids, payloads only. It lists every point in the
+//! collection, and says of each what [`QdrantStore::get`] would make of it.
+//!
 //! Qdrant point ids must be integers or UUIDs, and record ids are arbitrary strings, so the point id is the UUIDv5
 //! of the record id under a fixed namespace. The mapping is deterministic, so a record is always one point no
 //! matter which server instance writes it.
@@ -24,20 +27,25 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use qdrant_client::qdrant::point_id::PointIdOptions;
+use qdrant_client::qdrant::value::Kind;
 use qdrant_client::qdrant::vector_output::Vector as StoredVector;
 use qdrant_client::qdrant::vectors_config::Config as VectorsLayout;
 use qdrant_client::qdrant::{
   Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, DeletePointsBuilder, Distance, FieldType,
   Filter, GetPointsBuilder, HnswConfigDiffBuilder, KeywordIndexParamsBuilder, NamedVectors, PointId, PointStruct,
-  PointsIdsList, QueryPointsBuilder, UpdateMode, UpsertPointsBuilder, Value, VectorParamsBuilder, VectorsConfigBuilder,
-  VectorsOutput, VectorsSelector,
+  PointsIdsList, QueryPointsBuilder, RetrievedPoint, ScrollPointsBuilder, UpdateMode, UpsertPointsBuilder, Value,
+  VectorParamsBuilder, VectorsConfigBuilder, VectorsOutput, VectorsSelector,
 };
 use qdrant_client::{Payload, Qdrant, QdrantError};
 use serde::{Deserialize, Serialize};
 use similarity_core::{Quantities, RecordVectors};
 use uuid::Uuid;
 
-use crate::{Expected, Found, Neighbor, Result, SearchQuery, StoreError, StoredRecord, VectorStore, Version};
+use crate::{
+  Cursor, Entry, Expected, Found, Neighbor, Page, Result, Scan, ScannedRecord, SearchQuery, StoreError, StoredRecord,
+  VectorStore, Version,
+};
 
 const CURRENT: &str = "current";
 const ANCHOR: &str = "anchor";
@@ -46,6 +54,8 @@ const LAYOUT_KEY: &str = "layout";
 // The two payload keys a conditional write filters on. They are the names `PointPayload` serializes under.
 const REVISION_KEY: &str = "revision";
 const UPDATED_AT_KEY: &str = "updated_at";
+// Where a point says which record it is. Read by name only for a point that cannot be decoded.
+const RECORD_ID_KEY: &str = "record_id";
 
 /// The UUIDv5 namespace record ids are hashed under. Changing it orphans every stored point.
 const POINT_NAMESPACE: Uuid = Uuid::from_u128(0x7d0c_3f5e_9a41_4b6e_8c1d_52a7_e3b9_604f);
@@ -146,6 +156,38 @@ impl QdrantStore {
   /// [`StoreError::Unavailable`] if Qdrant cannot be reached, [`StoreError::Collection`] if the collection exists
   /// with an incompatible vector configuration, [`StoreError::Invalid`] if `dimension` is zero.
   pub async fn connect(settings: &QdrantSettings, layout: impl Into<String>, dimension: usize) -> Result<Self> {
+    let store = Self::client(settings, layout, dimension)?;
+    store.ensure_collection().await?;
+    Ok(store)
+  }
+
+  /// Connects to a collection that is already there, and changes nothing about it: for looking at a store, not
+  /// for serving from one. Where [`Self::connect`] creates a missing collection and its payload indexes, this
+  /// refuses a collection that does not exist and creates no index. The collection is verified as `connect`
+  /// verifies it.
+  ///
+  /// What comes back is a whole store and could be written to. Whoever opens one this way should hold it as a
+  /// [`Scan`], which cannot.
+  ///
+  /// # Errors
+  ///
+  /// [`StoreError::Unavailable`] if Qdrant cannot be reached, [`StoreError::Collection`] if the collection does
+  /// not exist or exists with an incompatible vector configuration, [`StoreError::Invalid`] if `dimension` is
+  /// zero.
+  pub async fn open(settings: &QdrantSettings, layout: impl Into<String>, dimension: usize) -> Result<Self> {
+    let store = Self::client(settings, layout, dimension)?;
+    if !store.collection_exists().await? {
+      return Err(StoreError::Collection {
+        collection: store.collection,
+        reason: "it does not exist".to_owned(),
+      });
+    }
+    store.verify_collection().await?;
+    Ok(store)
+  }
+
+  /// A store for `settings` that has not spoken to Qdrant yet.
+  fn client(settings: &QdrantSettings, layout: impl Into<String>, dimension: usize) -> Result<Self> {
     if dimension == 0 {
       return Err(StoreError::Invalid(
         "the composite dimension must be positive".to_owned(),
@@ -158,15 +200,13 @@ impl QdrantStore {
       builder = builder.api_key(key.as_str());
     }
     let client = builder.build().map_err(|source| unavailable(&source))?;
-    let store = Self {
+    Ok(Self {
       client,
       collection: settings.collection.clone(),
       layout: layout.into(),
       dimension,
       marks: Arc::new(Marks::new()),
-    };
-    store.ensure_collection().await?;
-    Ok(store)
+    })
   }
 
   async fn ensure_collection(&self) -> Result<()> {
@@ -435,6 +475,109 @@ fn decode_payload(id: &str, payload: HashMap<String, Value>) -> Result<PointPayl
     })
 }
 
+/// A point's id as a cursor. The kind of id is kept: a collection can hold points this service did not write, and
+/// theirs may be numbers.
+fn cursor_of(point: &PointId) -> Option<Cursor> {
+  match point.point_id_options.as_ref()? {
+    PointIdOptions::Uuid(uuid) => Some(Cursor(format!("u{uuid}"))),
+    PointIdOptions::Num(number) => Some(Cursor(format!("n{number}"))),
+  }
+}
+
+/// The point a cursor of this store names, or `None` for a cursor some other store gave.
+fn point_of(cursor: &Cursor) -> Option<PointId> {
+  let Cursor(text) = cursor;
+  if let Some(uuid) = text.strip_prefix('u') {
+    Some(PointId::from(uuid.to_owned()))
+  } else {
+    text.strip_prefix('n')?.parse::<u64>().ok().map(PointId::from)
+  }
+}
+
+/// What a scan says of one point, for a store of `layout`: what [`QdrantStore::get`] would make of it, without its
+/// vectors and without failing.
+fn entry(layout: &str, point: RetrievedPoint) -> Entry {
+  // Looked up before decoding, so that a point that cannot be decoded can still say which record it is.
+  let named = match point.payload.get(RECORD_ID_KEY).and_then(|value| value.kind.as_ref()) {
+    Some(Kind::StringValue(id)) => Some(id.clone()),
+    _ => None,
+  };
+  let payload = match decode_payload(named.as_deref().unwrap_or_default(), point.payload) {
+    Ok(payload) => payload,
+    Err(StoreError::Corrupt { reason, .. }) => return Entry::Unreadable { id: named, reason },
+    Err(other) => {
+      return Entry::Unreadable {
+        id: named,
+        reason: other.to_string(),
+      };
+    }
+  };
+  if point.id != Some(point_id(&payload.record_id)) {
+    // A point written by something other than this service: `get` looks for a record where its id puts it, and
+    // would never find this one.
+    return Entry::Unreadable {
+      id: Some(payload.record_id),
+      reason: "the point is not the one its record id is kept at".to_owned(),
+    };
+  }
+  if payload.layout != layout {
+    return Entry::OtherLayout {
+      id: payload.record_id,
+      layout: payload.layout,
+    };
+  }
+  Entry::Record(ScannedRecord {
+    id: payload.record_id,
+    brand_id: payload.brand_id,
+    hashes: payload.hashes,
+    quantities: payload.quantities,
+    anchor_quantities: payload.anchor_quantities,
+    revision: payload.revision,
+    updated_at: payload.updated_at,
+  })
+}
+
+impl Scan for QdrantStore {
+  /// In the order of the point ids, which is Qdrant's own and no order of the record ids.
+  async fn scan(&self, from: Option<&Cursor>, limit: usize) -> Result<Page> {
+    if limit == 0 {
+      return Err(StoreError::Invalid(
+        "a scan needs a page of at least one entry".to_owned(),
+      ));
+    }
+    let mut request = ScrollPointsBuilder::new(self.collection.as_str())
+      .limit(u32::try_from(limit).unwrap_or(u32::MAX))
+      .with_payload(true)
+      .with_vectors(false);
+    if let Some(cursor) = from {
+      let first = point_of(cursor)
+        .ok_or_else(|| StoreError::Invalid("the cursor is not one a scan of this store gave".to_owned()))?;
+      request = request.offset(first);
+    }
+    let response = self
+      .client
+      .scroll(request)
+      .await
+      .map_err(|source| unavailable(&source))?;
+    let next = match response.next_page_offset {
+      None => None,
+      // Ending the scan here would report everything after this page as not stored.
+      Some(point) => Some(
+        cursor_of(&point)
+          .ok_or_else(|| StoreError::Unavailable("Qdrant named a next page by a point with no id".to_owned()))?,
+      ),
+    };
+    Ok(Page {
+      entries: response
+        .result
+        .into_iter()
+        .map(|point| entry(&self.layout, point))
+        .collect(),
+      next,
+    })
+  }
+}
+
 impl VectorStore for QdrantStore {
   async fn check(&self) -> Result<()> {
     // One small call that needs the server to answer and the collection to be there. A collection can be
@@ -660,6 +803,116 @@ mod tests {
       point_id(" 42"),
       "ids are opaque: no trimming, no parsing"
     );
+  }
+
+  fn stored(record_id: &str, payload: serde_json::Value) -> RetrievedPoint {
+    RetrievedPoint {
+      id: Some(point_id(record_id)),
+      payload: Payload::try_from(payload).unwrap().into(),
+      ..RetrievedPoint::default()
+    }
+  }
+
+  #[test]
+  fn a_scanned_point_of_this_layout_is_its_record_without_its_vectors() {
+    let point = stored(
+      "product-42",
+      serde_json::json!({
+        "record_id": "product-42",
+        "brand_id": "brand-7",
+        "layout": "model-a|name",
+        "hashes": {"name": "00ff"},
+        "revision": 3,
+        "updated_at": 1_700_000_000,
+        "quantities": {"weight": {"min": 3.5, "max": 3.5, "unit": "g"}},
+        "anchor_quantities": {"weight": {"min": 1.0, "max": 1.0, "unit": "g"}},
+        "write": "00000000deadbeef",
+      }),
+    );
+    assert_eq!(
+      entry("model-a|name", point),
+      Entry::Record(ScannedRecord {
+        id: "product-42".to_owned(),
+        brand_id: Some("brand-7".to_owned()),
+        hashes: BTreeMap::from([("name".to_owned(), "00ff".to_owned())]),
+        quantities: Quantities::from([("weight".to_owned(), Quantity::single(3.5, "g"))]),
+        anchor_quantities: Quantities::from([("weight".to_owned(), Quantity::single(1.0, "g"))]),
+        revision: 3,
+        updated_at: 1_700_000_000,
+      })
+    );
+  }
+
+  #[test]
+  fn a_scanned_point_of_another_layout_is_named_and_not_read() {
+    let point = stored(
+      "product-42",
+      serde_json::json!({"record_id": "product-42", "layout": "model-b|name", "hashes": {"name": "00ff"}}),
+    );
+    assert_eq!(
+      entry("model-a|name", point),
+      Entry::OtherLayout {
+        id: "product-42".to_owned(),
+        layout: "model-b|name".to_owned()
+      }
+    );
+  }
+
+  #[test]
+  fn a_point_that_keeps_its_brand_under_the_old_name_is_unreadable_and_still_says_which_record() {
+    let point = stored(
+      "product-42",
+      serde_json::json!({"record_id": "product-42", "tenant": "brand-7", "layout": "model-a|name"}),
+    );
+    match entry("model-a|name", point) {
+      Entry::Unreadable { id, reason } => {
+        assert_eq!(id.as_deref(), Some("product-42"));
+        assert!(reason.contains("`tenant`"), "{reason}");
+      }
+      other => panic!("expected an unreadable point, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn a_point_that_does_not_say_which_record_it_is_is_unreadable() {
+    let mut point = stored("product-42", serde_json::json!({"note": "written by something else"}));
+    point.id = Some(PointId::from(7));
+    match entry("model-a|name", point) {
+      Entry::Unreadable { id, reason } => {
+        assert_eq!(id, None);
+        assert!(reason.contains("payload"), "{reason}");
+      }
+      other => panic!("expected an unreadable point, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn a_point_that_is_not_where_its_record_id_puts_it_is_unreadable() {
+    // `get` would look for `product-42` at another point and say there is no such record.
+    let mut point = stored(
+      "product-42",
+      serde_json::json!({"record_id": "product-42", "layout": "model-a|name"}),
+    );
+    point.id = Some(point_id("product-43"));
+    assert_eq!(
+      entry("model-a|name", point),
+      Entry::Unreadable {
+        id: Some("product-42".to_owned()),
+        reason: "the point is not the one its record id is kept at".to_owned()
+      }
+    );
+  }
+
+  #[test]
+  fn a_cursor_names_a_point_whichever_kind_of_id_it_has() {
+    for point in [point_id("product-42"), PointId::from(7), PointId::from(u64::MAX)] {
+      assert_eq!(point_of(&cursor_of(&point).unwrap()), Some(point));
+    }
+    assert_ne!(cursor_of(&PointId::from(7)), cursor_of(&PointId::from("7".to_owned())));
+    // What the in-memory store gives, a record id, is not a point.
+    assert_eq!(point_of(&Cursor("product-42".to_owned())), None);
+    assert_eq!(point_of(&Cursor("n-7".to_owned())), None);
+    assert_eq!(cursor_of(&PointId::default()), None);
   }
 
   #[test]

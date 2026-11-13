@@ -22,6 +22,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use qdrant_client::qdrant::ScrollPointsBuilder;
 use similarity_core::vector::{cosine, normalize};
 use similarity_core::{Quantities, Quantity, RecordVectors};
 use similarity_store::{
@@ -945,7 +946,7 @@ async fn a_collection_that_lost_its_payload_indexes_gets_them_back_on_connect() 
 #[ignore = "needs a Qdrant server at $QDRANT_URL (`just qdrant-up`); run with `just test-qdrant`"]
 async fn a_point_written_before_quantities_existed_reads_back_with_none() {
   use qdrant_client::Payload;
-  use qdrant_client::qdrant::{PointsIdsList, ScrollPointsBuilder, SetPayloadPointsBuilder};
+  use qdrant_client::qdrant::{PointsIdsList, SetPayloadPointsBuilder};
 
   let settings = qdrant_settings(unique_collection("legacy"));
   let store = QdrantStore::connect(&settings, LAYOUT, DIM).await.unwrap();
@@ -986,6 +987,175 @@ async fn a_point_written_before_quantities_existed_reads_back_with_none() {
     (Some("brand-1"), 1),
     "and the rest of the record is intact"
   );
+}
+
+#[tokio::test]
+#[ignore = "needs a Qdrant server at $QDRANT_URL (`just qdrant-up`); run with `just test-qdrant`"]
+async fn the_qdrant_store_lists_what_it_holds() {
+  let settings = qdrant_settings(unique_collection("scan"));
+  let store = QdrantStore::connect(&settings, LAYOUT, DIM).await.unwrap();
+  let other_layout = QdrantStore::connect(&settings, OTHER_LAYOUT, DIM).await.unwrap();
+
+  let outcome = tokio::spawn({
+    let (store, other_layout) = (store.clone(), other_layout);
+    async move { Box::pin(scanning(&store, &other_layout)).await }
+  })
+  .await;
+  store.delete_collection().await.unwrap();
+  outcome.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs a Qdrant server at $QDRANT_URL (`just qdrant-up`); run with `just test-qdrant`"]
+async fn a_point_that_cannot_be_read_is_listed_and_the_scan_goes_on() {
+  use qdrant_client::Payload;
+  use qdrant_client::qdrant::{NamedVectors, PointStruct, PointsIdsList, SetPayloadPointsBuilder, UpsertPointsBuilder};
+
+  let settings = qdrant_settings(unique_collection("unreadable"));
+  let store = QdrantStore::connect(&settings, LAYOUT, DIM).await.unwrap();
+  for id in ["gummies", "vape", "flower"] {
+    store
+      .put(&record(id, Some("brand-1"), [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+      .await
+      .unwrap();
+  }
+
+  // Two things this service did not write as they are now. A point from before 2026-11-12, whose brand is under
+  // `tenant`: the payload of `vape`, with the key renamed. And a point of something else altogether, under a
+  // number, as this service never names a point.
+  let client = qdrant_client::Qdrant::from_url(&settings.url).build().unwrap();
+  let scrolled = client
+    .scroll(ScrollPointsBuilder::new(settings.collection.as_str()).with_payload(true))
+    .await
+    .unwrap();
+  let point = scrolled
+    .result
+    .into_iter()
+    .find(|point| point.payload["record_id"].as_str().map(String::as_str) == Some("vape"))
+    .unwrap();
+  let mut old = serde_json::to_value(Payload::from(point.payload)).unwrap();
+  let keys = old.as_object_mut().unwrap();
+  let brand = keys.remove("brand_id").unwrap();
+  keys.insert("tenant".to_owned(), brand);
+  client
+    .overwrite_payload(
+      SetPayloadPointsBuilder::new(settings.collection.as_str(), Payload::try_from(old).unwrap())
+        .points_selector(PointsIdsList {
+          ids: vec![point.id.unwrap()],
+        })
+        .wait(true),
+    )
+    .await
+    .unwrap();
+  let direction = unit([0.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
+  let foreign = PointStruct::new(
+    7,
+    NamedVectors::default()
+      .add_vector("current", direction.clone())
+      .add_vector("anchor", direction),
+    Payload::try_from(serde_json::json!({"note": "not a record"})).unwrap(),
+  );
+  client
+    .upsert_points(UpsertPointsBuilder::new(settings.collection.as_str(), vec![foreign]).wait(true))
+    .await
+    .unwrap();
+
+  // One entry a page, so that the numbered point is a cursor on the way.
+  let scan = tokio::spawn({
+    let store = store.clone();
+    async move { scanned_from(&store, None, 1).await }
+  })
+  .await;
+  store.delete_collection().await.unwrap();
+  let entries = scan.unwrap();
+
+  assert_eq!(entries.len(), 4, "{entries:?}");
+  let mut readable: Vec<&str> = entries
+    .iter()
+    .filter_map(|entry| match entry {
+      Entry::Record(scanned) => Some(scanned.id.as_str()),
+      _ => None,
+    })
+    .collect();
+  readable.sort_unstable();
+  assert_eq!(readable, ["flower", "gummies"]);
+  assert!(entries.iter().any(|entry| matches!(
+    entry,
+    Entry::Unreadable { id: Some(id), reason } if id == "vape" && reason.contains("`tenant`")
+  )));
+  assert!(
+    entries
+      .iter()
+      .any(|entry| matches!(entry, Entry::Unreadable { id: None, .. }))
+  );
+}
+
+#[tokio::test]
+#[ignore = "needs a Qdrant server at $QDRANT_URL (`just qdrant-up`); run with `just test-qdrant`"]
+async fn opening_a_collection_that_is_not_there_is_refused_and_creates_nothing() {
+  let settings = qdrant_settings(unique_collection("absent"));
+  match QdrantStore::open(&settings, LAYOUT, DIM).await {
+    Err(StoreError::Collection { collection, reason }) => {
+      assert_eq!(collection, settings.collection);
+      assert!(reason.contains("does not exist"), "{reason}");
+    }
+    other => panic!("expected the collection to be reported missing, got {other:?}"),
+  }
+  let client = qdrant_client::Qdrant::from_url(&settings.url).build().unwrap();
+  assert!(!client.collection_exists(settings.collection.as_str()).await.unwrap());
+}
+
+#[tokio::test]
+#[ignore = "needs a Qdrant server at $QDRANT_URL (`just qdrant-up`); run with `just test-qdrant`"]
+async fn opening_a_collection_changes_nothing_about_it_and_lists_what_it_holds() {
+  use qdrant_client::qdrant::DeleteFieldIndexCollectionBuilder;
+
+  let settings = qdrant_settings(unique_collection("opened"));
+  let store = QdrantStore::connect(&settings, LAYOUT, DIM).await.unwrap();
+  store
+    .put(&record("gummies", None, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    .await
+    .unwrap();
+  let client = qdrant_client::Qdrant::from_url(&settings.url).build().unwrap();
+  for field in indexed_fields(&settings).await {
+    client
+      .delete_field_index(
+        DeleteFieldIndexCollectionBuilder::new(settings.collection.as_str(), field.as_str()).wait(true),
+      )
+      .await
+      .unwrap();
+  }
+
+  // Where `connect` would put the indexes back, `open` leaves the collection as it found it, and still refuses
+  // one of another width.
+  let opened = QdrantStore::open(&settings, LAYOUT, DIM).await;
+  let indexes = indexed_fields(&settings).await;
+  let listed = match &opened {
+    Ok(opened) => Some(opened.scan(None, 10).await),
+    Err(_) => None,
+  };
+  let wrong_width = QdrantStore::open(&settings, LAYOUT, DIM + 1).await;
+  store.delete_collection().await.unwrap();
+
+  assert!(indexes.is_empty(), "{indexes:?}");
+  let page = listed.unwrap().unwrap();
+  assert_eq!(page.next, None);
+  assert_eq!(page.entries.iter().map(id_of).collect::<Vec<_>>(), ["gummies"]);
+  assert!(matches!(wrong_width, Err(StoreError::Collection { .. })));
+}
+
+#[tokio::test]
+async fn an_unreachable_qdrant_cannot_be_opened() {
+  let settings = QdrantSettings {
+    url: "http://127.0.0.1:1".to_owned(),
+    api_key: None,
+    collection: "unreachable".to_owned(),
+    timeout: Duration::from_secs(2),
+  };
+  assert!(matches!(
+    QdrantStore::open(&settings, LAYOUT, DIM).await,
+    Err(StoreError::Unavailable(_))
+  ));
 }
 
 #[tokio::test]
