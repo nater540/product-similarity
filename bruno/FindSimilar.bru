@@ -1,7 +1,7 @@
 meta {
-  name: FindSimilar [Search]
+  name: FindSimilar
   type: grpc
-  seq: 11
+  seq: 5
 }
 
 grpc {
@@ -17,17 +17,14 @@ body:grpc {
   name: message 1
   content: '''
     {
-      "record": {
-        "fields": {
-          "name": "blueberry gummy 100 mg"
-        }
-      },
-      "limit": 3,
-      "min_similarity": 0.5
+      "id": "bruno-import-1",
+      "limit": 5,
+      "brand_id": "brand-1"
     }
   '''
 }
 
 docs {
-  The stored records most similar to text that is not stored.
+  The stored records most similar to a stored one (one the import created), here within one brand. Leave `brand_id` out to search every
+  brand's records.
 }

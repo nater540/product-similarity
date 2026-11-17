@@ -1,7 +1,7 @@
 meta {
-  name: Evaluate [Dry-Run]
+  name: Evaluate
   type: grpc
-  seq: 6
+  seq: 4
 }
 
 grpc {
@@ -21,29 +21,35 @@ body:grpc {
         "id": "bruno-1",
         "brand_id": "brand-1",
         "fields": {
-          "name": "Sour Diesel Live Resin Cartridge 1g",
-          "category": "Vape Pens > Cartridges",
+          "name": "Blueberry Gummies 100mg",
+          "category": "Edibles > Gummies",
           "brand": "Sunny Orchard",
-          "description": "A 1 gram 510-thread cartridge of Sour Diesel live resin, a sativa with notes of citrus and fuel. No cutting agents."
+          "description": "Ten vegan fruit gummies, indica-leaning, with a ripe blueberry flavor. 10mg THC per piece, 100mg per pouch."
         },
         "quantities": {
           "weight_per_item": {
-            "min": 1,
-            "max": 1,
+            "min": 40,
+            "max": 40,
             "unit": "g"
           },
           "thc_per_item": {
-            "min": 84,
-            "max": 88,
-            "unit": "%"
+            "min": 100,
+            "max": 100,
+            "unit": "mg"
           }
         }
       },
-      "mode": "WRITE_MODE_DRY_RUN"
+      "mode": "WRITE_MODE_ENFORCE"
     }
   '''
 }
 
 docs {
-  Judges and never writes: `stored` is false whatever the verdict. Use it to preview a verdict.
+  The first record for an id becomes its baseline: `VERDICT_CREATED`.
+  
+  <br/>
+  
+  **Notes:**
+  
+  `brand_id` is the primary key of the brand that owns the record.
 }

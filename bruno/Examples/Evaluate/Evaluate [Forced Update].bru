@@ -1,7 +1,7 @@
 meta {
-  name: Evaluate [Create Record]
+  name: Evaluate [Forced Update]
   type: grpc
-  seq: 4
+  seq: 1
 }
 
 grpc {
@@ -21,35 +21,30 @@ body:grpc {
         "id": "bruno-1",
         "brand_id": "brand-1",
         "fields": {
-          "name": "Blueberry Gummies 100mg",
-          "category": "Edibles > Gummies",
+          "name": "Sour Diesel Live Resin Cartridge 1g",
+          "category": "Vape Pens > Cartridges",
           "brand": "Sunny Orchard",
-          "description": "Ten vegan fruit gummies, indica-leaning, with a ripe blueberry flavor. 10mg THC per piece, 100mg per pouch."
+          "description": "A 1 gram 510-thread cartridge of Sour Diesel live resin, a sativa with notes of citrus and fuel. No cutting agents."
         },
         "quantities": {
           "weight_per_item": {
-            "min": 40,
-            "max": 40,
+            "min": 1,
+            "max": 1,
             "unit": "g"
           },
           "thc_per_item": {
-            "min": 100,
-            "max": 100,
-            "unit": "mg"
+            "min": 84,
+            "max": 88,
+            "unit": "%"
           }
         }
       },
-      "mode": "WRITE_MODE_ENFORCE"
+      "mode": "WRITE_MODE_FORCE"
     }
   '''
 }
 
 docs {
-  The first record for an id becomes its baseline: `VERDICT_CREATED`.
-  
-  <br/>
-  
-  **Notes:**
-  
-  `brand_id` is the primary key of the brand that owns the record.
+  Writes whatever the verdict (a reviewer approved the change), and makes this version the point drift is
+  measured from.
 }
