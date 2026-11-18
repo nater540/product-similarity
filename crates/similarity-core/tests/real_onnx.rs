@@ -79,6 +79,33 @@ fn onnx_runtime_reproduces_the_pytorch_embeddings() {
   }
 }
 
+/// How many threads a pass is spread across changes how fast a vector is made, never what it is (D45): it is in
+/// no fingerprint, and a server may set it without anything stored becoming another model's.
+#[test]
+#[ignore = "needs ./models/mdbr-leaf-mt and its onnx/model.onnx (`just export-onnx`); run with `just test-onnx`"]
+fn a_number_of_threads_gives_the_same_vectors_under_the_same_fingerprint() {
+  let golden = golden();
+  let chosen = embedder(&golden, 32, None, EngineChoice::Onnx);
+  let ours = chosen.embed(&golden.texts).unwrap();
+  for threads in [1, 3] {
+    let options = EmbedderOptions {
+      max_tokens: golden.max_tokens,
+      batch_size: 32,
+      output_dim: None,
+      threads: Some(threads),
+    };
+    let set = Embedder::load_with(&model_dir(), Device::flex(), &options, EngineChoice::Onnx).unwrap();
+    assert_eq!(set.fingerprint(), chosen.fingerprint());
+    let theirs = set.embed(&golden.texts).unwrap();
+    let largest = ours
+      .iter()
+      .zip(&theirs)
+      .map(|(ours, theirs)| worst(ours, theirs))
+      .fold(0.0_f32, f32::max);
+    assert!(largest < 1e-6, "{threads} threads moved a component by {largest:e}");
+  }
+}
+
 /// Two engines, one model: the same fingerprint, because the same vectors. That is what lets a collection written
 /// under one be read under the other.
 #[test]

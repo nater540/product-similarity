@@ -99,6 +99,11 @@ pub struct Failure {
 
 /// The lines of an export that hold something, as text, with their one-based line numbers. Blank lines and lines
 /// starting with `#` are passed over, as in every other file these tools read.
+///
+/// A line that is not UTF-8 is an `Err` of its own, and the line after it is read. Any other error is the last
+/// item: an export that cannot be read gives the same error to every later read, and a reader that counted each
+/// as a bad line never ended (a directory given as the export wrote a million of them in two seconds). Pass each
+/// line through [`readable`] to end on it.
 pub(crate) fn numbered(reader: impl BufRead) -> impl Iterator<Item = (usize, std::io::Result<String>)> {
   reader
     .lines()
@@ -109,18 +114,75 @@ pub(crate) fn numbered(reader: impl BufRead) -> impl Iterator<Item = (usize, std
         !line.trim().is_empty() && !line.trim_start().starts_with('#')
       })
     })
+    .scan(false, |ended, (number, line)| {
+      if *ended {
+        return None;
+      }
+      *ended = line.as_ref().is_err_and(export_unreadable);
+      Some((number, line))
+    })
+}
+
+/// Whether a failed read is the export failing, and not one line of it (which is not UTF-8).
+fn export_unreadable(error: &std::io::Error) -> bool {
+  error.kind() != std::io::ErrorKind::InvalidData
+}
+
+/// The line, or an error if the export itself could not be read at it. Nothing may be concluded from an export
+/// that was read only in part: an audit would call every record after it missing from the export.
+///
+/// # Errors
+///
+/// Returns the read's error, saying where it happened, if it was not about this one line.
+pub(crate) fn readable(number: usize, line: std::io::Result<String>) -> anyhow::Result<std::io::Result<String>> {
+  match line {
+    Err(error) if export_unreadable(&error) => {
+      Err(anyhow::Error::new(error).context(format!("cannot read the export at line {number}")))
+    }
+    line => Ok(line),
+  }
 }
 
 /// One line of an export, parsed.
 pub(crate) fn parse(line: std::io::Result<String>) -> anyhow::Result<ImportLine> {
-  line
-    .context("cannot read the line")
-    .and_then(|line| serde_json::from_str::<ImportLine>(&line).context("not a record to import"))
+  line.context("cannot read the line").and_then(|line| {
+    serde_json::from_str::<ImportLine>(&line)
+      .map_err(|error| anyhow::anyhow!(without_values(&error)))
+      .context("not a record to import")
+  })
 }
 
-/// The lines of an export that hold a record, parsed, with their one-based line numbers.
-fn lines(reader: impl BufRead) -> impl Iterator<Item = (usize, anyhow::Result<ImportLine>)> {
-  numbered(reader).map(|(number, line)| (number, parse(line)))
+/// What serde found wrong with a line, with no value from the line in it.
+///
+/// serde quotes the value it could not take (`invalid type: string "Blueberry gummies", expected a map`), and the
+/// values of an export are records' text, which no report or event may carry (D42). What was expected and where
+/// are kept; the value between them is not. Keys are kept: they are the schema's names, or the misspelling the
+/// message is about. The last `, expected` is the real one, because a quoted value can hold the same words.
+fn without_values(error: &serde_json::Error) -> String {
+  const VALUE_AFTER: [&str; 3] = ["invalid type: ", "invalid value: ", "unknown variant "];
+  let mut message = error.to_string();
+  for marker in VALUE_AFTER {
+    let Some(at) = message.find(marker) else {
+      continue;
+    };
+    let rest = message.get(at.saturating_add(marker.len())..).unwrap_or_default();
+    let expected = rest
+      .rfind(", expected")
+      .and_then(|end| rest.get(end..))
+      .unwrap_or_default();
+    let named = marker.trim_end().trim_end_matches(':');
+    message = format!("{}{named}{expected}", message.get(..at).unwrap_or_default());
+  }
+  if error.line() > 0 && !message.contains(" at line ") {
+    message = format!("{message} at line {} column {}", error.line(), error.column());
+  }
+  message
+}
+
+/// The lines of an export that hold a record, parsed, with their one-based line numbers, and an error that ends
+/// them if the export cannot be read.
+fn lines(reader: impl BufRead) -> impl Iterator<Item = anyhow::Result<(usize, anyhow::Result<ImportLine>)>> {
+  numbered(reader).map(|(number, line)| Ok((number, parse(readable(number, line)?))))
 }
 
 /// Imports every record of `export` that is not stored yet.
@@ -130,9 +192,9 @@ fn lines(reader: impl BufRead) -> impl Iterator<Item = (usize, anyhow::Result<Im
 ///
 /// # Errors
 ///
-/// Returns an error if the model fails (nothing of that batch is written) or, with
-/// [`Options::stop_on_error`], at the first record that cannot be imported. Records imported before the error stay
-/// imported, and running the import again skips them.
+/// Returns an error if the export itself cannot be read, if the model fails (nothing of that batch is written),
+/// or, with [`Options::stop_on_error`], at the first record that cannot be imported. Records imported before the
+/// error stay imported, and running the import again skips them.
 pub async fn run<S: VectorStore, E: TextEmbedder>(
   engine: &Engine<S, E>,
   export: impl BufRead,
@@ -152,7 +214,8 @@ pub async fn run<S: VectorStore, E: TextEmbedder>(
 
   let mut batch: Vec<(usize, ImportLine)> = Vec::new();
   let mut parsed = lines(export).peekable();
-  while let Some((number, line)) = parsed.next() {
+  while let Some(item) = parsed.next() {
+    let (number, line) = item?;
     summary.records = summary.records.saturating_add(1);
     match line {
       Ok(line) => batch.push((number, line)),
@@ -224,9 +287,14 @@ pub(crate) fn prepared(schema: &Schema, line: &ImportLine) -> Result<PreparedRec
 /// This is the quick way to find out whether an export will import: a misnamed field, a quantity sent as text, a
 /// missing required field, a blank id or brand, on every line that has one. `report` is called for each. Records
 /// are not embedded, so only what the schema can tell is checked; whether an id is already stored is not.
-pub fn check(schema: &Schema, export: impl BufRead, mut report: impl FnMut(&Failure)) -> Summary {
+///
+/// # Errors
+///
+/// Returns an error if the export itself cannot be read, as opposed to one line of it.
+pub fn check(schema: &Schema, export: impl BufRead, mut report: impl FnMut(&Failure)) -> anyhow::Result<Summary> {
   let mut summary = Summary::default();
-  for (number, line) in lines(export) {
+  for item in lines(export) {
+    let (number, line) = item?;
     summary.records = summary.records.saturating_add(1);
     let problem = match line {
       Err(error) => Some((None, format!("{error:#}"))),
@@ -244,7 +312,7 @@ pub fn check(schema: &Schema, export: impl BufRead, mut report: impl FnMut(&Fail
       });
     }
   }
-  summary
+  Ok(summary)
 }
 
 #[cfg(test)]
@@ -271,6 +339,90 @@ mod tests {
         reject_incomparable: false,
       }])
       .unwrap()
+  }
+
+  /// Fails `failures` reads, then gives `then`: what a reader does when the export itself cannot be read (a
+  /// directory, a disk that went away), bounded so that a regression fails the test instead of hanging it.
+  pub(crate) struct Unreadable {
+    pub(crate) failures: usize,
+    pub(crate) then: &'static [u8],
+  }
+
+  impl std::io::Read for Unreadable {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+      if self.failures > 0 {
+        self.failures -= 1;
+        return Err(std::io::Error::other("the disk went away"));
+      }
+      self.then.read(buf)
+    }
+  }
+
+  #[tokio::test]
+  async fn an_export_that_cannot_be_read_ends_the_check_and_the_import_with_an_error() {
+    let unreadable = || {
+      std::io::BufReader::new(Unreadable {
+        failures: 1_000,
+        then: EXPORT.as_bytes(),
+      })
+    };
+    let mut reported = Vec::new();
+    let error = check(&schema(), unreadable(), |failure| reported.push(failure.clone())).unwrap_err();
+    assert!(format!("{error:#}").contains("the disk went away"), "{error:#}");
+    assert!(
+      reported.is_empty(),
+      "a failed read is not a line of the export: {reported:?}"
+    );
+
+    let engine = engine();
+    let mut reported = Vec::new();
+    let error = run(
+      &engine,
+      unreadable(),
+      TWO_AT_A_TIME,
+      |failure| reported.push(failure.clone()),
+      |_| {},
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("the disk went away"), "{error:#}");
+    assert!(reported.is_empty(), "{reported:?}");
+  }
+
+  #[test]
+  fn a_line_that_is_not_utf8_is_one_invalid_line_and_the_rest_are_read() {
+    let mut export = b"\xff\xfe\n".to_vec();
+    export.extend_from_slice(EXPORT.as_bytes());
+    let mut failures = Vec::new();
+    let summary = check(&schema(), export.as_slice(), |failure| failures.push(failure.clone())).unwrap();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_eq!(failures[0].line, 1);
+    assert_eq!(summary.records, 4);
+  }
+
+  #[test]
+  fn a_line_that_is_not_a_record_is_described_without_any_value_it_holds() {
+    // serde quotes the value it could not take, and an export's values are records' text (D42).
+    for line in [
+      r#"{"id": "sku-1", "record": "SECRET gummies, expected a map"}"#,
+      r#"{"id": "sku-1", "record": {"name": "gummies"}, "anchor": "SECRET gummies"}"#,
+      r#"{"id": "sku-1", "record": {"name": "gummies", "weight": {"value": "SECRET", "unit": "g"}}}"#,
+      r#"{"id": "sku-1", "record": {"name": "gummies", "weight": {"value": 3.5, "unit": ["SECRET"]}}}"#,
+      r#"{"id": "SECRET", "record": {"name": "gummies"}, "brand_id": {"SECRET": 1}}"#,
+    ] {
+      let reason = format!("{:#}", parse(Ok(line.to_owned())).unwrap_err());
+      assert!(!reason.contains("SECRET"), "{reason}");
+      assert!(reason.contains("expected"), "what was expected is still said: {reason}");
+      assert!(reason.contains("line 1 column"), "and where: {reason}");
+    }
+    // A key is not a value: a misspelt one is the whole point of the message.
+    let misnamed = format!(
+      "{:#}",
+      parse(Ok(r#"{"id": "sku-1", "tenant": "b", "record": {}}"#.to_owned())).unwrap_err()
+    );
+    assert!(misnamed.contains("unknown field `tenant`"), "{misnamed}");
+    let not_json = format!("{:#}", parse(Ok("SECRET gummies".to_owned())).unwrap_err());
+    assert!(!not_json.contains("SECRET"), "{not_json}");
   }
 
   fn engine() -> Engine<MemoryStore, WordBagEmbedder> {
@@ -468,7 +620,7 @@ mod tests {
   #[test]
   fn an_export_can_be_checked_against_the_schema_without_a_model_or_a_store() {
     let mut failures = Vec::new();
-    let summary = check(&schema(), FLAWED.as_bytes(), |failure| failures.push(failure.clone()));
+    let summary = check(&schema(), FLAWED.as_bytes(), |failure| failures.push(failure.clone())).unwrap();
     assert_eq!(
       summary,
       Summary {
@@ -482,11 +634,11 @@ mod tests {
     assert_eq!(lines, [2, 3, 4, 5, 6, 7], "the same lines an import would refuse");
 
     let mut none = Vec::new();
-    let clean = check(&schema(), EXPORT.as_bytes(), |failure| none.push(failure.clone()));
+    let clean = check(&schema(), EXPORT.as_bytes(), |failure| none.push(failure.clone())).unwrap();
     assert_eq!((clean.records, clean.failed, none.len()), (3, 0, 0));
 
     let blank = r#"{"id": "  ", "record": {"name": "x"}}"#;
-    let summary = check(&schema(), blank.as_bytes(), |failure| failures.push(failure.clone()));
+    let summary = check(&schema(), blank.as_bytes(), |failure| failures.push(failure.clone())).unwrap();
     assert_eq!(summary.failed, 1);
     assert!(failures.last().unwrap().reason.contains("blank"));
   }
@@ -496,7 +648,7 @@ mod tests {
     let blank = r#"{"id": "sku-1", "brand_id": "  ", "record": {"name": "blueberry gummies"}}"#;
 
     let mut checked = Vec::new();
-    let summary = check(&schema(), blank.as_bytes(), |failure| checked.push(failure.clone()));
+    let summary = check(&schema(), blank.as_bytes(), |failure| checked.push(failure.clone())).unwrap();
     assert_eq!((summary.records, summary.failed), (1, 1));
     assert_eq!(checked[0].id.as_deref(), Some("sku-1"));
     assert!(

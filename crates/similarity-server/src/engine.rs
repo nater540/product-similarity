@@ -8,9 +8,9 @@
 //! Evaluating a record is read-compare-write, and two concurrent revisions of the same id must not both be
 //! compared against the same baseline and then both be written. Two things see to that. Within one process,
 //! requests for the same id take turns at the record's lock ([`Locks`]), the one piece of state the engine owns;
-//! requests for different ids never wait for each other. Across processes, which share no lock, every write is conditional on the
-//! store still holding what was read ([`VectorStore::put_if`]): a writer that finds the record changed under it
-//! has written nothing, and reads and judges again (docs/decisions.md, D10).
+//! requests for different ids never wait for each other. Across processes, which share no lock, every write is
+//! conditional on the store still holding what was read ([`VectorStore::put_if`]): a writer that finds the record
+//! changed under it has written nothing, and reads and judges again (docs/decisions.md, D10).
 //!
 //! A request can be dropped at any point where it waits: its caller's deadline ran out, or the caller hung up.
 //! Until it goes to write, that costs nothing and leaves nothing behind. A write is different: once the engine

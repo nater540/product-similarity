@@ -1283,15 +1283,16 @@ proptest! {
 
   /// Whoever arrives and leaves, in whatever order (D41): each record that anybody is at is held by exactly one
   /// request, the one that came first of those still there, so nobody waits for a record that is free or for a
-  /// request for another record; and the table holds those records and no others.
+  /// request for another record; and the table holds those records and no others. The waiting are asked in an
+  /// order that is generated too: a lock that went to whoever asked first would be given to the newest request.
   #[test]
   fn a_record_is_held_by_the_first_request_still_there_and_locked_only_while_somebody_is(
-    steps in prop::collection::vec(at_the_locks(), 0..80),
+    steps in prop::collection::vec((at_the_locks(), any::<bool>()), 0..80),
   ) {
     let locks = Locks::default();
     // Everyone at a lock, in the order they came.
     let mut there: Vec<(&str, Asking<'_>)> = Vec::new();
-    for step in steps {
+    for (step, newest_asks_first) in steps {
       match step {
         AtTheLocks::Arrives(record) => {
           let id = LOCKED.get(record).copied().unwrap_or("a");
@@ -1303,12 +1304,23 @@ proptest! {
         AtTheLocks::Leaves(_) => {}
       }
       let mut seen: Vec<&str> = Vec::new();
-      for (id, asking) in &mut there {
-        let first = !seen.contains(id);
-        prop_assert_eq!(asking.holds(), first, "`{}`, first there: {}", id, first);
-        if first {
-          seen.push(id);
-        }
+      let first: Vec<bool> = there
+        .iter()
+        .map(|(id, _)| {
+          let first = !seen.contains(id);
+          if first {
+            seen.push(id);
+          }
+          first
+        })
+        .collect();
+      let mut order: Vec<usize> = (0..there.len()).collect();
+      if newest_asks_first {
+        order.reverse();
+      }
+      for index in order {
+        let (id, asking) = &mut there[index];
+        prop_assert_eq!(asking.holds(), first[index], "`{}`, first there: {}", id, first[index]);
       }
       prop_assert_eq!(locks.in_use(), seen.len());
     }

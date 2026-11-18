@@ -2152,8 +2152,9 @@ and the fingerprints and quantities of the record as it was; and a last line wit
 vector is its components as little-endian bytes in base64, and not a list of numbers: a backup has to give back
 exactly what was stored, which bytes do by construction, and they are half the size. `base64` is the crate, at
 the version `tonic` already has in the build. The last line is how a file that was cut short is known to be
-one. `export` writes under another name and renames when the last line is on the disk, and never writes over a
-file that exists, so a file with the name that was asked for is whole.
+one. `export` writes under another name and, when the last line is on the disk, links the file to the name that
+was asked for, which fails rather than replace a file that appeared there meanwhile (a rename would not). It
+never writes over a file that exists, so a file with the name that was asked for is whole.
 
 **A backup belongs to a layout.** An anchor is a vector of one model over one set of fields (D12). A restore
 reads the whole file first and refuses, having written nothing, one that is not whole or is of another layout
@@ -2206,8 +2207,9 @@ answer so that nothing waits on them:
 
 1. *Where a backup may be kept.* It holds no text. It holds ids, brands, quantities, fingerprints of text, and
    a vector made from the text each record was created with, and what a vector gives away about the text it
-   was made from is not nothing. The command writes where it is told and nowhere else. The README says to give the file the care
-   the collection gets; whether that is enough is a question about the owner's data and not about this code.
+   was made from is not nothing. The command writes where it is told and nowhere else. The README says to give
+   the file the care the collection gets; whether that is enough is a question about the owner's data and not
+   about this code.
 2. *Records that changed between the backup and the loss.* They are `changed` and are left with the anchor the
    import gave them, which is the record as it is now: the drift they had come before the loss is forgotten.
    How many there are depends on how old the backup is. Giving them the kept anchor would be right for an
@@ -2288,7 +2290,9 @@ What the same measurements did show is that the Python runtime ran a pass much f
 same file and the same cores. The difference was spinning: a thread of ONNX Runtime's pool that finishes its
 part of one step of a pass either waits busily for the next or goes to sleep and is woken. A pass of this model
 is many small steps, and a sleeping thread is woken late for each. The session the server built did not ask
-for spinning, and ran exactly as it does with spinning turned off.
+for spinning, and ran exactly as it does with spinning turned off. The `ort` crate's documentation says intra-op
+spinning is on by default; whatever the reason, this build did not behave so, and the call that turns it on is
+what made the difference measured below.
 
 **Spinning is on, always.** Measured with `just throughput` and `just load`, same laptop, release build,
 default model, the number of threads left to ONNX Runtime:

@@ -54,7 +54,8 @@ const LAYOUT_KEY: &str = "layout";
 // The two payload keys a conditional write filters on. They are the names `PointPayload` serializes under.
 const REVISION_KEY: &str = "revision";
 const UPDATED_AT_KEY: &str = "updated_at";
-// Where a point says which record it is. Read by name only for a point that cannot be decoded.
+// Where a point says which record it is. A scan reads it by name for every point, so that a point whose payload
+// cannot be decoded is still placed if it says which record it is.
 const RECORD_ID_KEY: &str = "record_id";
 
 /// The UUIDv5 namespace record ids are hashed under. Changing it orphans every stored point.

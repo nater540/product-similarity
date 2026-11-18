@@ -224,8 +224,8 @@ impl<F: FnMut(&Finding)> Audit<F> {
 ///
 /// # Errors
 ///
-/// Returns an error if the store cannot be listed to its end. Nothing is concluded from part of a store: every
-/// record on a page that was not read would be reported as missing.
+/// Returns an error if the export cannot be read to its end, or the store cannot be listed to its end. Nothing is
+/// concluded from part of a store: every record on a page that was not read would be reported as missing.
 pub async fn run<S: Scan>(
   store: &S,
   schema: &Schema,
@@ -242,7 +242,7 @@ pub async fn run<S: Scan>(
     found,
   };
   for (number, line) in import::numbered(export) {
-    audit.line(schema, number, line);
+    audit.line(schema, number, import::readable(number, line)?);
   }
   // An id is compared if any of its lines can be.
   let Audit { expected, invalid, .. } = &mut audit;
@@ -618,6 +618,104 @@ mod tests {
       4,
       "an audit vouches for nothing it could not compare"
     );
+  }
+
+  /// A store in which `sku-2` cannot be read, and in which something sits in no record's place.
+  struct Damaged(Arc<MemoryStore>);
+
+  impl Scan for Damaged {
+    async fn scan(&self, from: Option<&Cursor>, limit: usize, read: Read) -> similarity_store::Result<Page> {
+      let mut page = self.0.scan(from, limit, read).await?;
+      for entry in &mut page.entries {
+        if matches!(entry, Entry::Record(record) if record.id == "sku-2") {
+          *entry = Entry::Unreadable {
+            id: Some("sku-2".to_owned()),
+            reason: "its payload cannot be decoded".to_owned(),
+          };
+        }
+      }
+      if page.next.is_none() {
+        page.entries.push(Entry::Unreadable {
+          id: None,
+          reason: "it does not say which record it is".to_owned(),
+        });
+      }
+      Ok(page)
+    }
+  }
+
+  #[tokio::test]
+  async fn a_stored_record_that_cannot_be_read_is_not_called_missing_and_each_unreadable_point_counts_once() {
+    let (engine, store) = serving(&[]).await;
+    import(&engine, EXPORT).await;
+
+    let (summary, findings) = audit(&Damaged(store), EXPORT).await;
+    assert_eq!(
+      told(&findings),
+      [
+        (Kind::Unreadable, Some("sku-2"), Some(4)),
+        (Kind::Unreadable, None, None)
+      ],
+      "sku-2 is stored, so it is not reported as not stored, and the export's line for it is named"
+    );
+    assert_eq!(findings[0].reason.as_deref(), Some("its payload cannot be decoded"));
+    assert_eq!((summary.points, summary.stored_records, summary.unreadable), (4, 2, 2));
+    assert_eq!((summary.agree, summary.not_compared, summary.not_stored), (2, 2, 0));
+    assert_eq!(
+      summary.differences(),
+      2,
+      "an audit vouches for nothing it could not read"
+    );
+  }
+
+  #[tokio::test]
+  async fn an_export_that_cannot_be_read_ends_the_audit_with_no_summary() {
+    /// Fails a thousand reads and then ends: a regression fails the test instead of hanging it.
+    struct Unreadable(usize);
+    impl std::io::Read for Unreadable {
+      fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+        if self.0 == 0 {
+          return Ok(0);
+        }
+        self.0 -= 1;
+        Err(std::io::Error::other("the disk went away"))
+      }
+    }
+    let (_, store) = serving(&[]).await;
+    let mut findings = Vec::new();
+    let outcome = run(
+      &store,
+      &schema(),
+      std::io::BufReader::new(Unreadable(1_000)),
+      PAGES_OF_TWO,
+      |finding| findings.push(finding.clone()),
+      |_| {},
+    )
+    .await;
+    let error = outcome.unwrap_err();
+    assert!(format!("{error:#}").contains("the disk went away"), "{error:#}");
+    assert!(
+      findings.is_empty(),
+      "a failed read is not a line of the export: {findings:?}"
+    );
+  }
+
+  #[tokio::test]
+  async fn an_invalid_line_is_reported_without_the_text_it_holds() {
+    let (_, store) = serving(&[]).await;
+    let flawed = concat!(
+      r#"{"id": "sku-1", "brand_id": "brand-1", "record": "SECRET blueberry gummies"}"#,
+      "\n",
+      r#"{"id": "sku-2", "record": {"name": "gummies", "weight": {"value": "SECRET", "unit": "g"}}}"#,
+      "\n",
+    );
+    let (_, findings) = audit(&store, flawed).await;
+    assert_eq!(findings.len(), 2);
+    for finding in &findings {
+      let reason = finding.reason.as_deref().unwrap();
+      assert!(!reason.contains("SECRET"), "{reason}");
+      assert!(reason.contains("expected"), "{reason}");
+    }
   }
 
   #[tokio::test]

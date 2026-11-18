@@ -46,7 +46,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Some(given) => Some(
       given
         .parse::<usize>()
-        .map_err(|_| format!("`{given}` is not a number of threads"))?,
+        .ok()
+        .filter(|threads| *threads > 0)
+        .ok_or_else(|| format!("`{given}` is not a number of threads; leave it out to let ONNX Runtime choose"))?,
     ),
   };
   let options = EmbedderOptions {

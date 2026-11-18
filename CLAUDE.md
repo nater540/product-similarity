@@ -228,7 +228,7 @@ changing a design. Infer conventions from the existing code first.
   anything. A backup belongs to its layout: `anchors::restore` reads the whole file first and refuses, having
   written nothing, one that is cut short (no last line) or of another layout. Keep vectors in the file as
   bytes in base64, never as numbers. `anchors export` opens the collection with `QdrantStore::open`, writes
-  under a `.partial` name and renames, and never writes over a file. A backup holds no text and must not gain
+  under a `.partial` name and then links it to its own, and never writes over a file (a rename would). A backup holds no text and must not gain
   any; a scan reads an anchor only when asked (`Read::Anchor`) and never a current composite. The file's line
   names and fields, and the codes of `Restored`, are an interface: add, never rename.
 - **The judging digest covers everything a verdict depends on, and its text is an interface** (D44).

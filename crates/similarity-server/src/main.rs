@@ -1508,7 +1508,7 @@ impl ImportArgs {
     let started = std::time::Instant::now();
 
     let summary = if self.check {
-      import::check(&schema, open()?, report_failure)
+      import::check(&schema, open()?, report_failure)?
     } else {
       let embedder = DirectEmbedder(load_embedder(&config, Tie::Enforced)?);
       let (layout, dimension) = store_layout(&schema, &embedder);
@@ -1567,14 +1567,6 @@ impl ImportArgs {
   }
 }
 
-/// The path a backup is written under until it is whole: beside the one it will have, so that giving it its name
-/// is a rename within one directory.
-fn partial(out: &Path) -> PathBuf {
-  let mut name = out.file_name().unwrap_or_default().to_os_string();
-  name.push(".partial");
-  out.with_file_name(name)
-}
-
 impl AnchorsExportArgs {
   fn run(self) -> anyhow::Result<()> {
     let config = Config::load(&self.config)?;
@@ -1604,16 +1596,11 @@ impl AnchorsExportArgs {
 
     // Written under another name and given its own only when its last line is in it and on the disk: a file with
     // the name asked for is a whole backup, whatever happened to this process.
-    let partial = partial(&self.out);
-    let file = std::fs::OpenOptions::new()
-      .write(true)
-      .create_new(true)
-      .open(&partial)
-      .with_context(|| format!("cannot create {}", partial.display()))?;
     let runtime = tokio::runtime::Builder::new_current_thread()
       .enable_all()
       .build()
       .context("cannot start tokio")?;
+    let (partial, file) = anchors::file::create_partial(&self.out)?;
     let written = runtime.block_on(async {
       let store = QdrantStore::open(&settings, layout.as_str(), dimension)
         .await
@@ -1650,8 +1637,7 @@ impl AnchorsExportArgs {
         return Err(error);
       }
     };
-    std::fs::rename(&partial, &self.out)
-      .with_context(|| format!("cannot give {} its name, {}", partial.display(), self.out.display()))?;
+    anchors::file::publish(&partial, &self.out)?;
 
     tracing::info!(
       target: similarity_log::RESULT,
@@ -2155,10 +2141,13 @@ mod tests {
 
     // Until it is whole a backup has another name, beside the one it was asked for.
     assert_eq!(
-      partial(Path::new("backups/anchors.ndjson")),
+      anchors::file::partial_path(Path::new("backups/anchors.ndjson")),
       PathBuf::from("backups/anchors.ndjson.partial")
     );
-    assert_eq!(partial(Path::new("anchors")), PathBuf::from("anchors.partial"));
+    assert_eq!(
+      anchors::file::partial_path(Path::new("anchors")),
+      PathBuf::from("anchors.partial")
+    );
   }
 
   #[test]

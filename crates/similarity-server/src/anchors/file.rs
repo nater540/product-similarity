@@ -19,7 +19,10 @@
 //! and a vector made from the text it was created with: it deserves the care the collection itself gets.
 
 use std::collections::{BTreeMap, HashSet};
+use std::fs::{File, OpenOptions};
+use std::io::ErrorKind;
 use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use base64::Engine as _;
@@ -337,11 +340,110 @@ pub fn check(reader: impl BufRead) -> anyhow::Result<Whole> {
   })
 }
 
+/// The path a backup is written under until it is whole: beside the one it will have, so that giving it its name
+/// stays within one directory.
+pub fn partial_path(out: &Path) -> PathBuf {
+  let mut name = out.file_name().unwrap_or_default().to_os_string();
+  name.push(".partial");
+  out.with_file_name(name)
+}
+
+/// Creates the file a backup to `out` is written under until it is whole.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be created, saying so plainly if it is already there: another export to
+/// the same name is running, or one was stopped part way. Which, only the person running them can tell, so it is
+/// never removed here.
+pub fn create_partial(out: &Path) -> anyhow::Result<(PathBuf, File)> {
+  let partial = partial_path(out);
+  match OpenOptions::new().write(true).create_new(true).open(&partial) {
+    Ok(file) => Ok((partial, file)),
+    Err(error) if error.kind() == ErrorKind::AlreadyExists => anyhow::bail!(
+      "{} exists: an export to {} is running, or one was stopped part way. If none is running, remove it",
+      partial.display(),
+      out.display()
+    ),
+    Err(error) => Err(error).with_context(|| format!("cannot create {}", partial.display())),
+  }
+}
+
+/// Gives a whole backup its name, never taking it from a file that has it.
+///
+/// A rename would replace a file that appeared at `out` while the backup was written, which may be minutes; a
+/// link to a name that is taken fails instead. The backup is then left whole under its partial name.
+///
+/// # Errors
+///
+/// Returns an error if `out` exists, naming where the backup is, or if the file system cannot link the two names.
+pub fn publish(partial: &Path, out: &Path) -> anyhow::Result<()> {
+  match std::fs::hard_link(partial, out) {
+    Ok(()) => {}
+    Err(error) if error.kind() == ErrorKind::AlreadyExists => anyhow::bail!(
+      "{} was created while the backup was written, and a backup is not written over another. The backup is \
+       whole in {}: give it a name of its own",
+      out.display(),
+      partial.display()
+    ),
+    Err(error) => {
+      return Err(error).with_context(|| format!("cannot give {} its name, {}", partial.display(), out.display()));
+    }
+  }
+  std::fs::remove_file(partial).with_context(|| {
+    format!(
+      "the backup is {}, and its partial name {} could not be removed",
+      out.display(),
+      partial.display()
+    )
+  })
+}
+
 #[cfg(test)]
 mod tests {
   use similarity_core::Quantity;
 
   use super::*;
+
+  #[test]
+  fn a_whole_backup_takes_its_name_and_leaves_no_partial_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("anchors.ndjson");
+    let (partial, mut file) = create_partial(&out).unwrap();
+    file.write_all(b"whole").unwrap();
+    drop(file);
+    publish(&partial, &out).unwrap();
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "whole");
+    assert!(!partial.exists());
+  }
+
+  #[test]
+  fn a_file_that_appeared_while_the_backup_was_written_is_not_written_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("anchors.ndjson");
+    let (partial, mut file) = create_partial(&out).unwrap();
+    file.write_all(b"whole").unwrap();
+    drop(file);
+    std::fs::write(&out, "someone else's").unwrap();
+
+    let error = format!("{:#}", publish(&partial, &out).unwrap_err());
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "someone else's");
+    assert_eq!(
+      std::fs::read_to_string(&partial).unwrap(),
+      "whole",
+      "and the backup is kept"
+    );
+    assert!(error.contains(&partial.display().to_string()), "{error}");
+  }
+
+  #[test]
+  fn an_export_stopped_part_way_is_named_by_the_next_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("anchors.ndjson");
+    std::fs::write(partial_path(&out), "half").unwrap();
+    let error = format!("{:#}", create_partial(&out).unwrap_err());
+    assert!(error.contains("stopped part way"), "{error}");
+    assert_eq!(std::fs::read_to_string(partial_path(&out)).unwrap(), "half");
+  }
 
   fn header() -> Header {
     Header {

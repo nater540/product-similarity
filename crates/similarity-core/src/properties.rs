@@ -738,17 +738,32 @@ proptest! {
 /// A field's text as a caller might send it: nothing, only whitespace, or a few words with stray whitespace
 /// around and between them.
 fn field_text() -> impl Strategy<Value = Option<String>> {
-  let spaced = (
+  prop_oneof![
+    Just(None),
+    proptest::sample::select(vec!["", " ", "\n\t"]).prop_map(|blank| Some(blank.to_owned())),
+    spaced_words().prop_map(Some),
+  ]
+}
+
+/// A few words with stray whitespace around and between them: a field that has a value.
+fn spaced_words() -> impl Strategy<Value = String> {
+  (
     proptest::sample::select(vec!["", " ", "\n", " \t "]),
     proptest::collection::vec(proptest::sample::select(WORDS.to_vec()), 1..4),
     proptest::sample::select(vec![" ", "  ", "\n"]),
   )
-    .prop_map(|(around, words, between)| format!("{around}{}{around}", words.join(between)));
-  prop_oneof![
-    Just(None),
-    proptest::sample::select(vec!["", " ", "\n\t"]).prop_map(|blank| Some(blank.to_owned())),
-    spaced.prop_map(Some),
-  ]
+    .prop_map(|(around, words, between)| format!("{around}{}{around}", words.join(between)))
+}
+
+/// The texts of a record's three fields, at least one of which has a value: a record with none is refused before
+/// it has fingerprints, and a case built of one would assert nothing.
+fn record_texts() -> impl Strategy<Value = Vec<Option<String>>> {
+  (proptest::collection::vec(field_text(), 3), 0..3_usize, spaced_words()).prop_map(|(mut texts, at, words)| {
+    if let Some(text) = texts.get_mut(at) {
+      *text = Some(words);
+    }
+    texts
+  })
 }
 
 proptest! {
@@ -759,8 +774,8 @@ proptest! {
   /// baseline. An audit compares an export with the store on the strength of this.
   #[test]
   fn the_fingerprints_of_a_prepared_record_are_the_ones_finish_stores(
-    texts in proptest::collection::vec(field_text(), 3),
-    stored in proptest::collection::vec(field_text(), 3),
+    texts in record_texts(),
+    stored in record_texts(),
   ) {
     let schema = Schema::new(
       (0..3).map(|index| FieldSpec { name: format!("f{index}"), weight: 1.0, required: false, reject_below: None }).collect(),
@@ -773,10 +788,8 @@ proptest! {
       let embedded: Vec<Vec<f32>> = plan.texts().iter().map(|text| fake_embedding(text, DIM)).collect();
       plan.finish(&schema, DIM, &embedded).unwrap()
     };
-    let (Ok(prepared), Ok(before)) = (PreparedRecord::new(&schema, fields(&texts)), PreparedRecord::new(&schema, fields(&stored))) else {
-      // A record with no value at all is refused before it has fingerprints.
-      return Ok(());
-    };
+    let prepared = PreparedRecord::new(&schema, fields(&texts)).unwrap();
+    let before = PreparedRecord::new(&schema, fields(&stored)).unwrap();
 
     let expected: BTreeMap<String, String> = texts
       .iter()

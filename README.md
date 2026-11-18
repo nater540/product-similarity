@@ -497,10 +497,17 @@ In JSON, enum values are written by name (`"WRITE_MODE_DRY_RUN"`), 64-bit intege
 `.proto`, which the collection names by a relative path: they stay in step with it, and the folder has to stay
 where it is in the checkout.
 
-Bruno lists them in an order that works on an empty server (`just serve-in-memory config.toml`): `Describe`,
-an `Import` stream that creates two records and has a third refused, six kinds of `Evaluate`, two searches,
-three matches, and a `Delete`. Each has a note saying what to expect. Every body was sent through Bruno's own gRPC
-client (4.3.0) against a local server, and they answer as the notes say.
+The top of the collection is one request for each call: `Describe`, an `Import` stream that creates two records
+and has a third refused, `Evaluate` (which creates a record), `FindSimilar` by id, `Match` with a threshold, and
+`Delete`. `Examples` holds the variations: five more kinds of `Evaluate` (an accepted update, a dry run, a rejected
+update, a forced update, and one that returns its vector), `FindSimilar` by text, and `Match` with and without a
+brand. Each request has a note saying what to expect.
+
+The notes describe one order on an empty server (`just serve-in-memory config.toml`), which is not the order
+Bruno lists them in: `Describe`, `Import`, `Evaluate`, then the examples Accepted Update, Dry-Run, Rejected
+Update, Forced Update, and Return Vector, then `FindSimilar`, FindSimilar [Search], Match [Without Brand], Match
+[With Brand], `Match`, and `Delete` last. Every body was sent through Bruno's own gRPC client (4.3.0) against a
+local server in that order, and they answered as the notes say. `Delete` removes a record the examples use.
 
 Bodies use the names in the `.proto` as they are written there (`brand_id`, `menu_item`, `return_vector`), and
 enum values by name (`"WRITE_MODE_DRY_RUN"`).
@@ -2323,7 +2330,8 @@ What it does, and what it will not do:
   about 6 KB a record at 1,024 components: 100,000 records are 600 MB.
 - **`export` reads, and changes nothing.** It opens the collection without creating it, writes under another
   name until the last line is on the disk, and never writes over a file that exists, so a file with the name
-  you asked for is a whole backup. The store is listed while the server may be writing to it. That is fine for
+  you asked for is a whole backup. An export that was stopped leaves its `.partial` file, and the next export to
+  the same name stops and names it. The store is listed while the server may be writing to it. That is fine for
   an anchor, which changes only when a record is created or a write is forced.
 - **A backup belongs to one model and one set of fields.** An anchor is a vector, and means nothing under
   another layout: `restore` refuses a backup of another layout whole, having written nothing. After a change of
@@ -2999,6 +3007,12 @@ on 2026-11-12 (`docs/decisions.md`, D34, has both sets of measurements).
   (D34).
 - **It runs on the CPU.** On macOS ONNX Runtime would otherwise pick CoreML, which is slower for a model this
   size. There is no GPU setting for serving; `--device` on the trainer is unaffected.
+- **Its threads spin.** A pass is many small steps, and ONNX Runtime's threads wait busily between them instead
+  of sleeping, which took a third off the time of one edit through gRPC (D45). It costs CPU while the model works,
+  about a third more for the same requests in one measurement, and none while the server is idle. There is no setting to
+  turn it off. `model.threads` sets how many threads a pass uses; leave it out unless ONNX Runtime counts more
+  cores than the server may use, as in a container given a share of a larger machine, where spinning threads on
+  every core would spend the share.
 - **In a container.** `just image` builds the server on Debian 13, because the prebuilt library is compiled
   against the C++ standard library of GCC 13 and does not link on Debian 12. It fetches the model, exports it in
   a build stage that has `uv` and PyTorch (the CPU builds), and copies only the model directory out of that
