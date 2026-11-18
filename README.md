@@ -680,12 +680,12 @@ answer: the server saying, before the deadline, that it will not make it.
 
 **Bootstrapping an existing catalog.** Export every record as one JSON object per line and load the file with
 `record-similarity import` ([Importing a catalog](#importing-a-catalog)). Every record that is not stored yet
-becomes a baseline. On a laptop CPU, 2,000 four-field records were imported in 5 seconds, so 50,000 take about
-two minutes. A caller that cannot run a command next to Qdrant sends the same records over one
-[`Import` stream](#creating-records-over-a-stream), at about 400 records a second on that CPU, sharing the model
-with whoever else is calling. [`docs/import-prompt.md`](docs/import-prompt.md) is a ready-made brief for doing
-this with the real catalog, where the data lives: what to find out first, the export, the checks before and
-after, and what never to do.
+becomes a baseline. On a laptop CPU, 2,000 four-field records were imported in 5 seconds, so 50,000 take about two
+minutes (measured before threads spun, D45, which made the model faster). A caller that cannot run a command next to
+Qdrant sends the same records over one [`Import` stream](#creating-records-over-a-stream), at about 480 records a
+second on that CPU, sharing the model with whoever else is calling. [`docs/import-prompt.md`](docs/import-prompt.md)
+is a ready-made brief for doing this with the real catalog, where the data lives: what to find out first, the
+export, the checks before and after, and what never to do.
 
 **At edit time.**
 
@@ -783,7 +783,8 @@ the call is `Import(stream ImportRequest) returns (stream ImportResponse)`.)
   sends everything gets them eight at a time. There is no latency of a single record to speak of.
 - **A stream shares the one model with everyone else, and slows them down.** While a stream runs, any other
   request waits for the stream's batch in front of it. Measured with one caller of `Evaluate` beside a stream
-  that never ran dry (`just load ... --server`, separate runs for each setting):
+  that never ran dry (`just load ... --server`, separate runs for each setting), on a build from before threads
+  spun (D45), when the model was slower:
 
   | `server.import_batch_records` | Stream, records per second | An edit's median, no stream | An edit's median, beside a stream | A create's median, beside a stream |
   |---|---|---|---|---|
@@ -2037,6 +2038,7 @@ commented starting point.
 | `model.output_dim` | none (native width) | Keep only the first N components of each field vector. Only for models trained for it. The example config sets 256 for the default model. |
 | `model.batch_size` | `32` | The most texts in one forward pass. |
 | `model.queue_depth` | `256` | Requests that may wait for the encoder before new ones get `RESOURCE_EXHAUSTED`. A request whose caller has gone no longer counts. |
+| `model.threads` | none (ONNX Runtime chooses) | How many threads one forward pass is spread across. Leaving it out was as fast as any number tried on the machine the [Performance](#performance) figures come from; set it where ONNX Runtime counts more cores than the server may use, and measure with `just load`. Changes no vector, no fingerprint, and no verdict. |
 | `model.expected_fingerprint` | none | The fingerprint of the model the thresholds were measured with, as on the `model` line of `calibrate`. With it, `serve` and `import` refuse to run with any other model, and `compare` and the `calibrate` commands warn. Without it nothing is checked, and `serve` and `import` say so once. |
 | `qdrant.url` | `http://localhost:6334` | Qdrant's gRPC endpoint (6334, not the REST port 6333). |
 | `qdrant.collection` | `records` | The collection. Created if missing. |
@@ -2070,6 +2072,7 @@ What a change costs:
 | A threshold, a floor, `required` | None. Takes effect on restart. |
 | `[shadow]` added, changed, or removed | None for any verdict or stored record. Takes effect on restart. With a shadow the server writes result lines on stdout, which is otherwise empty. |
 | A quantity added, removed, or given a limit | None. Quantities are stored beside the vectors, not in them. A record stored before a quantity existed reports it as `ADDED` the first time it arrives. |
+| `model.threads` | None for any vector or verdict. Takes effect on restart. |
 | A field weight | Verdicts use the new weight at once. Search rankings use the weights records were written with until they are rewritten. |
 | `model.dir`, `output_dim`, `max_tokens`, or the set of fields | Stored vectors are no longer comparable. Use a new collection and re-index. The server refuses to mix them. With `model.expected_fingerprint` set, `serve` and `import` also refuse to start until it names the new model, which is the reminder that the thresholds have to be measured again. |
 
@@ -2749,10 +2752,10 @@ checked against, is beside it because the difference is why ([The ONNX engine](#
 
 | Input | ONNX Runtime (`just throughput`) | Burn (`just throughput models/mdbr-leaf-mt burn`) |
 |---|---|---|
-| One short field (the usual edit) | 1.3 ms | 4.2 ms |
-| One description | 2.8 ms | 12.2 ms |
-| One whole record, four fields | 4.3 ms | 19.8 ms |
-| Eight whole records in one batch | 16.2 ms | 85.9 ms |
+| One short field (the usual edit) | 0.8 ms | 4.2 ms |
+| One description | 1.9 ms | 12.2 ms |
+| One whole record, four fields | 2.9 ms | 19.8 ms |
+| Eight whole records in one batch | 13.2 ms | 85.9 ms |
 
 Model load is about 0.4 s: 0.2 s for Burn to read the weights, and the rest for ONNX Runtime to read its file and
 for the two to be checked against each other. A stored composite at the example settings is 1024 floats, so
@@ -2774,32 +2777,32 @@ On the same machine (12 cores, release build, default model, 300 records per lev
 
 | Callers | Phase | Requests per second | Median | 99th percentile | Texts per forward pass | Mean wait in the queue |
 |---|---|---|---|---|---|---|
-| 1 | create | 213 | 4.8 ms | 5.3 ms | 4.0 | 0.0 ms |
-| 1 | edit | 623 | 1.6 ms | 1.7 ms | 1.0 | 0.0 ms |
-| 1 | resave | 10,191 | 0.1 ms | 0.1 ms | | |
-| 4 | create | 293 | 13.7 ms | 15.3 ms | 8.0 | 5.4 ms |
-| 4 | edit | 1,061 | 3.8 ms | 4.0 ms | 2.0 | 1.4 ms |
-| 16 | create | 401 | 40.2 ms | 43.8 ms | 30.8 | 19.0 ms |
-| 16 | edit | 1,873 | 8.5 ms | 9.0 ms | 7.9 | 1.9 ms |
-| 64 | create | 398 | 156.0 ms | 170.6 ms | 30.8 | 124.2 ms |
-| 64 | edit | 2,526 | 24.5 ms | 28.0 ms | 27.3 | 10.1 ms |
-| 64 | resave | 29,337 | 2.1 ms | 2.9 ms | | |
-| 1 | stream | 405 | | | 31.6 | 0.0 ms |
+| 1 | create | 285 | 3.6 ms | 4.1 ms | 4.0 | 0.0 ms |
+| 1 | edit | 890 | 1.1 ms | 1.3 ms | 1.0 | 0.0 ms |
+| 1 | resave | 9,709 | 0.1 ms | 0.1 ms | | |
+| 4 | create | 368 | 10.9 ms | 12.6 ms | 8.1 | 4.0 ms |
+| 4 | edit | 1,430 | 2.8 ms | 3.0 ms | 2.0 | 0.9 ms |
+| 16 | create | 484 | 32.9 ms | 36.8 ms | 30.8 | 15.6 ms |
+| 16 | edit | 2,165 | 7.3 ms | 8.2 ms | 7.9 | 2.5 ms |
+| 64 | create | 483 | 131.8 ms | 137.0 ms | 30.8 | 102.8 ms |
+| 64 | edit | 2,807 | 22.2 ms | 25.6 ms | 27.3 | 8.4 ms |
+| 64 | resave | 23,016 | 2.4 ms | 4.3 ms | | |
+| 1 | stream | 483 | | | 31.6 | 0.0 ms |
 
 - **create** sends a new record, so all four fields go to the model. **edit** sends it back with the name
   changed, so one short text does: this is edit-time traffic, the figure a replica is sized by. **resave** sends
   the edited record again unchanged, so nothing reaches the model, and what is left is gRPC, the per-record lock,
   and the store. **stream** creates the same number of new records over one `Import` call.
 - **More callers buy throughput by sharing forward passes, and pay for it in latency.** From 1 caller to 64,
-  edits per second go from 623 to 2,526 while the median goes from 1.6 ms to 25 ms. The model was busy for
-  nearly all of every create and edit phase (89% of the time with one caller editing, 99% and more from four):
-  one replica's ceiling on this machine is about 2,500 edits a second.
-- **The slowest requests are close to the median**: at 64 callers the 99th percentile of an edit is 28 ms
-  against a median of 25. Everybody waits for the model, and nobody waits for anybody else
+  edits per second go from 890 to 2,807 while the median goes from 1.1 ms to 22 ms. The model was busy for
+  nearly all of every create and edit phase (83% of the time with one caller editing, 99% and more from four):
+  one replica's ceiling on this machine is about 2,800 edits a second.
+- **The slowest requests are close to the median**: at 64 callers the 99th percentile of an edit is 26 ms
+  against a median of 22. Everybody waits for the model, and nobody waits for anybody else
   ([Where a request's time goes](#where-a-requests-time-goes)).
-- **Creating whole records levels off at about 400 a second**, 1,600 texts, once a forward pass is full
+- **Creating whole records levels off at about 480 a second**, 1,900 texts, once a forward pass is full
   (`model.batch_size` is 32). **One stream reaches that ceiling from a single caller**: it fills forward passes
-  on purpose, where 64 callers of `Evaluate` fill them by arriving together and wait 160 ms each to do it. The
+  on purpose, where 64 callers of `Evaluate` fill them by arriving together and wait 130 ms each to do it. The
   `import` command is no faster a second, but shares the model with nobody.
 - **No request was refused** in any phase: the queue holds 256 (`model.queue_depth`), more than 64 callers can
   fill. A refused request is counted (`overloaded`) and sent again after 5 ms.
@@ -2811,7 +2814,7 @@ the second kind. The store is in memory, so a round trip to Qdrant comes on top.
 stream. The table leaves out two of the resave rows. One line:
 
 ```json
-{"message":"load_phase","run_id":"1-1794528411","concurrency":16,"phase":"edit","requests":300,"ok":300,"overloaded":0,"expired":0,"failed":0,"created":0,"accepted":300,"rejected":0,"seconds":0.162,"per_second":1852.3,"p50_ms":8.53,"p90_ms":9.0,"p99_ms":9.4,"max_ms":14.89,"mean_ms":8.52,"batches":38,"texts":300,"texts_per_batch":7.89,"model_busy":0.995,"queue_wait_ms":2.26,"abandoned":0,"too_late":0}
+{"message":"load_phase","run_id":"1-1795012571","concurrency":16,"phase":"edit","requests":300,"ok":300,"overloaded":0,"expired":0,"failed":0,"created":0,"accepted":300,"rejected":0,"seconds":0.139,"per_second":2164.6,"p50_ms":7.34,"p90_ms":7.63,"p99_ms":8.21,"max_ms":8.27,"mean_ms":7.28,"batches":38,"texts":300,"texts_per_batch":7.89,"model_busy":0.993,"queue_wait_ms":2.48,"abandoned":0,"too_late":0}
 ```
 
 `--server http://host:port` drives a server that is already running, instead of starting one. Its records are
@@ -2828,9 +2831,11 @@ and many requests' from whatever the traces are sent to ([Telemetry](#telemetry)
 when there is a collector to send them to.
 
 The table below was measured on an earlier build of the same day that put each request's waits on its own log
-line, which is how a request can be told to be a create, an edit, or a resave. What is left of a request's time
-after its waits is the server's own work: validating, scoring, translating. Mean milliseconds per `Evaluate`,
-from `just load ... --server` runs of 1,000 records at each level, same machine:
+line, which is how a request can be told to be a create, an edit, or a resave. It is also from before threads
+spun (D45), so its forward passes are slower than the server's are now; what it shows is where the time goes.
+What is left of a request's time after its waits is the server's own work: validating, scoring, translating.
+Mean milliseconds per `Evaluate`, from `just load ... --server` runs of 1,000 records at each level, same
+machine:
 
 | Store | Callers | Phase | Whole | Lock | Read | Wait for model | Forward pass | Write | Texts in the pass |
 |---|---|---|---|---|---|---|---|---|---|
@@ -2894,32 +2899,35 @@ the server can answer in that time, it is being asked for more than it has.
 just load config.example.toml --concurrency 128,256 --records 20000 --deadline-ms 50
 ```
 
-The model can do 2,450 edits a second. A caller that is answered sends its next request at once, so 128
-callers ask for more than that, and 256 for more still. Edits answered in time, of 20,000, on the same
+The model can do about 2,800 edits a second. A caller that is answered sends its next request at once, so 128
+callers ask for about that much, and 256 for twice it. Edits answered in time, of 20,000, on the same
 machine, two runs each, against this server and against the commit before it learned any of this (`0cf6011`),
 each as a process of its own (`--server`) on a store in memory:
 
 | Callers | Deadline | Before: answered in time | Before: a second | Now: answered in time | Now: a second |
 |---|---|---|---|---|---|
-| 128 | 50 ms | 2,061 and 2,152 | 251 and 261 | 12,780 and 12,788 | 2,374 and 2,364 |
-| 256 | 50 ms | 98 and 105 | 13.5 and 14.5 | 7,557 and 7,561 | 2,319 and 2,320 |
+| 128 | 50 ms | 2,061 and 2,152 | 251 and 261 | 18,400 and 18,132 | 2,605 and 2,595 |
+| 256 | 50 ms | 98 and 105 | 13.5 and 14.5 | 8,032 and 8,038 | 2,615 and 2,618 |
+
+The "now" columns were measured again once threads spun (D45), which made the model faster; the "before" ones
+are of the older commit, on the slower model.
 
 - **Before, a server that fell behind stopped answering.** The embedding thread took requests in the order
   they came, whether or not anybody was still waiting. Once the wait passed the deadline, everything it reached
   had been given up on, so it spent all of its time on answers nobody read, and at twice its capacity it
   answered one request in two hundred. The queue stayed full of such requests, and refused some 65,000
   attempts with `RESOURCE_EXHAUSTED` in seven seconds.
-- **Now it answers as many as it has time for**: 2,320 to 2,370 edits a second, about 95% of what it does
-  when nobody is in a hurry. The count out of 20,000 is lower than that share because callers that are
-  answered sooner come back sooner: the median answer took 25 ms, and the callers sent 3,700 requests a second
-  at 128 and 6,100 at 256.
-  Three things do it, and an in-process run at 256 callers counts each (7,565 edits answered in time, for
-  7,859 texts embedded):
+- **Now it answers as many as it has time for**: 2,590 to 2,620 edits a second, about 93% of what it does
+  when nobody is in a hurry. At 256 callers the count out of 20,000 is lower than that share because callers
+  that are answered sooner come back sooner: the median answer took 48 ms at 128 callers and 21 ms at 256, and
+  the callers sent 2,830 requests a second at 128 and 6,510 at 256.
+  Three things do it, and an in-process run at 256 callers counts each (8,067 edits answered in time, for
+  8,085 texts embedded):
   - The thread passes over a request whose caller has gone, and such a request gives up its place among the
-    waiting at once (`abandoned`, 3,132).
+    waiting at once (`abandoned`, 20).
   - A forward pass is made up of requests it can answer before their deadlines. One that is out of time, or
     that the pass about to run leaves no time for, is told `DEADLINE_EXCEEDED` then, and not embedded
-    (`too_late`, 9,228).
+    (`too_late`, 11,895).
   - Requests are served in the order they came until one is lost in either of those ways. From then on the
     server is behind, and the request at the head of the queue is always the one closest to its deadline: its
     answer would arrive as its caller gave up. So while it is behind the thread takes the newest requests
@@ -2930,7 +2938,7 @@ each as a process of its own (`--server`) on a store in memory:
   cannot be met, never for one that merely might not be, and a request alone in a pass is never refused on a
   guess at its own texts. In a server's first moments, before it has run a full pass, the bound is a rough one.
 - **A caller that gave up while its edit was being written got its edit written** (see [Errors](#errors)), with
-  its `WARN` line: 50 of the 20,000 edits in that run.
+  its `WARN` line: 82 in the two runs.
 
 A caller spends the whole deadline on a record it gives up on, also when the server refuses it sooner, so a
 server that fails fast is not sent more for it. The create phase has no deadline, because the other two need
@@ -2941,7 +2949,8 @@ expired was not stored. This is still a closed loop.
 it helps, because the queue is then in the store, where this server has no say over who goes first. Qdrant in
 Docker on the same laptop is such a store. With no deadline it takes about 1,500 edits a second however many
 callers there are (1,497 with 16 callers at a median of 10 ms, 1,444 with 64 at 36 ms, 1,613 with 128 at
-64 ms), against the 2,450 the model can do. At a 50 ms deadline, of 10,000 edits, one run each:
+64 ms), against the 2,450 the model could do on that build, from before threads spun (D45). At a 50 ms
+deadline, of 10,000 edits, one run each:
 
 | Callers | Deadline | Before: answered in time | Now: answered in time |
 |---|---|---|---|
@@ -2962,7 +2971,7 @@ model. What the server is doing as a whole, and what each request waited for, is
 ### The ONNX engine
 
 The forward pass is nearly all of what a request costs, and Burn's CPU backend is not the fastest way to run it:
-the first table of [Performance](#performance) has ONNX Runtime three to five times faster on the same model
+the first table of [Performance](#performance) has ONNX Runtime five to seven times faster on the same model
 and texts.
 So [ONNX Runtime](https://onnxruntime.ai) runs the forward pass, in every command that embeds, and there is no
 setting for it. Burn was the engine at first and for a day was the default beside this one; it stopped serving
@@ -2995,7 +3004,7 @@ on 2026-11-12 (`docs/decisions.md`, D34, has both sets of measurements).
   a build stage that has `uv` and PyTorch (the CPU builds), and copies only the model directory out of that
   stage: the image is 328 MB with no Python in it.
 - **On Linux it is slower than on macOS.** `load` inside that image (Linux on arm64, 12 cores, the same laptop,
-  300 records per level):
+  300 records per level), on a build from before threads spun (D45), which has not been measured in the image:
 
   | Callers | Phase | Requests per second | Median |
   |---|---|---|---|
@@ -3005,7 +3014,7 @@ on 2026-11-12 (`docs/decisions.md`, D34, has both sets of measurements).
   | 16 | edit | 803 | 19.4 ms |
   | 1 | stream | 169 | |
 
-  That is under half of what the same laptop does natively on macOS (the table above), whose ONNX Runtime
+  That was under half of what the same laptop did natively on macOS on the same build, whose ONNX Runtime
   build has more behind it on that hardware. **Not measured: x86-64**, which is likely what you serve on and may
   differ again. Run `load` there before sizing anything.
 
@@ -3107,7 +3116,7 @@ data/
   regression.snapshot.ndjson      what the pinned model and the example config make of them
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D44)
+  decisions.md               why things are the way they are (D1 to D45)
   data-request-prompt.md     a brief for collecting labeled production data
   import-prompt.md           a brief for loading the real catalog into a running service
   feature-suggestions.md     features that could be added, built and not, the last twelve about production

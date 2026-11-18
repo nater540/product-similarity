@@ -44,6 +44,7 @@ fn embedder(golden: &Golden, batch_size: usize, output_dim: Option<usize>, engin
     max_tokens: golden.max_tokens,
     batch_size,
     output_dim,
+    threads: None,
   };
   Embedder::load_with(&model_dir(), Device::flex(), &options, engine).unwrap()
 }

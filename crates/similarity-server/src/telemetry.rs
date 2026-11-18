@@ -449,6 +449,7 @@ mod tests {
           max_tokens: 16,
           batch_size: 8,
           output_dim: None,
+          threads: None,
         };
         let embedder = similarity_core::testing::tiny_embedder(&options);
         let worker = EmbedWorker::spawn_measured(embedder, 4, 8, &telemetry.metrics()).unwrap();

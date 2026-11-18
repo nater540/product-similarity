@@ -904,7 +904,7 @@ proptest! {
       .unwrap();
     let mut policy = Policy::new(0.8, Some(0.7)).unwrap();
     policy.reject_on_measure_change = true;
-    let options = EmbedderOptions { max_tokens: 16, batch_size: 8, output_dim: None };
+    let options = EmbedderOptions { max_tokens: 16, batch_size: 8, output_dim: None, threads: None };
     let offline = std::sync::Arc::new(Offline::new(tiny_embedder(&options), schema.clone(), policy));
 
     let expected = offline

@@ -131,8 +131,8 @@ verify-model dir:
     PARITY_MODEL_DIR={{ dir }} PARITY_FIXTURE=target/parity-fixture.json cargo test -p similarity-core --test real_parity -- --ignored
 
 # Forward-pass latency on this machine's CPU
-throughput model="models/mdbr-leaf-mt" engine="onnx":
-    cargo run --release -p similarity-core {{ if engine == "onnx" { "--features onnx" } else { "" } }} --example throughput -- {{ model }} {{ engine }}
+throughput model="models/mdbr-leaf-mt" engine="onnx" threads="":
+    cargo run --release -p similarity-core {{ if engine == "onnx" { "--features onnx" } else { "" } }} --example throughput -- {{ model }} {{ engine }} {{ threads }}
 
 # Score the labeled pairs and report the threshold that separates edits from recycled records.
 # Flags go last: `just calibrate data/calibration.sample.full.jsonl config.example.toml --full --split holdout`

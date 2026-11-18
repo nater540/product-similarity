@@ -607,6 +607,7 @@ fn load_embedder(config: &Config, tie: Tie) -> anyhow::Result<Embedder> {
     fingerprint = embedder.fingerprint(),
     dimension = embedder.dimension(),
     engine = embedder.engine().as_str(),
+    threads = config.model.threads,
     elapsed = ?started.elapsed(),
     written_by = origin.as_ref().map(|origin| origin.tool.as_str()),
     written_at = origin.as_ref().map(|origin| origin.written_at),

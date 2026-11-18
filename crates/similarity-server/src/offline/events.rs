@@ -681,6 +681,7 @@ mod tests {
       max_tokens: 16,
       batch_size: 8,
       output_dim: None,
+      threads: None,
     };
     let policy = Policy::new(0.5, None).unwrap();
     (Offline::new(tiny_embedder(&options), schema, policy), policy)

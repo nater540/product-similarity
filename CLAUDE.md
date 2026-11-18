@@ -6,7 +6,7 @@ and trained in [Burn](https://burn.dev), run by ONNX Runtime), compared with the
 rejected against calibrated thresholds. A record's quantities (weight, volume, potency) are compared as numbers
 beside that, never embedded. Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D44) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D45) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -265,7 +265,9 @@ changing a design. Infer conventions from the existing code first.
   load and refuses a graph that differs, because the file goes stale silently when the weights change. Never put
   the engine into the fingerprint or the layout id: the vectors are the same, and that is what the check is for.
   `ort` stays a feature of `similarity-core` that the server always enables and the trainer never does, pinned
-  exactly. The tests stay on Burn, the reference: the tiny encoders, and the real-model tests, which load with
+  exactly. Its threads spin, always, and `model.threads` (left out by default) says how many there are (D45):
+  neither changes a vector, so neither goes into the fingerprint, the layout id, or the judging digest. The tests
+  stay on Burn, the reference: the tiny encoders, and the real-model tests, which load with
   `Embedder::load`. After changing the encoder, the pooling, or the export, run `just test-onnx` (it needs
   `just export-onnx` first), which is what holds the two engines to each other.
 - **A model directory is not usable until it is exported.** `just export-onnx <dir>` after `model fetch`, after a

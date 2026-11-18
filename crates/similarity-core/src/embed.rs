@@ -73,6 +73,9 @@ pub struct EmbedderOptions {
   /// Keep only the first N components of each vector, then re-normalize. Only meaningful for models trained with
   /// Matryoshka representation learning (the default model is); `None` keeps the model's native width.
   pub output_dim: Option<usize>,
+  /// How many threads ONNX Runtime spreads one forward pass across; `None` leaves it to ONNX Runtime. Burn ignores
+  /// it. It changes how fast a vector is made and never what it is, so it is no part of the fingerprint.
+  pub threads: Option<usize>,
 }
 
 impl Default for EmbedderOptions {
@@ -81,6 +84,7 @@ impl Default for EmbedderOptions {
       max_tokens: 256,
       batch_size: 32,
       output_dim: None,
+      threads: None,
     }
   }
 }
@@ -140,7 +144,7 @@ impl Embedder {
     match engine {
       EngineChoice::Burn => Ok(burn),
       #[cfg(feature = "onnx")]
-      EngineChoice::Onnx => burn.onto_onnx(dir),
+      EngineChoice::Onnx => burn.onto_onnx(dir, options.threads),
       #[cfg(not(feature = "onnx"))]
       EngineChoice::Onnx => Ok(burn),
     }
@@ -148,10 +152,10 @@ impl Embedder {
 
   /// The same embedder with its forward pass on ONNX Runtime, if the directory's graph agrees with it.
   #[cfg(feature = "onnx")]
-  fn onto_onnx(self, dir: &Path) -> Result<Self> {
+  fn onto_onnx(self, dir: &Path, threads: Option<usize>) -> Result<Self> {
     let expected = self.embed(&PROBES)?;
     let onnx = Self {
-      engine: Engine::Onnx(crate::model::onnx::OnnxEncoder::load(dir, self.native)?),
+      engine: Engine::Onnx(crate::model::onnx::OnnxEncoder::load(dir, self.native, threads)?),
       ..self
     };
     let found = onnx.embed(&PROBES)?;
@@ -399,6 +403,7 @@ mod tests {
       max_tokens,
       batch_size,
       output_dim,
+      threads: None,
     }
   }
 

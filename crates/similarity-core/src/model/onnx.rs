@@ -63,13 +63,14 @@ fn failed(what: &str, error: impl fmt::Display) -> Error {
 
 impl OnnxEncoder {
   /// Loads `onnx/model.onnx` from `dir`. `dimension` is the native width the directory's weights produce; the
-  /// graph has to produce the same.
+  /// graph has to produce the same. `threads` is how many threads a forward pass is spread across, and `None`
+  /// leaves that to ONNX Runtime.
   ///
   /// # Errors
   ///
   /// Returns [`Error::UnsupportedModel`] if the file is not there, and [`Error::Inference`] if ONNX Runtime
   /// cannot load it.
-  pub fn load(dir: &Path, dimension: usize) -> Result<Self> {
+  pub fn load(dir: &Path, dimension: usize, threads: Option<usize>) -> Result<Self> {
     let path = dir.join(ONNX_FILE);
     if !path.is_file() {
       return Err(Error::unsupported(
@@ -77,12 +78,23 @@ impl OnnxEncoder {
         format!("the ONNX engine needs `{ONNX_FILE}`, which is not there; write it with `just export-onnx <dir>`"),
       ));
     }
-    let session = Session::builder(environment()?)
+    let mut builder = Session::builder(environment()?)
       .map_err(|error| failed("cannot configure a session", error))?
       // On macOS the default is to hand the graph to CoreML, which is slower for a model this small and cannot run
       // every batch shape. This engine is a CPU engine everywhere.
       .with_auto_device(AutoDevicePolicy::PreferCPU)
       .map_err(|error| failed("cannot select the CPU", error))?
+      // A pass of this model is many small steps, and a thread that sleeps between them is woken too late for the
+      // next: spinning made one edit a third faster through gRPC and creates a fifth, for a third more CPU under
+      // load and none at rest (docs/decisions.md, D45). Unasked, the downloaded build ran as it does with it off.
+      .with_intra_op_spinning(true)
+      .map_err(|error| failed("cannot let threads spin", error))?;
+    if let Some(threads) = threads {
+      builder = builder
+        .with_intra_threads(threads)
+        .map_err(|error| failed("cannot set the number of threads", error))?;
+    }
+    let session = builder
       .commit_from_file(&path)
       .map_err(|error| failed(&format!("cannot load {}", path.display()), error))?;
     Ok(Self {

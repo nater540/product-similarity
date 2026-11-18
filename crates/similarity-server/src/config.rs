@@ -215,6 +215,12 @@ pub struct ModelConfig {
   pub output_dim: Option<usize>,
   /// How many embedding requests may wait for the encoder before new ones are refused with `RESOURCE_EXHAUSTED`.
   pub queue_depth: usize,
+  /// How many threads one forward pass is spread across. Omit to leave it to ONNX Runtime.
+  ///
+  /// A measurement of the machine, like `batch_size`, and not a rule of judging: it changes how fast a vector is
+  /// made and never what it is, so it is in neither the fingerprint, the layout, nor the judging digest
+  /// (docs/decisions.md, D45).
+  pub threads: Option<usize>,
   /// The fingerprint of the model the thresholds in this file were measured with. `serve` and `import` refuse
   /// to run with any other model: thresholds do not transfer between models. Omit, and nothing is checked.
   ///
@@ -246,6 +252,7 @@ impl Default for ModelConfig {
       // Deliberately not 256, even though that is what `config.example.toml` sets for the default model: a
       // default that truncates would silently damage any model that was not trained for it (docs/decisions.md, D4).
       output_dim: None,
+      threads: None,
       queue_depth: 256,
       expected_fingerprint: None,
     }
@@ -276,6 +283,7 @@ impl ModelConfig {
       max_tokens: self.max_tokens,
       batch_size: self.batch_size,
       output_dim: self.output_dim,
+      threads: self.threads,
     }
   }
 }
@@ -493,6 +501,9 @@ impl Config {
     config.policy()?;
     if config.model.queue_depth == 0 {
       bail!("`model.queue_depth` must be positive");
+    }
+    if config.model.threads == Some(0) {
+      bail!("`model.threads` must be positive; omit it to leave the number of threads to ONNX Runtime");
     }
     if let Some(expected) = &config.model.expected_fingerprint
       && expected.trim() != expected
@@ -1137,6 +1148,17 @@ mod tests {
     assert!(Config::parse(&MINIMAL.replace("threshold = 0.8", "threshold = 8")).is_err());
     assert!(Config::parse(&MINIMAL.replace("weight = 1.0", "weight = 0")).is_err());
     assert!(Config::parse(&format!("[model]\nqueue_depth = 0\n{MINIMAL}")).is_err());
+  }
+
+  #[test]
+  fn a_thread_count_is_left_to_onnx_runtime_unless_given_and_zero_is_refused() {
+    assert_eq!(Config::parse(MINIMAL).unwrap().model.embedder_options().threads, None);
+    let given = Config::parse(&format!("[model]\nthreads = 6\n{MINIMAL}")).unwrap();
+    assert_eq!(given.model.embedder_options().threads, Some(6));
+    let zero = Config::parse(&format!("[model]\nthreads = 0\n{MINIMAL}"))
+      .unwrap_err()
+      .to_string();
+    assert!(zero.contains("model.threads"), "{zero}");
   }
 
   #[test]

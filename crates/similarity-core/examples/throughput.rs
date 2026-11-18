@@ -3,11 +3,12 @@
 //! ```text
 //! cargo run --release -p similarity-core --example throughput -- models/mdbr-leaf-mt
 //! cargo run --release -p similarity-core --features onnx --example throughput -- models/mdbr-leaf-mt onnx
+//! cargo run --release -p similarity-core --features onnx --example throughput -- models/mdbr-leaf-mt onnx 6
 //! ```
 //!
 //! The shapes mirror real traffic: a single short field (one edited name), one whole record (four fields, one of
-//! them a description), and a full micro-batch. Run it before changing `max_tokens`, `batch_size`, the model, or the
-//! backend features, because those are the knobs that move these numbers.
+//! them a description), and a full micro-batch. Run it before changing `max_tokens`, `batch_size`, `threads`, the
+//! model, or the backend features, because those are the knobs that move these numbers.
 
 #![allow(clippy::print_stdout, reason = "an example's whole job is to print")]
 
@@ -32,15 +33,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   let dir = PathBuf::from(
     std::env::args()
       .nth(1)
-      .ok_or("usage: throughput <model-dir> [burn|onnx]")?,
+      .ok_or("usage: throughput <model-dir> [burn|onnx] [threads]")?,
   );
   let engine = match std::env::args().nth(2).as_deref() {
     None | Some("burn") => EngineChoice::Burn,
     Some("onnx") => EngineChoice::Onnx,
     Some(other) => return Err(format!("`{other}` is not an engine; it is `burn` or `onnx`").into()),
   };
+  // As `model.threads`: how many threads ONNX Runtime spreads a pass across, left to it when not given.
+  let threads = match std::env::args().nth(3) {
+    None => None,
+    Some(given) => Some(
+      given
+        .parse::<usize>()
+        .map_err(|_| format!("`{given}` is not a number of threads"))?,
+    ),
+  };
+  let options = EmbedderOptions {
+    threads,
+    ..EmbedderOptions::default()
+  };
   let started = Instant::now();
-  let embedder = Embedder::load_with(&dir, Device::flex(), &EmbedderOptions::default(), engine)?;
+  let embedder = Embedder::load_with(&dir, Device::flex(), &options, engine)?;
   println!(
     "loaded {} in {:.0?} (dimension {}, engine {})",
     dir.display(),

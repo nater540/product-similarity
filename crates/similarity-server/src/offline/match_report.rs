@@ -451,6 +451,7 @@ mod tests {
       max_tokens: 16,
       batch_size: 8,
       output_dim: None,
+      threads: None,
     };
     Offline::new(tiny_embedder(&options), schema, Policy::new(0.5, None).unwrap())
   }

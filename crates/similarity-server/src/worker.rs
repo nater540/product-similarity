@@ -1209,6 +1209,7 @@ mod tests {
       max_tokens: 16,
       batch_size: 8,
       output_dim: None,
+      threads: None,
     };
     let worker = EmbedWorker::spawn(similarity_core::testing::tiny_embedder(&options), 4, 8).unwrap();
     assert_eq!(worker.stats.fastest_ns_per_text.load(Ordering::Relaxed), 0);
@@ -1296,6 +1297,7 @@ mod tests {
       max_tokens: 16,
       batch_size: 8,
       output_dim: None,
+      threads: None,
     };
     let worker = EmbedWorker::spawn(similarity_core::testing::tiny_embedder(&options), 4, 8).unwrap();
     assert_eq!(worker.stats(), WorkerSnapshot::default());
@@ -1346,6 +1348,7 @@ mod tests {
       max_tokens: 16,
       batch_size: 8,
       output_dim: None,
+      threads: None,
     };
     let worker = EmbedWorker::spawn(similarity_core::testing::tiny_embedder(&options), 4, 8).unwrap();
     assert!(worker.alive());

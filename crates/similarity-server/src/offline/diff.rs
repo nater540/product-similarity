@@ -1041,6 +1041,7 @@ mod tests {
       max_tokens: 16,
       batch_size: 8,
       output_dim: None,
+      threads: None,
     };
     let policy = Policy::new(-1.0, None).unwrap();
     let offline = Offline::new(tiny_embedder(&options), schema(1.0, None, None), policy);

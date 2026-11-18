@@ -489,6 +489,7 @@ fn a_text_embeds_the_same_alone_and_in_any_batch() {
     max_tokens: 16,
     batch_size: 4,
     output_dim: None,
+    threads: None,
   });
   // Sentences of one to seven known words, so that a batch mixes lengths and has to be padded.
   let sentence =

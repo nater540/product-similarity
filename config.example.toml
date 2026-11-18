@@ -38,6 +38,11 @@ output_dim = 256
 batch_size = 32
 # Requests that may wait for the encoder before new ones get RESOURCE_EXHAUSTED.
 queue_depth = 256
+# How many threads one forward pass is spread across. Not set here, which leaves it to ONNX Runtime: on the laptop
+# the README was measured on, that was as fast as any number tried. Set it where ONNX Runtime counts more cores than
+# the server may use, as in a container given a share of a larger machine, and measure with `just load`. It changes
+# how fast a vector is made and never what it is.
+# threads = 6
 # The model the thresholds below were measured with. Not set here. Set it in a production config, to the
 # fingerprint on the `model` line of `calibrate` (or the one `model promote` prints): `serve` and `import` then
 # refuse to run with any other model, because thresholds do not transfer between models.

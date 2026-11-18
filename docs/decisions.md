@@ -2271,3 +2271,63 @@ clear. Only what needs no re-index may be reloaded (D12): thresholds, weights, f
 model or the set of fields. A reload that does not parse, or that would change the layout, should leave the
 old policy in force and say so loudly, since a server that stops on a typo turns a mistake into an outage. And
 the digest is what tells whoever sent the signal that every replica took it.
+
+## D45. ONNX Runtime's threads spin, and how many there are is a setting of the machine
+
+Asked how to make the server faster, the first candidate was quantizing the model to 8-bit integers. It was
+measured first, on a copy of the model and in Python's ONNX Runtime 1.32 on the README's laptop (an M4 Pro, 8
+fast cores and 4 slow ones), and it is not worth having there: one short field went from 0.82 to 0.56 ms, while
+a description (2.09 to 2.02 ms) and a batch of 32 texts (27.1 to 25.4 ms), which are most of the work, hardly
+moved. Per-channel quantization kept every vector within a cosine of 0.9974 of the original and per-tensor
+within 0.9838, but a different vector is a different model, with a new fingerprint, a re-index, and a new
+calibration, and the load check of D34 would have to be loosened to admit it. ONNX Runtime's transformer
+fusion found no attention to fuse and gained nothing. x86-64 processors with fast 8-bit instructions may say
+otherwise, and are not measured.
+
+What the same measurements did show is that the Python runtime ran a pass much faster than the server on the
+same file and the same cores. The difference was spinning: a thread of ONNX Runtime's pool that finishes its
+part of one step of a pass either waits busily for the next or goes to sleep and is woken. A pass of this model
+is many small steps, and a sleeping thread is woken late for each. The session the server built did not ask
+for spinning, and ran exactly as it does with spinning turned off.
+
+**Spinning is on, always.** Measured with `just throughput` and `just load`, same laptop, release build,
+default model, the number of threads left to ONNX Runtime:
+
+| | Before | Spinning |
+|---|---|---|
+| One short field | 1.31 ms | 0.78 ms |
+| One whole record | 4.27 ms | 2.92 ms |
+| Eight whole records | 16.3 ms | 13.2 ms |
+| One edit through gRPC, one caller | 1.64 ms | 1.11 ms |
+| Edits a second, 16 callers | 1,834 | 2,165 |
+| Edits a second, 64 callers | 2,479 | 2,807 |
+| Creates a second, 64 callers | 399 | 483 |
+| One `Import` stream, records a second | 398 | 483 |
+
+The vectors are the same: the arithmetic is unchanged, only how the threads wait for it. So nothing about it is
+in the fingerprint, the layout, or the judging digest (D44), and no threshold moves. It costs CPU while a pass
+runs, about a third more for the same work under load in one measurement with 6 threads (6.8 s against 5.0 s
+of CPU for the same requests), and none at rest: a server that had been idle for 10 seconds had used no CPU
+in them either way.
+That is a cost on a machine the server shares, and there is no setting to turn it off; one can be added if a
+deployment needs it.
+
+**How many threads is `model.threads`, and is left out by default.** In a probe of the runtime alone, 8
+spinning threads looked best. Through gRPC, where the server's own threads and the load test's want cores too,
+8 was worse than 6, and 4 was worse again. With spinning on and the
+number left to ONNX Runtime, the server was as fast as with 6 at every level of `just load` (2,807 against
+2,809 edits a second at 64 callers). So `config.example.toml` sets none. The setting exists for the machines
+where ONNX Runtime's own count is wrong, most likely a container that is given a share of a larger machine and
+sees all of its cores. It is checked to be positive, written on the line that says the model was loaded, and
+`just throughput <dir> onnx <threads>` measures a number before it is configured.
+
+**What was measured before this is labeled so.** In the README, where a request's time goes, a server
+against Qdrant, the Linux container, the `import` command, and a stream beside edits are from builds before
+spinning, and say so; the per-record locks are a comparison of two builds and say which. They still show what
+they were measured to show (shares of a request, the store as the limit, Linux against macOS, what a stream
+costs its neighbors). The figures that size a server were measured again: the forward pass, `just load` at 1
+to 64 callers, and the deadline runs at 128 and 256.
+
+**Not done:** several embedding threads, each with a session of fewer threads (D34 lists it), which is the next
+thing to measure now that a pass no longer waits on its own threads; the Linux container and x86-64 with
+spinning; and quantization on x86-64.

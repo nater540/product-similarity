@@ -53,6 +53,7 @@ fn embedder(golden: &Golden, batch_size: usize, output_dim: Option<usize>) -> Em
     max_tokens: golden.max_tokens,
     batch_size,
     output_dim,
+    threads: None,
   };
   let dir = path_from_env("PARITY_MODEL_DIR", workspace_root().join("models/mdbr-leaf-mt"));
   Embedder::load(&dir, Device::flex(), &options).unwrap()

@@ -650,6 +650,7 @@ mod tests {
       max_tokens: 16,
       batch_size: 8,
       output_dim: None,
+      threads: None,
     };
     let counted = crate::telemetry::testing::paged();
     let embedder = similarity_core::testing::tiny_embedder(&options);
@@ -767,6 +768,7 @@ mod tests {
             max_tokens: 16,
             batch_size: 8,
             output_dim: None,
+            threads: None,
           };
           let worker = EmbedWorker::spawn(similarity_core::testing::tiny_embedder(&options), 4, 8).unwrap();
           let schema = Schema::new(vec![FieldSpec {
