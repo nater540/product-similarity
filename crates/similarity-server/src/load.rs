@@ -355,7 +355,8 @@ pub struct WorkerShare {
   pub texts: u64,
   /// Texts per call: how much sharing of forward passes the level of concurrency bought.
   pub texts_per_batch: Option<f64>,
-  /// The share of the phase's wall time the model was busy.
+  /// How many forward passes were running, on average over the phase: the share of its wall time the model was
+  /// busy with one session, and up to `model.sessions` with several.
   pub busy: f64,
   /// How long a request waited in the queue before the model took it, on average, in milliseconds.
   pub queue_wait_ms: Option<f64>,

@@ -153,9 +153,11 @@ changing a design. Infer conventions from the existing code first.
   itself goes through `Engine::committed`, which runs the store call, the observer, and the making of the answer
   on a task of their own with the record's lock, and whose result logs itself if nobody takes it. Never call
   `put_if` or `delete_if` on the request's own task, never put anything after the write that the detached task
-  does not do, and never log that line for a request that was answered. The embedding thread passes over a job
-  whose reply nobody holds; do not make `EmbedWorker::embed` keep working for a caller that is gone (no
-  spawning it, no holding the receiver elsewhere). A deadline reaches the thread through `worker::by`, a
+  does not do, and never log that line for a request that was answered. The embedding threads (one for each of
+  `model.sessions`, sharing one backlog under one lock, D46) pass over a job whose reply nobody holds; do not
+  make `EmbedWorker::embed` keep working for a caller that is gone (no spawning it, no holding the receiver
+  elsewhere). With several sessions, a request left waiting is refused only if no session can be free before
+  its deadline: never while one is idle. A deadline reaches the thread through `worker::by`, a
   task-local: work moved to another task does not carry it. The thread judges "cannot be answered in time" on
   the *fastest* rate it has seen, a lower bound on purpose: a request is refused only for a deadline that
   cannot be met, never for one that might not be, a request alone in a pass is never refused on a guess at its

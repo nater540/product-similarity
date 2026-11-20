@@ -452,7 +452,7 @@ mod tests {
           threads: None,
         };
         let embedder = similarity_core::testing::tiny_embedder(&options);
-        let worker = EmbedWorker::spawn_measured(embedder, 4, 8, &telemetry.metrics()).unwrap();
+        let worker = EmbedWorker::spawn_measured(vec![embedder], 4, 8, &telemetry.metrics()).unwrap();
         let schema = Schema::new(vec![FieldSpec {
           name: "name".to_owned(),
           weight: 1.0,

@@ -43,6 +43,11 @@ queue_depth = 256
 # the server may use, as in a container given a share of a larger machine, and measure with `just load`. It changes
 # how fast a vector is made and never what it is.
 # threads = 6
+# How many forward passes run at once, each in a session of the model of its own with `threads` threads (needed
+# when this is more than one). Not set here, which is one. Several do more work under load on the same cores and
+# answer a request alone more slowly, and an `Import` stream more slowly too (D46): measure with `just load`, and
+# leave cores for the rest of the server.
+# sessions = 4
 # The model the thresholds below were measured with. Not set here. Set it in a production config, to the
 # fingerprint on the `model` line of `calibrate` (or the one `model promote` prints): `serve` and `import` then
 # refuse to run with any other model, because thresholds do not transfer between models.

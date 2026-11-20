@@ -2045,7 +2045,8 @@ commented starting point.
 | `model.output_dim` | none (native width) | Keep only the first N components of each field vector. Only for models trained for it. The example config sets 256 for the default model. |
 | `model.batch_size` | `32` | The most texts in one forward pass. |
 | `model.queue_depth` | `256` | Requests that may wait for the encoder before new ones get `RESOURCE_EXHAUSTED`. A request whose caller has gone no longer counts. |
-| `model.threads` | none (ONNX Runtime chooses) | How many threads one forward pass is spread across. Leaving it out was as fast as any number tried on the machine the [Performance](#performance) figures come from; set it where ONNX Runtime counts more cores than the server may use, and measure with `just load`. Changes no vector, no fingerprint, and no verdict. |
+| `model.threads` | none (ONNX Runtime chooses) | How many threads one forward pass is spread across. Leaving it out was as fast as any number tried on the machine the [Performance](#performance) figures come from; set it where ONNX Runtime counts more cores than the server may use, and measure with `just load`. With `model.sessions`, the threads of each session. Changes no vector, no fingerprint, and no verdict. |
+| `model.sessions` | `1` | How many forward passes run at once, each in a session of the model of its own; more than one needs `model.threads`. On the laptop, several served up to 1.6 times the edits and over twice the creates under load, answered a request alone a third slower or more, and served an `Import` stream more slowly (D46). Measure with `just load`. Changes no vector, no fingerprint, and no verdict. |
 | `model.expected_fingerprint` | none | The fingerprint of the model the thresholds were measured with, as on the `model` line of `calibrate`. With it, `serve` and `import` refuse to run with any other model, and `compare` and the `calibrate` commands warn. Without it nothing is checked, and `serve` and `import` say so once. |
 | `qdrant.url` | `http://localhost:6334` | Qdrant's gRPC endpoint (6334, not the REST port 6333). |
 | `qdrant.collection` | `records` | The collection. Created if missing. |
@@ -2079,7 +2080,7 @@ What a change costs:
 | A threshold, a floor, `required` | None. Takes effect on restart. |
 | `[shadow]` added, changed, or removed | None for any verdict or stored record. Takes effect on restart. With a shadow the server writes result lines on stdout, which is otherwise empty. |
 | A quantity added, removed, or given a limit | None. Quantities are stored beside the vectors, not in them. A record stored before a quantity existed reports it as `ADDED` the first time it arrives. |
-| `model.threads` | None for any vector or verdict. Takes effect on restart. |
+| `model.threads`, `model.sessions` | None for any vector or verdict. Takes effect on restart. |
 | A field weight | Verdicts use the new weight at once. Search rankings use the weights records were written with until they are rewritten. |
 | `model.dir`, `output_dim`, `max_tokens`, or the set of fields | Stored vectors are no longer comparable. Use a new collection and re-index. The server refuses to mix them. With `model.expected_fingerprint` set, `serve` and `import` also refuse to start until it names the new model, which is the reminder that the thresholds have to be measured again. |
 
@@ -3013,6 +3014,10 @@ on 2026-11-12 (`docs/decisions.md`, D34, has both sets of measurements).
   turn it off. `model.threads` sets how many threads a pass uses; leave it out unless ONNX Runtime counts more
   cores than the server may use, as in a container given a share of a larger machine, where spinning threads on
   every core would spend the share.
+- **One session, or several.** `model.sessions` runs that many forward passes at once, each in a session of
+  `model.threads` threads. Under load they keep more cores working (1.6 times the edits a second at 64 callers
+  with eight sessions of one thread, on the laptop); a request alone is slower, the slowest requests under load
+  are slower, and a stream, which uses one session at a time, is slower. One is the default (D46).
 - **In a container.** `just image` builds the server on Debian 13, because the prebuilt library is compiled
   against the C++ standard library of GCC 13 and does not link on Debian 12. It fetches the model, exports it in
   a build stage that has `uv` and PyTorch (the CPU builds), and copies only the model directory out of that

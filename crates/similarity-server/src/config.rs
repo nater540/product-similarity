@@ -221,6 +221,13 @@ pub struct ModelConfig {
   /// made and never what it is, so it is in neither the fingerprint, the layout, nor the judging digest
   /// (docs/decisions.md, D45).
   pub threads: Option<usize>,
+  /// How many forward passes run at once, each in a session of the model of its own on a thread of its own,
+  /// with `threads` threads. One unless given. More than one needs `threads`: left to ONNX Runtime, each session
+  /// would spread its passes across every core.
+  ///
+  /// A measurement of the machine like `threads`, in neither the fingerprint, the layout, nor the judging digest
+  /// (docs/decisions.md, D46).
+  pub sessions: usize,
   /// The fingerprint of the model the thresholds in this file were measured with. `serve` and `import` refuse
   /// to run with any other model: thresholds do not transfer between models. Omit, and nothing is checked.
   ///
@@ -253,6 +260,7 @@ impl Default for ModelConfig {
       // default that truncates would silently damage any model that was not trained for it (docs/decisions.md, D4).
       output_dim: None,
       threads: None,
+      sessions: 1,
       queue_depth: 256,
       expected_fingerprint: None,
     }
@@ -504,6 +512,16 @@ impl Config {
     }
     if config.model.threads == Some(0) {
       bail!("`model.threads` must be positive; omit it to leave the number of threads to ONNX Runtime");
+    }
+    if config.model.sessions == 0 {
+      bail!("`model.sessions` must be positive; omit it for one");
+    }
+    if config.model.sessions > 1 && config.model.threads.is_none() {
+      bail!(
+        "`model.sessions` is {} and needs `model.threads`, the threads of each: left to ONNX Runtime, every session \
+         would take every core",
+        config.model.sessions
+      );
     }
     if let Some(expected) = &config.model.expected_fingerprint
       && expected.trim() != expected
@@ -1159,6 +1177,26 @@ mod tests {
       .unwrap_err()
       .to_string();
     assert!(zero.contains("model.threads"), "{zero}");
+  }
+
+  /// One session unless given. More than one needs a number of threads for each: left to ONNX Runtime, every
+  /// session would take every core.
+  #[test]
+  fn sessions_are_one_unless_given_and_more_than_one_needs_threads() {
+    assert_eq!(Config::parse(MINIMAL).unwrap().model.sessions, 1);
+    let given = Config::parse(&format!("[model]\nsessions = 4\nthreads = 2\n{MINIMAL}")).unwrap();
+    assert_eq!((given.model.sessions, given.model.threads), (4, Some(2)));
+    let one = Config::parse(&format!("[model]\nsessions = 1\n{MINIMAL}")).unwrap();
+    assert_eq!((one.model.sessions, one.model.threads), (1, None));
+
+    let zero = Config::parse(&format!("[model]\nsessions = 0\n{MINIMAL}"))
+      .unwrap_err()
+      .to_string();
+    assert!(zero.contains("model.sessions"), "{zero}");
+    let unthreaded = Config::parse(&format!("[model]\nsessions = 4\n{MINIMAL}"))
+      .unwrap_err()
+      .to_string();
+    assert!(unthreaded.contains("model.threads"), "{unthreaded}");
   }
 
   #[test]

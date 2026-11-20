@@ -1,14 +1,19 @@
 //! Running a synchronous, CPU-bound model under an async server.
 //!
 //! A forward pass takes milliseconds to tens of milliseconds of solid CPU and must never run on a tokio worker,
-//! where it would stall every other request on that thread. [`EmbedWorker`] owns one dedicated OS thread that owns
-//! the model; request handlers hand it texts over a bounded queue and await the reply.
+//! where it would stall every other request on that thread. [`EmbedWorker`] owns dedicated OS threads, one for each
+//! session of the model (`model.sessions`, one unless configured); request handlers hand it texts over a bounded
+//! queue and await the reply.
 //!
-//! One thread, not a pool: the backend already spreads a forward pass across cores, so a second concurrent pass
-//! would only fight the first for them. What a single thread gives instead is **batching for free**. While one pass
-//! runs, requests pile up in the queue; when it finishes, the worker takes everything waiting and runs it as one
-//! pass. Under light load a request is served alone with no added delay; under heavy load batches grow on their own.
-//! There is no timer to tune.
+//! What a thread gives is **batching for free**. While a pass runs, requests pile up in the queue; when it
+//! finishes, the thread takes everything waiting and runs it as one pass. Under light load a request is served
+//! alone with no added delay; under heavy load batches grow on their own. There is no timer to tune.
+//!
+//! One session spreads a pass across all the cores it is given, and that leaves cores idle between the many small
+//! steps of a pass. Several sessions with fewer threads each run passes side by side and do more work on the same
+//! cores, and each pass is slower alone (docs/decisions.md, D46). They share one backlog: a thread takes it only
+//! to put its next pass together, so who is served next is still one decision, made by the rules below, and the
+//! model never runs while it is held.
 //!
 //! The number of requests that may wait is bounded. When that many are waiting the server says so immediately
 //! (`RESOURCE_EXHAUSTED`) instead of accepting work it will only finish after the caller has timed out.
@@ -20,8 +25,8 @@
 //!   thread passes over it. It also gives up its place among the waiting the moment it goes, so a queue of
 //!   requests nobody wants refuses nobody.
 //! - A request that says when its caller stops waiting ([`by`]) is in a pass only if the pass can end before
-//!   then, even at the fastest rate the model has shown ([`fit`]). One that is out of time, or that the pass
-//!   about to run leaves no time for, is told so ([`EmbedError::TooLate`]) and not embedded.
+//!   then, even at the fastest rate the model has shown ([`fit`]). One that is out of time, or that no session
+//!   can be free for in time, is told so ([`EmbedError::TooLate`]) and not embedded.
 //! - Once any request has been lost that way, the thread is behind, and waiting in order is what loses them:
 //!   the request at the head of the queue is always the one closest to its deadline. So while it is behind it
 //!   takes the newest requests first, which have the most time left, also for whatever the request still has to
@@ -31,9 +36,9 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use similarity_core::Embedder;
@@ -261,8 +266,8 @@ struct WorkerStats {
   waiting: AtomicU64,
   /// The least time per text any forward pass that succeeded has taken, in nanoseconds; zero until there is one.
   fastest_ns_per_text: AtomicU64,
-  /// Set when the thread ends, for whatever reason.
-  stopped: AtomicBool,
+  /// The sessions' threads that have not ended, for whatever reason.
+  running: AtomicUsize,
   /// Where a monitoring system reads some of this from ([`crate::metrics`]). Kept nowhere unless asked.
   metrics: Arc<Metrics>,
 }
@@ -287,7 +292,7 @@ fn nanoseconds(elapsed: Duration) -> u64 {
   u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// A handle to the embedding thread. Cheap to clone; the thread stops when the last handle is dropped.
+/// A handle to the embedding threads. Cheap to clone; the threads stop when the last handle is dropped.
 #[derive(Debug, Clone)]
 pub struct EmbedWorker {
   queue: Sender<Job>,
@@ -308,28 +313,63 @@ impl EmbedWorker {
   ///
   /// Returns the OS error if the thread cannot be spawned.
   pub fn spawn(embedder: Embedder, queue_depth: usize, max_batch_texts: usize) -> std::io::Result<Self> {
-    Self::spawn_measured(embedder, queue_depth, max_batch_texts, &Arc::new(Metrics::discarded()))
+    Self::spawn_measured(
+      vec![embedder],
+      queue_depth,
+      max_batch_texts,
+      &Arc::new(Metrics::discarded()),
+    )
   }
 
-  /// As [`Self::spawn`], with what the thread does counted into `metrics`: its forward passes, the requests
-  /// waiting for one, and the requests it refuses or passes over.
+  /// Moves each of `sessions` onto a thread of its own, all serving one queue, with what they do counted into
+  /// `metrics`: their forward passes, the requests waiting for one, and the requests they refuse or pass over.
+  ///
+  /// The sessions are copies of one model, loaded alike; the first one's dimension and fingerprint are the
+  /// worker's.
   ///
   /// # Errors
   ///
-  /// Returns the OS error if the thread cannot be spawned.
+  /// Returns [`std::io::ErrorKind::InvalidInput`] if `sessions` is empty, and the OS error if a thread cannot be
+  /// spawned.
   pub fn spawn_measured(
-    embedder: Embedder,
+    sessions: Vec<Embedder>,
     queue_depth: usize,
     max_batch_texts: usize,
     metrics: &Arc<Metrics>,
   ) -> std::io::Result<Self> {
-    // Not a bounded channel: the bound is on requests whose callers are waiting, wherever the thread has them.
+    let Some(first) = sessions.first() else {
+      return Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "an embedding worker needs at least one session of the model",
+      ));
+    };
+    let (dimension, fingerprint) = (first.dimension(), first.fingerprint().to_owned());
+    let sessions = sessions
+      .into_iter()
+      .map(|embedder| move |texts: &[&str]| embedder.embed(texts))
+      .collect();
+    Self::start(sessions, dimension, &fingerprint, queue_depth, max_batch_texts, metrics)
+  }
+
+  /// Starts a thread for each forward pass in `sessions`.
+  fn start<F>(
+    sessions: Vec<F>,
+    dimension: usize,
+    fingerprint: &str,
+    queue_depth: usize,
+    max_batch_texts: usize,
+    metrics: &Arc<Metrics>,
+  ) -> std::io::Result<Self>
+  where
+    F: Fn(&[&str]) -> similarity_core::Result<Vec<Vec<f32>>> + Send + 'static,
+  {
+    // Not a bounded channel: the bound is on requests whose callers are waiting, wherever the threads have them.
     let (queue, jobs) = channel();
     let handle = Self {
       queue,
       depth: count(queue_depth.max(1)),
-      dimension: embedder.dimension(),
-      fingerprint: Arc::from(embedder.fingerprint()),
+      dimension,
+      fingerprint: Arc::from(fingerprint),
       stats: Arc::new(WorkerStats {
         metrics: Arc::clone(metrics),
         ..WorkerStats::default()
@@ -337,14 +377,26 @@ impl EmbedWorker {
     };
     let waiting = Arc::clone(&handle.stats);
     metrics.watch_waiting(move || waiting.waiting.load(Ordering::Relaxed));
-    let stats = Arc::clone(&handle.stats);
-    std::thread::Builder::new()
-      .name("embed-worker".to_owned())
-      .spawn(move || {
-        // Dropped however the thread ends, a panic included: that is the one way to learn that it has.
-        let _stopped = Stopped(Arc::clone(&stats));
-        run(&embedder, &jobs, max_batch_texts.max(1), &stats);
-      })?;
+    let intake = Arc::new(Mutex::new(Intake {
+      jobs,
+      backlog: VecDeque::new(),
+      behind: false,
+      free_at: vec![None; sessions.len()],
+    }));
+    for (session, embed) in sessions.into_iter().enumerate() {
+      let stats = Arc::clone(&handle.stats);
+      let intake = Arc::clone(&intake);
+      // Counted before the thread starts, so that a thread that ends at once cannot be counted out first.
+      stats.running.fetch_add(1, Ordering::Relaxed);
+      let running = Stopped(Arc::clone(&stats));
+      std::thread::Builder::new()
+        .name(format!("embed-worker-{session}"))
+        .spawn(move || {
+          // Dropped however the thread ends, a panic included: that is the one way to learn that it has.
+          let _stopped = running;
+          run(&embed, session, &intake, max_batch_texts.max(1), &stats);
+        })?;
+    }
     Ok(handle)
   }
 
@@ -369,18 +421,19 @@ impl EmbedWorker {
   }
 }
 
-/// Marks the embedding thread as gone when the thread lets go of it.
+/// Counts a session's thread out when the thread lets go of it.
 struct Stopped(Arc<WorkerStats>);
 
 impl Drop for Stopped {
   fn drop(&mut self) {
-    self.0.stopped.store(true, Ordering::Relaxed);
+    self.0.running.fetch_sub(1, Ordering::Relaxed);
   }
 }
 
 impl TextEmbedder for EmbedWorker {
+  /// Alive while any session's thread is: one that is left still answers every request, more slowly.
   fn alive(&self) -> bool {
-    !self.stats.stopped.load(Ordering::Relaxed)
+    self.stats.running.load(Ordering::Relaxed) > 0
   }
 
   async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, EmbedError> {
@@ -519,8 +572,9 @@ fn fit(batch: Vec<Job>, now: Instant, stats: &WorkerStats) -> Vec<Job> {
 ///
 /// First everything nobody can use is dropped, wherever it stands ([`wanted`]). Then the pass is filled up to
 /// its limit and held to what it can answer in time ([`fit`]); a place that frees is filled again. Last, a
-/// request that is left waiting, and whose deadline will have passed before the pass about to run can end, is
-/// told now and not when it has.
+/// request that is left waiting, and whose deadline will have passed before any session can be free for it, is
+/// told now and not when it has. The soonest is the end of the pass about to run, or `free_elsewhere`: the
+/// soonest another session can be free, which is `None` when there is no other session.
 ///
 /// The pass is filled with the oldest requests first, unless the thread is `behind`: a request was lost the
 /// last time, or has been this time. Then it is filled with the newest. In order, the request being served is
@@ -534,6 +588,7 @@ fn gather(
   max_batch_texts: usize,
   behind: bool,
   stats: &WorkerStats,
+  free_elsewhere: Option<Instant>,
 ) -> (Vec<Job>, bool) {
   let came = backlog.len();
   let mut waiting: VecDeque<Job> = std::mem::take(backlog)
@@ -567,7 +622,10 @@ fn gather(
   }
 
   let fastest = stats.fastest_ns_per_text.load(Ordering::Relaxed);
-  if let Some(ends) = least_wait(count(texts_in(&batch)), fastest).and_then(|least| now.checked_add(least)) {
+  let ends = least_wait(count(texts_in(&batch)), fastest)
+    .and_then(|least| now.checked_add(least))
+    .map(|ends| free_elsewhere.map_or(ends, |elsewhere| ends.min(elsewhere)));
+  if let Some(ends) = ends {
     let left = waiting.len();
     waiting = waiting
       .into_iter()
@@ -601,19 +659,66 @@ fn remember(stats: &WorkerStats, texts: u64, elapsed: Duration) {
     });
 }
 
-fn run(embedder: &Embedder, jobs: &Receiver<Job>, max_batch_texts: usize, stats: &WorkerStats) {
-  // The requests waiting, in the order they came, and whether one was lost when the last pass was put together.
-  let mut backlog = VecDeque::new();
-  let mut behind = false;
-  loop {
-    if backlog.is_empty() {
-      // `recv` fails only when every handle is gone, which is the signal to stop.
-      let Ok(first) = jobs.recv() else { break };
-      backlog.push_back(first);
-    }
-    backlog.extend(jobs.try_iter());
-    let (batch, lost) = gather(&mut backlog, Instant::now(), max_batch_texts, behind, stats);
-    behind = lost;
+/// What the sessions share: the queue requests arrive on, and everything that decides who is served next.
+///
+/// A thread holds it only while it puts a pass together, and while it waits for a request when none is
+/// waiting. Waiting with it held is what hands each arrival to exactly one idle thread; the others wait for the
+/// lock, and a thread that has finished a pass takes its turn there like any idle one.
+struct Intake {
+  jobs: Receiver<Job>,
+  /// The requests waiting, in the order they came.
+  backlog: VecDeque<Job>,
+  /// Whether a request was lost when the last pass was put together, by whichever session.
+  behind: bool,
+  /// For each session, the soonest its pass in progress can end, at the fastest rate seen. A time that has
+  /// passed is a session that may be free; a session whose pass runs longer than that is taken for free too,
+  /// which only ever lets a request wait that might have been refused.
+  free_at: Vec<Option<Instant>>,
+}
+
+/// The soonest a session other than `session` can be free, or `None` if there is no other.
+fn free_elsewhere(free_at: &[Option<Instant>], session: usize, now: Instant) -> Option<Instant> {
+  free_at
+    .iter()
+    .enumerate()
+    .filter(|(other, _)| *other != session)
+    .map(|(_, free)| free.map_or(now, |free| free.max(now)))
+    .min()
+}
+
+/// The next pass for `session`, or `None` once every handle is gone.
+fn next_pass(intake: &Mutex<Intake>, session: usize, max_batch_texts: usize, stats: &WorkerStats) -> Option<Vec<Job>> {
+  // Nothing under the lock can panic, and a thread that did would leave the backlog as consistent as any
+  // other moment does: the other sessions go on.
+  let mut intake = intake.lock().unwrap_or_else(PoisonError::into_inner);
+  let Intake {
+    jobs,
+    backlog,
+    behind,
+    free_at,
+  } = &mut *intake;
+  if backlog.is_empty() {
+    // `recv` fails only when every handle is gone, which is the signal to stop.
+    let first = jobs.recv().ok()?;
+    backlog.push_back(first);
+  }
+  backlog.extend(jobs.try_iter());
+  let now = Instant::now();
+  let elsewhere = free_elsewhere(free_at, session, now);
+  let (batch, lost) = gather(backlog, now, max_batch_texts, *behind, stats, elsewhere);
+  *behind = lost;
+  let fastest = stats.fastest_ns_per_text.load(Ordering::Relaxed);
+  if let Some(mine) = free_at.get_mut(session) {
+    *mine = least_wait(count(texts_in(&batch)), fastest).and_then(|least| now.checked_add(least));
+  }
+  Some(batch)
+}
+
+fn run<F>(embed: &F, session: usize, intake: &Mutex<Intake>, max_batch_texts: usize, stats: &WorkerStats)
+where
+  F: Fn(&[&str]) -> similarity_core::Result<Vec<Vec<f32>>>,
+{
+  while let Some(batch) = next_pass(intake, session, max_batch_texts, stats) {
     if batch.is_empty() {
       continue;
     }
@@ -631,7 +736,7 @@ fn run(embedder: &Embedder, jobs: &Receiver<Job>, max_batch_texts: usize, stats:
     stats.jobs.fetch_add(count(batch.len()), Ordering::Relaxed);
     stats.texts.fetch_add(texts, Ordering::Relaxed);
     stats.queue_wait_ns.fetch_add(nanoseconds(waited), Ordering::Relaxed);
-    let succeeded = serve(embedder, batch);
+    let succeeded = serve_with(embed, batch);
     let elapsed = taken.elapsed();
     if succeeded {
       // A pass that failed says nothing about how fast the model is: an error can come back in no time at all.
@@ -640,7 +745,10 @@ fn run(embedder: &Embedder, jobs: &Receiver<Job>, max_batch_texts: usize, stats:
     }
     stats.busy_ns.fetch_add(nanoseconds(elapsed), Ordering::Relaxed);
   }
-  tracing::debug!("embedding worker stopped: every handle was dropped");
+  tracing::debug!(
+    session = i64::try_from(session).unwrap_or(i64::MAX),
+    "embedding session stopped: every handle was dropped"
+  );
 }
 
 /// One call into the model, with a backend panic turned into an error.
@@ -664,10 +772,6 @@ where
       Err(EmbedError::Failed("the embedding backend panicked".to_owned()))
     }
   }
-}
-
-fn serve(embedder: &Embedder, batch: Vec<Job>) -> bool {
-  serve_with(&|texts: &[&str]| embedder.embed(texts), batch)
 }
 
 /// Answers every job of `batch`, embedding them in one call when that works, and says whether it did.
@@ -781,7 +885,7 @@ pub(crate) mod testing {
 mod tests {
   use similarity_core::vector::cosine;
 
-  use super::testing::{WordBagEmbedder, word_bag};
+  use super::testing::{WORD_BAG_DIMENSION, WordBagEmbedder, word_bag};
   use super::*;
 
   #[test]
@@ -852,7 +956,7 @@ mod tests {
   /// a request was lost.
   fn pass(jobs: Vec<Job>, limit: usize, stats: &WorkerStats) -> (Vec<Job>, VecDeque<Job>, bool) {
     let mut backlog: VecDeque<Job> = jobs.into();
-    let (batch, lost) = gather(&mut backlog, Instant::now(), limit, false, stats);
+    let (batch, lost) = gather(&mut backlog, Instant::now(), limit, false, stats, None);
     (batch, backlog, lost)
   }
 
@@ -1070,10 +1174,10 @@ mod tests {
       job.deadline = Some(Instant::now() + Duration::from_mins(1));
     }
     let mut backlog: VecDeque<Job> = jobs.into();
-    let (batch, lost) = gather(&mut backlog, Instant::now(), 2, true, &stats);
+    let (batch, lost) = gather(&mut backlog, Instant::now(), 2, true, &stats, None);
     assert_eq!(texts_of(&batch), ["d", "c"]);
     assert!(!lost, "nobody was lost this time, so the next pass is in order again");
-    let (batch, _) = gather(&mut backlog, Instant::now(), 1, lost, &stats);
+    let (batch, _) = gather(&mut backlog, Instant::now(), 1, lost, &stats, None);
     assert_eq!(texts_of(&batch), ["a"]);
   }
 
@@ -1101,6 +1205,120 @@ mod tests {
     );
     assert_eq!(waiting_in(&stats), 1);
     assert_eq!(stats.too_late.load(Ordering::Relaxed), 1);
+  }
+
+  /// With other sessions, a request left waiting may be taken by one of them before the pass about to run
+  /// ends. It is told it is too late only if its deadline comes before every session can be free, at the
+  /// fastest rate seen: never while another session is idle.
+  #[test]
+  fn a_request_left_waiting_is_refused_only_if_no_session_can_be_free_before_its_deadline() {
+    let stats = slow();
+    let requests: [&[&str]; 3] = [&["a", "b"], &["c"], &["soon"]];
+    let setup = || {
+      let (mut jobs, replies) = jobs_counted(&requests, &stats);
+      let now = Instant::now();
+      jobs[0].deadline = Some(now + Duration::from_mins(1));
+      jobs[1].deadline = Some(now + Duration::from_mins(1));
+      // The pass will be three texts, three seconds at the least; this one has two.
+      jobs[2].deadline = Some(now + Duration::from_secs(2));
+      (VecDeque::from(jobs), replies, now)
+    };
+
+    // Another session is free now: it can take the request the moment this pass is put together.
+    let (mut backlog, mut replies, now) = setup();
+    let (batch, lost) = gather(&mut backlog, now, 3, false, &stats, Some(now));
+    assert_eq!(texts_of(&batch), ["a", "b", "c"]);
+    assert!(!lost);
+    assert_eq!(backlog.len(), 1, "still waiting, for the free session");
+    assert!(replies[2].try_recv().is_err(), "not answered");
+
+    // The other session is busy for one more second at the least: still in time.
+    let (mut backlog, _replies, now) = setup();
+    let (_, lost) = gather(&mut backlog, now, 3, false, &stats, Some(now + Duration::from_secs(1)));
+    assert!(!lost && backlog.len() == 1);
+
+    // Busy for five: neither session can reach it in two seconds.
+    let (mut backlog, mut replies, now) = setup();
+    let (_, lost) = gather(&mut backlog, now, 3, false, &stats, Some(now + Duration::from_secs(5)));
+    assert!(lost && backlog.is_empty());
+    assert_eq!(replies[2].try_recv().unwrap(), Err(EmbedError::TooLate));
+  }
+
+  /// Sessions run passes at the same time. A forward pass that cannot finish until another pass has started
+  /// beside it is answered only by a worker with two sessions that both work.
+  #[tokio::test]
+  async fn two_sessions_run_two_passes_at_once() {
+    let started = Arc::new((std::sync::Mutex::new(0_usize), std::sync::Condvar::new()));
+    let session = || {
+      let started = Arc::clone(&started);
+      move |texts: &[&str]| {
+        // Counts itself in, then waits for the other pass to have started too: neither ends alone.
+        let (count, changed) = &*started;
+        let mut count = count.lock().unwrap();
+        *count += 1;
+        changed.notify_all();
+        let (count, timeout) = changed
+          .wait_timeout_while(count, Duration::from_secs(5), |count| *count < 2)
+          .unwrap();
+        drop(count);
+        if timeout.timed_out() {
+          return Err(similarity_core::Error::Inference(
+            "the other pass never started".to_owned(),
+          ));
+        }
+        Ok(texts.iter().map(|text| word_bag(text)).collect())
+      }
+    };
+    // One text a pass, so that the two requests cannot share one.
+    let worker = EmbedWorker::start(
+      vec![session(), session()],
+      WORD_BAG_DIMENSION,
+      "two",
+      4,
+      1,
+      &Arc::new(Metrics::discarded()),
+    )
+    .unwrap();
+    let (first, second) = tokio::join!(
+      worker.embed(vec!["blueberry gummies".to_owned()]),
+      worker.embed(vec!["vape cartridge".to_owned()]),
+    );
+    assert_eq!(first.unwrap(), [word_bag("blueberry gummies")]);
+    assert_eq!(second.unwrap(), [word_bag("vape cartridge")]);
+    assert_eq!(worker.stats().batches, 2);
+  }
+
+  /// Every session's thread ends when the last handle goes, and only then is the worker no longer alive.
+  #[tokio::test]
+  async fn every_session_stops_when_the_last_handle_is_dropped() {
+    let options = similarity_core::EmbedderOptions {
+      max_tokens: 16,
+      batch_size: 8,
+      output_dim: None,
+      threads: None,
+    };
+    let sessions = (0..3)
+      .map(|_| similarity_core::testing::tiny_embedder(&options))
+      .collect();
+    let worker = EmbedWorker::spawn_measured(sessions, 4, 8, &Arc::new(Metrics::discarded())).unwrap();
+    assert_eq!(worker.stats.running.load(Ordering::Relaxed), 3);
+    worker.embed(vec!["blueberry gummies".to_owned()]).await.unwrap();
+    let stats = Arc::clone(&worker.stats);
+    drop(worker);
+    for _ in 0..400 {
+      if stats.running.load(Ordering::Relaxed) == 0 {
+        break;
+      }
+      tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(stats.running.load(Ordering::Relaxed), 0);
+  }
+
+  #[test]
+  fn a_worker_needs_at_least_one_session() {
+    let none: Vec<Embedder> = Vec::new();
+    let refused = EmbedWorker::spawn_measured(none, 4, 8, &Arc::new(Metrics::discarded())).unwrap_err();
+    assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
   }
 
   #[test]
@@ -1358,6 +1576,7 @@ mod tests {
     // A thread that has ended, however it ended: here by returning, and a panic unwinds through the same mark.
     let (queue, jobs) = channel();
     let stats = Arc::<WorkerStats>::default();
+    stats.running.store(1, Ordering::Relaxed);
     let ended = Arc::clone(&stats);
     std::thread::spawn(move || {
       let _stopped = Stopped(ended);

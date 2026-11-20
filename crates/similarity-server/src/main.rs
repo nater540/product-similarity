@@ -608,6 +608,7 @@ fn load_embedder(config: &Config, tie: Tie) -> anyhow::Result<Embedder> {
     dimension = embedder.dimension(),
     engine = embedder.engine().as_str(),
     threads = config.model.threads,
+    sessions = config.model.sessions,
     elapsed = ?started.elapsed(),
     written_by = origin.as_ref().map(|origin| origin.tool.as_str()),
     written_at = origin.as_ref().map(|origin| origin.written_at),
@@ -630,6 +631,37 @@ fn load_embedder(config: &Config, tie: Tie) -> anyhow::Result<Embedder> {
   }
   check_tie(config, embedder.fingerprint(), tie)?;
   Ok(embedder)
+}
+
+/// The sessions an embedding worker runs, `model.sessions` of them: the first as [`load_embedder`] loads it, and
+/// each other loaded and checked against the directory the same way (docs/decisions.md, D46).
+fn load_sessions(config: &Config, tie: Tie) -> anyhow::Result<Vec<Embedder>> {
+  let first = load_embedder(config, tie)?;
+  let mut sessions = Vec::with_capacity(config.model.sessions);
+  for session in 1..config.model.sessions {
+    let embedder = Embedder::load_with(
+      &config.model.dir,
+      Device::flex(),
+      &config.model.embedder_options(),
+      EngineChoice::Onnx,
+    )
+    .with_context(|| {
+      format!(
+        "cannot load session {session} of the model from {}",
+        config.model.dir.display()
+      )
+    })?;
+    // The directory could only change under a running load; a session of another model must not serve.
+    anyhow::ensure!(
+      embedder.fingerprint() == first.fingerprint(),
+      "session {session} of the model is `{}`, and the first is `{}`: the directory changed while it was loaded",
+      embedder.fingerprint(),
+      first.fingerprint()
+    );
+    sessions.push(embedder);
+  }
+  sessions.insert(0, first);
+  Ok(sessions)
 }
 
 /// Passes every request to stop on to the server, for as long as the process lives: Ctrl-C as [`Stop::Now`] (a
@@ -796,9 +828,9 @@ impl ServeArgs {
     } = serving;
     let telemetry = Arc::new(telemetry);
     let listen = self.listen.unwrap_or(config.server.listen);
-    let embedder = load_embedder(&config, Tie::Enforced)?;
+    let sessions = load_sessions(&config, Tie::Enforced)?;
     let (depth, batch) = (config.model.queue_depth, config.model.batch_size);
-    let worker = EmbedWorker::spawn_measured(embedder, depth, batch, &telemetry.metrics())
+    let worker = EmbedWorker::spawn_measured(sessions, depth, batch, &telemetry.metrics())
       .context("cannot start the embedding thread")?;
     let (layout, dimension) = store_layout(&config.schema()?, &worker);
 
@@ -1374,10 +1406,11 @@ impl LoadArgs {
 
     // A server of its own, on a store in memory: nothing here can touch a real collection.
     let config = Config::load(&self.config)?;
-    let worker = EmbedWorker::spawn(
-      load_embedder(&config, Tie::Reported)?,
+    let worker = EmbedWorker::spawn_measured(
+      load_sessions(&config, Tie::Reported)?,
       config.model.queue_depth,
       config.model.batch_size,
+      &Arc::new(similarity_server::metrics::Metrics::discarded()),
     )
     .context("cannot start the embedding thread")?;
     let schema = config.schema()?;

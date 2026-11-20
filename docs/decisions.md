@@ -2333,5 +2333,82 @@ costs its neighbors). The figures that size a server were measured again: the fo
 to 64 callers, and the deadline runs at 128 and 256.
 
 **Not done:** several embedding threads, each with a session of fewer threads (D34 lists it), which is the next
-thing to measure now that a pass no longer waits on its own threads; the Linux container and x86-64 with
+thing to measure now that a pass no longer waits on its own threads (since measured and built: D46); the Linux container and x86-64 with
 spinning; and quantization on x86-64.
+
+## D46. Several sessions of the model can serve at once, and one is the default
+
+D45 left one idea to measure: several embedding threads, each with a session of fewer threads. One session
+spreads a pass across every core it is given, and a pass is many small steps; between them, cores wait for each
+other. Sessions side by side keep more cores working. It was measured first, then built, then measured through
+the server.
+
+**What the model alone does.** A probe ran k sessions of t threads each, every one embedding the same batch over
+and over, on the README's laptop (M4 Pro, 8 fast cores and 4 slow ones), release build, default model. Texts a
+second, all sessions together:
+
+| Records a pass | 1 session, ONNX Runtime's count | 2 × 4 threads | 4 × 2 | 8 × 1 |
+|---|---|---|---|---|
+| 1 | 1,344 | 2,042 | 2,793 | 3,347 |
+| 4 | 1,935 | 2,930 | 3,559 | 4,475 |
+| 16 | 2,254 | 2,918 | 3,561 | 4,321 |
+
+The price is the pass itself: one record takes 2.97 ms in a session with every thread, 3.53 ms with four, 4.43
+with two, and 5.87 with one, when nothing else runs; side by side, longer.
+
+**What was built.** `model.sessions`, one unless given, is how many sessions the server loads (each checked
+against the weights as D34 requires, and each the same fingerprint), each on a thread of its own. They share one
+backlog under one lock, which a thread takes only to put its next pass together, so D38 holds as it was: the
+order requests are served in, the switch to the newest while requests are being lost, the bound that refuses
+only what cannot be met, are one decision whoever makes it. The one rule that had to change is the last step of
+putting a pass together: a request left waiting was told it was too late when the pass about to run would end
+after its deadline. With other sessions, another may be free for it sooner, so it is now told only when its
+deadline comes before the soonest any session can be free, at the fastest rate seen. A session that is idle
+refuses nobody. With one session the rule is what it was.
+
+`model.threads` becomes the threads of each session, and is required when `sessions` is more than one: left to
+ONNX Runtime, every session would take every core. Neither setting changes a vector, so neither is in the
+fingerprint, the layout id, or the judging digest (D44). The worker is alive (D37) while any session's thread is.
+
+**Measured through the server.** `just load`, same laptop with a browser and a terminal open (which is why the
+one-session figures are below the README's: everything here was run side by side under the same conditions, and
+the ratios are the result, not the numbers), 1,000 records a level, two runs of each alternating:
+
+| | 1 session | 4 × 2 | 8 × 1 |
+|---|---|---|---|
+| Edits a second, 1 caller | 709, 769 | 552, 570 | 493, 498 |
+| Median edit, 1 caller | 1.38, 1.27 ms | 1.79, 1.73 ms | 2.01, 2.01 ms |
+| Edits a second, 64 callers | 2,341, 2,526 | 3,174, 3,503 | 3,859, 3,966 |
+| Median edit, 64 callers | 27.0, 25.2 ms | 16.3, 17.5 ms | 8.0, 11.2 ms |
+| 99th percentile edit, 64 callers | 30.9, 33.8 ms | 51.8, 41.8 ms | 68.6, 48.8 ms |
+| Creates a second, 64 callers | 405, 444 | 722, 774 | 955, 982 |
+| One `Import` stream, records a second | 392 | 280 | 189 |
+
+With a 50 ms deadline and 20,000 records (D38's run), edits answered in time a second, two runs:
+
+| Callers | 1 session | 4 × 2 | 8 × 1 | 6 × 1 | 3 × 2 |
+|---|---|---|---|---|---|
+| 128 | 2,196 | 4,051, 3,740 | 4,207, 3,750 | 3,676 | 2,955 |
+| 256 | 2,244 | 3,516, 2,987 | 1,666, 1,085 | 2,476 | 2,870 |
+
+So: under load, sessions do much more work on the same cores: 1.6 times the edits and 2.2 to 2.4 times the
+creates with 8 × 1, and at the median a loaded server answers sooner. Everything else costs. A request alone is
+about a third slower with 4 × 2 and up to 60% with 8 × 1, the slowest requests under load are slower, and an `Import` stream, which sends one batch at a
+time and so only ever uses one session, is slower in proportion to the threads its session lost. With the most
+sessions, a server well past its capacity with deadlines answers fewer in time than one session does: at 256
+callers 8 × 1 fell to half. Most of those were lost after the model had answered them in time. A rule that
+treated a request answered after its deadline as lost (so that the next pass would take the newest) was tried
+and changed nothing, which says the time went after the model: the sessions held every fast core, and gRPC, the
+runtime, and the load test's own callers waited for one. 4 × 2 leaves room for them: it was the best of those tried at 256
+callers, and close to 8 × 1 at 128.
+
+**One is the default, and `config.example.toml` sets none.** Which is better depends on what a deployment
+needs: a quiet server answers a single request faster with one session, a busy one serves more with several,
+and a server that imports by stream wants one. That is a choice for the machine and the traffic, like
+`threads`, and it is measured with `just load` on the machine that will run it. Leave cores for the rest of the
+server: sessions times threads at or below the fast cores, and fewer when it is past its capacity.
+
+**Not done.** A long job split across idle sessions, which would give a stream its speed back. The `import`
+command embeds directly and uses one session of `threads` threads, so with `threads` set for several sessions it
+is slower too; it could be given a count of its own. Linux, the container, and x86-64 are not measured, and
+nothing here was run against Qdrant, which D38 found to be the limit before the model is.
