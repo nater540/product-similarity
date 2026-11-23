@@ -969,8 +969,31 @@ recipe fixes the seed and turns off the regression files, which would otherwise 
 thrown away.
 
 **Why it is not in `just ci`.** Twenty-five minutes of twelve cores when this was written, and forty at the last
-run. It is run by hand after a change to what it covers, as the thorough property pass is. The repository had no
-remote then; it has one now, and a scheduled job for this is not set up.
+run. The repository had no remote then; it has one now, and a scheduled job for this is not set up.
+
+**It is run in extreme cases only** (the owner's decision, 2026-11-23). Until then the rule was a full run after
+any change to a file it covers. That was right while the runs were finding things: the first found eighteen
+gaps, and of the runs made after a new piece was built, several found between one and four more, and one found
+tests that hang. It stopped paying for what it costs.
+The runs over the two newest pieces of verdict code found no gap in the tests: of the amount parser's 155
+mutants one survived, in a check that was redundant, and the 14 mutants of the unit rules' digest (D44) were
+all caught. Each of those was minutes of the whole machine for a narrowed run and would have been forty for a
+full one, and the owner's word on it was that it takes a long time.
+
+So no run is owed by an ordinary change, not the full one, not `mutants-diff`, and not one narrowed to a file.
+What a change owes is `just ci`, and the thorough property pass where D19 asks for it. A run is for an extreme
+case: a rewrite of how a verdict is decided (the scoring, the quantity comparison, the engine's write path), or
+the last check before the service first judges real edits. Whether something is one is the owner's to say.
+What keeps the boundaries held in between is what did the work in those last runs: tests written to the changes
+the tool would make, the properties, the pinned verdicts (D22), and the conformance file (D48). A new file whose
+boundaries are verdicts is still added to `.cargo/mutants.toml`, so that the next run covers it.
+
+What this leaves unknown, said plainly: the last complete run (811 mutants, above) predates `amount.rs` joining
+the list, and no complete run has been made since. A full run begun by mistake on 2026-11-22 was cut off at ten
+minutes; before it stopped it reported four mutants missed in `anchors/file.rs` and one at the time limit in
+`engine.rs`. Nobody has looked into them, and that run was made in the working tree and not in a checkout of its
+own, which is how this tool comes to report things that are not so (below). The next run is where they are
+settled.
 
 **Excluding a mutant is for one case only:** the change cannot alter behavior. One is excluded, with its reason:
 `>` against `>=` at a block length that no block can have, since `Schema::new` now refuses the weighting that

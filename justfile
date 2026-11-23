@@ -70,7 +70,8 @@ verdict-gate old pairs config="config.toml" *flags:
 # in a copy that has none.
 mutants_env := "PROPTEST_RNG_SEED=1 PROPTEST_DISABLE_FAILURE_PERSISTENCE=1 RECORD_SIMILARITY_COMMIT=mutants"
 
-# Mutation testing of the files whose boundaries are verdicts (slow; needs `cargo install cargo-mutants`)
+# Mutation testing of the files whose boundaries are verdicts. About 40 minutes: for extreme cases only, D25
+# (needs `cargo install cargo-mutants`)
 mutants *flags:
     {{ mutants_env }} cargo mutants --output target {{ flags }}
 

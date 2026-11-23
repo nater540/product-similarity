@@ -3361,7 +3361,7 @@ anchors is kept in. It needs `cargo install --locked cargo-mutants@27.1.0`, whic
 machine and not a dependency of the project.
 
 ```sh
-just mutants -j 3          # every mutant; about 40 minutes
+just mutants -j 3          # every mutant; about 40 minutes, so in extreme cases only (below)
 just mutants-diff          # only the mutants in what changed since the last commit
 just mutants --list        # what would be tested, without building anything
 just mutants-train -j 3    # the trainer's checkpoint rules, a set of its own; four minutes
@@ -3370,9 +3370,14 @@ just mutants-train -j 3    # the trainer's checkpoint rules, a set of its own; f
 The last full run tested 811 mutants in 40 minutes at three jobs: 663 were caught, 148 did not compile, none
 survived, and none had to be stopped by the tool's time limit. The trainer's set is 58 more, 39 caught and 19
 that did not compile.
-It is not part of `just ci`. Run it after changing the scoring, the quantity comparison, the schema, the engine's write
-path, the calibration statistics, the match ranking, the promotion gate, the audit's comparison, or the file a
-backup of anchors is kept in.
+`amount.rs` joined the list after that run; its 155 mutants were run on their own (149 caught, 5 that did not
+compile, and one survivor in a redundant check, which was removed).
+
+It is not part of `just ci`, and it is not run after every change to those files: forty minutes of the whole
+machine is too much for that. It is kept for extreme cases, which are a rewrite of how a verdict is decided
+(the scoring, the quantity comparison, the engine's write path) and the last check before the service first
+judges real edits. Everything else relies on the tests that run in seconds: the examples, the properties, the
+pinned verdicts, and the conformance file.
 
 - **A survivor is answered with a test,** an example that states the boundary as a sentence, or a property if
   the rule holds for every input. It is excluded in `.cargo/mutants.toml` only when the change cannot alter any

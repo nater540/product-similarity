@@ -44,12 +44,18 @@ changing a design. Infer conventions from the existing code first.
   proptest, D19), beside the example tests and not in place of them. After changing the engine's write path, the
   anchor, or the scoring, run `PROPTEST_CASES=5000 just test` once. When a property fails, fix the code or the
   rule, keep the shrunk case as an ordinary named test, and commit the `proptest-regressions/` file it wrote.
-- **The tests of the verdict-deciding files are themselves tested** (D25). After changing the scoring, the
-  quantity comparison, the schema, the engine's write path, the calibration statistics, the match ranking, the
-  promotion gate, the audit's comparison, or the file a backup of anchors is kept in, run `just mutants -j 3`
-  (40 minutes; `just mutants-diff` for a quick look) from a clean checkout, never from a tree being
-  edited. A surviving mutant gets a test that states the boundary. Exclude one in `.cargo/mutants.toml` only if
-  the change cannot alter behavior, with the reason, and never because it is hard to kill.
+- **Mutation testing is for extreme cases, and is not part of ordinary work** (D25; the owner's decision,
+  2026-11-23, because it takes a long time). Do not run `just mutants`, `just mutants-diff`, `just mutants-train`,
+  or a `cargo mutants` narrowed to a file after a change, and do not count a run among what a change needs to be
+  done: `just ci` is that, with the thorough property pass where the rule above asks for it. An extreme case is
+  a rewrite of how a verdict is decided (the scoring, the quantity comparison, the engine's write path), or the
+  last check before the service first judges real edits. If it is not plainly one of those, it is not one; ask
+  the owner before starting a run, and never start one unasked. Write the tests of a new boundary by hand
+  instead, to the changes the tool would make (`<` against `<=`, a body replaced by a constant). When a run is
+  made: from a clean checkout, never from a tree being edited; a surviving mutant gets a test that states the
+  boundary; exclude one in `.cargo/mutants.toml` only if the change cannot alter behavior, with the reason, and
+  never because it is hard to kill. A new file whose boundaries are verdicts still goes into that list, so that
+  the next run covers it.
 - **Verdicts on curated hard cases are pinned** (D22). `data/regression.jsonl` is synthetic and stays that way;
   `data/regression.snapshot.ndjson` is what the pinned model and `config.example.toml` make of it. A change to the
   config or the scoring code that moves any case fails `cargo test` (the snapshot is judged again, with no model);
@@ -389,8 +395,8 @@ changing a design. Infer conventions from the existing code first.
 - The engine: `just export-onnx <model-dir>` (needs `uv`), `just test-onnx`, `just throughput <model-dir>` and
   `just throughput <model-dir> burn` for the reference beside it; `just image <tag>` exports inside the build
   (Debian 13: the prebuilt runtime does not link on Debian 12)
-- Mutation testing (needs `cargo install cargo-mutants`): `just mutants -j 3`, `just mutants-diff`,
-  `just mutants-train`
+- Mutation testing, in extreme cases only (40 minutes; needs `cargo install cargo-mutants`): `just mutants -j 3`,
+  `just mutants-diff`, `just mutants-train`
 - Run: `just serve` (needs Qdrant) or `just serve-in-memory`; then `just client describe`
 - Watch its traces and metrics: `just observe-up` (an OpenTelemetry Collector on 4317, Jaeger on 16686, and
   Prometheus on 9090, in Docker; the server needs `[telemetry]` set), `just observe-down`

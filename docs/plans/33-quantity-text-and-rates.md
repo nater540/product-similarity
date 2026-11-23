@@ -369,8 +369,9 @@ Each step ends with `just ci`. Commit a feature at a time.
 9. Curated cases with rates in `data/regression.jsonl`, then `just snapshot` (it needs the model) and what it
    prints in the commit message. No existing case moves: the sample data uses `g`, `mg`, `%`, `ml`, `fl oz`,
    and `oz` only.
-10. D49, README, `CLAUDE.md`, the data request. `PROPTEST_CASES=5000 just test` once, `just test-real`, and
-    `just mutants -j 3` from a clean checkout (the quantity comparison changed).
+10. D49, README, `CLAUDE.md`, the data request. `PROPTEST_CASES=5000 just test` once, and `just test-real`. No
+    mutation run unless the owner asks for one: they are for extreme cases only (D25, 2026-11-23). 34 changes
+    the quantity comparison, so ask whether it is one.
 
 ## Tests
 
@@ -461,8 +462,8 @@ Answered on 2026-11-22 where it says so. The rest stand at their defaults until 
 
 **33 is medium**, three or four days: the parser and its conformance file are two, the call and the survey are
 one or two. **34 is medium**, three days: the unit model and its tests are two, the digest line, the wire, and
-the snapshot are one. Step 6 alone is half a day. The mutation run is 40 minutes; one run after 34 covers both
-if they land together, and 33 alone owes one for `amount.rs`.
+the snapshot are one. Step 6 alone is half a day. Neither owes a mutation run any more (D25, 2026-11-23); the
+parser's mutants were run on their own when it was built.
 
 ## Out of scope
 

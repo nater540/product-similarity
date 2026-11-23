@@ -3,6 +3,9 @@
 # The files listed here are the ones whose boundaries are verdicts (docs/decisions.md, D25). A mutant that survives
 # in one is an untested boundary: kill it with a test, or, only if it cannot change any observable behavior,
 # exclude it below with the reason. Never exclude a mutant because it is hard to kill.
+#
+# A run takes about 40 minutes and is made in extreme cases only, not after every change to these files (D25). A
+# new file whose boundaries are verdicts is still added here, so that the next run covers it.
 
 examine_globs = [
   "crates/similarity-core/src/score.rs",
