@@ -2412,3 +2412,52 @@ server: sessions times threads at or below the fast cores, and fewer when it is 
 command embeds directly and uses one session of `threads` threads, so with `threads` set for several sessions it
 is slower too; it could be given a count of its own. Linux, the container, and x86-64 are not measured, and
 nothing here was run against Qdrant, which D38 found to be the limit before the model is.
+
+## D47. Quantities are also a service of their own, which computes nothing the engine does not
+
+The owner asked for the quantity comparison to be callable without a record: other systems need to know whether
+two amounts are the same, and weights are intricate enough (an eighth of an ounce is not 3.5 g) to deserve tests
+that state what the service makes of them. So the package has a second service, `Quantities`, with three calls:
+`Compare` (two versions' quantities, name by name, answered with the `QuantityScore` of D16), `Convert` (one
+quantity in another unit, or in the unit its dimension is compared in), and `ListUnits` (the table).
+
+**It is the engine's code, not a copy of it.** `Compare` is `quantity::compare`, called the way `Evaluate` calls
+it. `Convert` is `Quantity::in_unit`, which is new, and is the conversion `compare` already made internally: a
+property holds that a quantity converted to another unit of its dimension is `Unchanged` against itself, and that
+the conversion is the arithmetic the properties of D16 were already checking by hand. `ListUnits` reads the one
+table. There is no second place where a unit or a factor is written, so the service cannot say something about
+two amounts that a verdict would contradict.
+
+**A service of its own, and not three more calls on `RecordSimilarity`.** That service is about records: its
+readiness is the store and the model, its calls honor deadlines against the embedding threads (D38), and its
+names are held to the configured schema. None of that is true of a conversion. As a separate service it has a
+health name of its own (`recordsimilarity.v1.Quantities`), which is `SERVING` from the start until the server
+leaves the rotation to stop (D37) and does not go away when Qdrant does, and a client that wants only this
+generates only this.
+
+**It reads nothing of the server.** No schema: a name is whatever the caller says, since a quantity that this
+deployment does not define is exactly what another system will ask about. No limits: `beyond_limit` is never
+set, because a limit is a measurement that belongs to a schema (D16), and applying this server's to another
+system's amounts would be a decision made for it. No store, no model, no lock. The same request gets the same
+answer from any server of this version, whatever its configuration, which is what makes the answers fit to be
+written into a test.
+
+**Units that do not convert are an answer.** `Convert` from `%` to `mg` returns no quantity and both
+dimensions, for the reason `Compare` reports `INCOMPARABLE` and does not fail: it is a fact about the two units.
+A unit the table does not know stays its own dimension, comparable with itself (D16). What is refused,
+`INVALID_ARGUMENT`, is what a record is refused for (an amount that is not a usable measurement), a missing
+quantity, a blank target unit, and an amount that is a number in its own unit and not in the one asked for
+(`1e300 kg` in `mcg`). Another spelling of the same unit changes no number: `v * f / f` is not always `v`, and
+"oz" to "ounces" should not be arithmetic.
+
+**What it adds to operations is small on purpose.** A span for each of the two calls that compute
+(`compare_quantities` with how many, `convert_quantity` with whether there was one, at `debug` like the others,
+D40), one log line each with those and `elapsed_ms`, and no metric (D39: a count of calls is what a trace is
+for). Nothing of a request's names, units, or amounts is in either.
+
+**Not done.** Parsing an amount out of text (`"3.5g"`, `"1/8 oz"`): the service takes a number and a unit, as a
+record does. Units per something (`mg/ml`, `mg` per serving against `mg` per package), which are different
+dimensions to the table and so are comparable only with themselves. A limit on how many quantities one `Compare`
+may carry beyond the transport's message size. A Bruno request for the three calls. `just mutants` has not been
+run over the new code in `quantity.rs`; it is covered by example tests written to its boundaries and by the
+property above, and the run is owed (D25).

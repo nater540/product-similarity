@@ -7,6 +7,7 @@
 //! - [`worker`]: the dedicated thread that runs the model, and the [`worker::TextEmbedder`] seam the engine uses.
 //! - [`engine`]: the service's behavior: validate, embed, compare, decide, write.
 //! - [`grpc`]: protobuf translation and status codes around the engine.
+//! - [`quantities`]: the `Quantities` service, which converts and compares quantities with no engine at all.
 //! - [`fetch`]: downloading and verifying a model directory.
 //! - [`import`]: loading a whole catalog into the store, a batch at a time.
 //! - [`import_stream`]: the same over a streaming call, sharing the model with live requests.
@@ -36,6 +37,7 @@ pub mod metrics;
 pub mod offline;
 #[cfg(test)]
 mod properties;
+pub mod quantities;
 pub mod registry;
 pub mod runs;
 pub mod shadow;
@@ -47,6 +49,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use similarity_proto::v1::quantities_server::QuantitiesServer;
 use similarity_proto::v1::record_similarity_server::RecordSimilarityServer;
 use similarity_store::VectorStore;
 use tokio::net::TcpListener;
@@ -59,6 +62,7 @@ use tonic_tracing_opentelemetry::middleware::server::OtelGrpcLayer;
 use crate::engine::Engine;
 use crate::grpc::GrpcService;
 use crate::metrics::Metrics;
+use crate::quantities::QuantitiesService;
 use crate::worker::TextEmbedder;
 
 /// How the server reports its health, and how it stops (docs/decisions.md, D37).
@@ -165,6 +169,11 @@ where
   // The first answer is found out before the listener can be asked for it, so that it is never a guess.
   let ready = report::<S, E>(&health_reporter, None, checked(&engine, lifecycle).await).await;
   let watch = tokio::spawn(watch(Arc::clone(&engine), health_reporter.clone(), lifecycle, ready));
+  // `Quantities` needs neither the store nor the model, so nothing that makes the API not ready makes it not
+  // ready: it serves from the first moment until the server leaves the rotation (D47).
+  health_reporter
+    .set_serving::<QuantitiesServer<QuantitiesService>>()
+    .await;
   let reflection = tonic_reflection::server::Builder::configure()
     .register_encoded_file_descriptor_set(similarity_proto::FILE_DESCRIPTOR_SET)
     // Without this the health service still answers, but reflection-driven tools such as `grpcurl` cannot find it.
@@ -181,6 +190,7 @@ where
     .add_service(health_service)
     .add_service(reflection)
     .add_service(RecordSimilarityServer::new(GrpcService::new(engine, metrics)))
+    .add_service(QuantitiesServer::new(QuantitiesService))
     // `TcpIncoming` rather than a bare stream of connections: only it applies `TCP_NODELAY`, without which Nagle's
     // algorithm can hold a small unary response back for tens of milliseconds, several times the cost of
     // computing it.
@@ -202,6 +212,9 @@ where
   let _ = watch.await;
   health_reporter
     .set_not_serving::<RecordSimilarityServer<GrpcService<S, E>>>()
+    .await;
+  health_reporter
+    .set_not_serving::<QuantitiesServer<QuantitiesService>>()
     .await;
   let notice = match stop {
     Stop::Now => Duration::ZERO,
@@ -1074,6 +1087,99 @@ mod tests {
 
     running.stop.send(()).unwrap();
     drop((running.client, running.channel, health));
+    running.server.await.unwrap().unwrap();
+  }
+
+  /// D47: `Quantities` is served beside the API by the same listener, under a health name of its own, and knows
+  /// nothing of this server's schema: `potency` is not a quantity here, and `weight` has a limit of 4 that an
+  /// `Evaluate` would hold a factor of 8 to.
+  #[tokio::test]
+  async fn the_quantities_service_is_served_beside_the_api_under_a_health_name_of_its_own() {
+    use similarity_proto::v1 as wire;
+    let running = start().await;
+    let mut quantities = wire::quantities_client::QuantitiesClient::new(running.channel.clone());
+    let amount = |value: f64, unit: &str| wire::Quantity {
+      min: value,
+      max: value,
+      unit: unit.to_owned(),
+    };
+    let scores = quantities
+      .compare(wire::CompareQuantitiesRequest {
+        before: [
+          ("potency".to_owned(), amount(100.0, "mg")),
+          ("weight".to_owned(), amount(3.5, "g")),
+        ]
+        .into(),
+        after: [
+          ("potency".to_owned(), amount(0.1, "g")),
+          ("weight".to_owned(), amount(28.0, "g")),
+        ]
+        .into(),
+        original: std::collections::HashMap::new(),
+      })
+      .await
+      .unwrap()
+      .into_inner()
+      .quantities;
+    assert_eq!(scores.len(), 2);
+    assert_eq!(
+      (scores[0].field.as_str(), scores[0].change()),
+      ("potency", wire::QuantityChange::Unchanged)
+    );
+    assert_eq!((scores[1].field.as_str(), scores[1].factor), ("weight", Some(8.0)));
+    assert!(!scores[1].beyond_limit);
+
+    // Optional presence survives the wire in both directions: no `to_unit` is the base unit, and units that do
+    // not convert come back with no quantity.
+    let base = quantities
+      .convert(wire::ConvertQuantityRequest {
+        quantity: Some(amount(1.0, "oz")),
+        to_unit: None,
+      })
+      .await
+      .unwrap()
+      .into_inner();
+    assert_eq!(base.converted, Some(amount(28_349.523_125, "mg")));
+    let none = quantities
+      .convert(wire::ConvertQuantityRequest {
+        quantity: Some(amount(1.0, "oz")),
+        to_unit: Some("ml".to_owned()),
+      })
+      .await
+      .unwrap()
+      .into_inner();
+    assert_eq!(none.converted, None);
+    assert_eq!(
+      (none.dimension(), none.to_dimension()),
+      (wire::Dimension::Mass, wire::Dimension::Volume)
+    );
+    let refused = quantities
+      .convert(wire::ConvertQuantityRequest::default())
+      .await
+      .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    assert!(
+      !quantities
+        .list_units(wire::ListUnitsRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .units
+        .is_empty()
+    );
+
+    let mut health = tonic_health::pb::health_client::HealthClient::new(running.channel.clone());
+    let service = "recordsimilarity.v1.Quantities".to_owned();
+    let status = health
+      .check(tonic_health::pb::HealthCheckRequest { service })
+      .await
+      .unwrap()
+      .into_inner()
+      .status();
+    assert_eq!(status, tonic_health::pb::health_check_response::ServingStatus::Serving);
+
+    running.stop.send(()).unwrap();
+    drop((running.client, running.channel, health, quantities));
     running.server.await.unwrap().unwrap();
   }
 

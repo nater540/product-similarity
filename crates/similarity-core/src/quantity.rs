@@ -133,6 +133,84 @@ impl Quantity {
     let (dimension, factor) = unit(&self.unit);
     (dimension, self.min * factor, self.max * factor)
   }
+
+  /// What this quantity's unit measures.
+  #[must_use]
+  pub fn dimension(&self) -> Dimension {
+    unit(&self.unit).0
+  }
+
+  /// The same amount written in the unit `to`, which is kept as the caller wrote it apart from the space around
+  /// it. `to` in the spelling this quantity already has, or in another spelling of the same unit, changes no
+  /// number.
+  ///
+  /// This is the conversion [`compare`] makes before it compares, offered on its own: two quantities that
+  /// convert into one another are exactly the ones that are comparable.
+  ///
+  /// # Errors
+  ///
+  /// [`Unconvertible::OtherDimension`] if the two units measure different things, which includes a unit the table
+  /// does not know against any unit but itself. [`Unconvertible::TooLarge`] if the amount does not fit in a
+  /// number once it is written in `to`.
+  pub fn in_unit(&self, to: &str) -> Result<Self, Unconvertible> {
+    let (from_dimension, from_factor) = unit(&self.unit);
+    let (to_dimension, to_factor) = unit(to);
+    if from_dimension != to_dimension {
+      return Err(Unconvertible::OtherDimension {
+        from: self.unit.trim().to_owned(),
+        to: to.trim().to_owned(),
+      });
+    }
+    // One unit under two spellings is the same numbers, and not the numbers a multiplication and a division by
+    // one factor happen to round to.
+    let convert = |value: f64| {
+      if from_factor.to_bits() == to_factor.to_bits() {
+        value
+      } else {
+        value * from_factor / to_factor
+      }
+    };
+    let (min, max) = (convert(self.min), convert(self.max));
+    if !(min.is_finite() && max.is_finite()) {
+      return Err(Unconvertible::TooLarge {
+        from: self.unit.trim().to_owned(),
+        to: to.trim().to_owned(),
+      });
+    }
+    Ok(Self::range(min, max, to.trim()))
+  }
+
+  /// The same amount in the unit its dimension is compared in: `mg`, `ml`, or `%`. A quantity in a unit the
+  /// table does not know comes back in that unit, normalized.
+  ///
+  /// # Errors
+  ///
+  /// [`Unconvertible::TooLarge`] if the amount does not fit in a number in that unit, which [`Self::check`]
+  /// refuses first for a quantity it was asked about.
+  pub fn in_base_unit(&self) -> Result<Self, Unconvertible> {
+    self.in_unit(self.dimension().base_unit())
+  }
+}
+
+/// Why a quantity cannot be written in another unit.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Unconvertible {
+  /// The units measure different things. Not a failure of the table: a potency in `%` has no weight in `mg`.
+  #[error("`{from}` and `{to}` do not measure the same thing, so one cannot be written as the other")]
+  OtherDimension {
+    /// The unit the quantity is in.
+    from: String,
+    /// The unit that was asked for.
+    to: String,
+  },
+  /// The amount is a number in its own unit and not in the one asked for.
+  #[error("the amount is too large to write in `{to}` (it is in `{from}`)")]
+  TooLarge {
+    /// The unit the quantity is in.
+    from: String,
+    /// The unit that was asked for.
+    to: String,
+  },
 }
 
 /// What a unit measures. Quantities are only comparable within one dimension.
@@ -147,6 +225,43 @@ pub enum Dimension {
   /// A unit the table does not know, which is comparable only with the identical unit (after trimming, collapsing
   /// whitespace, and lowercasing). Holds that normalized unit.
   Other(String),
+}
+
+impl Dimension {
+  /// The unit amounts of this dimension are compared in, in the spelling [`units`] lists first for it. A unit
+  /// the table does not know is its own.
+  #[must_use]
+  pub fn base_unit(&self) -> &str {
+    match self {
+      Self::Mass => "mg",
+      Self::Volume => "ml",
+      Self::Fraction => "%",
+      Self::Other(unit) => unit,
+    }
+  }
+}
+
+/// One unit of the table: every spelling it is recognized under, what it measures, and how many of its
+/// dimension's base unit one of it is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnitEntry {
+  /// The spellings, already lowercase and with single spaces: what a unit is matched against after the same is
+  /// done to it.
+  pub spellings: &'static [&'static str],
+  /// What the unit measures. Never [`Dimension::Other`].
+  pub dimension: Dimension,
+  /// One of this unit in [`Dimension::base_unit`]: 1,000 for `g`, whose base unit is `mg`.
+  pub factor: f64,
+}
+
+/// Every unit that is converted, in the table's order. A unit that is not here is still accepted everywhere a
+/// quantity is: it is comparable with itself and with nothing else.
+pub fn units() -> impl Iterator<Item = UnitEntry> {
+  UNITS.iter().map(|(spellings, dimension, factor)| UnitEntry {
+    spellings,
+    dimension: dimension.clone(),
+    factor: *factor,
+  })
 }
 
 /// Every unit this crate can convert: the spellings, the dimension, and the factor to the dimension's base unit.
@@ -600,6 +715,126 @@ mod tests {
       r#"{"value": "3.5", "unit": "g"}"#,
     ] {
       assert!(serde_json::from_str::<Quantity>(malformed).is_err(), "{malformed}");
+    }
+  }
+
+  #[test]
+  fn a_quantity_is_written_in_another_unit_of_its_dimension() {
+    assert_eq!(grams(3.5).in_unit("mg").unwrap(), Quantity::single(3500.0, "mg"));
+    assert_eq!(Quantity::single(3500.0, "mg").in_unit("g").unwrap(), grams(3.5));
+    assert_eq!(
+      Quantity::range(0.5, 2.0, "L").in_unit(" ml ").unwrap(),
+      Quantity::range(500.0, 2000.0, "ml")
+    );
+    // An ounce is 28.349523125 g exactly, by definition.
+    assert_eq!(Quantity::single(1.0, "oz").in_unit("g").unwrap(), grams(28.349_523_125));
+    let eighth = grams(3.5).in_unit("oz").unwrap();
+    assert!((eighth.min - 0.123_458_86).abs() < 1e-8, "{}", eighth.min);
+    assert_eq!(eighth.min.to_bits(), eighth.max.to_bits());
+    assert_eq!(eighth.unit, "oz");
+  }
+
+  /// `28.349523125 * f / f` is not always `28.349523125`. One unit under another of its names is not arithmetic.
+  #[test]
+  fn another_spelling_of_the_same_unit_changes_no_number() {
+    for amount in [0.1, 1.0 / 3.0, 28.349_523_125, 1e-9, 7e11] {
+      for (from, to) in [
+        ("oz", "ounces"),
+        ("OZ", "oz"),
+        ("fl oz", "fluid ounce"),
+        ("lb", "pounds"),
+        ("%", "pct"),
+      ] {
+        let rewritten = Quantity::single(amount, from).in_unit(to).unwrap();
+        assert_eq!(rewritten.min.to_bits(), amount.to_bits(), "{amount} {from} in {to}");
+        assert_eq!(rewritten.unit, to);
+      }
+    }
+  }
+
+  #[test]
+  fn units_that_measure_different_things_do_not_convert() {
+    let other = |from: &str, to: &str| Unconvertible::OtherDimension {
+      from: from.to_owned(),
+      to: to.to_owned(),
+    };
+    assert_eq!(grams(1.0).in_unit("ml"), Err(other("g", "ml")));
+    assert_eq!(Quantity::single(20.0, " % ").in_unit("mg"), Err(other("%", "mg")));
+    // A unit the table does not know is comparable with itself, in any case and spacing, and with nothing else.
+    assert_eq!(
+      Quantity::single(2.0, "Pack").in_unit(" pack"),
+      Ok(Quantity::single(2.0, "pack"))
+    );
+    assert_eq!(
+      Quantity::single(2.0, "pack").in_unit("each"),
+      Err(other("pack", "each"))
+    );
+    assert_eq!(Quantity::single(2.0, "pack").in_unit("g"), Err(other("pack", "g")));
+  }
+
+  #[test]
+  fn an_amount_that_is_not_a_number_in_the_other_unit_is_refused() {
+    let too_large = Unconvertible::TooLarge {
+      from: "kg".to_owned(),
+      to: "mcg".to_owned(),
+    };
+    // 1e300 kg is a number of milligrams (`check` passes) and not a number of micrograms.
+    let huge = Quantity::single(1e300, "kg");
+    assert!(huge.check().is_ok());
+    assert_eq!(huge.in_unit("mcg"), Err(too_large.clone()));
+    assert_eq!(huge.in_unit("g").unwrap(), grams(1e303));
+    // Either end is enough, also the low end of a range that was never checked.
+    assert_eq!(Quantity::range(1e300, 1.0, "kg").in_unit("mcg"), Err(too_large.clone()));
+    assert_eq!(Quantity::range(1.0, 1e300, "kg").in_unit("mcg"), Err(too_large));
+  }
+
+  #[test]
+  fn the_base_unit_of_a_dimension_is_the_unit_it_is_compared_in() {
+    assert_eq!(grams(3.5).in_base_unit().unwrap(), Quantity::single(3500.0, "mg"));
+    assert_eq!(
+      Quantity::single(1.0, "fl oz").in_base_unit().unwrap(),
+      Quantity::single(29.573_529_562_5, "ml")
+    );
+    assert_eq!(
+      Quantity::single(20.0, "percent").in_base_unit().unwrap(),
+      Quantity::single(20.0, "%")
+    );
+    assert_eq!(
+      Quantity::single(2.0, " Pre  Rolls ").in_base_unit().unwrap(),
+      Quantity::single(2.0, "pre rolls")
+    );
+    assert_eq!(grams(1.0).dimension(), Dimension::Mass);
+    assert_eq!(Quantity::single(1.0, "cl").dimension(), Dimension::Volume);
+    assert_eq!(Quantity::single(1.0, "pct").dimension(), Dimension::Fraction);
+    assert_eq!(
+      Quantity::single(1.0, "Each").dimension(),
+      Dimension::Other("each".to_owned())
+    );
+  }
+
+  /// The listing is the table: every spelling in it is recognized as what the listing says, a base unit is listed
+  /// with a factor of exactly one, and no spelling is listed twice.
+  #[test]
+  fn the_listed_units_are_the_ones_that_are_recognized() {
+    let listed: Vec<UnitEntry> = units().collect();
+    assert_eq!(listed.len(), UNITS.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for entry in &listed {
+      assert!(!entry.spellings.is_empty());
+      assert!(entry.factor > 0.0 && entry.factor.is_finite());
+      assert!(!matches!(entry.dimension, Dimension::Other(_)));
+      for spelling in entry.spellings {
+        assert!(seen.insert(*spelling), "`{spelling}` is listed twice");
+        assert_eq!(unit(spelling), (entry.dimension.clone(), entry.factor), "{spelling}");
+      }
+    }
+    for dimension in [Dimension::Mass, Dimension::Volume, Dimension::Fraction] {
+      assert_eq!(unit(dimension.base_unit()), (dimension.clone(), 1.0));
+      let first = listed
+        .iter()
+        .find(|entry| entry.factor == 1.0 && entry.dimension == dimension)
+        .unwrap();
+      assert_eq!(first.spellings.first(), Some(&dimension.base_unit()));
     }
   }
 }

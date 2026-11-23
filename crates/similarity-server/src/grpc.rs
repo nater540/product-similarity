@@ -210,7 +210,7 @@ fn quantity_change(change: QuantityChange) -> pb::QuantityChange {
   }
 }
 
-fn quantity_score(score: QuantityScore) -> pb::QuantityScore {
+pub(crate) fn quantity_score(score: QuantityScore) -> pb::QuantityScore {
   pb::QuantityScore {
     field: score.field,
     change: quantity_change(score.change).into(),
@@ -252,7 +252,7 @@ fn six(value: f32) -> f64 {
 
 /// How long a request has taken so far, in milliseconds to two places: from the first line of its handler to its
 /// log line, which is everything but the framing of the reply.
-fn milliseconds(started: Instant) -> f64 {
+pub(crate) fn milliseconds(started: Instant) -> f64 {
   (started.elapsed().as_secs_f64() * 100_000.0).round() / 100.0
 }
 

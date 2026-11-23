@@ -396,6 +396,27 @@ proptest! {
     }
   }
 
+  /// D47: converting is the comparison's own arithmetic. A quantity written in another unit of its dimension is
+  /// the same amount to `compare`, comes back as itself (to rounding), and the conversion is the one this module's
+  /// reference makes by hand.
+  #[test]
+  fn a_quantity_converted_to_another_unit_is_the_same_amount((unit, other) in known_unit(), ends in range()) {
+    let quantity = Quantity::range(ends.0, ends.1, unit);
+    let converted = quantity.in_unit(other).unwrap();
+    prop_assert_eq!(&converted, &rewritten(&quantity, other));
+    prop_assert_eq!(converted.dimension(), quantity.dimension());
+
+    let same = quantity::compare("q", Some(&quantity), None, Some(&converted)).unwrap();
+    prop_assert_eq!(same.change, QuantityChange::Unchanged);
+
+    let back = converted.in_unit(unit).unwrap();
+    for (was, is) in [(quantity.min, back.min), (quantity.max, back.max)] {
+      prop_assert!((was - is).abs() <= 1e-12 * was, "{} against {}", was, is);
+    }
+    // Into its own unit it is not arithmetic at all.
+    prop_assert_eq!(quantity.in_unit(unit).unwrap(), quantity);
+  }
+
   /// D16: quantities are judged beside the text and never inside it. Judging them changes no similarity and
   /// removes no reason; with no limit configured it adds none; and a limit only ever adds.
   #[test]

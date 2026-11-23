@@ -95,6 +95,39 @@ service RecordSimilarity {
   rpc Describe(DescribeRequest) returns (DescribeResponse);
 }
 
+// Quantities on their own: the unit conversion and the comparison that `RecordSimilarity` applies to a record's
+// quantities, for a caller that has amounts and no record.
+//
+// Nothing here reads or writes a record, runs the model, or looks at this server's schema or limits: every call
+// is answered from its request alone, and the same request always gets the same answer. A name does not have to
+// be a quantity the schema defines. What a call computes is exactly what `Evaluate` reports for the same amounts,
+// except that `QuantityScore.beyond_limit` is never set, since a limit belongs to a schema.
+//
+// As everywhere, a unit this server does not convert is not an error. It is comparable with itself (without
+// regard to case or spacing) and with nothing else.
+service Quantities {
+  // Compares the quantities of two versions, name by name.
+  //
+  // `before` and `after` are what `Record.quantities` holds for the stored version and for the new one. The
+  // answer has one `QuantityScore` for every name either of them has, in order of name.
+  //
+  // Errors: `INVALID_ARGUMENT` for an amount that is not a usable measurement (not finite, negative, a range that
+  // runs backwards, a blank unit, or too large to convert), naming the side and the quantity.
+  rpc Compare(CompareQuantitiesRequest) returns (CompareQuantitiesResponse);
+
+  // Writes one quantity in another unit, or in the unit its dimension is compared in.
+  //
+  // Two units that measure different things do not convert. That is an answer and not an error: `converted` is
+  // absent, and the two dimensions say why.
+  //
+  // Errors: `INVALID_ARGUMENT` for a missing `quantity`, an amount that is not a usable measurement, a blank
+  // `to_unit`, or an amount that does not fit in a number once written in the unit asked for.
+  rpc Convert(ConvertQuantityRequest) returns (ConvertQuantityResponse);
+
+  // Lists every unit this server converts.
+  rpc ListUnits(ListUnitsRequest) returns (ListUnitsResponse);
+}
+
 // A measured amount with its unit: a weight, a volume, a potency.
 //
 // A single value is sent as a range whose ends are equal. A caller that has only one end of a range sends it as
@@ -609,4 +642,87 @@ message DescribeResponse {
   // reached all of them. Two digests that differ mean the configurations differ in something, not that any
   // verdict necessarily would: weights that are all doubled judge the same and are another digest.
   string judging_digest = 11;
+}
+
+message CompareQuantitiesRequest {
+  // The earlier version's quantities, by name. A name that is missing here and present in `after` was added.
+  map<string, Quantity> before = 1;
+
+  // The later version's quantities, by name. A name that is missing here and present in `before` was removed.
+  map<string, Quantity> after = 2;
+
+  // The first value each quantity ever had: what `Evaluate` keeps as a record's anchor. It matters only for a
+  // name that `before` lacks and `after` has: with a value here the quantity is `QUANTITY_CHANGE_RESTORED` and is
+  // compared with that value, and without one it is `QUANTITY_CHANGE_ADDED`. Leave it empty to compare two
+  // versions and nothing else.
+  map<string, Quantity> original = 3;
+}
+
+message CompareQuantitiesResponse {
+  // One for each name in `before` or `after`, in order of name. `beyond_limit` is never set.
+  repeated QuantityScore quantities = 1;
+}
+
+// What a unit measures. Two quantities are comparable, and convert into one another, when their units measure
+// the same thing.
+enum Dimension {
+  DIMENSION_UNSPECIFIED = 0;
+
+  // A mass. Compared in `mg`.
+  DIMENSION_MASS = 1;
+
+  // A volume. Compared in `ml`.
+  DIMENSION_VOLUME = 2;
+
+  // A share of the whole. Compared in `%`.
+  DIMENSION_FRACTION = 3;
+
+  // A unit this server does not convert: `pack`, `each`, a misspelling. It is its own dimension, the same as
+  // itself and different from every other unit.
+  DIMENSION_OTHER = 4;
+}
+
+message ConvertQuantityRequest {
+  // The quantity to convert. Required.
+  Quantity quantity = 1;
+
+  // The unit to write it in. Absent: the unit its dimension is compared in (`mg`, `ml`, `%`), or for a unit this
+  // server does not convert, that unit itself in lower case with single spaces. Not blank when present.
+  optional string to_unit = 2;
+}
+
+message ConvertQuantityResponse {
+  // What the quantity's own unit measures.
+  Dimension dimension = 1;
+
+  // What `to_unit` measures; the same as `dimension` when `to_unit` was absent. For `DIMENSION_OTHER` the two
+  // are the same dimension only if they are the same unit, which is what `converted` being present says.
+  Dimension to_dimension = 2;
+
+  // The same amount in the unit asked for, written as the request wrote it apart from the space around it.
+  // Absent when the two units measure different things. Another spelling of the quantity's own unit changes no
+  // number.
+  optional Quantity converted = 3;
+}
+
+message ListUnitsRequest {}
+
+// One unit this server converts.
+message UnitDescription {
+  // Every spelling the unit is recognized under, in lower case with single spaces. A unit in a request is
+  // matched after the same is done to it, so `G`, ` g `, and `g` are one unit.
+  repeated string spellings = 1;
+
+  // What it measures. Never `DIMENSION_OTHER`.
+  Dimension dimension = 2;
+
+  // The unit its dimension is compared in: `mg`, `ml`, or `%`.
+  string base_unit = 3;
+
+  // How many of `base_unit` one of this unit is: 1000 for `g`.
+  double factor = 4;
+}
+
+message ListUnitsResponse {
+  repeated UnitDescription units = 1;
 }

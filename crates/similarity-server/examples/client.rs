@@ -6,6 +6,9 @@
 //! cargo run -p similarity-server --example client -- evaluate sku-1 data/examples/vape.json --dry-run
 //! cargo run -p similarity-server --example client -- similar sku-1
 //! cargo run -p similarity-server --example client -- delete sku-1
+//! cargo run -p similarity-server --example client -- quantities data/examples/gummies.json data/examples/vape.json
+//! cargo run -p similarity-server --example client -- convert 3.5 g --to oz
+//! cargo run -p similarity-server --example client -- units
 //! ```
 //!
 //! A record file is one JSON object: a string value is a text field, an object value is a quantity, as
@@ -21,6 +24,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use similarity_proto::v1 as pb;
+use similarity_proto::v1::quantities_client::QuantitiesClient;
 use similarity_proto::v1::record_similarity_client::RecordSimilarityClient;
 use similarity_server::import::ImportLine;
 use similarity_server::offline::RecordFields;
@@ -91,6 +95,29 @@ enum Command {
     #[arg(long)]
     brand_id: Option<String>,
   },
+  /// Compare the quantities of two record files, and nothing else: no record is read or stored, and the names
+  /// need not be ones the server's schema defines.
+  Quantities {
+    /// The earlier version: a record file, of which only the quantities are sent.
+    before: PathBuf,
+    /// The later version.
+    after: PathBuf,
+    /// The first version there ever was, for a quantity that `before` lacks and `after` has again.
+    #[arg(long)]
+    original: Option<PathBuf>,
+  },
+  /// Write an amount in another unit, or in the unit its kind is compared in.
+  Convert {
+    /// The amount.
+    value: f64,
+    /// The unit it is in.
+    unit: String,
+    /// The unit to write it in. Left out: `mg`, `ml`, or `%`, whichever the unit's kind is compared in.
+    #[arg(long)]
+    to: Option<String>,
+  },
+  /// List the units the server converts.
+  Units,
 }
 
 fn print_evaluation(response: &pb::EvaluateResponse) {
@@ -121,19 +148,7 @@ fn print_evaluation(response: &pb::EvaluateResponse) {
     );
   }
   for quantity in &response.quantities {
-    let factor = match quantity.factor {
-      Some(factor) => format!("x{factor:.2}"),
-      None if quantity.zero_crossing => "no limit".to_owned(),
-      None => "-".to_owned(),
-    };
-    let limit = if quantity.beyond_limit { "  << beyond limit" } else { "" };
-    println!(
-      "quantity  {:<16} {factor:>8}  {:?} ({} to {}){limit}",
-      quantity.field,
-      quantity.change(),
-      quantity.previous_unit.as_deref().unwrap_or("-"),
-      quantity.unit.as_deref().unwrap_or("-")
-    );
+    print_quantity(quantity);
   }
   if response.measure_changed {
     println!("measures  changed");
@@ -149,6 +164,61 @@ fn print_evaluation(response: &pb::EvaluateResponse) {
 /// One reason as data: its code, what it is about, and the number against its limit. The sentence instead, where
 /// the data is no use to this client: a server too old to send it, or one new enough to send a code this client
 /// was not built to know. An unknown reason is still a reason.
+fn print_quantity(quantity: &pb::QuantityScore) {
+  let factor = match quantity.factor {
+    Some(factor) => format!("x{factor:.2}"),
+    None if quantity.zero_crossing => "no limit".to_owned(),
+    None => "-".to_owned(),
+  };
+  let limit = if quantity.beyond_limit { "  << beyond limit" } else { "" };
+  println!(
+    "quantity  {:<16} {factor:>8}  {:?} ({} to {}){limit}",
+    quantity.field,
+    quantity.change(),
+    quantity.previous_unit.as_deref().unwrap_or("-"),
+    quantity.unit.as_deref().unwrap_or("-")
+  );
+}
+
+/// The quantities of a record file, and nothing else of it.
+fn read_quantities(path: &Path) -> anyhow::Result<HashMap<String, pb::Quantity>> {
+  Ok(read_record(path, None, None)?.quantities)
+}
+
+fn print_conversion(value: f64, unit: &str, to: Option<&str>, response: &pb::ConvertQuantityResponse) {
+  match &response.converted {
+    Some(converted) if converted.min.to_bits() == converted.max.to_bits() => {
+      println!("{value} {} is {} {}", unit.trim(), converted.min, converted.unit);
+    }
+    Some(converted) => println!(
+      "{value} {} is {} to {} {}",
+      unit.trim(),
+      converted.min,
+      converted.max,
+      converted.unit
+    ),
+    None => println!(
+      "{value} {} cannot be written in {}: {:?} and {:?} do not measure the same thing",
+      unit.trim(),
+      to.unwrap_or("-").trim(),
+      response.dimension(),
+      response.to_dimension()
+    ),
+  }
+}
+
+fn print_units(response: &pb::ListUnitsResponse) {
+  for unit in &response.units {
+    println!(
+      "{:<9} {:>16} {:<3} {}",
+      format!("{:?}", unit.dimension()),
+      unit.factor,
+      unit.base_unit,
+      unit.spellings.join(", ")
+    );
+  }
+}
+
 fn reason_line(detail: Option<&pb::ReasonDetail>, sentence: &str) -> String {
   let known = detail.and_then(|detail| {
     let code = pb::ReasonCode::try_from(detail.code).ok()?;
@@ -321,14 +391,74 @@ fn read_record(path: &Path, id: Option<String>, brand_id: Option<String>) -> any
   })
 }
 
+/// Runs a command of the `Quantities` service, which needs no record and nothing of the other service, or hands
+/// back a command that is not one.
+async fn run_quantities(server: &str, command: Command) -> anyhow::Result<Option<Command>> {
+  if !matches!(
+    command,
+    Command::Quantities { .. } | Command::Convert { .. } | Command::Units
+  ) {
+    return Ok(Some(command));
+  }
+  let mut quantities_client = QuantitiesClient::connect(server.to_owned())
+    .await
+    .with_context(|| format!("cannot connect to {server}"))?;
+  match command {
+    Command::Quantities {
+      before,
+      after,
+      original,
+    } => {
+      let request = pb::CompareQuantitiesRequest {
+        before: read_quantities(&before)?,
+        after: read_quantities(&after)?,
+        original: original
+          .as_deref()
+          .map(read_quantities)
+          .transpose()?
+          .unwrap_or_default(),
+      };
+      let response = quantities_client.compare(request).await?.into_inner();
+      for quantity in &response.quantities {
+        print_quantity(quantity);
+      }
+    }
+    Command::Convert { value, unit, to } => {
+      let request = pb::ConvertQuantityRequest {
+        quantity: Some(pb::Quantity {
+          min: value,
+          max: value,
+          unit: unit.clone(),
+        }),
+        to_unit: to.clone(),
+      };
+      let response = quantities_client.convert(request).await?.into_inner();
+      print_conversion(value, &unit, to.as_deref(), &response);
+    }
+    Command::Units => {
+      print_units(
+        &quantities_client
+          .list_units(pb::ListUnitsRequest {})
+          .await?
+          .into_inner(),
+      );
+    }
+    other => return Ok(Some(other)),
+  }
+  Ok(None)
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
   let cli = Cli::parse();
+  let Some(command) = run_quantities(&cli.server, cli.command).await? else {
+    return Ok(());
+  };
   let mut client = RecordSimilarityClient::connect(cli.server.clone())
     .await
     .with_context(|| format!("cannot connect to {}", cli.server))?;
 
-  match cli.command {
+  match command {
     Command::Describe => {
       print_description(client.describe(pb::DescribeRequest {}).await?.into_inner());
     }
@@ -413,6 +543,8 @@ async fn main() -> anyhow::Result<()> {
       let deleted = client.delete(request).await?.into_inner().deleted;
       println!("{}", if deleted { "deleted" } else { "nothing to delete" });
     }
+    // Handed to `run_quantities` above, which answers them.
+    Command::Quantities { .. } | Command::Convert { .. } | Command::Units => {}
   }
   Ok(())
 }

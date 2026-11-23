@@ -316,6 +316,9 @@ range of which only one end is known. `unit` is free text: mass (`mcg`, `mg`, `g
 `1000 mg` are the same quantity. Any other unit is accepted and is comparable only with itself. Values must be
 finite, not negative, and `min` not above `max`. A quantity is never sent as text in `fields`, and a quantity the
 record does not have is left out. [Mapping your records](#mapping-your-records) shows where each column goes.
+A second service in the same package, `Quantities`, converts and compares amounts with no record at all:
+[Quantities on their own](#quantities-on-their-own).
+
 
 **Brands.** Once a record is stored under a brand, every later `Evaluate` or `Delete` for its id must name the
 same brand. A request naming another brand, or none, gets `FAILED_PRECONDITION`. A record stored without a
@@ -344,6 +347,9 @@ just client --server http://other-host:50051 describe
 
 ```json
 {
+just client quantities <before.json> <after.json> [--original <first.json>]
+just client convert <value> <unit> [--to <unit>]
+just client units
   "name": "Sour Diesel Vape Cartridge 1g",
   "category": "Vape Pens > Cartridges",
   "weight_per_item": {"value": 1, "unit": "g"},
@@ -720,6 +726,58 @@ brand's product record, with the example configuration:
 |---|---|---|
 | Brand foreign key | `brand_id`, as a string | The brand that owns the product. A product moving to another brand is then refused by the brand check. |
 | Brand name, looked up from the key | `fields["brand"]` | The same for every product of a brand, so it rarely moves a score. |
+### Quantities on their own
+
+The package has a second service, `Quantities`, for a caller that has amounts and no record: another system that
+needs to know whether `0.125 oz` and `3.5 g` are the same weight, or a test that wants to pin what a change of
+units does. It is the comparison and the unit conversion `Evaluate` applies to a record's quantities, and nothing
+else of the server: no record is read or written, the model is not run, and the schema and its limits are not
+consulted, so a name does not have to be one the schema defines and `beyond_limit` is never set. The same request
+always gets the same answer (D47).
+
+| RPC | What it does |
+|---|---|
+| `Compare` | Compares the quantities of two versions, name by name, and answers with the `QuantityScore` an `Evaluate` would report for each: unchanged, modified by a factor, added, removed, or incomparable. An optional `original` is the anchor's part: a quantity that `before` lacks and `after` has again is compared with it. |
+| `Convert` | Writes one quantity in another unit, or in the unit its kind is compared in (`mg`, `ml`, `%`) when none is asked for. Units that measure different things do not convert, which is an answer and not an error: the response has no quantity and names both dimensions. |
+| `ListUnits` | Lists every unit the server converts, with its spellings and its factor. |
+
+With the bundled client, against the two example records the top of this page evaluates and then alone:
+
+```text
+$ just client quantities data/examples/gummies.json data/examples/gummies-edited.json
+quantity  thc_per_item        x1.00  Unchanged (mg to g)
+quantity  weight_per_item     x1.00  Unchanged (g to g)
+
+$ just client quantities data/examples/gummies.json data/examples/vape.json
+quantity  thc_per_item            -  Incomparable (mg to %)
+quantity  weight_per_item    x40.00  Modified (g to g)
+
+$ just client convert 3.5 g --to oz
+3.5 g is 0.12345886682353145 oz
+
+$ just client convert 0.125 oz --to g
+0.125 oz is 3.543690390625 g
+
+$ just client convert 1 oz
+1 oz is 28349.523125 mg
+
+$ just client convert 20 % --to mg
+20 % cannot be written in mg: Fraction and Mass do not measure the same thing
+
+$ just client convert 2 pack
+2 pack is 2 pack
+```
+
+An eighth of an ounce is 3.54 g and not 3.5: the two are a factor of 1.0125 apart, which `Compare` reports as
+`Modified`, and whether that is the same product is for a limit to say, where one is configured. `pack` is not a
+unit the server converts, so it is comparable with itself, in any case and spacing, and with nothing else; that is
+never an error. `just client units` prints the table (eleven units: six of mass, four of volume, and percent).
+
+An amount that is not a usable measurement (negative, not finite, a range that runs backwards, a blank unit) is
+`INVALID_ARGUMENT`, naming the side and the quantity, as it is in a record. The service is one more name for the
+health service, `recordsimilarity.v1.Quantities` ([Health and shutdown](#health-and-shutdown)). It needs neither
+the store nor the model, so it answers while the API is not ready.
+
 | Root and sub category, through the join | `fields["category"]`, for example `Edibles > Gummies` | See the two rules below. |
 | `name`, `description` | `fields["name"]`, `fields["description"]` | Sent as stored. Do not trim or clean them; the service normalizes whitespace itself. |
 | `weight_per_item_value` and `_unit` | `quantities["weight_per_item"]` | A single value: `min` and `max` both set to it. |
@@ -2515,12 +2573,14 @@ vectors are the old model's.
 
 ### Health and shutdown
 
-The server implements the standard gRPC health service, and it has two answers:
+The server implements the standard gRPC health service, and it has two answers, and a third name for the
+service that needs nothing:
 
 | Service name | The question | `SERVING` when |
 |---|---|---|
 | empty | Is the process up? (liveness) | Always, while it runs. |
-| `recordsimilarity.v1.RecordSimilarity` | Could a request be served now? (readiness) | The embedding thread is alive and the store answered the last time it was asked, which is every `server.store_check_every_ms` (2 seconds). |
+| `recordsimilarity.v1.RecordSimilarity` | Could a request be served now? (readiness) | An embedding thread is alive and the store answered the last time it was asked, which is every `server.store_check_every_ms` (2 seconds). |
+| `recordsimilarity.v1.Quantities` | Could a quantity be converted or compared now? | From the start until the server leaves the rotation to stop. It needs neither the store nor the model. |
 
 A server whose Qdrant has gone away is not ready and is still live: restarting it would not bring Qdrant back,
 and sending it requests gets them `UNAVAILABLE`. It says so on stderr (`not ready`, with the reason, and
@@ -2626,7 +2686,9 @@ recordsimilarity.v1.RecordSimilarity/Evaluate    3.811 ms  rpc.grpc.status_code=
 
 That request spent 1.7 ms waiting for the model and 2 ms in a forward pass it shared with another, and next to
 nothing anywhere else. A save with no changes is the same without `embed` and the write (0.044 ms); a `Delete`
-is `delete` with `lock` and two `store` spans; `FindSimilar` and `Match` are `find_similar` and `match`.
+is `delete` with `lock` and two `store` spans; `FindSimilar` and `Match` are `find_similar` and `match`. The
+`Quantities` calls are `compare_quantities`, which carries how many quantities were compared, and
+`convert_quantity`, which carries whether there was a conversion; neither waits for anything.
 
 - **What a span says about a record** is its id, the mode asked for, the verdict, whether it was stored, and
   its revision; for a `Match`, the decision. Never a record's text, its brand, or a score.
@@ -3135,7 +3197,7 @@ data/
   regression.snapshot.ndjson      what the pinned model and the example config make of them
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D45)
+  decisions.md               why things are the way they are (D1 to D47)
   data-request-prompt.md     a brief for collecting labeled production data
   import-prompt.md           a brief for loading the real catalog into a running service
   feature-suggestions.md     features that could be added, built and not, the last twelve about production

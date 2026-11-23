@@ -6,7 +6,7 @@ and trained in [Burn](https://burn.dev), run by ONNX Runtime), compared with the
 rejected against calibrated thresholds. A record's quantities (weight, volume, potency) are compared as numbers
 beside that, never embedded. Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D45) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D47) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -72,7 +72,8 @@ changing a design. Infer conventions from the existing code first.
   audit and the anchor backup do), `MemoryStore`, `QdrantStore`.
 - `crates/similarity-runs`: the local record of runs (D23): the manifest, starting and ending a run, reading runs
   back. It records and lists; it decides nothing.
-- `crates/similarity-server`: config, the embedding worker thread, `Engine` (all behavior), the thin gRPC layer,
+- `crates/similarity-server`: config, the embedding worker threads, `Engine` (all behavior), the thin gRPC layer, `quantities` (the
+  `Quantities` service, thinner still: no engine behind it),
   `import_stream` (the loop behind the streaming `Import` call), `locks` (one lock for each record a request is
   at), `metrics` (the few numbers the server keeps
   about itself), `telemetry` (where its traces and metrics go: the exporters, the page, the traced store),
@@ -183,6 +184,13 @@ changing a design. Infer conventions from the existing code first.
 - **Quantity limits are measurements, like thresholds.** `config.example.toml` ships every quantity with no
   `reject_above_factor`, no `reject_incomparable`, and `reject_on_measure_change` off. Never add a limit there
   that was not read from `just calibrate` on real labeled pairs, and never from the synthetic sample.
+- **The `Quantities` service computes nothing of its own** (D47). `quantities.rs` translates and calls
+  `similarity_core::quantity`: `compare` for `Compare`, `Quantity::in_unit` for `Convert`, `units()` for
+  `ListUnits`. That is what makes its answers the ones `Evaluate` reports. Do not give it arithmetic, a unit, or
+  a rule of its own, do not let it read the schema, a limit, the store, or the model (it must answer while the
+  API is not ready, and the same request must always get the same answer), and do not set `beyond_limit` in it.
+  Units that do not convert are an answer, not a status code. A new conversion rule goes into `quantity.rs`,
+  which is mutation-tested, and a new `Dimension` needs a wire value (a test in `quantities.rs` holds that).
 - **An unknown unit is never an error.** It is its own dimension, comparable only with itself. Extend the `UNITS`
   table in `quantity.rs` when a new unit turns up; do not make the server refuse it.
 - **Calibration events are flat, and their names are an interface** (D17). `calibrate --ndjson` writes one `pair`
