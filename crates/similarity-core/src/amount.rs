@@ -227,9 +227,7 @@ fn vulgar(text: &str) -> Option<(f64, &str)> {
 fn ratio(text: &str) -> Option<(f64, f64, &str)> {
   let (over, rest) = digits(text);
   let (under, rest) = digits(rest.strip_prefix('/')?);
-  if over.is_empty() || under.is_empty() {
-    return None;
-  }
+  // No digits on either side is not a number, which is what reading nothing as one says.
   Some((over.parse().ok()?, under.parse().ok()?, rest))
 }
 
