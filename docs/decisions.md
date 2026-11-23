@@ -2462,7 +2462,7 @@ D40), one log line each with those and `elapsed_ms`, and no metric (D39: a count
 for). Nothing of a request's names, units, or amounts is in either.
 
 **Not done.** Parsing an amount out of text (`"3.5g"`, `"1/8 oz"`): the service takes a number and a unit, as a
-record does. Units per something (`mg/ml`, `mg` per serving against `mg` per package), which are different
+record does. (Planned, with the next item: `docs/plans/33-quantity-text-and-rates.md`.) Units per something (`mg/ml`, `mg` per serving against `mg` per package), which are different
 dimensions to the table and so are comparable only with themselves. A limit on how many quantities one `Compare`
 may carry beyond the transport's message size. A Bruno request for the three calls. `just mutants` has not been
 run over the new code in `quantity.rs`; it is covered by example tests written to its boundaries and by the

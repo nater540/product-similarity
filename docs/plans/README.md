@@ -1,4 +1,4 @@
-# Plans for fifteen of the suggested features, built and not
+# Plans for fifteen of the suggested features, built and not, and one written since
 
 **On names.** These plans were written before 2026-11-12, when the words were changed to the ones the owner's
 company uses (`docs/decisions.md`, D36). Where a plan says `tenant` or `owner` for the brand a record belongs to,
@@ -49,6 +49,7 @@ record has an anchor (plans 11 and 18). `calibrate-diff --config-b` is not affec
 | 18 | [Shadow evaluation](18-shadow-evaluation.md) | large, **policy half built** | 12 helps | A low-priority thread does nothing: Burn runs on the global rayon pool |
 | 19 | [Reason codes](19-reason-codes.md) | small, **built** | | Mostly exists; a server-side word diff is impossible (only hashes are stored) |
 | 20 | [Menu-item matching](20-menu-item-matching.md) | large, **built** | | A brand-name filter is impossible; search returns no vectors |
+| 33, 34 | [Amounts from text, and units per something](33-quantity-text-and-rates.md) | medium each | 33 before 34's tables | Written 2026-11-22, after the others, from D47's "not done". The judging digest does not cover the unit table |
 
 ## Where the plans meet
 
