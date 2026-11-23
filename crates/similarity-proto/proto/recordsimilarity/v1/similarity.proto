@@ -653,11 +653,12 @@ message DescribeResponse {
   uint32 match_overfetch = 10;
 
   // A digest of everything a verdict depends on: the model fingerprint, every field with its weight, whether it
-  // is required, and its floor, the thresholds, every quantity with its limits, and how a match is decided.
+  // is required, and its floor, the thresholds, every quantity with its limits, how a match is decided, and
+  // which units the server's build converts (the table `Quantities.ListUnits` gives).
   // Sixteen hexadecimal digits. Two servers that report the same digest judge by the same rules with the same
   // model, which is how to see that every replica has the configuration it should, and that a change has
-  // reached all of them. Two digests that differ mean the configurations differ in something, not that any
-  // verdict necessarily would: weights that are all doubled judge the same and are another digest.
+  // reached all of them. Two digests that differ mean the configurations or the builds differ in something, not
+  // that any verdict necessarily would: weights that are all doubled judge the same and are another digest.
   string judging_digest = 11;
 }
 

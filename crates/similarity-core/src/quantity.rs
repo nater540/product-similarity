@@ -15,6 +15,9 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::record::hex_prefix;
 
 /// Two converted values closer than this, relative to the larger, are the same value.
 ///
@@ -268,7 +271,7 @@ pub fn units() -> impl Iterator<Item = UnitEntry> {
 ///
 /// Extending it is one line. A unit that is missing is never an error, only a [`Dimension::Other`], so the table
 /// can lag behind the data without refusing a record.
-const UNITS: &[(&[&str], Dimension, f64)] = &[
+const UNITS: &[UnitRow] = &[
   // "µ" is U+00B5 (micro sign) and "μ" is U+03BC (Greek mu). Keyboards and databases produce both.
   (&["mcg", "µg", "μg", "microgram", "micrograms"], Dimension::Mass, 0.001),
   (&["mg", "milligram", "milligrams"], Dimension::Mass, 1.0),
@@ -290,6 +293,58 @@ const UNITS: &[(&[&str], Dimension, f64)] = &[
   ),
   (&["%", "percent", "pct"], Dimension::Fraction, 1.0),
 ];
+
+/// One row of the unit table: the spellings of a unit, what it measures, and its factor to the base unit.
+type UnitRow = (&'static [&'static str], Dimension, f64);
+
+/// Which way of comparing amounts this is, for what no row of the table shows: how a unit is normalized before it
+/// is looked up, and how a change is told from none. Raise it with any change to those, so that a server
+/// comparing the new way and one comparing the old way do not report one digest ([`rules_digest`]).
+const RULES_VERSION: u32 = 1;
+
+/// The rules amounts are compared by, written out: the version, the tolerance, and every spelling with the base
+/// unit it converts to and its factor. Numbers are written as the bits they are, so that the text does not depend
+/// on how a number is printed, and units are quoted, so that no spelling can pass for two.
+///
+/// One spelling to a line, in the order of the spellings and not of the table: what is written is what [`unit`]
+/// answers, and moving a row or a spelling within the table changes no answer.
+fn rules(table: &[UnitRow]) -> String {
+  let mut lines: Vec<String> = table
+    .iter()
+    .flat_map(|(spellings, dimension, factor)| {
+      spellings.iter().map(move |spelling| {
+        format!(
+          "unit {spelling:?} {:016x} {:?}\n",
+          factor.to_bits(),
+          dimension.base_unit()
+        )
+      })
+    })
+    .collect();
+  lines.sort();
+  format!(
+    "rules {RULES_VERSION}\ntolerance {:016x}\n{}",
+    RELATIVE_TOLERANCE.to_bits(),
+    lines.concat()
+  )
+}
+
+/// The digest of a unit table's rules: the first eight bytes of the SHA-256 of [`rules`], in hexadecimal.
+fn digest_of(table: &[UnitRow]) -> String {
+  hex_prefix(&Sha256::digest(rules(table).as_bytes()), 8)
+}
+
+/// A digest of the rules amounts are compared by: sixteen hexadecimal digits that two builds share exactly when
+/// they convert the same units by the same factors and tell a change from none the same way.
+///
+/// Which units convert is a rule of judging that no configuration holds: where a quantity that stops being
+/// comparable is rejected, a server whose table knows a unit and one whose table does not give two verdicts for
+/// one edit. The server writes this into what it says it judges by, so that the two do not look alike. A line
+/// added to the table changes it, and so it changes for every server that takes the new build.
+#[must_use]
+pub fn rules_digest() -> String {
+  digest_of(UNITS)
+}
 
 /// A unit in the spelling it is matched in: trimmed, inner whitespace collapsed, and in lower case. Two units
 /// that are the same here are one unit everywhere, and it is what [`Dimension::Other`] holds.
@@ -846,5 +901,90 @@ mod tests {
         .unwrap();
       assert_eq!(first.spellings.first(), Some(&dimension.base_unit()));
     }
+  }
+
+  /// Two units, one of them under two spellings: enough of a table to see everything the rules are written from.
+  const SMALL: &[UnitRow] = &[
+    (&["g", "gram"], Dimension::Mass, 1_000.0),
+    (&["%"], Dimension::Fraction, 1.0),
+  ];
+
+  #[test]
+  fn the_unit_rules_are_written_out_one_spelling_to_a_line_with_numbers_as_their_bits() {
+    // Pinned to the letter: builds of different versions compare digests of this text. 1e-6 is
+    // 3eb0c6f7a0b5ed8d, 1000 is 408f400000000000, and 1 is 3ff0000000000000.
+    assert_eq!(
+      rules(SMALL),
+      concat!(
+        "rules 1\n",
+        "tolerance 3eb0c6f7a0b5ed8d\n",
+        "unit \"%\" 3ff0000000000000 \"%\"\n",
+        "unit \"g\" 408f400000000000 \"mg\"\n",
+        "unit \"gram\" 408f400000000000 \"mg\"\n",
+      )
+    );
+    assert_eq!(
+      digest_of(SMALL),
+      hex_prefix(&Sha256::digest(rules(SMALL).as_bytes()), 8)
+    );
+    assert_eq!(digest_of(SMALL).len(), 16);
+  }
+
+  #[test]
+  fn a_unit_a_spelling_a_factor_or_a_dimension_that_differs_is_another_digest_and_the_order_of_the_table_is_not() {
+    let digests = [
+      digest_of(SMALL),
+      // A unit more, a spelling more, a spelling less, another factor, another dimension, and no unit at all.
+      digest_of(&[
+        (&["g", "gram"], Dimension::Mass, 1_000.0),
+        (&["%"], Dimension::Fraction, 1.0),
+        (&["ml"], Dimension::Volume, 1.0),
+      ]),
+      digest_of(&[
+        (&["g", "gram", "grams"], Dimension::Mass, 1_000.0),
+        (&["%"], Dimension::Fraction, 1.0),
+      ]),
+      digest_of(&[(&["g"], Dimension::Mass, 1_000.0), (&["%"], Dimension::Fraction, 1.0)]),
+      digest_of(&[
+        (&["g", "gram"], Dimension::Mass, 1_000.5),
+        (&["%"], Dimension::Fraction, 1.0),
+      ]),
+      digest_of(&[
+        (&["g", "gram"], Dimension::Volume, 1_000.0),
+        (&["%"], Dimension::Fraction, 1.0),
+      ]),
+      digest_of(&[]),
+    ];
+    let distinct: std::collections::BTreeSet<&String> = digests.iter().collect();
+    assert_eq!(distinct.len(), digests.len(), "{digests:?}");
+
+    // The same answers from a table laid out another way: its rows in another order, and a unit's spellings too.
+    assert_eq!(
+      digest_of(&[
+        (&["%"], Dimension::Fraction, 1.0),
+        (&["gram", "g"], Dimension::Mass, 1_000.0),
+      ]),
+      digest_of(SMALL)
+    );
+    // And one unit written as two rows, which answers as one row does.
+    assert_eq!(
+      digest_of(&[
+        (&["gram"], Dimension::Mass, 1_000.0),
+        (&["%"], Dimension::Fraction, 1.0),
+        (&["g"], Dimension::Mass, 1_000.0),
+      ]),
+      digest_of(SMALL)
+    );
+  }
+
+  /// The table that ships has one digest, written here on purpose. A row added to `UNITS`, a factor corrected, or
+  /// a change to the tolerance or the version fails this test, and that is the moment to know what it means: the
+  /// judging digest of every server changes with the build (D44), and a server on the new build and one on the
+  /// old do not report that they judge alike, because they do not. Say so in the change, then write the new
+  /// value here.
+  #[test]
+  fn the_unit_rules_that_ship_have_this_digest_and_changing_them_changes_it_for_every_server() {
+    assert_eq!(rules_digest(), digest_of(UNITS));
+    assert_eq!(rules_digest(), "04e2fe2122fc2178");
   }
 }

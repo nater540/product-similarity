@@ -7,9 +7,10 @@ memory of the planning can carry it out. Reviewed the same day against the owner
 under [the decisions](#decisions-for-the-owner-with-the-default-to-use-meanwhile). Delete this file, or fold what
 is still true into `docs/decisions.md`, when the work is done.
 
-**Where it stands (2026-11-22):** steps 1 to 5 are built and are D48: `amount.rs`, its conformance file and
-properties, `Quantities.Parse`, `just client parse`, and `amounts survey`. That is all of 33. Next is the
-survey's run at work, and then step 6. Nothing of 34 is built.
+**Where it stands (2026-11-23):** steps 1 to 6 are built. Steps 1 to 5 are D48: `amount.rs`, its conformance
+file and properties, `Quantities.Parse`, `just client parse`, and `amounts survey`. That is all of 33. Step 6,
+the unit rules in the judging digest, was built on its own at the owner's word and is written up in D44. Next
+is the survey's run at work. Nothing of 34 is built.
 
 Read `CLAUDE.md` first, then this file. D16 (quantities are compared, not embedded), D25 (mutation testing), D44
 (the judging digest), and D47 (the `Quantities` service) in `docs/decisions.md` are the decisions it rests on.
@@ -73,8 +74,8 @@ that already should be.
    policy, the matching settings, every field, and every `QuantitySpec`. Which units convert is not among them,
    and it is a rule of judging: with `reject_incomparable` or `policy.reject_on_measure_change` set, a server
    whose table knows `mg/g` and one whose table does not give two verdicts for one edit, and report one digest.
-   This is true today for any line added to `UNITS`. Feature 34 changes the unit rules more than a line does, so
-   it has to fix this (step 6 below), and the fix is worth making even if 34 is never built.
+   This was true for any line added to `UNITS`. Feature 34 changes the unit rules more than a line does, so
+   it had to be fixed first (step 6 below), and it was, on 2026-11-23, before 34.
 2. **`mg/g` and `mg / g` are two different unknown units today.** Collapsing whitespace leaves the spaces around
    the slash. A record whose potency is re-saved with a space reads as `INCOMPARABLE` against itself. Feature 34
    removes this as a side effect.
@@ -310,11 +311,17 @@ and merging them here would make a tenth of a package compare as a whole one. A 
 
 ### The judging digest says which unit rules a server has
 
-`quantity::rules_digest()` hashes the rows of `UNITS` and `COUNT_NOUNS` in order, their factors as bits, and a
-rule version that this feature sets to 2. `Description::judging` gains one last line, `units <hex>`. D44 allows
-exactly this: a line added for a rule, none reworded or reordered. Every server's digest changes once, at the
-upgrade, which is the truth: a server with these unit rules and one without them do not judge alike. From then
-on a line added to either table changes the digest, which closes the gap found above.
+**Built 2026-11-23, ahead of 34.** `quantity::rules_digest()` hashes a version (1 today), the tolerance, and one
+line for each spelling of `UNITS` with its factor as bits and its base unit. `Description::judging` ends with
+`units <hex>`. D44 allows exactly this: a line added for a rule, none reworded or reordered. Every server's
+digest changed once, at the upgrade. Two things differ from what was first written here: the lines are sorted
+by spelling and not in the table's order, so that moving a row is not a judging change, and the tolerance has a
+line of its own.
+
+What 34 still owes it: `COUNT_NOUNS` written into the same text (a line for each spelling, sorted with the
+rest), and `RULES_VERSION` raised to 2, because a unit with a slash in it will compare another way. That moves
+every server's digest a second time, which is the truth: a server that reduces `mg/g` to a share and one that
+does not do not judge alike.
 
 ### What it changes for records already stored
 
@@ -355,7 +362,7 @@ Each step ends with `just ci`. Commit a feature at a time.
 4. `Quantities.Parse` in the `.proto` and `quantities.rs`; `just client parse <text>...`.
 5. `record-similarity amounts survey` in the `offline` module, with its events. D48. README. **Stop here and
    have the survey run at work** before step 6 if the tables are to be right the first time.
-6. `quantity::rules_digest()` and the `units` line of the judging digest. Worth doing alone if 34 is deferred.
+6. `quantity::rules_digest()` and the `units` line of the judging digest. **Built** (2026-11-23), alone.
 7. `Dimension::Per`, the split, the reduction, and `COUNT_NOUNS` in `quantity.rs`, tests first. Fix every
    `match` on `Dimension` the compiler names.
 8. The wire: `DIMENSION_RATE`, `UnitKind`, `count_nouns`, `rules_digest`. The client's `convert` and `units`.
@@ -388,8 +395,10 @@ Each step ends with `just ci`. Commit a feature at a time.
   `Per` of two unknown units, the digest moving when a row is added.
 - **`quantities.rs`**: every `NotAnAmount` and every `Dimension` has a wire value of its own; `Parse` answers in
   order and answers a refusal as data; more than 1000 texts is `INVALID_ARGUMENT`.
-- **The digest**: the pinned text of `judging` in `engine.rs`'s tests gains its last line; a test adds a unit
-  row behind a test-only table and sees the digest move.
+- **The digest** (built): the pinned text of `judging` in `engine.rs`'s tests has its last line; tests in
+  `quantity.rs` write the rules of a test-only table out to the letter, see the digest move with a row, a
+  spelling, a factor, and a dimension and not with the table's order, and pin the digest of the table that
+  ships. 34 adds a count noun to the first two and changes the pinned value.
 - **Fuzzing** (plan 14, deferred): `amount::parse` and `quantity::unit` are its first two targets when it is
   built. Nothing here waits for it.
 

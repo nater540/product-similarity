@@ -2251,8 +2251,8 @@ that disagree on what to accept.
 **What is in it** is everything a verdict or a match decision depends on, and nothing else: the model's
 fingerprint (two replicas with one policy and two models do not judge alike), the threshold, the drift
 threshold, whether a change of measure rejects, every field's name, weight, whether it is required, and its
-floor, every quantity's name and limits, and the match threshold and over-fetch. Not the address, not a batch
-size, not the shadow, which decides nothing (D30).
+floor, every quantity's name and limits, the match threshold and over-fetch, and the unit rules (below). Not the
+address, not a batch size, not the shadow, which decides nothing (D30).
 
 **It is a digest of a text, and the text is pinned.** The rules are written out one to a line, in an order that
 does not depend on the order the configuration lists them in, with names quoted so that no name can pass for
@@ -2266,10 +2266,30 @@ a new rule is a new line, never a change to one that is there.
 written into the text. The failure this prevents is the worst one a digest can have: two servers that judge
 differently and say they agree.
 
+**The unit rules are in it, though no configuration holds them** (added 2026-11-23). Which units convert, and by
+what factor, is the `UNITS` table, compiled into the build. It is a rule of judging: with `reject_incomparable`
+on a quantity, or `policy.reject_on_measure_change`, a build whose table knows a unit and one whose table does
+not give two verdicts for one edit, and until this was added they reported one digest. That was found while
+planning D48, and it was true of any line ever added to the table. `quantity::rules_digest()` is a digest of the
+rules written out: a version (for what no row shows: how a unit is normalized, how a change is told from none),
+the tolerance two values are the same within, and one line for each spelling with its factor and the base unit
+it converts to. The lines are in the order of the spellings, not of the table, so that a table laid out another
+way and answering the same is the same digest, by the rule the configuration is already held to. The judging
+text ends with `units` and that digest, as one line: a new rule is a new line, and a line for every spelling
+would be no easier to compare than their digest. A test beside the table pins the digest of the table that
+ships, so that whoever adds a unit is stopped once and told what it means.
+
+What it cost: the digest of every server changed once, with the build that added the line, whatever its
+configuration. During that one upgrade the old replicas and the new report two digests, which is the truth
+(the new ones would also disagree with the old about the next unit), and no verdict moved, because the table
+did not. From then on a unit added to the table moves the digest of every server that takes the build, and so
+does a change to this text's version. The words `amount::parse` reads (D48) are not in it: reading decides
+nothing, and a record takes numbers.
+
 **What a difference means, and does not.** The same digest means the same rules. A different one means the
-configurations differ in something, and not that any verdict would: weights that are all doubled give the same
-scores and another digest. Making the digest blind to that would mean deciding which differences matter, and a
-digest that has opinions is one more thing to get wrong.
+configurations or the builds differ in something, and not that any verdict would: weights that are all doubled
+give the same scores and another digest. Making the digest blind to that would mean deciding which differences
+matter, and a digest that has opinions is one more thing to get wrong.
 
 **The other half of the suggestion is not built:** reloading the policy without a restart. A threshold is the
 setting most likely to be changed in a hurry, and today that is a restart of every replica, each loading the

@@ -453,9 +453,9 @@ pub struct Description {
 
 impl Description {
   /// Everything a verdict depends on, written out one value to a line: the model, each field with its weight and
-  /// its floor, the thresholds, each quantity with its limits, and how a match is decided. Numbers are written as
-  /// the bits they are, so that the text does not depend on how a number is printed, and names are quoted, so
-  /// that no name can pass for two.
+  /// its floor, the thresholds, each quantity with its limits, how a match is decided, and which units this build
+  /// converts. Numbers are written as the bits they are, so that the text does not depend on how a number is
+  /// printed, and names are quoted, so that no name can pass for two.
   ///
   /// The order and the wording are fixed: this text is what [`Self::judging_digest`] is a digest of, and servers
   /// of different versions compare digests. Add a line for a new rule; never change one that is there.
@@ -519,6 +519,10 @@ impl Description {
       "matching threshold={} overfetch={overfetch}",
       bits(match_threshold)
     );
+    // The one rule here that no configuration holds: which units convert, and by what factor, is compiled in. With
+    // a limit on a quantity that stops being comparable, a build that knows a unit and one that does not give two
+    // verdicts for one edit.
+    let _ = writeln!(text, "units {}", quantity::rules_digest());
     text
   }
 
@@ -4256,17 +4260,23 @@ mod tests {
     let description = described();
     // Pinned to the letter: servers of different versions compare digests of this text. 0.75 is 3f400000,
     // 0.5 is 3f000000, 0.3 is 3e99999a, 4.0 is 40800000 (and 4010000000000000 as a quantity's factor).
+    // The last line is the unit rules this build compares amounts by, whose own text and digest are pinned beside
+    // the table (`quantity.rs`).
     assert_eq!(
       description.judging(),
-      concat!(
-        "model \"word-bag-v1\"\n",
-        "policy threshold=3f400000 anchor_threshold=3f000000 reject_on_measure_change=false\n",
-        "field \"category\" weight=40000000 required=false reject_below=-\n",
-        "field \"description\" weight=3f800000 required=false reject_below=-\n",
-        "field \"name\" weight=40800000 required=true reject_below=3e99999a\n",
-        "quantity \"thc\" reject_above_factor=- reject_incomparable=false\n",
-        "quantity \"weight\" reject_above_factor=4010000000000000 reject_incomparable=true\n",
-        "matching threshold=3f19999a overfetch=3\n",
+      format!(
+        concat!(
+          "model \"word-bag-v1\"\n",
+          "policy threshold=3f400000 anchor_threshold=3f000000 reject_on_measure_change=false\n",
+          "field \"category\" weight=40000000 required=false reject_below=-\n",
+          "field \"description\" weight=3f800000 required=false reject_below=-\n",
+          "field \"name\" weight=40800000 required=true reject_below=3e99999a\n",
+          "quantity \"thc\" reject_above_factor=- reject_incomparable=false\n",
+          "quantity \"weight\" reject_above_factor=4010000000000000 reject_incomparable=true\n",
+          "matching threshold=3f19999a overfetch=3\n",
+          "units {}\n",
+        ),
+        quantity::rules_digest()
       )
     );
     let digest = description.judging_digest();

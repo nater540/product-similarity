@@ -278,8 +278,8 @@ format to switch to. Each line has `timestamp`, `level`, `message`, and `target`
 beside them:
 
 ```json
-{"timestamp":"2026-11-22T23:44:38.304509Z","level":"INFO","message":"serving gRPC","address":"127.0.0.1:50051","judging_digest":"7f0f0943d564b1b1","target":"record_similarity"}
-{"timestamp":"2026-11-22T23:44:38.985807Z","level":"INFO","message":"evaluate","id":"sku-1","verdict":"Created","stored":true,"revision":1,"measure_changed":false,"elapsed_ms":8.87,"target":"similarity_server::grpc"}
+{"timestamp":"2026-11-23T14:12:53.270732Z","level":"INFO","message":"serving gRPC","address":"127.0.0.1:50051","judging_digest":"c76281ea4196ec86","target":"record_similarity"}
+{"timestamp":"2026-11-23T14:12:53.646880Z","level":"INFO","message":"evaluate","id":"sku-1","verdict":"Created","stored":true,"revision":1,"measure_changed":false,"elapsed_ms":13.93,"target":"similarity_server::grpc"}
 ```
 
 A command that fails ends with a `failed` line at level `ERROR` carrying the reason in `error`, and a crash is
@@ -2830,29 +2830,35 @@ it happened or it did not, sending the request again is safe either way
 Two replicas with two configurations give two verdicts on one edit, depending on which of them the request
 reaches, and during a rolling deploy that is the normal state for a while. `Describe` lists everything a server
 judges by, and also gives one string for all of it, `judging_digest`: the model's fingerprint, the thresholds,
-every field with its weight and floor, every quantity with its limits, and how a match is decided. Two servers
-with the same digest judge by the same rules. The bundled client prints it last:
+every field with its weight and floor, every quantity with its limits, how a match is decided, and which units
+the build converts. Two servers with the same digest judge by the same rules. The bundled client prints it last:
 
 ```text
 $ just client describe
 ...
 matching  no threshold: menu items are ranked, not judged; 5 records are scored for each one returned
-judging   7f0f0943d564b1b1
+judging   c76281ea4196ec86
 ```
 
 A server also logs it when it starts, so replicas can be compared without calling them. Two servers started on
 one configuration, and a third with `threshold = 0.91` where the others have `0.90` (envelope fields removed):
 
 ```json
-{"level":"INFO","message":"serving gRPC","address":"127.0.0.1:50081","judging_digest":"7f0f0943d564b1b1"}
-{"level":"INFO","message":"serving gRPC","address":"127.0.0.1:50082","judging_digest":"7f0f0943d564b1b1"}
-{"level":"INFO","message":"serving gRPC","address":"127.0.0.1:50083","judging_digest":"211f6271a48d4974"}
+{"level":"INFO","message":"serving gRPC","address":"127.0.0.1:50081","judging_digest":"c76281ea4196ec86"}
+{"level":"INFO","message":"serving gRPC","address":"127.0.0.1:50082","judging_digest":"c76281ea4196ec86"}
+{"level":"INFO","message":"serving gRPC","address":"127.0.0.1:50083","judging_digest":"d3e633edd5237fba"}
 ```
 
 The order things are written in the configuration does not change the digest. Anything that could change a
 verdict does, and so do a few things that could not: weights that are all doubled judge exactly as before and
 are another digest. A difference means the configurations differ, which is the thing to look at. Changing a
 threshold still takes a restart of each replica; the digest is how to see when the last one has it.
+
+One part of it comes from the build and not from the configuration: the [table of units](#quantities-on-their-own)
+that are converted. A replica whose build knows a unit and one whose build does not can judge one edit two ways
+(with `reject_incomparable`, or `reject_on_measure_change`), so they are two digests. A release that adds a unit
+therefore changes the digest of every server that takes it, with no change to any configuration, and so did the
+release that first put the units into the digest.
 
 ### Telemetry
 

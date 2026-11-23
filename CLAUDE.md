@@ -215,6 +215,13 @@ changing a design. Infer conventions from the existing code first.
   `docs/plans/33-quantity-text-and-rates.md`.
 - **An unknown unit is never an error.** It is its own dimension, comparable only with itself. Extend the `UNITS`
   table in `quantity.rs` when a new unit turns up; do not make the server refuse it.
+- **A unit added to the table is a judging change** (D44). `quantity::rules_digest()` covers every spelling with
+  its factor, the tolerance, and `RULES_VERSION`, and is the last line of the judging digest's text, so a new row
+  changes the digest of every server that takes the build. A test in `quantity.rs` pins the digest of the table
+  that ships: when it fails, say in the change that the digest moves, then write the new value. Raise
+  `RULES_VERSION` for a change to how amounts are compared that no row shows (how a unit is normalized, how a
+  change is told from none). The lines are sorted by spelling, so moving a row changes nothing; keep it so. The
+  `NAMED` words of `amount.rs` are not in it: reading decides nothing.
 - **Calibration events are flat, and their names are an interface** (D17). `calibrate --ndjson` writes one `pair`
   line and then one line per field, quantity, and reason, joined on `pair_id`, through `similarity-log`. Do not
   nest an object or a list into an event (it could only be a preformatted string), and do not rename an event, a
@@ -269,7 +276,8 @@ changing a design. Infer conventions from the existing code first.
   digests, so add a line for a new rule and never reword, reorder, or drop one. It takes `Policy`, `Matching`,
   `FieldSpec`, and `QuantitySpec` apart by name with nothing left over on purpose: do not add `..` to make a new
   field compile, write the field out. Numbers go in as their bits, never formatted. Nothing that is not a
-  rule of judging belongs in it (an address, a batch size, the shadow).
+  rule of judging belongs in it (an address, a batch size, the shadow). Its last line, `units`, is the one rule
+  no configuration holds: the digest of the unit table the build compares amounts by.
 - **A brand, once stored, must be named by every later request for that id**, including `Delete` (D14).
 - **What a supported model directory is lives in one place**, `similarity_core::model::Pipeline`. The loader and
   `model fetch` both use it; never parse `modules.json` anywhere else.
