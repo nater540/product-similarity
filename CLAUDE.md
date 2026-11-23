@@ -6,7 +6,7 @@ and trained in [Burn](https://burn.dev), run by ONNX Runtime), compared with the
 rejected against calibrated thresholds. A record's quantities (weight, volume, potency) are compared as numbers
 beside that, never embedded. Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D47) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D48) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -67,7 +67,7 @@ changing a design. Infer conventions from the existing code first.
 - `crates/similarity-proto`: the `.proto` (the source of truth for the API, and where its docs live) and generated
   code.
 - `crates/similarity-core`: encoder, strict weight loading and saving, tokenization, composite vectors, quantities,
-  scoring, policy, and scoring a menu item against stored records (`matching`). Synchronous, no I/O beyond reading and writing a model directory, no network code ever (D11).
+  amounts read from text (`amount`), scoring, policy, and scoring a menu item against stored records (`matching`). Synchronous, no I/O beyond reading and writing a model directory, no network code ever (D11).
 - `crates/similarity-store`: the `VectorStore` trait, the `Scan` trait (listing what a store holds, which only the
   audit and the anchor backup do), `MemoryStore`, `QdrantStore`.
 - `crates/similarity-runs`: the local record of runs (D23): the manifest, starting and ending a run, reading runs
@@ -191,6 +191,20 @@ changing a design. Infer conventions from the existing code first.
   API is not ready, and the same request must always get the same answer), and do not set `beyond_limit` in it.
   Units that do not convert are an answer, not a status code. A new conversion rule goes into `quantity.rs`,
   which is mutation-tested, and a new `Dimension` needs a wire value (a test in `quantities.rs` holds that).
+  `Parse` is `similarity_core::amount::parse` for each text and nothing more.
+- **An amount is read whole from a text, or refused, and never guessed** (D48). `amount::parse` reads a string
+  that is an amount and nothing else: it does not look for one inside prose, and data that is wrong is refused
+  and not rescued, by the owner's decision (2026-11-22). Do not add a reading for a decimal comma, a qualifier
+  (`<1 %`), a multiple (`10 x 10 mg`), or a word in front, and do not loosen what a unit may be made of. Every
+  text must have one reading: the comma rule, the rule for `1-1/2`, and the unit's characters are what make that
+  so, and a change to any of them needs the others checked. A record still takes a `Quantity` and never a text
+  (the owner decided, 2026-11-22): do not accept a string in `quantities`, and keep the refusal in `record.rs`.
+  A weight named by a word (`eighth`) is not read until the owner says what each word equals; it is their
+  company's vocabulary (D36). `NotAnAmount::code` and `AmountProblem` are an interface: add, never rename, and a
+  new reason needs a wire value and a line in `data/amounts.cases.jsonl` (tests hold both). That file is
+  synthetic and is the specification: a new form or refusal is a line there first, and both the parser and the
+  service are held to every line. The plan for what is not built (a survey of a column, units per something) is
+  `docs/plans/33-quantity-text-and-rates.md`.
 - **An unknown unit is never an error.** It is its own dimension, comparable only with itself. Extend the `UNITS`
   table in `quantity.rs` when a new unit turns up; do not make the server refuse it.
 - **Calibration events are flat, and their names are an interface** (D17). `calibrate --ndjson` writes one `pair`

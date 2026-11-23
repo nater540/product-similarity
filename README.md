@@ -327,7 +327,9 @@ range of which only one end is known. `unit` is free text: mass (`mcg`, `mg`, `g
 `cl`, `l`, `fl oz`), and `%` are converted before comparing, whatever their case or spacing, so `1 g` and
 `1000 mg` are the same quantity. Any other unit is accepted and is comparable only with itself. Values must be
 finite, not negative, and `min` not above `max`. A quantity is never sent as text in `fields`, and a quantity the
-record does not have is left out. [Mapping your records](#mapping-your-records) shows where each column goes.
+record does not have is left out. A source that holds an amount as a string (`"3.5g"`, `"1/8 oz"`) has it read
+first, by `Quantities.Parse` ([Quantities on their own](#quantities-on-their-own)).
+[Mapping your records](#mapping-your-records) shows where each column goes.
 
 **Brands.** Once a record is stored under a brand, every later `Evaluate` or `Delete` for its id must name the
 same brand. A request naming another brand, or none, gets `FAILED_PRECONDITION`. A record stored without a
@@ -350,6 +352,7 @@ just client delete <id> [--brand-id T]
 just client quantities <before.json> <after.json> [--original <first.json>]
 just client convert <value> <unit> [--to <unit>]
 just client units
+just client parse <text>...
 just client --server http://other-host:50051 describe
 ```
 
@@ -729,17 +732,19 @@ would have been rejected, and produces exactly the data the next two sections ne
 ### Quantities on their own
 
 The package has a second service, `Quantities`, for a caller that has amounts and no record: another system that
-needs to know whether `0.125 oz` and `3.5 g` are the same weight, or a test that wants to pin what a change of
-units does. It is the comparison and the unit conversion `Evaluate` applies to a record's quantities, and nothing
-else of the server: no record is read or written, the model is not run, and the schema and its limits are not
-consulted, so a name does not have to be one the schema defines and `beyond_limit` is never set. The same request
-always gets the same answer (D47).
+needs to know whether `0.125 oz` and `3.5 g` are the same weight, a test that wants to pin what a change of
+units does, or a source that holds an amount as text and needs it as a number and a unit. It is the comparison
+and the unit conversion `Evaluate` applies to a record's quantities, and nothing else of the server: no record
+is read or written, the model is not run, and the schema and its limits are not consulted, so a name does not
+have to be one the schema defines and `beyond_limit` is never set. The same request always gets the same answer
+(D47, D48).
 
 | RPC | What it does |
 |---|---|
 | `Compare` | Compares the quantities of two versions, name by name, and answers with the `QuantityScore` an `Evaluate` would report for each: unchanged, modified by a factor, added, removed, or incomparable. An optional `original` is the anchor's part: a quantity that `before` lacks and `after` has again is compared with it. |
 | `Convert` | Writes one quantity in another unit, or in the unit its kind is compared in (`mg`, `ml`, `%`) when none is asked for. Units that measure different things do not convert, which is an answer and not an error: the response has no quantity and names both dimensions. |
 | `ListUnits` | Lists every unit the server converts, with its spellings and its factor. |
+| `Parse` | Reads amounts written as text into quantities, up to 1000 texts to a call, one answer for each. The whole text is the amount or it is refused with a reason; nothing is guessed. |
 
 With the bundled client, against the two example records the top of this page evaluates and then alone:
 
@@ -778,6 +783,80 @@ An amount that is not a usable measurement (negative, not finite, a range that r
 health service, `recordsimilarity.v1.Quantities` ([Health and shutdown](#health-and-shutdown)). It needs neither
 the store nor the model, so it answers while the API is not ready.
 
+#### Amounts written as text
+
+A record takes a quantity as a number and a unit, never as text. A caller whose source holds `"3.5g"` in a
+column calls `Parse` first, puts the quantity it gets into the record, and decides for itself what to do with a
+text that was refused. A caller that already holds a number and a unit has no reason to call it, and neither
+converts a unit before sending: `Evaluate` does that when it compares.
+
+```text
+$ just client parse "3.5g" "1,000 mg" "1/8 oz" "1 1/2 oz" "½ oz" "18-22%" "18 to 22 %" "25 mg/5 ml" "2 pack"
+"3.5g" is 3.5 g (Mass)
+"1,000 mg" is 1000 mg (Mass)
+"1/8 oz" is 0.125 oz (Mass)
+"1 1/2 oz" is 1.5 oz (Mass)
+"½ oz" is 0.5 oz (Mass)
+"18-22%" is 18 to 22 % (Fraction)
+"18 to 22 %" is 18 to 22 % (Fraction)
+"25 mg/5 ml" is 25 mg/5 ml (a unit the server does not convert)
+"2 pack" is 2 pack (a unit the server does not convert)
+
+$ just client parse "3,5 g" "10 x 10 mg" "<1 %" "500 mg - 1 g" "Blueberry Gummies 100mg" "3.5 g (1/8 oz)" "eighth" "3.5"
+"3,5 g" is not an amount: ambiguous_separator
+"10 x 10 mg" is not an amount: multiple
+"<1 %" is not an amount: qualified
+"500 mg - 1 g" is not an amount: mixed_units
+"Blueberry Gummies 100mg" is not an amount: no_number
+"3.5 g (1/8 oz)" is not an amount: unreadable_unit
+"eighth" is not an amount: no_number
+"3.5" is not an amount: no_unit
+```
+
+**The whole text is the amount, or it is not an amount.** Nothing is looked for inside prose: a name that says
+`100mg` is a name. And nothing is guessed, because a wrong number that looks right becomes a baseline. Data that
+is wrong is refused, and is not rescued.
+
+What is read: a decimal (`3.5`, `.5`); thousands grouped by commas (`1,000`); a fraction (`1/8`, `⅛`); a whole
+number and a proper fraction (`1 1/2`, `1-1/2`, `1½`); a range of any two of those, joined by a hyphen, a dash,
+or the word `to`, with the unit on the last end or on both (`18% - 22%`); and then a unit, kept as it was
+written. A unit the server does not convert is not a refusal: the amount comes back with it, and the answer's
+`dimension` is `DIMENSION_OTHER`, which is worth a look before the amount becomes a record's baseline (`2 pack`
+is fine; `3.5 gr` is a misspelling).
+
+What is refused, each with a code that is a value of `AmountProblem` on the wire:
+
+| Code | For example | Why it is not read |
+|---|---|---|
+| `empty` | nothing but whitespace | |
+| `no_number` | `g`, `THC 22%`, `eighth`, `up to 22 %` | It does not start with a number. A word in front makes it prose. |
+| `no_unit` | `3.5`, `18% - 22` | A number is not a measurement. The last end of a range has to say the unit. |
+| `ambiguous_separator` | `3,5 g`, `1,00 mg`, `0,500 g` | A comma that is not grouping thousands: three and a half, or thirty-five with a typo. |
+| `bad_number` | `1.2.3 g`, `1/0 oz`, `1 3/2 oz` | It starts as a number and is not one. |
+| `negative` | `-1 g` | |
+| `backwards_range` | `22-18 %` | |
+| `mixed_units` | `500 mg - 1 g` | The two ends say different units. |
+| `multiple` | `10 x 10 mg`, `10 mg x 10` | A hundred milligrams a package or ten an item: only the caller knows which its quantity means. |
+| `qualified` | `<1 %`, `~3.5 g`, `≥ 20 %` | "Less than one" is not a number and a unit. |
+| `unreadable_unit` | `3.5 g (1/8 oz)`, `20 %+`, `5 mg 2` | What follows the number is not made of what a unit is made of. |
+| `too_large` | a 1 and four hundred zeros, in `g` | Too large to compare. |
+
+Three rules give every text one reading. A comma groups thousands and does nothing else: the first group is one
+to three digits and does not start with a zero, and every later group is exactly three, so `0,500 g` is not five
+hundred grams. `1-1/2 oz` is one and a half ounces only because the whole number is at least 1 and the fraction
+is proper, which are exactly the pairs that would run backwards as a range (`0-1/2 oz` is a range from nothing
+to a half). And a unit is letters, spaces, `%`, `.`, `/`, a hyphen between two letters (`pre-rolls`), and a
+number only as the amount of what it is per (`mg/5 ml`), starting with a letter or `%`.
+
+`data/amounts.cases.jsonl` holds every form and every refusal, one case to a line (185 of them, synthetic). The
+parser and the `Parse` call are both tested against every line, and a client in another language can hold a
+server to the same file. Reading `1/8 oz` gives 0.125 oz, which is 3.54 g: what is said above about an eighth
+applies to what is read as much as to what is sent.
+
+Not read, on purpose: a weight named by a word (`eighth`, `quarter`, `zip`), which is `no_number`; a decimal
+comma; anything in a language other than English. A unit that is one thing per another (`mg/5 ml`, `mg/g`) is
+read and kept, and is for now a unit the server does not convert, comparable only with its own exact spelling.
+
 ### Mapping your records
 
 The service has two kinds of field: text, which is embedded, and quantities, which are compared as numbers. For a
@@ -805,6 +884,9 @@ Rules for the caller:
   every time. Otherwise a product whose rows merely came back in another order looks edited.
 - **A quantity is never rendered into text.** Not as a field of its own and not appended to the name. What the
   name already says about size or potency stays in the name; the columns go in `quantities`.
+- **An amount the source holds as text is read before it is sent**, by `Quantities.Parse`
+  ([Amounts written as text](#amounts-written-as-text)), up to 1000 to a call. What it refuses is yours to
+  decide about: leave the quantity out, or fix the source. Do not write a parser of your own beside it.
 - **A null column is a quantity left out**, not a zero. A stored zero is a value and is sent as one. A move
   between zero and anything else is reported as a `zero_crossing`.
 - **Send the unit as stored.** The service converts the units it knows. A unit it does not know is still
@@ -3199,7 +3281,7 @@ backup of anchors is kept in.
 crates/
   similarity-log/       logging for both binaries: one JSON object per line, nothing else
   similarity-proto/     the .proto file and generated gRPC code
-  similarity-core/      the encoder (Burn), tokenization, composite vectors, quantities, scoring, policy. No network, no async.
+  similarity-core/      the encoder (Burn), tokenization, composite vectors, quantities, amounts read from text, scoring, policy. No network, no async.
   similarity-store/     the VectorStore trait, the Scan trait (listing a store), an in-memory implementation, and the Qdrant one
   similarity-runs/      the local record of runs: what was trained and calibrated here
   similarity-server/    config, embedding worker threads, engine, gRPC service, import, audit, anchor backup, calibration, telemetry, and the `record-similarity` binary
@@ -3211,9 +3293,10 @@ data/
   catalog-groups.sample.jsonl     synthetic products with menu items of them, for `calibrate-match`
   regression.jsonl                curated hard cases, synthetic, whose verdicts are pinned
   regression.snapshot.ndjson      what the pinned model and the example config make of them
+  amounts.cases.jsonl             what each amount written as text is read as or refused for, synthetic
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D47)
+  decisions.md               why things are the way they are (D1 to D48)
   data-request-prompt.md     a brief for collecting labeled production data
   import-prompt.md           a brief for loading the real catalog into a running service
   feature-suggestions.md     features that could be added, built and not, the last twelve about production

@@ -1,15 +1,18 @@
-//! The `Quantities` service: unit conversion and the comparison of quantities, for a caller with no record.
+//! The `Quantities` service: unit conversion and the comparison of quantities, for a caller with no record, and
+//! the reading of an amount a caller holds as text.
 //!
 //! As thin as [`crate::grpc`], and thinner, since there is no engine behind it. Every answer is computed by
-//! `similarity_core::quantity` from the request alone (docs/decisions.md, D47). That is the code a record's
-//! quantities are judged with, so what this service says about two amounts is what `Evaluate` would report for
-//! them, and the two cannot come apart. Nothing here waits for anything: there is no store, no model, and no lock,
-//! which is also why there is no deadline to honor and nothing for readiness to check.
+//! `similarity_core::quantity` from the request alone (docs/decisions.md, D47), and for `Parse` by
+//! `similarity_core::amount`. That is the code a record's quantities are judged with, so what this service says
+//! about two amounts is what `Evaluate` would report for them, and the two cannot come apart. Nothing here waits
+//! for anything: there is no store, no model, and no lock, which is also why there is no deadline to honor and
+//! nothing for readiness to check.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Instant;
 
 use similarity_core::Quantity;
+use similarity_core::amount::{self, NotAnAmount};
 use similarity_core::quantity::{self, Dimension, Unconvertible};
 use similarity_proto::v1 as pb;
 use similarity_proto::v1::quantities_server::Quantities;
@@ -30,6 +33,60 @@ fn dimension(dimension: &Dimension) -> pb::Dimension {
     Dimension::Fraction => pb::Dimension::Fraction,
     Dimension::Other(_) => pb::Dimension::Other,
   }
+}
+
+/// The most texts one `Parse` call reads. Not a measurement: reading a text takes well under a microsecond, so
+/// this bounds the size of an answer and nothing else. A caller with more sends them in several calls.
+const MAX_TEXTS: usize = 1000;
+
+/// Exhaustive on purpose: a new reason does not compile until it has a value on the wire. A test holds each name
+/// to [`NotAnAmount::code`].
+fn problem(problem: NotAnAmount) -> pb::AmountProblem {
+  match problem {
+    NotAnAmount::Empty => pb::AmountProblem::Empty,
+    NotAnAmount::NoNumber => pb::AmountProblem::NoNumber,
+    NotAnAmount::NoUnit => pb::AmountProblem::NoUnit,
+    NotAnAmount::AmbiguousSeparator => pb::AmountProblem::AmbiguousSeparator,
+    NotAnAmount::BadNumber => pb::AmountProblem::BadNumber,
+    NotAnAmount::Negative => pb::AmountProblem::Negative,
+    NotAnAmount::BackwardsRange => pb::AmountProblem::BackwardsRange,
+    NotAnAmount::MixedUnits => pb::AmountProblem::MixedUnits,
+    NotAnAmount::Multiple => pb::AmountProblem::Multiple,
+    NotAnAmount::Qualified => pb::AmountProblem::Qualified,
+    NotAnAmount::UnreadableUnit => pb::AmountProblem::UnreadableUnit,
+    NotAnAmount::TooLarge => pb::AmountProblem::TooLarge,
+  }
+}
+
+/// `Parse`: [`amount::parse`] for every text, in order. A text that is not an amount is an answer.
+fn parsed(request: &pb::ParseAmountsRequest) -> Result<pb::ParseAmountsResponse, Status> {
+  if request.texts.len() > MAX_TEXTS {
+    return Err(Status::invalid_argument(format!(
+      "{} texts in one call, and at most {MAX_TEXTS} are read: send them in several",
+      request.texts.len()
+    )));
+  }
+  let amounts = request
+    .texts
+    .iter()
+    .map(|text| match amount::parse(text) {
+      Ok(quantity) => pb::ParsedAmount {
+        dimension: dimension(&quantity.dimension()).into(),
+        quantity: Some(pb::Quantity {
+          min: quantity.min,
+          max: quantity.max,
+          unit: quantity.unit,
+        }),
+        problem: pb::AmountProblem::Unspecified.into(),
+      },
+      Err(refused) => pb::ParsedAmount {
+        quantity: None,
+        problem: problem(refused).into(),
+        dimension: pb::Dimension::Unspecified.into(),
+      },
+    })
+    .collect();
+  Ok(pb::ParseAmountsResponse { amounts })
 }
 
 /// A quantity off the wire, refused unless it is a usable measurement, in the form a record keeps one in.
@@ -145,6 +202,23 @@ impl Quantities for QuantitiesService {
 
   async fn list_units(&self, _: Request<pb::ListUnitsRequest>) -> Result<Response<pb::ListUnitsResponse>, Status> {
     Ok(Response::new(listed()))
+  }
+
+  async fn parse(
+    &self,
+    request: Request<pb::ParseAmountsRequest>,
+  ) -> Result<Response<pb::ParseAmountsResponse>, Status> {
+    let started = Instant::now();
+    // How many texts there were and how many of them were amounts, and never a text (D40).
+    let span = tracing::debug_span!("parse_amounts", texts = Empty, amounts = Empty);
+    let response = span.in_scope(|| parsed(request.get_ref()))?;
+    let count = |number: usize| i64::try_from(number).unwrap_or(i64::MAX);
+    let texts = count(response.amounts.len());
+    let amounts = count(response.amounts.iter().filter(|each| each.quantity.is_some()).count());
+    span.record("texts", texts);
+    span.record("amounts", amounts);
+    tracing::info!(texts, amounts, elapsed_ms = milliseconds(started), "parse_amounts");
+    Ok(Response::new(response))
   }
 }
 
@@ -478,6 +552,159 @@ mod tests {
     assert!(!wire.contains(&i32::from(pb::Dimension::Unspecified)));
   }
 
+  fn parse(texts: &[&str]) -> Vec<pb::ParsedAmount> {
+    parsed(&pb::ParseAmountsRequest {
+      texts: texts.iter().map(|text| (*text).to_owned()).collect(),
+    })
+    .unwrap()
+    .amounts
+  }
+
+  #[test]
+  fn texts_are_read_in_order_and_one_that_is_not_an_amount_is_an_answer() {
+    let amounts = parse(&["3.5g", "3,5 g", " 18 - 22 % ", "", "2 pack", "1 1/2 oz"]);
+    assert_eq!(amounts.len(), 6);
+    assert_eq!(amounts[0].quantity, Some(amount(3.5, "g")));
+    assert_eq!(
+      (amounts[0].problem(), amounts[0].dimension()),
+      (pb::AmountProblem::Unspecified, pb::Dimension::Mass)
+    );
+    assert_eq!(amounts[1].quantity, None);
+    assert_eq!(
+      (amounts[1].problem(), amounts[1].dimension()),
+      (pb::AmountProblem::AmbiguousSeparator, pb::Dimension::Unspecified)
+    );
+    assert_eq!(
+      amounts[2].quantity,
+      Some(pb::Quantity {
+        min: 18.0,
+        max: 22.0,
+        unit: "%".to_owned(),
+      })
+    );
+    assert_eq!(amounts[2].dimension(), pb::Dimension::Fraction);
+    assert_eq!(
+      (amounts[3].quantity.as_ref(), amounts[3].problem()),
+      (None, pb::AmountProblem::Empty)
+    );
+    // A unit that is not converted is an amount all the same, and the answer says which kind it is.
+    assert_eq!(amounts[4].quantity, Some(amount(2.0, "pack")));
+    assert_eq!(
+      (amounts[4].problem(), amounts[4].dimension()),
+      (pb::AmountProblem::Unspecified, pb::Dimension::Other)
+    );
+    assert_eq!(amounts[5].quantity, Some(amount(1.5, "oz")));
+    assert!(parse(&[]).is_empty());
+  }
+
+  /// What `Parse` reads can be sent as a record's quantity as it is, and compares as the amount it is.
+  #[test]
+  fn a_parsed_amount_is_a_quantity_the_other_calls_accept() {
+    let amounts = parse(&["1/8 oz", "3.5 g", "100mg", "0.1 g"]);
+    let quantity = |index: usize| amounts[index].quantity.clone().unwrap();
+    let scores = compare(
+      &[("thc", quantity(2)), ("weight", quantity(1))],
+      &[("thc", quantity(3)), ("weight", quantity(0))],
+      &[],
+    )
+    .unwrap();
+    assert_eq!(scores[0].change(), pb::QuantityChange::Unchanged);
+    // An eighth of an ounce is 3.54 g, not 3.5 g: a small change, and reported as one.
+    assert_eq!(scores[1].change(), pb::QuantityChange::Modified);
+    assert!(
+      (scores[1].factor.unwrap() - 1.0125).abs() < 1e-4,
+      "{:?}",
+      scores[1].factor
+    );
+  }
+
+  #[test]
+  fn more_texts_than_one_call_reads_are_refused_and_exactly_that_many_are_read() {
+    let texts = |count: usize| pb::ParseAmountsRequest {
+      texts: vec!["1 g".to_owned(); count],
+    };
+    assert_eq!(parsed(&texts(MAX_TEXTS)).unwrap().amounts.len(), 1000);
+    let refused = parsed(&texts(MAX_TEXTS + 1)).unwrap_err();
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert!(
+      refused.message().starts_with("1001 texts in one call"),
+      "{}",
+      refused.message()
+    );
+  }
+
+  /// The codes the offline tools count are an interface, and the API's enum is the same names, so a refusal
+  /// read from a response and one read from a survey are joined without a table.
+  #[test]
+  fn every_reason_a_text_is_refused_for_has_a_wire_value_named_after_its_code() {
+    let wire: BTreeSet<i32> = NotAnAmount::ALL.iter().map(|each| i32::from(problem(*each))).collect();
+    assert_eq!(wire.len(), NotAnAmount::ALL.len());
+    assert!(!wire.contains(&i32::from(pb::AmountProblem::Unspecified)));
+    for refused in NotAnAmount::ALL {
+      assert_eq!(
+        problem(refused).as_str_name(),
+        format!("AMOUNT_PROBLEM_{}", refused.code().to_uppercase())
+      );
+    }
+  }
+
+  /// One line of `data/amounts.cases.jsonl`, which `similarity_core::amount` is held to as well: the service
+  /// and the function cannot differ, and a client in another language can hold a server to the same file.
+  #[derive(Debug, serde::Deserialize)]
+  #[serde(deny_unknown_fields)]
+  struct Case {
+    text: String,
+    min: Option<f64>,
+    max: Option<f64>,
+    unit: Option<String>,
+    refused: Option<String>,
+  }
+
+  #[test]
+  fn the_service_reads_every_case_in_the_file_as_the_file_says() {
+    let cases: Vec<Case> = include_str!("../../../data/amounts.cases.jsonl")
+      .lines()
+      .filter(|line| !(line.trim().is_empty() || line.starts_with('#')))
+      .map(|line| serde_json::from_str(line).unwrap())
+      .collect();
+    assert!(cases.len() > 150);
+    // In calls of no more than one call reads, as a client would send them.
+    for batch in cases.chunks(MAX_TEXTS) {
+      let texts: Vec<&str> = batch.iter().map(|case| case.text.as_str()).collect();
+      for (case, answer) in batch.iter().zip(parse(&texts)) {
+        match (&case.refused, &answer.quantity) {
+          (None, Some(quantity)) => {
+            assert_eq!(
+              Some(quantity.min.to_bits()),
+              case.min.map(f64::to_bits),
+              "{:?}",
+              case.text
+            );
+            assert_eq!(
+              Some(quantity.max.to_bits()),
+              case.max.map(f64::to_bits),
+              "{:?}",
+              case.text
+            );
+            assert_eq!(Some(&quantity.unit), case.unit.as_ref(), "{:?}", case.text);
+            assert_eq!(answer.problem(), pb::AmountProblem::Unspecified, "{:?}", case.text);
+            assert_ne!(answer.dimension(), pb::Dimension::Unspecified, "{:?}", case.text);
+          }
+          (Some(code), None) => {
+            assert_eq!(
+              answer.problem().as_str_name(),
+              format!("AMOUNT_PROBLEM_{}", code.to_uppercase()),
+              "{:?}",
+              case.text
+            );
+            assert_eq!(answer.dimension(), pb::Dimension::Unspecified, "{:?}", case.text);
+          }
+          other => panic!("{:?}: {other:?}", case.text),
+        }
+      }
+    }
+  }
+
   #[tokio::test]
   async fn the_service_answers_each_call_from_its_request_alone() {
     let service = QuantitiesService;
@@ -509,6 +736,24 @@ mod tests {
       .unwrap()
       .into_inner();
     assert!(!units.units.is_empty());
+
+    let read = service
+      .parse(Request::new(pb::ParseAmountsRequest {
+        texts: vec!["½ oz".to_owned(), "half an ounce".to_owned()],
+      }))
+      .await
+      .unwrap()
+      .into_inner();
+    assert_eq!(read.amounts[0].quantity, Some(amount(0.5, "oz")));
+    assert_eq!(read.amounts[1].problem(), pb::AmountProblem::NoNumber);
+    let too_many = service
+      .parse(Request::new(pb::ParseAmountsRequest {
+        texts: vec![String::new(); 1001],
+      }))
+      .await
+      .unwrap_err();
+    assert_eq!(too_many.code(), Code::InvalidArgument);
+
     let refused = service
       .convert(Request::new(pb::ConvertQuantityRequest::default()))
       .await

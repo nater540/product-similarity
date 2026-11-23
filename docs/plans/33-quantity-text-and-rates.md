@@ -7,6 +7,9 @@ memory of the planning can carry it out. Reviewed the same day against the owner
 under [the decisions](#decisions-for-the-owner-with-the-default-to-use-meanwhile). Delete this file, or fold what
 is still true into `docs/decisions.md`, when the work is done.
 
+**Where it stands (2026-11-22):** steps 1 to 4 are built and are D48: `amount.rs`, its conformance file and
+properties, `Quantities.Parse`, and `just client parse`. Step 5 (the survey) is next. Nothing of 34 is built.
+
 Read `CLAUDE.md` first, then this file. D16 (quantities are compared, not embedded), D25 (mutation testing), D44
 (the judging digest), and D47 (the `Quantities` service) in `docs/decisions.md` are the decisions it rests on.
 

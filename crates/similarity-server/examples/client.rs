@@ -9,6 +9,7 @@
 //! cargo run -p similarity-server --example client -- quantities data/examples/gummies.json data/examples/vape.json
 //! cargo run -p similarity-server --example client -- convert 3.5 g --to oz
 //! cargo run -p similarity-server --example client -- units
+//! cargo run -p similarity-server --example client -- parse "3.5g" "1/8 oz" "18-22%" "3,5 g"
 //! ```
 //!
 //! A record file is one JSON object: a string value is a text field, an object value is a quantity, as
@@ -118,6 +119,12 @@ enum Command {
   },
   /// List the units the server converts.
   Units,
+  /// Read amounts written as text, each argument the whole of one: `parse "3.5g" "1/8 oz" "18-22%"`.
+  Parse {
+    /// The texts. Quote one that has a space in it.
+    #[arg(required = true)]
+    texts: Vec<String>,
+  },
 }
 
 fn print_evaluation(response: &pb::EvaluateResponse) {
@@ -204,6 +211,23 @@ fn print_conversion(value: f64, unit: &str, to: Option<&str>, response: &pb::Con
       response.dimension(),
       response.to_dimension()
     ),
+  }
+}
+
+fn print_parsed(text: &str, parsed: &pb::ParsedAmount) {
+  let Some(quantity) = &parsed.quantity else {
+    let code = parsed.problem().as_str_name().trim_start_matches("AMOUNT_PROBLEM_");
+    println!("{text:?} is not an amount: {}", code.to_lowercase());
+    return;
+  };
+  let amount = if quantity.min.to_bits() == quantity.max.to_bits() {
+    format!("{} {}", quantity.min, quantity.unit)
+  } else {
+    format!("{} to {} {}", quantity.min, quantity.max, quantity.unit)
+  };
+  match parsed.dimension() {
+    pb::Dimension::Other => println!("{text:?} is {amount} (a unit the server does not convert)"),
+    dimension => println!("{text:?} is {amount} ({dimension:?})"),
   }
 }
 
@@ -396,7 +420,7 @@ fn read_record(path: &Path, id: Option<String>, brand_id: Option<String>) -> any
 async fn run_quantities(server: &str, command: Command) -> anyhow::Result<Option<Command>> {
   if !matches!(
     command,
-    Command::Quantities { .. } | Command::Convert { .. } | Command::Units
+    Command::Quantities { .. } | Command::Convert { .. } | Command::Units | Command::Parse { .. }
   ) {
     return Ok(Some(command));
   }
@@ -442,6 +466,13 @@ async fn run_quantities(server: &str, command: Command) -> anyhow::Result<Option
           .await?
           .into_inner(),
       );
+    }
+    Command::Parse { texts } => {
+      let request = pb::ParseAmountsRequest { texts: texts.clone() };
+      let response = quantities_client.parse(request).await?.into_inner();
+      for (text, parsed) in texts.iter().zip(&response.amounts) {
+        print_parsed(text, parsed);
+      }
     }
     other => return Ok(Some(other)),
   }
@@ -544,7 +575,7 @@ async fn main() -> anyhow::Result<()> {
       println!("{}", if deleted { "deleted" } else { "nothing to delete" });
     }
     // Handed to `run_quantities` above, which answers them.
-    Command::Quantities { .. } | Command::Convert { .. } | Command::Units => {}
+    Command::Quantities { .. } | Command::Convert { .. } | Command::Units | Command::Parse { .. } => {}
   }
   Ok(())
 }

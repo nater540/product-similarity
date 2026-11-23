@@ -2461,9 +2461,97 @@ quantity, a blank target unit, and an amount that is a number in its own unit an
 D40), one log line each with those and `elapsed_ms`, and no metric (D39: a count of calls is what a trace is
 for). Nothing of a request's names, units, or amounts is in either.
 
-**Not done.** Parsing an amount out of text (`"3.5g"`, `"1/8 oz"`): the service takes a number and a unit, as a
-record does. (Planned, with the next item: `docs/plans/33-quantity-text-and-rates.md`.) Units per something (`mg/ml`, `mg` per serving against `mg` per package), which are different
-dimensions to the table and so are comparable only with themselves. A limit on how many quantities one `Compare`
-may carry beyond the transport's message size. A Bruno request for the three calls. `just mutants` has not been
-run over the new code in `quantity.rs`; it is covered by example tests written to its boundaries and by the
-property above, and the run is owed (D25).
+**Not done.** Parsing an amount out of text (`"3.5g"`, `"1/8 oz"`) was not done here and has been since: D48.
+Units per something (`mg/ml`, `mg` per serving against `mg` per package), which are different dimensions to the
+table and so are comparable only with themselves (planned: `docs/plans/33-quantity-text-and-rates.md`). A limit
+on how many quantities one `Compare` may carry beyond the transport's message size. A Bruno request for the three
+calls. `just mutants` has not been run over the new code in `quantity.rs`; it is covered by example tests written
+to its boundaries and by the property above, and the run is owed (D25).
+
+## D48. An amount written as text is read whole or refused, by a call a caller makes before it has a record
+
+D47 made the comparison of amounts callable and left one thing in every caller's hands: turning `"3.5g"`,
+`"1/8 oz"`, or `"18-22%"` into a number and a unit. Each caller's own parser is a place where `1,000 mg` becomes
+1 and `1/8` becomes 1, and reading an amount is as intricate as comparing one. So it is done here once:
+`similarity_core::amount::parse`, and `Quantities.Parse` in front of it.
+
+**The whole string is the amount, or it is not an amount.** The parser does not find an amount inside prose
+(`Blueberry Gummies 100mg` is a name, and what a name says stays in the name, D16), and it never guesses. A wrong
+number that looks right is worse than no number, because the first one a record is given becomes its baseline
+and its anchor. The owner's rule (2026-11-22) is wider than that and is the rule for everything below: data that
+is wrong is refused, and nothing here tries to rescue it.
+
+**What is read.** A decimal, thousands grouped by commas, a fraction (`1/8`, or one of the eighteen
+single-character ones), a whole number with a proper fraction (`1 1/2`, `1-1/2`, `1½`), a range of any two of
+those joined by a hyphen, a dash, or the word `to`, and then a unit. The unit is kept as written and handed to
+`quantity::unit`, so one the table does not know is still not an error (D16). The answer is a `Quantity` that
+`check` accepts, and nothing else: a range is `min` and `max`, a single value has them equal, and no new type
+was needed. Nothing is written back; there is no canonical spelling of an amount.
+
+**What is refused has a code**, twelve of them (`empty`, `no_number`, `no_unit`, `ambiguous_separator`,
+`bad_number`, `negative`, `backwards_range`, `mixed_units`, `multiple`, `qualified`, `unreadable_unit`,
+`too_large`), which are an interface as `Reason::code` is (D17) and are the names of `AmountProblem` on the wire.
+The codes exist so that a column can be counted by what kind of wrong it holds, not so that each can grow a
+reading later. Three of them are decisions the owner made rather than facts about numbers:
+
+- `3,5 g` is `ambiguous_separator`. Reading a decimal comma needs to know the text's locale, and US English
+  reads it as neither three and a half nor thirty-five.
+- `<1 %` and `~3.5 g` are `qualified`. Reading them as a range from zero is a claim the text does not make. A
+  qualifier is known by its symbol; a list of words (`up to`, `about`) would never be complete, and a word in
+  front is `no_number` like any other.
+- `10 x 10 mg` is `multiple`. It is 100 mg a package or 10 mg an item, and which one a quantity named
+  `thc_per_item` wants is the caller's to know.
+
+**Three rules give every string one reading.** They were found by reviewing the plan before any code, and each
+closes a way to read a wrong number:
+
+- *A comma groups thousands and does nothing else.* The first group is one to three digits and does not start
+  with a zero; every later group is exactly three. Without the rule about the first group, `0,500 g`, which is
+  somebody's half a gram, reads as five hundred.
+- *`1-1/2` is a mixed number only where a range would run backwards.* A hyphen with no space, between a whole
+  number of at least 1 and a proper fraction. Those are exactly the pairs for which "from 1 to a half" is
+  impossible, so neither reading can be taken for the other: `0-1/2 oz` is a range, and `1 - 1/2 oz`, with its
+  spaces, is a backwards one and is refused.
+- *A unit is made of a fixed set of characters.* Letters, spaces, `%`, `.`, `/`, a hyphen between two letters,
+  and digits only as the amount of a denominator (`mg/5 ml`), starting with a letter or `%`. The first draft
+  refused a digit and nothing else, and would have answered `3.5 g (approx)` with 3.5 of a unit called
+  `g (approx)`, comparable with itself: accepted, stored, and wrong.
+
+**A record still takes numbers** (the owner decided, 2026-11-22). `Evaluate`, `Import`, `Match`, and the export
+format take a `Quantity`, and a quantity sent as text is still refused by name. Parsing is a call a caller makes
+before it has a record, up to 1000 texts at a time, so that what was understood is in the caller's hands and a
+refusal is its to act on. Accepting a string in `quantities` would hide the reading inside a write, and a text
+the server could not read would have to become either a failed request or a silently missing quantity. A caller
+that already has a number and a unit never calls it.
+
+**A unit that is not converted is an answer, and the answer says so.** `2 pack` is an amount. So is `3.5 gr`,
+which is a misspelling. `ParsedAmount.dimension` is `DIMENSION_OTHER` for both, which is how a caller tells them
+from `3.5 g` without a second call, before one of them becomes a baseline that is comparable with nothing.
+
+**Hand-written, after looking.** The owner prefers a maintained crate, and crates.io was searched first. What
+exists is implementations of UCUM (a strict standard that refuses `fl oz` and `1 1/2`), parsers of typesetting
+dimensions and of Kubernetes quantities, and recipe-ingredient parsers, which read prose and guess. None gives a
+refusal a reason, and the grammar is this domain's vocabulary. It is one file with no dependency, no regular
+expression, and no indexing.
+
+**How it is held.** `data/amounts.cases.jsonl` is the specification: 185 synthetic cases, one to a line, each a
+text and what it is read as or the code it is refused with. One test holds `amount::parse` to every line and
+another holds the service to it, so the two cannot differ, a refusal with no case fails a test, and a client in
+another language can run the same file against a server. Four properties (D19) cover what a list cannot: any
+text at all is an amount a record accepts or a refusal, and padding it changes nothing; a quantity written out
+is read back as itself to the bit, however a range is joined; a number with its thousands grouped is that
+number, and with one group cut short is refused; a fraction is one division and a mixed number one addition.
+`amount.rs` is in the list of mutation-tested files (D25): it decides nothing, and what it reads is believed.
+
+**What it adds to operations** is a span and a log line, `parse_amounts`, with how many texts there were and how
+many were amounts. Never a text (D40), and no metric (D39).
+
+**Numbers nothing measured.** A thousand texts to a call bounds the size of an answer and nothing else: reading
+nine texts took 0.04 ms.
+
+**Not done.** A command that surveys a column of texts and counts the units and the refusals, which is how the
+real data's vocabulary would be learned where the data is (the plan's next step). A weight named by a word
+(`eighth`, `quarter`, `zip`): what each equals is the owner's company's to say (D36), no table for them exists,
+and such a text is `no_number`. Units per something: `25 mg/5 ml` is read and kept, and until the plan's second
+half is built it is a unit the table does not know, comparable only with its own spelling. A reading of anything
+refused above. A Bruno request and a step in `tools/demo.py`.
