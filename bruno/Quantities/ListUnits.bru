@@ -1,0 +1,28 @@
+meta {
+  name: ListUnits
+  type: grpc
+  seq: 7
+}
+
+grpc {
+  url: {{server}}
+  method: /recordsimilarity.v1.Quantities/ListUnits
+  body: grpc
+  protoPath: ../crates/similarity-proto/proto/recordsimilarity/v1/similarity.proto
+  auth: none
+  methodType: unary
+}
+
+body:grpc {
+  name: message 1
+  content: '''
+    {}
+  '''
+}
+
+docs {
+  Every unit the server converts: its spellings, what it measures, the unit it is compared in, and how many of that
+  one of it is. Eleven units: six of mass, four of volume, and percent.
+  
+  A unit that is not listed is still accepted everywhere. It is comparable with itself and with nothing else.
+}

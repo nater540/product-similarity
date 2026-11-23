@@ -1,0 +1,55 @@
+meta {
+  name: Compare [Incomparable]
+  type: grpc
+  seq: 3
+}
+
+grpc {
+  url: {{server}}
+  method: /recordsimilarity.v1.Quantities/Compare
+  body: grpc
+  protoPath: ../crates/similarity-proto/proto/recordsimilarity/v1/similarity.proto
+  auth: none
+  methodType: unary
+}
+
+body:grpc {
+  name: message 1
+  content: '''
+    {
+      "before": {
+        "thc_per_item": {
+          "min": 100,
+          "max": 100,
+          "unit": "mg"
+        },
+        "count": {
+          "min": 2,
+          "max": 2,
+          "unit": "pack"
+        }
+      },
+      "after": {
+        "thc_per_item": {
+          "min": 18,
+          "max": 22,
+          "unit": "%"
+        },
+        "count": {
+          "min": 2,
+          "max": 2,
+          "unit": "Pack"
+        }
+      }
+    }
+  '''
+}
+
+docs {
+  Units that measure different things are an answer, not an error.
+  
+  `thc_per_item` goes from 100 mg to 18-22 %: `QUANTITY_CHANGE_INCOMPARABLE`, `incomparable: true`, and no factor.
+  
+  `pack` is not a unit the server converts, so it is comparable only with itself, in any case and spacing: `2 pack`
+  to `2 Pack` is `QUANTITY_CHANGE_UNCHANGED`.
+}

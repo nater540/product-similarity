@@ -1,0 +1,45 @@
+meta {
+  name: Compare [Restored]
+  type: grpc
+  seq: 2
+}
+
+grpc {
+  url: {{server}}
+  method: /recordsimilarity.v1.Quantities/Compare
+  body: grpc
+  protoPath: ../crates/similarity-proto/proto/recordsimilarity/v1/similarity.proto
+  auth: none
+  methodType: unary
+}
+
+body:grpc {
+  name: message 1
+  content: '''
+    {
+      "before": {},
+      "after": {
+        "weight_per_item": {
+          "min": 28,
+          "max": 28,
+          "unit": "g"
+        }
+      },
+      "original": {
+        "weight_per_item": {
+          "min": 3.5,
+          "max": 3.5,
+          "unit": "g"
+        }
+      }
+    }
+  '''
+}
+
+docs {
+  `original` is the first value a quantity ever had, which `Evaluate` keeps as a record's anchor. It matters only for
+  a name that `before` lacks and `after` has again.
+  
+  The weight is missing from `before` and comes back as 28 g, where it was 3.5 g originally:
+  `QUANTITY_CHANGE_RESTORED`, factor 8. Without `original` the same request answers `QUANTITY_CHANGE_ADDED`.
+}

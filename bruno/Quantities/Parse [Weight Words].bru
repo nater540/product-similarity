@@ -1,0 +1,48 @@
+meta {
+  name: Parse [Weight Words]
+  type: grpc
+  seq: 9
+}
+
+grpc {
+  url: {{server}}
+  method: /recordsimilarity.v1.Quantities/Parse
+  body: grpc
+  protoPath: ../crates/similarity-proto/proto/recordsimilarity/v1/similarity.proto
+  auth: none
+  methodType: unary
+}
+
+body:grpc {
+  name: message 1
+  content: '''
+    {
+      "texts": [
+        "eighth",
+        "an eighth",
+        "quarter",
+        "half ounce",
+        "half gram",
+        "ounce",
+        "zip",
+        "1/8 oz",
+        "half"
+      ]
+    }
+  '''
+}
+
+docs {
+  A weight the trade names by a word is read as the weight it is sold as, in grams, when the word is the whole text:
+  
+  - `eighth`, `an eighth`: 3.5 g
+  - `quarter`: 7 g
+  - `half ounce`: 14 g
+  - `half gram`: 0.5 g
+  - `ounce`, `zip`: 28 g
+  
+  A number and a unit stay exact: `1/8 oz` is 0.125 oz, normalized 3543.690390625 mg, not 3500.
+  
+  `half` alone is refused, `AMOUNT_PROBLEM_AMBIGUOUS_NAME`: it is half an ounce of flower and half a gram of
+  concentrate.
+}

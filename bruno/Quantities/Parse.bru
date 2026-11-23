@@ -1,0 +1,48 @@
+meta {
+  name: Parse
+  type: grpc
+  seq: 8
+}
+
+grpc {
+  url: {{server}}
+  method: /recordsimilarity.v1.Quantities/Parse
+  body: grpc
+  protoPath: ../crates/similarity-proto/proto/recordsimilarity/v1/similarity.proto
+  auth: none
+  methodType: unary
+}
+
+body:grpc {
+  name: message 1
+  content: '''
+    {
+      "texts": [
+        "3.5g",
+        "1,000 mg",
+        "1/8 oz",
+        "1 1/2 oz",
+        "½ oz",
+        "18-22%",
+        "18 to 22 %",
+        "25 mg/5 ml",
+        "2 pack"
+      ]
+    }
+  '''
+}
+
+docs {
+  Reads amounts written as text, one answer for each text, in order. For a caller whose source holds an amount as a
+  string: a record takes a number and a unit, never a text.
+  
+  Each answer has `quantity` (the amount as written), `normalized` (the same amount in `mg`, `ml`, or `%`), and
+  `dimension`. All nine texts here are amounts:
+  
+  - `3.5g` is 3.5 g, normalized 3500 mg.
+  - `1,000 mg` is 1000 mg. A comma only groups thousands.
+  - `1/8 oz` is 0.125 oz, normalized 3543.690390625 mg.
+  - `1 1/2 oz` and `½ oz` are 1.5 oz and 0.5 oz.
+  - `18-22%` and `18 to 22 %` are the range 18 to 22 %.
+  - `25 mg/5 ml` and `2 pack` are amounts in units the server does not convert: `DIMENSION_OTHER`.
+}

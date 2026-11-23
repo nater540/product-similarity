@@ -522,11 +522,19 @@ and has a third refused, `Evaluate` (which creates a record), `FindSimilar` by i
 rejected update, a forced update, and one that returns its vector), `FindSimilar` by text, and `Match` with and without a
 brand. Each request has a note saying what to expect.
 
+`Quantities` is a folder for the second service, ten requests that need no record and can be sent in any order,
+against a server in any state: `Compare` three ways (a change of amount, a quantity that comes back, and units
+that do not compare), `Convert` three ways (to a unit, to the base unit, and between units that do not convert),
+`ListUnits`, and `Parse` three ways (amounts in every form that is read, the weight words, and one text for each
+kind of refusal).
+
 The notes describe one order on an empty server (`just serve-in-memory config.toml`), which is not the order
 Bruno lists them in: `Describe`, `Import`, `Evaluate`, then the examples Accepted Update, Dry-Run, Rejected
 Update, Forced Update, and Return Vector, then `FindSimilar`, FindSimilar [Search], Match [Without Brand], Match
 [With Brand], `Match`, and `Delete` last. Every body was sent through Bruno's own gRPC client (4.3.0) against a
 local server in that order, and they answered as the notes say. `Delete` removes a record the examples use.
+The ten `Quantities` bodies were sent to a local server as well, and answered as their notes say, but by a
+Python gRPC client reading them out of the `.bru` files, and not through Bruno itself.
 
 Bodies use the names in the `.proto` as they are written there (`brand_id`, `menu_item`, `return_vector`), and
 enum values by name (`"WRITE_MODE_DRY_RUN"`).

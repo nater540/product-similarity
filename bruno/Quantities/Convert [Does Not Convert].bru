@@ -1,0 +1,33 @@
+meta {
+  name: Convert [Does Not Convert]
+  type: grpc
+  seq: 6
+}
+
+grpc {
+  url: {{server}}
+  method: /recordsimilarity.v1.Quantities/Convert
+  body: grpc
+  protoPath: ../crates/similarity-proto/proto/recordsimilarity/v1/similarity.proto
+  auth: none
+  methodType: unary
+}
+
+body:grpc {
+  name: message 1
+  content: '''
+    {
+      "quantity": {
+        "min": 20,
+        "max": 20,
+        "unit": "%"
+      },
+      "to_unit": "mg"
+    }
+  '''
+}
+
+docs {
+  A share has no weight. The answer has no `converted`, and the two dimensions say why: `DIMENSION_FRACTION` and
+  `DIMENSION_MASS`. That is an answer and not an error.
+}

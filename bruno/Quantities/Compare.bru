@@ -1,0 +1,56 @@
+meta {
+  name: Compare
+  type: grpc
+  seq: 1
+}
+
+grpc {
+  url: {{server}}
+  method: /recordsimilarity.v1.Quantities/Compare
+  body: grpc
+  protoPath: ../crates/similarity-proto/proto/recordsimilarity/v1/similarity.proto
+  auth: none
+  methodType: unary
+}
+
+body:grpc {
+  name: message 1
+  content: '''
+    {
+      "before": {
+        "weight_per_item": {
+          "min": 3.5,
+          "max": 3.5,
+          "unit": "g"
+        },
+        "thc_per_item": {
+          "min": 100,
+          "max": 100,
+          "unit": "mg"
+        }
+      },
+      "after": {
+        "weight_per_item": {
+          "min": 28,
+          "max": 28,
+          "unit": "g"
+        },
+        "thc_per_item": {
+          "min": 0.1,
+          "max": 0.1,
+          "unit": "g"
+        }
+      }
+    }
+  '''
+}
+
+docs {
+  Compares two versions' quantities, name by name, as `Evaluate` does for a record. No record is read or stored, and
+  the names need not be ones the server's schema defines.
+  
+  Here `thc_per_item` goes from 100 mg to 0.1 g, the same amount: `QUANTITY_CHANGE_UNCHANGED`, factor 1.
+  `weight_per_item` goes from 3.5 g to 28 g: `QUANTITY_CHANGE_MODIFIED`, factor 8. The answer is in order of name.
+  
+  `beyond_limit` is never set here: a limit belongs to a schema.
+}

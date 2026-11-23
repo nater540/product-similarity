@@ -2461,12 +2461,12 @@ quantity, a blank target unit, and an amount that is a number in its own unit an
 D40), one log line each with those and `elapsed_ms`, and no metric (D39: a count of calls is what a trace is
 for). Nothing of a request's names, units, or amounts is in either.
 
-**Not done.** Parsing an amount out of text (`"3.5g"`, `"1/8 oz"`) was not done here and has been since: D48.
-Units per something (`mg/ml`, `mg` per serving against `mg` per package), which are different dimensions to the
-table and so are comparable only with themselves (planned: `docs/plans/33-quantity-text-and-rates.md`). A limit
-on how many quantities one `Compare` may carry beyond the transport's message size. A Bruno request for the three
-calls. `just mutants` has not been run over the new code in `quantity.rs`; it is covered by example tests written
-to its boundaries and by the property above, and the run is owed (D25).
+**Not done.** Parsing an amount out of text (`"3.5g"`, `"1/8 oz"`) was not done here and has been since: D48. Units
+per something (`mg/ml`, `mg` per serving against `mg` per package), which are different dimensions to the table and so
+are comparable only with themselves (planned: `docs/plans/33-quantity-text-and-rates.md`). A limit on how many
+quantities one `Compare` may carry beyond the transport's message size. (The Bruno requests for these calls came with
+D48's.) `just mutants` has not been run over the new code in `quantity.rs`; it is covered by example tests written to
+its boundaries and by the property above, and the run is owed (D25).
 
 ## D48. An amount written as text is read whole or refused, by a call a caller makes before it has a record
 
@@ -2586,4 +2586,5 @@ README and in `amount.rs`. A fraction with no unit (`1/8`), which a menu may wel
 `no_unit`: the survey's `--examples` will show whether it occurs. A number in front of a name (`2 eighths`).
 Units per something: `25 mg/5 ml` is read and kept, and until the plan's second
 half is built it is a unit the table does not know, comparable only with its own spelling. A reading of anything
-refused above. A Bruno request and a step in `tools/demo.py`.
+refused above. A step in `tools/demo.py`. The Bruno requests for the service (`bruno/Quantities`, ten of them)
+were sent to a server by a Python client and not through Bruno's own.
