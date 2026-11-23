@@ -241,7 +241,7 @@ mod tests {
   use super::*;
 
   const COLUMN: &str = "3.5 g\n3.5g\n1/8 oz\n28 Grams\n100 MG\n2 pack\n2  Pack\n3.5 gr\n18-22%\n\n3,5 g\n3,5  g\n1,00 g\n\
-                        eighth\n<1 %\n10 x 10 mg\n";
+                        n/a\n<1 %\n10 x 10 mg\n";
 
   fn unit(unit: &str, dimension: &'static str, amounts: usize) -> UnitCount {
     UnitCount {
@@ -327,7 +327,7 @@ mod tests {
     let made = survey(COLUMN, 1);
     // `3,5 g` twice, once with two spaces: one text.
     assert_eq!(made.problems[0], problem("ambiguous_separator", 3, &[("3,5 g", 2)]));
-    assert_eq!(made.problems[3], problem("no_number", 1, &[("eighth", 1)]));
+    assert_eq!(made.problems[3], problem("no_number", 1, &[("n/a", 1)]));
 
     let made = survey(COLUMN, 5);
     assert_eq!(
@@ -374,7 +374,7 @@ look among those units for misspellings of one that is, and for units the table 
                1  \n      1  multiple
                1  10 x 10 mg
       1  no_number
-               1  eighth
+               1  n/a
       1  qualified
                1  <1 %
 "
@@ -450,7 +450,7 @@ look among those units for misspellings of one that is, and for units the table 
     // Without being asked, no text leaves.
     let quiet = similarity_log::testing::capture("off", || emit(&survey(COLUMN, 0)));
     assert!(quiet.results.iter().all(|line| !line.contains("amount_example")));
-    assert!(quiet.results.iter().all(|line| !line.contains("eighth")));
+    assert!(quiet.results.iter().all(|line| !line.contains("n/a")));
   }
 
   /// The survey says what the service would: it is held to the file the parser and the service are held to.

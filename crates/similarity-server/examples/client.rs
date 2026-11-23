@@ -220,14 +220,17 @@ fn print_parsed(text: &str, parsed: &pb::ParsedAmount) {
     println!("{text:?} is not an amount: {}", code.to_lowercase());
     return;
   };
-  let amount = if quantity.min.to_bits() == quantity.max.to_bits() {
-    format!("{} {}", quantity.min, quantity.unit)
-  } else {
-    format!("{} to {} {}", quantity.min, quantity.max, quantity.unit)
+  let written = |quantity: &pb::Quantity| {
+    if quantity.min.to_bits() == quantity.max.to_bits() {
+      format!("{} {}", quantity.min, quantity.unit)
+    } else {
+      format!("{} to {} {}", quantity.min, quantity.max, quantity.unit)
+    }
   };
-  match parsed.dimension() {
-    pb::Dimension::Other => println!("{text:?} is {amount} (a unit the server does not convert)"),
-    dimension => println!("{text:?} is {amount} ({dimension:?})"),
+  let amount = written(quantity);
+  match (parsed.dimension(), &parsed.normalized) {
+    (pb::Dimension::Other, _) | (_, None) => println!("{text:?} is {amount} (a unit the server does not convert)"),
+    (dimension, Some(normalized)) => println!("{text:?} is {amount} ({dimension:?}: {})", written(normalized)),
   }
 }
 

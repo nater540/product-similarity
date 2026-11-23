@@ -2488,11 +2488,11 @@ those joined by a hyphen, a dash, or the word `to`, and then a unit. The unit is
 `check` accepts, and nothing else: a range is `min` and `max`, a single value has them equal, and no new type
 was needed. Nothing is written back; there is no canonical spelling of an amount.
 
-**What is refused has a code**, twelve of them (`empty`, `no_number`, `no_unit`, `ambiguous_separator`,
-`bad_number`, `negative`, `backwards_range`, `mixed_units`, `multiple`, `qualified`, `unreadable_unit`,
-`too_large`), which are an interface as `Reason::code` is (D17) and are the names of `AmountProblem` on the wire.
-The codes exist so that a column can be counted by what kind of wrong it holds, not so that each can grow a
-reading later. Three of them are decisions the owner made rather than facts about numbers:
+**What is refused has a code**, thirteen of them (`empty`, `no_number`, `no_unit`, `ambiguous_separator`,
+`bad_number`, `negative`, `backwards_range`, `mixed_units`, `multiple`, `qualified`, `unreadable_unit`, `too_large`,
+`ambiguous_name`), which are an interface as `Reason::code` is (D17) and are the names of `AmountProblem` on the wire.
+The codes exist so that a column can be counted by what kind of wrong it holds, not so that each can grow a reading
+later. Three of them are decisions the owner made rather than facts about numbers:
 
 - `3,5 g` is `ambiguous_separator`. Reading a decimal comma needs to know the text's locale, and US English
   reads it as neither three and a half nor thirty-five.
@@ -2517,6 +2517,25 @@ closes a way to read a wrong number:
   refused a digit and nothing else, and would have answered `3.5 g (approx)` with 3.5 of a unit called
   `g (approx)`, comparable with itself: accepted, stored, and wrong.
 
+**A weight named by a word is the weight it is sold as** (the owner decided, 2026-11-22, having said that such
+words occur). `gram` is 1 g, `half gram` 0.5 g, `eighth` 3.5 g, `quarter` 7 g, `half ounce` 14 g, `ounce` and
+`zip` 28 g, each under a few spellings (`an eighth`, `quarter oz`), in any case, when the name is the whole
+text. These are trade weights and not fractions of an ounce, and the owner chose that over the exact reading
+(an eighth as 0.125 oz, 3.54 g), under which every `eighth` would differ from the `3.5 g` beside it by 1.25%.
+The owner was offered two ways to carry the same idea to numbers and declined both: snapping `1/8 oz` to 3.5 g
+in `Parse`, and making an ounce 28 g in the unit table. So a number and a unit stay exact, because an ounce of
+an edible or a beverage is a real one, and changing `UNITS` would change how every stored record is judged. The
+result has a seam, stated and not hidden: `eighth` is 3.5 g and `1/8 oz` is 3.54 g, a factor of 1.0125 apart,
+which `Compare` reports as `Modified` and nothing rejects. A bare `half` is half an ounce of flower and half a
+gram of concentrate; the owner chose to refuse it, as `ambiguous_name`, over reading it as either. A number in
+front of a name (`2 eighths`) is a number and a unit the table does not know, as before.
+
+**Every answer is also normalized.** The owner wants weights in one unit, whichever it is. `ParsedAmount` has
+`normalized` beside `quantity`: `Quantity::in_base_unit`, so `mg`, `ml`, or `%`, and for a unit that is not
+converted the unit in the spelling it is matched in. It is what `Convert` answers with no unit asked for, and
+the service adds no arithmetic for it (D47). `quantity` stays what was written. Either can be a record's
+quantity: a test holds that the two compare as unchanged for every case in the file.
+
 **A record still takes numbers** (the owner decided, 2026-11-22). `Evaluate`, `Import`, `Match`, and the export
 format take a `Quantity`, and a quantity sent as text is still refused by name. Parsing is a call a caller makes
 before it has a record, up to 1000 texts at a time, so that what was understood is in the caller's hands and a
@@ -2534,7 +2553,7 @@ dimensions and of Kubernetes quantities, and recipe-ingredient parsers, which re
 refusal a reason, and the grammar is this domain's vocabulary. It is one file with no dependency, no regular
 expression, and no indexing.
 
-**How it is held.** `data/amounts.cases.jsonl` is the specification: 185 synthetic cases, one to a line, each a
+**How it is held.** `data/amounts.cases.jsonl` is the specification: 218 synthetic cases, one to a line, each a
 text and what it is read as or the code it is refused with. One test holds `amount::parse` to every line and
 another holds the service to it, so the two cannot differ, a refusal with no case fails a test, and a client in
 another language can run the same file against a server. Four properties (D19) cover what a list cannot: any
@@ -2562,8 +2581,9 @@ are still the company's. `--ndjson` writes the survey as flat events (`amount_su
 in two columns surveys its unit column by putting `1 ` in front of each value. The run that matters is the one
 at work, and it comes before the unit table is extended (the plan's second half waits for it).
 
-**Not done.** A weight named by a word
-(`eighth`, `quarter`, `zip`): what each equals is the owner's company's to say (D36), no table for them exists,
-and such a text is `no_number`. Units per something: `25 mg/5 ml` is read and kept, and until the plan's second
+**Not done.** A listing of the named weights over the API, as `ListUnits` lists the units: the table is in the
+README and in `amount.rs`. A fraction with no unit (`1/8`), which a menu may well mean as an eighth and which is
+`no_unit`: the survey's `--examples` will show whether it occurs. A number in front of a name (`2 eighths`).
+Units per something: `25 mg/5 ml` is read and kept, and until the plan's second
 half is built it is a unit the table does not know, comparable only with its own spelling. A reading of anything
 refused above. A Bruno request and a step in `tools/demo.py`.

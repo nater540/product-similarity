@@ -81,12 +81,37 @@
 {"text": "10 xl", "min": 10.0, "max": 10.0, "unit": "xl"}
 {"text": "1 each", "min": 1.0, "max": 1.0, "unit": "each"}
 {"text": "2 photo", "min": 2.0, "max": 2.0, "unit": "photo"}
+{"text": "gram", "min": 1.0, "max": 1.0, "unit": "g"}
+{"text": "a gram", "min": 1.0, "max": 1.0, "unit": "g"}
+{"text": "half gram", "min": 0.5, "max": 0.5, "unit": "g"}
+{"text": "half a gram", "min": 0.5, "max": 0.5, "unit": "g"}
+{"text": "a half gram", "min": 0.5, "max": 0.5, "unit": "g"}
+{"text": "half g", "min": 0.5, "max": 0.5, "unit": "g"}
+{"text": "eighth", "min": 3.5, "max": 3.5, "unit": "g"}
+{"text": "an eighth", "min": 3.5, "max": 3.5, "unit": "g"}
+{"text": "eighth oz", "min": 3.5, "max": 3.5, "unit": "g"}
+{"text": "eighth ounce", "min": 3.5, "max": 3.5, "unit": "g"}
+{"text": "Eighth", "min": 3.5, "max": 3.5, "unit": "g"}
+{"text": "AN  EIGHTH", "min": 3.5, "max": 3.5, "unit": "g"}
+{"text": "quarter", "min": 7.0, "max": 7.0, "unit": "g"}
+{"text": "a quarter", "min": 7.0, "max": 7.0, "unit": "g"}
+{"text": "quarter oz", "min": 7.0, "max": 7.0, "unit": "g"}
+{"text": "quarter ounce", "min": 7.0, "max": 7.0, "unit": "g"}
+{"text": "half ounce", "min": 14.0, "max": 14.0, "unit": "g"}
+{"text": "half oz", "min": 14.0, "max": 14.0, "unit": "g"}
+{"text": "half an ounce", "min": 14.0, "max": 14.0, "unit": "g"}
+{"text": "a half ounce", "min": 14.0, "max": 14.0, "unit": "g"}
+{"text": "ounce", "min": 28.0, "max": 28.0, "unit": "g"}
+{"text": "an ounce", "min": 28.0, "max": 28.0, "unit": "g"}
+{"text": "zip", "min": 28.0, "max": 28.0, "unit": "g"}
+{"text": "a zip", "min": 28.0, "max": 28.0, "unit": "g"}
+{"text": " Zip ", "min": 28.0, "max": 28.0, "unit": "g"}
+{"text": "2 eighths", "min": 2.0, "max": 2.0, "unit": "eighths"}
 {"text": "", "refused": "empty"}
 {"text": "   ", "refused": "empty"}
 {"text": "\t\n", "refused": "empty"}
 {"text": "g", "refused": "no_number"}
 {"text": "THC 22%", "refused": "no_number"}
-{"text": "eighth", "refused": "no_number"}
 {"text": "up to 22 %", "refused": "no_number"}
 {"text": "about 3.5 g", "refused": "no_number"}
 {"text": ". g", "refused": "no_number"}
@@ -187,3 +212,11 @@
 {"text": "5 mg/5.5 ml5", "refused": "unreadable_unit"}
 {"text": "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 g", "refused": "too_large"}
 {"text": "100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 kg", "refused": "too_large"}
+{"text": "eighths", "refused": "no_number"}
+{"text": "eighth of flower", "refused": "no_number"}
+{"text": "the eighth", "refused": "no_number"}
+{"text": "oz", "refused": "no_number"}
+{"text": "halves", "refused": "no_number"}
+{"text": "half", "refused": "ambiguous_name"}
+{"text": "Half", "refused": "ambiguous_name"}
+{"text": "a half", "refused": "ambiguous_name"}

@@ -427,14 +427,15 @@ Answered on 2026-11-22 where it says so. The rest stand at their defaults until 
    caller whose source holds text calls `Parse` first. The alternative, accepting a string in `quantities`, hides
    what was understood inside a write.
 2. **The named amounts.** Whether menus or catalogs ever hold a weight as a word (`eighth`, `quarter`, `half`,
-   `zip`) with no number, and if so what each word equals. **Open: asked again in plainer words.** Default: none
-   are read, and such a text is refused as `no_number`.
+   `zip`) with no number, and if so what each word equals. **Decided, and built (D48):** they occur, and each is
+   the weight it is sold as, in grams (eighth 3.5, quarter 7, half ounce 14, ounce and zip 28, gram 1, half
+   gram 0.5). A bare `half` is refused as `ambiguous_name`.
 3. **Is an eighth 3.5 g?** `1/8 oz` is 3.54 g, a factor of 1.0125 from 3.5 g. So a record whose weight goes from
    `3.5 g` to `1/8 oz` has its weight reported as `MODIFIED` (the comparison's word for "both sides have a value
    and the values differ") with that factor, and not as `UNCHANGED`. It is rejected only if a
    `reject_above_factor` below 1.0125 is ever configured for that quantity, and none is configured at all today.
-   **Open: asked again in plainer words.** Default: leave it so. The alternative is a table of nominal
-   equivalents, which is a statement about products and not about units.
+   **Decided: leave it so.** A number and a unit stay exact; the owner declined both snapping `1/8 oz` to
+   3.5 g in `Parse` and making an ounce 28 g in the table. A word (`eighth`) is the trade weight, 3.5 g.
 4. **The decimal comma.** **Decided: refused.** `3,5 g` is `ambiguous_separator`.
 5. **Qualifiers.** **Decided: refused**, with the comma: wrong data is not rescued. `<1 %` is `qualified`.
 6. **A mass over a mass is a share.** Default: yes, as D16 planned for `mg/g`, and for volume over volume. A

@@ -55,6 +55,16 @@ fn problem(problem: NotAnAmount) -> pb::AmountProblem {
     NotAnAmount::Qualified => pb::AmountProblem::Qualified,
     NotAnAmount::UnreadableUnit => pb::AmountProblem::UnreadableUnit,
     NotAnAmount::TooLarge => pb::AmountProblem::TooLarge,
+    NotAnAmount::AmbiguousName => pb::AmountProblem::AmbiguousName,
+  }
+}
+
+/// A quantity as the wire holds one.
+fn wire(quantity: Quantity) -> pb::Quantity {
+  pb::Quantity {
+    min: quantity.min,
+    max: quantity.max,
+    unit: quantity.unit,
   }
 }
 
@@ -72,17 +82,17 @@ fn parsed(request: &pb::ParseAmountsRequest) -> Result<pb::ParseAmountsResponse,
     .map(|text| match amount::parse(text) {
       Ok(quantity) => pb::ParsedAmount {
         dimension: dimension(&quantity.dimension()).into(),
-        quantity: Some(pb::Quantity {
-          min: quantity.min,
-          max: quantity.max,
-          unit: quantity.unit,
-        }),
+        // What `Convert` answers with no unit asked for. An amount that was read is one `check` accepts, which is
+        // one that is a number in its base unit.
+        normalized: quantity.in_base_unit().ok().map(wire),
+        quantity: Some(wire(quantity)),
         problem: pb::AmountProblem::Unspecified.into(),
       },
       Err(refused) => pb::ParsedAmount {
         quantity: None,
         problem: problem(refused).into(),
         dimension: pb::Dimension::Unspecified.into(),
+        normalized: None,
       },
     })
     .collect();
@@ -141,11 +151,7 @@ fn converted(request: pb::ConvertQuantityRequest) -> Result<pb::ConvertQuantityR
     None => (from.clone(), quantity.in_base_unit()),
   };
   let converted = match outcome {
-    Ok(converted) => Some(pb::Quantity {
-      min: converted.min,
-      max: converted.max,
-      unit: converted.unit,
-    }),
+    Ok(converted) => Some(wire(converted)),
     // An answer, like `QUANTITY_CHANGE_INCOMPARABLE` is: the two dimensions in the response say why.
     Err(Unconvertible::OtherDimension { .. }) => None,
     Err(error @ Unconvertible::TooLarge { .. }) => return Err(Status::invalid_argument(error.to_string())),
@@ -597,6 +603,52 @@ mod tests {
     assert!(parse(&[]).is_empty());
   }
 
+  /// A caller that wants every weight in one unit gets it with the amount: what `Convert` would answer.
+  #[test]
+  fn a_parsed_amount_comes_with_itself_in_the_unit_its_dimension_is_compared_in() {
+    let amounts = parse(&[
+      "3.5 g",
+      "1/8 oz",
+      "3500 mg",
+      "12 Fl. Oz.",
+      "18-22 percent",
+      "2  Pre Rolls",
+      "3,5 g",
+    ]);
+    let normalized = |index: usize| amounts[index].normalized.clone();
+    assert_eq!(normalized(0), Some(amount(3500.0, "mg")));
+    assert_eq!(normalized(1), Some(amount(3_543.690_390_625, "mg")));
+    // One amount under two spellings is one normalized amount, and what was written is still there.
+    assert_eq!(normalized(2), normalized(0));
+    assert_eq!(amounts[2].quantity, Some(amount(3500.0, "mg")));
+    assert_eq!(normalized(3), Some(amount(12.0 * 29.573_529_562_5, "ml")));
+    assert_eq!(
+      normalized(4),
+      Some(pb::Quantity {
+        min: 18.0,
+        max: 22.0,
+        unit: "%".to_owned(),
+      })
+    );
+    // A unit that is not converted is its own, in the spelling it is matched in.
+    assert_eq!(amounts[5].quantity, Some(amount(2.0, "Pre Rolls")));
+    assert_eq!(normalized(5), Some(amount(2.0, "pre rolls")));
+    assert_eq!(normalized(6), None);
+    for parsed in &amounts {
+      if let Some(quantity) = &parsed.quantity {
+        assert_eq!(parsed.normalized, convert(quantity.clone(), None).unwrap().converted);
+        // Either may be sent as a record's quantity: they are the same amount.
+        let same = compare(
+          &[("q", quantity.clone())],
+          &[("q", parsed.normalized.clone().unwrap())],
+          &[],
+        )
+        .unwrap();
+        assert_eq!(same[0].change(), pb::QuantityChange::Unchanged);
+      }
+    }
+  }
+
   /// What `Parse` reads can be sent as a record's quantity as it is, and compares as the amount it is.
   #[test]
   fn a_parsed_amount_is_a_quantity_the_other_calls_accept() {
@@ -689,6 +741,12 @@ mod tests {
             assert_eq!(Some(&quantity.unit), case.unit.as_ref(), "{:?}", case.text);
             assert_eq!(answer.problem(), pb::AmountProblem::Unspecified, "{:?}", case.text);
             assert_ne!(answer.dimension(), pb::Dimension::Unspecified, "{:?}", case.text);
+            assert_eq!(
+              answer.normalized,
+              convert(quantity.clone(), None).unwrap().converted,
+              "{:?}",
+              case.text
+            );
           }
           (Some(code), None) => {
             assert_eq!(
@@ -698,6 +756,7 @@ mod tests {
               case.text
             );
             assert_eq!(answer.dimension(), pb::Dimension::Unspecified, "{:?}", case.text);
+            assert_eq!(answer.normalized, None, "{:?}", case.text);
           }
           other => panic!("{:?}: {other:?}", case.text),
         }
@@ -739,13 +798,19 @@ mod tests {
 
     let read = service
       .parse(Request::new(pb::ParseAmountsRequest {
-        texts: vec!["½ oz".to_owned(), "half an ounce".to_owned()],
+        texts: vec![
+          "½ oz".to_owned(),
+          "about half an ounce".to_owned(),
+          "an eighth".to_owned(),
+        ],
       }))
       .await
       .unwrap()
       .into_inner();
     assert_eq!(read.amounts[0].quantity, Some(amount(0.5, "oz")));
     assert_eq!(read.amounts[1].problem(), pb::AmountProblem::NoNumber);
+    assert_eq!(read.amounts[2].quantity, Some(amount(3.5, "g")));
+    assert_eq!(read.amounts[2].normalized, Some(amount(3500.0, "mg")));
     let too_many = service
       .parse(Request::new(pb::ParseAmountsRequest {
         texts: vec![String::new(); 1001],

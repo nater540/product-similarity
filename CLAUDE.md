@@ -192,23 +192,27 @@ changing a design. Infer conventions from the existing code first.
   Units that do not convert are an answer, not a status code. A new conversion rule goes into `quantity.rs`,
   which is mutation-tested, and a new `Dimension` needs a wire value (a test in `quantities.rs` holds that).
   `Parse` is `similarity_core::amount::parse` for each text and nothing more.
-- **An amount is read whole from a text, or refused, and never guessed** (D48). `amount::parse` reads a string
-  that is an amount and nothing else: it does not look for one inside prose, and data that is wrong is refused
-  and not rescued, by the owner's decision (2026-11-22). Do not add a reading for a decimal comma, a qualifier
-  (`<1 %`), a multiple (`10 x 10 mg`), or a word in front, and do not loosen what a unit may be made of. Every
-  text must have one reading: the comma rule, the rule for `1-1/2`, and the unit's characters are what make that
-  so, and a change to any of them needs the others checked. A record still takes a `Quantity` and never a text
-  (the owner decided, 2026-11-22): do not accept a string in `quantities`, and keep the refusal in `record.rs`.
-  A weight named by a word (`eighth`) is not read until the owner says what each word equals; it is their
-  company's vocabulary (D36). `NotAnAmount::code` and `AmountProblem` are an interface: add, never rename, and a
-  new reason needs a wire value and a line in `data/amounts.cases.jsonl` (tests hold both). That file is
-  synthetic and is the specification: a new form or refusal is a line there first, and both the parser and the
-  service are held to every line. `amounts survey` (`offline/amounts.rs`) counts what a column of texts holds
-  by calling the same `parse`: never give it a reading of its own, keep every number of its report and its
-  events a field of `Survey`, and never let it write a text of the column unless `--examples` asks (the default
-  is 0 on purpose: the values are the data's owner's). Its `amount_*` event names and fields, and the dimension
-  names (`mass`, `volume`, `fraction`, `other`), are an interface like the calibration ones. The plan for what
-  is not built (units per something) is `docs/plans/33-quantity-text-and-rates.md`.
+- **An amount is read whole from a text, or refused, and never guessed** (D48). `amount::parse` reads a string that is
+  an amount and nothing else: it does not look for one inside prose, and data that is wrong is refused and not
+  rescued, by the owner's decision (2026-11-22). Do not add a reading for a decimal comma, a qualifier (`<1 %`), a
+  multiple (`10 x 10 mg`), or a word in front, and do not loosen what a unit may be made of. Every text must have one
+  reading: the comma rule, the rule for `1-1/2`, and the unit's characters are what make that so, and a change to any
+  of them needs the others checked. A record still takes a `Quantity` and never a text (the owner decided,
+  2026-11-22): do not accept a string in `quantities`, and keep the refusal in `record.rs`. A weight named by a word
+  is read as the weight it is sold as, in grams (`eighth` 3.5 g, `quarter` 7 g, `half ounce` 14 g, `ounce` and `zip`
+  28 g: the `NAMED` table, the owner's values, 2026-11-22), and a number and a unit stay exact (`1/8 oz` is 3.54 g):
+  do not snap a written ounce to a trade weight, and do not make `oz` 28 g in `UNITS`, which the owner declined. A
+  bare `half` is refused (`ambiguous_name`) by the owner's decision. A new word is the owner's company's vocabulary
+  (D36) and its value is theirs to give. `ParsedAmount.normalized` is `Quantity::in_base_unit` and nothing else.
+  `NotAnAmount::code` and `AmountProblem` are an interface: add, never rename, and a new reason needs a wire value and
+  a line in `data/amounts.cases.jsonl` (tests hold both). That file is synthetic and is the specification: a new form
+  or refusal is a line there first, and both the parser and the service are held to every line. `amounts survey`
+  (`offline/amounts.rs`) counts what a column of texts holds by calling the same `parse`: never give it a reading of
+  its own, keep every number of its report and its events a field of `Survey`, and never let it write a text of the
+  column unless `--examples` asks (the default is 0 on purpose: the values are the data's owner's). Its `amount_*`
+  event names and fields, and the dimension names (`mass`, `volume`, `fraction`, `other`), are an interface like the
+  calibration ones. The plan for what is not built (units per something) is
+  `docs/plans/33-quantity-text-and-rates.md`.
 - **An unknown unit is never an error.** It is its own dimension, comparable only with itself. Extend the `UNITS`
   table in `quantity.rs` when a new unit turns up; do not make the server refuse it.
 - **Calibration events are flat, and their names are an interface** (D17). `calibrate --ndjson` writes one `pair`

@@ -15,6 +15,11 @@
 //! still not an error. `data/amounts.cases.jsonl` is every form and every refusal, one to a line, and the tests
 //! here hold [`parse`] to all of it.
 //!
+//! One kind of text has no number and is read all the same: a weight the trade names by a word (`eighth`,
+//! `quarter`, `zip`). What each word equals is the owner's company's to say, and the owner said it (2026-11-22):
+//! the weight the product is sold as, in grams. So `eighth` is 3.5 g, while `1/8 oz`, which is a number and a
+//! unit, stays an exact eighth of an ounce, 3.54 g. A word is a trade weight; a number is a number.
+//!
 //! Nothing here decides anything, and nothing is written back: there is no canonical spelling of an amount.
 
 use crate::quantity::{self, Quantity};
@@ -58,11 +63,14 @@ pub enum NotAnAmount {
   /// A number and a unit, and too large to compare: [`Quantity::check`] refuses it.
   #[error("the amount is too large to compare")]
   TooLarge,
+  /// A word that names two weights: `half` is half an ounce of flower and half a gram of concentrate.
+  #[error("the word names more than one weight, and which is meant is not this reader's to say")]
+  AmbiguousName,
 }
 
 impl NotAnAmount {
   /// Every reason, in the order they are declared.
-  pub const ALL: [Self; 12] = [
+  pub const ALL: [Self; 13] = [
     Self::Empty,
     Self::NoNumber,
     Self::NoUnit,
@@ -75,6 +83,7 @@ impl NotAnAmount {
     Self::Qualified,
     Self::UnreadableUnit,
     Self::TooLarge,
+    Self::AmbiguousName,
   ];
 
   /// The stable name of this reason, for a file, an event, or a count. An interface in the sense
@@ -94,6 +103,7 @@ impl NotAnAmount {
       Self::Qualified => "qualified",
       Self::UnreadableUnit => "unreadable_unit",
       Self::TooLarge => "too_large",
+      Self::AmbiguousName => "ambiguous_name",
     }
   }
 }
@@ -127,10 +137,31 @@ const VULGAR: [(char, f64, f64); 18] = [
   ('⅒', 1.0, 10.0),
 ];
 
+/// The weights the trade names by a word, each as what a product of that name is sold as: the spellings, in
+/// lower case with single spaces, the amount, and its unit.
+///
+/// The owner's company's vocabulary (D36), and the owner's values (2026-11-22). They are the weights on the
+/// shelf, not fractions of an ounce: an eighth is 3.5 g, where an eighth of an ounce is 3.54 g. Adding a word is
+/// a line here and a case in `data/amounts.cases.jsonl`. A word that could mean two weights goes in
+/// [`AMBIGUOUS`] and not here.
+const NAMED: &[(&[&str], f64, &str)] = &[
+  (&["gram", "a gram"], 1.0, "g"),
+  (&["half gram", "half a gram", "a half gram", "half g"], 0.5, "g"),
+  (&["eighth", "an eighth", "eighth oz", "eighth ounce"], 3.5, "g"),
+  (&["quarter", "a quarter", "quarter oz", "quarter ounce"], 7.0, "g"),
+  (&["half ounce", "half oz", "half an ounce", "a half ounce"], 14.0, "g"),
+  (&["ounce", "an ounce", "zip", "a zip"], 28.0, "g"),
+];
+
+/// Words that name more than one weight. `half` is half an ounce of flower and half a gram of concentrate, so it
+/// is refused by the owner's decision (2026-11-22) and both are read when written out.
+const AMBIGUOUS: &[&str] = &["half", "a half"];
+
 /// Reads a string that is an amount, the whole of it.
 ///
 /// Whitespace around the text and runs of it inside are not part of it. The unit comes back as it was written,
-/// and what comes back is a quantity a record accepts ([`Quantity::check`] passes).
+/// and what comes back is a quantity a record accepts ([`Quantity::check`] passes). A weight named by a word
+/// comes back in grams.
 ///
 /// # Errors
 ///
@@ -149,7 +180,7 @@ pub fn parse(text: &str) -> Result<Quantity, NotAnAmount> {
     return Err(NotAnAmount::Negative);
   }
   if !starts_number(&text) {
-    return Err(NotAnAmount::NoNumber);
+    return named(&text).unwrap_or(Err(NotAnAmount::NoNumber));
   }
 
   let (low, rest) = number(&text)?;
@@ -184,6 +215,19 @@ pub fn parse(text: &str) -> Result<Quantity, NotAnAmount> {
     return Err(NotAnAmount::TooLarge);
   }
   Ok(quantity)
+}
+
+/// What a text with no number is, if it is a weight named by a word: the weight, or the refusal of a word that
+/// names two. `None` for any other text. The whole text is the name, in any case.
+fn named(text: &str) -> Option<Result<Quantity, NotAnAmount>> {
+  let name = text.to_lowercase();
+  if AMBIGUOUS.contains(&name.as_str()) {
+    return Some(Err(NotAnAmount::AmbiguousName));
+  }
+  NAMED
+    .iter()
+    .find(|(spellings, ..)| spellings.contains(&name.as_str()))
+    .map(|(_, amount, unit)| Ok(Quantity::single(*amount, *unit)))
 }
 
 /// Whether two spellings are one unit to the table: `g` and `grams`, and not `g` and `mg`.
@@ -508,6 +552,7 @@ mod tests {
         "qualified",
         "unreadable_unit",
         "too_large",
+        "ambiguous_name",
       ]
     );
     for problem in NotAnAmount::ALL {
@@ -639,7 +684,7 @@ mod tests {
     for text in [
       "g",
       "THC 22%",
-      "eighth",
+      "flower",
       "up to 22 %",
       ". g",
       ".",
@@ -767,6 +812,76 @@ mod tests {
       "5 mg pe 2 ml",
     ] {
       assert_eq!(parse(text), Err(NotAnAmount::UnreadableUnit), "{text}");
+    }
+  }
+
+  /// A word is a trade weight, and a number is a number: `eighth` is the 3.5 g on the shelf, and `1/8 oz` is an
+  /// eighth of an ounce.
+  #[test]
+  fn a_weight_named_by_a_word_is_the_weight_it_is_sold_as() {
+    for (text, grams) in [
+      ("gram", 1.0),
+      ("half gram", 0.5),
+      ("eighth", 3.5),
+      ("An Eighth", 3.5),
+      ("EIGHTH  OZ", 3.5),
+      ("quarter", 7.0),
+      ("Quarter Ounce", 7.0),
+      ("half ounce", 14.0),
+      ("half an ounce", 14.0),
+      ("Half Oz", 14.0),
+      ("ounce", 28.0),
+      (" Zip ", 28.0),
+    ] {
+      assert_eq!(parse(text), single(grams, "g"), "{text}");
+    }
+    assert_eq!(parse("1/8 oz"), single(0.125, "oz"));
+    assert_eq!(parse("1 ounce"), single(1.0, "ounce"));
+    // The whole text is the name, or it is prose like any other.
+    for text in [
+      "eighth of flower",
+      "eighths",
+      "the eighth",
+      "zips",
+      "oz",
+      "g",
+      "eighth.",
+    ] {
+      assert_eq!(parse(text), Err(NotAnAmount::NoNumber), "{text}");
+    }
+    // A number in front of a word is a number and a unit, and the unit is one the table does not know.
+    assert_eq!(parse("2 eighths"), single(2.0, "eighths"));
+  }
+
+  #[test]
+  fn a_word_that_names_two_weights_is_refused_and_each_of_them_is_read_when_written_out() {
+    for text in ["half", "Half", "a half", " A  HALF "] {
+      assert_eq!(parse(text), Err(NotAnAmount::AmbiguousName), "{text}");
+    }
+    assert_eq!(parse("half ounce"), single(14.0, "g"));
+    assert_eq!(parse("half gram"), single(0.5, "g"));
+    assert_eq!(parse("halves"), Err(NotAnAmount::NoNumber));
+  }
+
+  /// The table is matched against a text in lower case with single spaces, so that is how it has to be written,
+  /// and a name is read as one weight or refused, never both.
+  #[test]
+  fn every_name_in_the_table_is_read_in_any_case_and_no_name_is_there_twice() {
+    let mut seen = BTreeSet::new();
+    for (spellings, grams, unit) in NAMED {
+      assert!(!spellings.is_empty());
+      assert!(*grams > 0.0 && *unit == "g");
+      for spelling in *spellings {
+        assert!(seen.insert(*spelling), "`{spelling}` is in the table twice");
+        assert_eq!(*spelling, quantity::normalized(spelling), "{spelling}");
+        assert!(spelling.starts_with(char::is_alphabetic), "{spelling}");
+        assert_eq!(parse(spelling), single(*grams, "g"), "{spelling}");
+        assert_eq!(parse(&spelling.to_uppercase()), single(*grams, "g"), "{spelling}");
+      }
+    }
+    for name in AMBIGUOUS {
+      assert!(seen.insert(*name), "`{name}` is read and refused");
+      assert_eq!(*name, quantity::normalized(name), "{name}");
     }
   }
 

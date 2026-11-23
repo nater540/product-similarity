@@ -745,7 +745,7 @@ have to be one the schema defines and `beyond_limit` is never set. The same requ
 | `Compare` | Compares the quantities of two versions, name by name, and answers with the `QuantityScore` an `Evaluate` would report for each: unchanged, modified by a factor, added, removed, or incomparable. An optional `original` is the anchor's part: a quantity that `before` lacks and `after` has again is compared with it. |
 | `Convert` | Writes one quantity in another unit, or in the unit its kind is compared in (`mg`, `ml`, `%`) when none is asked for. Units that measure different things do not convert, which is an answer and not an error: the response has no quantity and names both dimensions. |
 | `ListUnits` | Lists every unit the server converts, with its spellings and its factor. |
-| `Parse` | Reads amounts written as text into quantities, up to 1000 texts to a call, one answer for each. The whole text is the amount or it is refused with a reason; nothing is guessed. |
+| `Parse` | Reads amounts written as text into quantities, up to 1000 texts to a call, one answer for each: the amount as written, and the same amount normalized to `mg`, `ml`, or `%`. The whole text is the amount or it is refused with a reason; nothing is guessed. |
 
 With the bundled client, against the two example records the top of this page evaluates and then alone:
 
@@ -792,27 +792,55 @@ text that was refused. A caller that already holds a number and a unit has no re
 converts a unit before sending: `Evaluate` does that when it compares.
 
 ```text
-$ just client parse "3.5g" "1,000 mg" "1/8 oz" "1 1/2 oz" "½ oz" "18-22%" "18 to 22 %" "25 mg/5 ml" "2 pack"
-"3.5g" is 3.5 g (Mass)
-"1,000 mg" is 1000 mg (Mass)
-"1/8 oz" is 0.125 oz (Mass)
-"1 1/2 oz" is 1.5 oz (Mass)
-"½ oz" is 0.5 oz (Mass)
-"18-22%" is 18 to 22 % (Fraction)
-"18 to 22 %" is 18 to 22 % (Fraction)
+$ just client parse "3.5g" "1,000 mg" "1/8 oz" "1 1/2 oz" "½ oz" "18-22%" "18 to 22 %" "eighth" "half ounce" "zip" "25 mg/5 ml" "2 pack"
+"3.5g" is 3.5 g (Mass: 3500 mg)
+"1,000 mg" is 1000 mg (Mass: 1000 mg)
+"1/8 oz" is 0.125 oz (Mass: 3543.690390625 mg)
+"1 1/2 oz" is 1.5 oz (Mass: 42524.284687499996 mg)
+"½ oz" is 0.5 oz (Mass: 14174.7615625 mg)
+"18-22%" is 18 to 22 % (Fraction: 18 to 22 %)
+"18 to 22 %" is 18 to 22 % (Fraction: 18 to 22 %)
+"eighth" is 3.5 g (Mass: 3500 mg)
+"half ounce" is 14 g (Mass: 14000 mg)
+"zip" is 28 g (Mass: 28000 mg)
 "25 mg/5 ml" is 25 mg/5 ml (a unit the server does not convert)
 "2 pack" is 2 pack (a unit the server does not convert)
 
-$ just client parse "3,5 g" "10 x 10 mg" "<1 %" "500 mg - 1 g" "Blueberry Gummies 100mg" "3.5 g (1/8 oz)" "eighth" "3.5"
+$ just client parse "3,5 g" "10 x 10 mg" "<1 %" "500 mg - 1 g" "Blueberry Gummies 100mg" "3.5 g (1/8 oz)" "half" "3.5"
 "3,5 g" is not an amount: ambiguous_separator
 "10 x 10 mg" is not an amount: multiple
 "<1 %" is not an amount: qualified
 "500 mg - 1 g" is not an amount: mixed_units
 "Blueberry Gummies 100mg" is not an amount: no_number
 "3.5 g (1/8 oz)" is not an amount: unreadable_unit
-"eighth" is not an amount: no_number
+"half" is not an amount: ambiguous_name
 "3.5" is not an amount: no_unit
 ```
+
+**Every answer comes normalized as well.** Beside the amount as it was written (`quantity`), an answer holds the
+same amount in the one unit its kind is compared in (`normalized`: `mg` for a weight, `ml` for a volume, `%` for
+a share), which is what the client prints after the colon. A caller that wants every weight in one unit stores
+that one. Either can be sent as a record's quantity, since the two compare as unchanged, and `Convert` writes an
+amount in any other unit (`just client convert 3500 mg --to g`).
+
+**A weight named by a word is the weight it is sold as.** The trade names weights, and those names are read, in
+any case, when the name is the whole text:
+
+| Words | Read as |
+|---|---|
+| `gram`, `a gram` | 1 g |
+| `half gram`, `half a gram`, `a half gram`, `half g` | 0.5 g |
+| `eighth`, `an eighth`, `eighth oz`, `eighth ounce` | 3.5 g |
+| `quarter`, `a quarter`, `quarter oz`, `quarter ounce` | 7 g |
+| `half ounce`, `half oz`, `half an ounce`, `a half ounce` | 14 g |
+| `ounce`, `an ounce`, `zip`, `a zip` | 28 g |
+
+These are the weights on the shelf and not fractions of an ounce, and the difference is kept on purpose: a word
+is a trade weight, and a number is a number. `eighth` is 3.5 g. `1/8 oz` is an eighth of an ounce, 3.54 g, and
+`1 oz` is 28.35 g, because an ounce of an edible or a beverage is a real ounce. So `eighth` against a record
+that says `3.5 g` is unchanged, and `1/8 oz` against it is a change by a factor of 1.0125, reported and rejected
+by nothing. `half` alone is refused, as `ambiguous_name`: it is half an ounce of flower and half a gram of
+concentrate.
 
 **The whole text is the amount, or it is not an amount.** Nothing is looked for inside prose: a name that says
 `100mg` is a name. And nothing is guessed, because a wrong number that looks right becomes a baseline. Data that
@@ -841,6 +869,7 @@ What is refused, each with a code that is a value of `AmountProblem` on the wire
 | `qualified` | `<1 %`, `~3.5 g`, `≥ 20 %` | "Less than one" is not a number and a unit. |
 | `unreadable_unit` | `3.5 g (1/8 oz)`, `20 %+`, `5 mg 2` | What follows the number is not made of what a unit is made of. |
 | `too_large` | a 1 and four hundred zeros, in `g` | Too large to compare. |
+| `ambiguous_name` | `half`, `a half` | A word that names two weights. `half ounce` and `half gram` are read. |
 
 Three rules give every text one reading. A comma groups thousands and does nothing else: the first group is one
 to three digits and does not start with a zero, and every later group is exactly three, so `0,500 g` is not five
@@ -849,13 +878,14 @@ is proper, which are exactly the pairs that would run backwards as a range (`0-1
 to a half). And a unit is letters, spaces, `%`, `.`, `/`, a hyphen between two letters (`pre-rolls`), and a
 number only as the amount of what it is per (`mg/5 ml`), starting with a letter or `%`.
 
-`data/amounts.cases.jsonl` holds every form and every refusal, one case to a line (185 of them, synthetic). The
+`data/amounts.cases.jsonl` holds every form and every refusal, one case to a line (218 of them, synthetic). The
 parser and the `Parse` call are both tested against every line, and a client in another language can hold a
 server to the same file. Reading `1/8 oz` gives 0.125 oz, which is 3.54 g: what is said above about an eighth
 applies to what is read as much as to what is sent.
 
-Not read, on purpose: a weight named by a word (`eighth`, `quarter`, `zip`), which is `no_number`; a decimal
-comma; anything in a language other than English. A unit that is one thing per another (`mg/5 ml`, `mg/g`) is
+Not read, on purpose: a decimal comma; a number in front of a named weight (`2 eighths` is two of a unit the
+server does not convert); a fraction with no unit (`1/8`, which is `no_unit`); anything in a language other than
+English. A unit that is one thing per another (`mg/5 ml`, `mg/g`) is
 read and kept, and is for now a unit the server does not convert, comparable only with its own exact spelling.
 
 #### Surveying a column
@@ -868,11 +898,11 @@ read the column:
 ```text
 $ just amounts survey weights.txt
 texts    18
-amounts  11
-refused  7
+amounts  12
+refused  6
 
 amounts  measures       unit
-      3  mass           g
+      4  mass           g
       2  mass           mg
       1  fraction       %
       1  not converted  gr
@@ -888,7 +918,6 @@ look among those units for misspellings of one that is, and for units the table 
       3  ambiguous_separator
       1  empty
       1  multiple
-      1  no_number
       1  qualified
 ```
 

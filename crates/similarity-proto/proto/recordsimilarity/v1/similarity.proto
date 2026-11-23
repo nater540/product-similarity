@@ -133,11 +133,13 @@ service Quantities {
   // `Quantity` and never a text, so such a caller asks here first and puts what it gets into the record; a
   // caller that already holds a number and a unit has no reason to call this.
   //
-  // The whole text is the amount, or it is not an amount. Nothing is looked for inside prose (a product's name
-  // that says `100mg` is a name), and nothing is guessed: `3,5 g`, `<1 %`, and `10 x 10 mg` are refused, each
-  // with its reason. A text that is not an amount is an answer and not an error, since a caller checking a
-  // column wants every answer and a count of each reason. A unit this server does not convert is not a refusal
-  // either: the amount comes back with that unit, and `dimension` says so.
+  // The whole text is the amount, or it is not an amount. Nothing is looked for inside prose (a product's name that
+  // says `100mg` is a name), and nothing is guessed: `3,5 g`, `<1 %`, and `10 x 10 mg` are refused, each with its
+  // reason. A weight the trade names by a word is read as the weight it is sold as, in grams: `gram` 1, `half gram`
+  // 0.5, `eighth` 3.5, `quarter` 7, `half ounce` 14, `ounce` and `zip` 28. A number and a unit stay exact, so `1/8
+  // oz` is 0.125 `oz`, which is 3.54 g and not 3.5. A text that is not an amount is an answer and not an error,
+  // since a caller checking a column wants every answer and a count of each reason. A unit this server does not
+  // convert is not a refusal either: the amount comes back with that unit, and `dimension` says so.
   //
   // Errors: `INVALID_ARGUMENT` for more than 1000 texts in one call.
   rpc Parse(ParseAmountsRequest) returns (ParseAmountsResponse);
@@ -792,6 +794,10 @@ enum AmountProblem {
 
   // A number and a unit, and too large to compare.
   AMOUNT_PROBLEM_TOO_LARGE = 12;
+
+  // A word that names more than one weight: `half` is half an ounce of flower and half a gram of concentrate.
+  // `half ounce` and `half gram` are read.
+  AMOUNT_PROBLEM_AMBIGUOUS_NAME = 13;
 }
 
 // What one text was read as.
@@ -807,6 +813,14 @@ message ParsedAmount {
   // (`pack`, a misspelling of `g`), which is worth a look before it becomes a record's baseline.
   // `DIMENSION_UNSPECIFIED` when `quantity` is absent.
   Dimension dimension = 3;
+
+  // The same amount in the one unit its dimension is compared in: `mg` for a mass, `ml` for a volume, `%` for a
+  // share. It is what `Convert` answers for `quantity` with no `to_unit`, given here so that a caller that wants
+  // every weight in one unit needs one call: `3.5 g` is 3500 `mg`, and `1/8 oz` is 3543.690390625 `mg`. For a
+  // unit this server does not convert, the amount is unchanged and the unit is in lower case with single
+  // spaces. `quantity` is still what was written, and either may be sent as a record's quantity: they compare
+  // as unchanged. Absent when `quantity` is.
+  optional Quantity normalized = 4;
 }
 
 message ParseAmountsResponse {
