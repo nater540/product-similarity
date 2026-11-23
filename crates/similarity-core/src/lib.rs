@@ -15,6 +15,7 @@
 //! - [`embed`]: [`Embedder`], text in and unit vectors out.
 //! - [`schema`]: the fields of a record, their weights, and the composite-vector layout.
 //! - [`quantity`]: the numeric fields of a record, which are compared as numbers and never embedded.
+//! - [`amount`]: an amount written as text, read into a quantity or refused with the reason.
 //! - [`record`]: validating a record, reusing unchanged fields, and packing the stored form.
 //! - [`provenance`]: the note a model directory carries about where it came from.
 //! - [`rng`]: a small seeded generator, for results that must be reproducible from a seed.
@@ -24,6 +25,7 @@
 // Tests compute expected values with ordinary arithmetic and compare exact floats where exactness is the point.
 #![cfg_attr(test, allow(clippy::arithmetic_side_effects, clippy::float_cmp))]
 
+pub mod amount;
 pub mod embed;
 pub mod error;
 pub mod matching;

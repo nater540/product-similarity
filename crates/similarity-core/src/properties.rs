@@ -5,7 +5,8 @@
 //! verdict rests on: that a composite's cosine is the weighted mean it is documented to be (D5), that the anchor
 //! never loses a value it holds (D8), that judging again equals judging afresh (D17), and that a quantity's
 //! factor means the same thing whichever way round, and in whatever unit, it is asked (D16), and that a long text
-//! is tokenized as if all of it had been read (D21).
+//! is tokenized as if all of it had been read (D21). An amount read from text is not a verdict, and is held here
+//! for the same reason: what it reads becomes a baseline.
 //!
 //! Each property runs a modest number of cases so that the fast suite stays fast. A failure is shrunk to a small
 //! input and saved under `proptest-regressions/`, which is checked in: the case is then replayed first on every
@@ -17,6 +18,7 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
 use tokenizers::normalizers::BertNormalizer;
 
+use crate::amount::{self, NotAnAmount};
 use crate::embed::EmbedderOptions;
 use crate::matching::{self, Candidate};
 use crate::quantity::{self, Quantities, Quantity, QuantityChange, first_values};
@@ -343,6 +345,143 @@ fn rewritten(quantity: &Quantity, unit: &str) -> Quantity {
   let (_, from) = quantity::unit(&quantity.unit);
   let (_, to) = quantity::unit(unit);
   Quantity::range(quantity.min * from / to, quantity.max * from / to, unit)
+}
+
+/// A unit as a text might end with: one the table converts, one it does not, one with a number in it.
+fn written_unit() -> impl Strategy<Value = &'static str> {
+  prop_oneof![
+    Just("g"),
+    Just("mg"),
+    Just("oz"),
+    Just("fl oz"),
+    Just("ml"),
+    Just("%"),
+    Just("percent"),
+    Just("pack"),
+    Just("pre-rolls"),
+    Just("mg/g"),
+    Just("mg/5 ml"),
+    Just("mg per serving"),
+  ]
+}
+
+/// Any text at all, and text made of what amounts are made of, which reaches further into the reader than
+/// arbitrary characters do.
+fn amount_text() -> impl Strategy<Value = String> {
+  prop_oneof![
+    1 => "\\PC{0,24}",
+    3 => "[0-9]{0,4}[0-9 .,/%a-zx½<~×-]{0,14}",
+  ]
+}
+
+/// A whole number written with a comma between its thousands.
+fn grouped(number: u64) -> String {
+  let digits = number.to_string();
+  let mut written = String::new();
+  for (place, digit) in digits.chars().enumerate() {
+    if place > 0 && (digits.len() - place).is_multiple_of(3) {
+      written.push(',');
+    }
+    written.push(digit);
+  }
+  written
+}
+
+proptest! {
+  #![proptest_config(cases())]
+
+  /// Reading never fails on any text; what it reads is a quantity a record accepts; and the whitespace around a
+  /// text, or how much of it there is inside, is not part of the text.
+  #[test]
+  fn any_text_is_an_amount_a_record_accepts_or_is_refused_with_a_reason(text in amount_text()) {
+    let read = amount::parse(&text);
+    if let Ok(quantity) = &read {
+      prop_assert!(quantity.check().is_ok(), "{:?}", quantity);
+      prop_assert_eq!(quantity, &quantity.trimmed());
+      prop_assert!(quantity.min <= quantity.max);
+      prop_assert!(quantity.unit.chars().next().is_some_and(|first| first.is_alphabetic() || first == '%'));
+    }
+    let padded = format!(" \t{}\n ", text.replace(' ', "  "));
+    prop_assert_eq!(amount::parse(&padded), read);
+  }
+
+  /// A quantity written out the plain way is read back as itself: the same numbers to the bit, and the unit as
+  /// it was written. However the two ends of a range are joined, and whether or not both say the unit.
+  #[test]
+  fn a_quantity_written_out_is_read_back_as_itself(
+    ends in range(), unit in written_unit(), spaced in any::<bool>(),
+    joined in prop_oneof![Just("-"), Just(" - "), Just("\u{2013}"), Just(" \u{2014} "), Just(" to ")],
+  ) {
+    let (min, max) = ends;
+    let gap = if spaced { " " } else { "" };
+    prop_assert_eq!(amount::parse(&format!("{min}{gap}{unit}")), Ok(Quantity::single(min, unit)));
+
+    let whole = Quantity::range(min, max, unit);
+    let written = format!("{min}{joined}{max}{gap}{unit}");
+    prop_assert_eq!(amount::parse(&written), Ok(whole.clone()), "{}", written);
+    let twice = format!("{min}{gap}{unit}{joined}{max}{gap}{unit}");
+    prop_assert_eq!(amount::parse(&twice), Ok(whole.clone()), "{}", twice);
+
+    // The other way round it runs backwards, unless the ends are one number.
+    let backwards = amount::parse(&format!("{max}{joined}{min} {unit}"));
+    if min < max {
+      prop_assert_eq!(backwards, Err(NotAnAmount::BackwardsRange));
+    } else {
+      prop_assert_eq!(backwards, Ok(whole.clone()));
+    }
+
+    // The case a text is written in changes the spelling of its unit and nothing about the amount.
+    let loud = amount::parse(&written.to_uppercase()).unwrap();
+    prop_assert_eq!((loud.min.to_bits(), loud.max.to_bits()), (min.to_bits(), max.to_bits()));
+    let same = quantity::compare("q", Some(&whole), None, Some(&loud)).unwrap();
+    prop_assert_eq!(same.change, QuantityChange::Unchanged);
+  }
+
+  /// A comma between thousands is read through, and a comma anywhere else is never read at all.
+  #[test]
+  fn a_number_with_its_thousands_grouped_is_that_number(number in 0_u64..1_000_000_000_000_000, cut in 1_usize..3) {
+    let written = grouped(number);
+    #[allow(clippy::cast_precision_loss, reason = "below 2^53, where every whole number is a double")]
+    let value = number as f64;
+    prop_assert_eq!(amount::parse(&format!("{written} mg")), Ok(Quantity::single(value, "mg")));
+    prop_assert_eq!(amount::parse(&format!("{number} mg")), Ok(Quantity::single(value, "mg")));
+
+    // The same digits with one group cut short are a number nobody can be sure of.
+    if let Some((front, back)) = written.rsplit_once(',') {
+      let short = format!("{front},{} mg", &back[..cut]);
+      prop_assert_eq!(amount::parse(&short), Err(NotAnAmount::AmbiguousSeparator), "{}", short);
+      let long = format!("{front},{back}0 mg");
+      prop_assert_eq!(amount::parse(&long), Err(NotAnAmount::AmbiguousSeparator), "{}", long);
+    }
+  }
+
+  /// A fraction is its numerator over its denominator, and a whole number in front of a proper one is added to
+  /// it, in each of the ways that is written.
+  #[test]
+  fn a_fraction_is_one_division_and_a_mixed_number_one_addition(
+    whole in 0_u32..500, over in 1_u32..64, under in 2_u32..=64,
+  ) {
+    let share = f64::from(over) / f64::from(under);
+    prop_assert_eq!(amount::parse(&format!("{over}/{under} oz")), Ok(Quantity::single(share, "oz")));
+
+    let mixed = amount::parse(&format!("{whole} {over}/{under} oz"));
+    let hyphened = amount::parse(&format!("{whole}-{over}/{under} oz"));
+    if over < under {
+      let sum = Quantity::single(f64::from(whole) + share, "oz");
+      prop_assert_eq!(mixed, Ok(sum.clone()));
+      // With a hyphen it is the mixed number exactly where a range would run backwards.
+      let expected = if whole >= 1 { sum } else { Quantity::range(0.0, share, "oz") };
+      prop_assert_eq!(hyphened, Ok(expected));
+    } else {
+      prop_assert_eq!(mixed, Err(NotAnAmount::BadNumber));
+      let as_range = if f64::from(whole) <= share {
+        Ok(Quantity::range(f64::from(whole), share, "oz"))
+      } else {
+        Err(NotAnAmount::BackwardsRange)
+      };
+      prop_assert_eq!(hyphened, as_range);
+    }
+  }
 }
 
 proptest! {

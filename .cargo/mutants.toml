@@ -7,6 +7,9 @@
 examine_globs = [
   "crates/similarity-core/src/score.rs",
   "crates/similarity-core/src/quantity.rs",
+  # Reading an amount decides nothing, and what it reads is believed: a number read wrongly is a baseline that is
+  # wrong and looks right.
+  "crates/similarity-core/src/amount.rs",
   "crates/similarity-core/src/schema.rs",
   "crates/similarity-core/src/vector.rs",
   "crates/similarity-core/src/record.rs",

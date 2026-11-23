@@ -1,0 +1,189 @@
+# What an amount written as text is read as, or the code it is refused with (docs/plans/33-quantity-text-and-rates.md).
+# Synthetic: written for this repository. One case to a line: `text`, and either `min`, `max`, and `unit` or
+# `refused`. `similarity_core::amount::parse` and the `Quantities.Parse` call are both held to every line, and a
+# client in another language can hold a server to the same file. Adding a case is adding a line.
+{"text": "3.5 g", "min": 3.5, "max": 3.5, "unit": "g"}
+{"text": "3.5g", "min": 3.5, "max": 3.5, "unit": "g"}
+{"text": "3.5 G", "min": 3.5, "max": 3.5, "unit": "G"}
+{"text": "  3.5   g ", "min": 3.5, "max": 3.5, "unit": "g"}
+{"text": "3.5\u00a0g", "min": 3.5, "max": 3.5, "unit": "g"}
+{"text": ".5 g", "min": 0.5, "max": 0.5, "unit": "g"}
+{"text": "0.5 g", "min": 0.5, "max": 0.5, "unit": "g"}
+{"text": "0 mg", "min": 0.0, "max": 0.0, "unit": "mg"}
+{"text": "100mg", "min": 100.0, "max": 100.0, "unit": "mg"}
+{"text": "0.1 g", "min": 0.1, "max": 0.1, "unit": "g"}
+{"text": "28 grams", "min": 28.0, "max": 28.0, "unit": "grams"}
+{"text": "12 fl oz", "min": 12.0, "max": 12.0, "unit": "fl oz"}
+{"text": "12 Fl. Oz.", "min": 12.0, "max": 12.0, "unit": "Fl. Oz."}
+{"text": "22%", "min": 22.0, "max": 22.0, "unit": "%"}
+{"text": "22 percent", "min": 22.0, "max": 22.0, "unit": "percent"}
+{"text": "5 µg", "min": 5.0, "max": 5.0, "unit": "µg"}
+{"text": "5 μg", "min": 5.0, "max": 5.0, "unit": "μg"}
+{"text": "1,000 mg", "min": 1000.0, "max": 1000.0, "unit": "mg"}
+{"text": "12,500 mg", "min": 12500.0, "max": 12500.0, "unit": "mg"}
+{"text": "1,000,000 mcg", "min": 1000000.0, "max": 1000000.0, "unit": "mcg"}
+{"text": "1,000.5 mg", "min": 1000.5, "max": 1000.5, "unit": "mg"}
+{"text": "999 mg", "min": 999.0, "max": 999.0, "unit": "mg"}
+{"text": "1000 mg", "min": 1000.0, "max": 1000.0, "unit": "mg"}
+{"text": "1/8 oz", "min": 0.125, "max": 0.125, "unit": "oz"}
+{"text": "1/8oz", "min": 0.125, "max": 0.125, "unit": "oz"}
+{"text": "1/4 oz", "min": 0.25, "max": 0.25, "unit": "oz"}
+{"text": "3/2 oz", "min": 1.5, "max": 1.5, "unit": "oz"}
+{"text": "1/3 oz", "min": 0.3333333333333333, "max": 0.3333333333333333, "unit": "oz"}
+{"text": "1 1/2 oz", "min": 1.5, "max": 1.5, "unit": "oz"}
+{"text": "1-1/2 oz", "min": 1.5, "max": 1.5, "unit": "oz"}
+{"text": "3-1/2 g", "min": 3.5, "max": 3.5, "unit": "g"}
+{"text": "0 1/2 oz", "min": 0.5, "max": 0.5, "unit": "oz"}
+{"text": "2 3/4 lb", "min": 2.75, "max": 2.75, "unit": "lb"}
+{"text": "½ oz", "min": 0.5, "max": 0.5, "unit": "oz"}
+{"text": "1½ oz", "min": 1.5, "max": 1.5, "unit": "oz"}
+{"text": "1 ½ oz", "min": 1.5, "max": 1.5, "unit": "oz"}
+{"text": "⅛ oz", "min": 0.125, "max": 0.125, "unit": "oz"}
+{"text": "¼ oz", "min": 0.25, "max": 0.25, "unit": "oz"}
+{"text": "¾ g", "min": 0.75, "max": 0.75, "unit": "g"}
+{"text": "⅓ oz", "min": 0.3333333333333333, "max": 0.3333333333333333, "unit": "oz"}
+{"text": "3½ g", "min": 3.5, "max": 3.5, "unit": "g"}
+{"text": "18-22%", "min": 18.0, "max": 22.0, "unit": "%"}
+{"text": "18 - 22 %", "min": 18.0, "max": 22.0, "unit": "%"}
+{"text": "18–22 %", "min": 18.0, "max": 22.0, "unit": "%"}
+{"text": "18 – 22 %", "min": 18.0, "max": 22.0, "unit": "%"}
+{"text": "18\u201422 %", "min": 18.0, "max": 22.0, "unit": "%"}
+{"text": "18\u221222 %", "min": 18.0, "max": 22.0, "unit": "%"}
+{"text": "18 to 22 %", "min": 18.0, "max": 22.0, "unit": "%"}
+{"text": "18 TO 22 %", "min": 18.0, "max": 22.0, "unit": "%"}
+{"text": "18% - 22%", "min": 18.0, "max": 22.0, "unit": "%"}
+{"text": "18%-22%", "min": 18.0, "max": 22.0, "unit": "%"}
+{"text": "18 g - 22 grams", "min": 18.0, "max": 22.0, "unit": "grams"}
+{"text": "5 mg to 10 mg", "min": 5.0, "max": 10.0, "unit": "mg"}
+{"text": "1/8 - 1/4 oz", "min": 0.125, "max": 0.25, "unit": "oz"}
+{"text": "1/8-1/4 oz", "min": 0.125, "max": 0.25, "unit": "oz"}
+{"text": "0-1/2 oz", "min": 0.0, "max": 0.5, "unit": "oz"}
+{"text": "1-3/2 oz", "min": 1.0, "max": 1.5, "unit": "oz"}
+{"text": "1 - 1 1/2 oz", "min": 1.0, "max": 1.5, "unit": "oz"}
+{"text": "½-1 oz", "min": 0.5, "max": 1.0, "unit": "oz"}
+{"text": "1-1/2-2 oz", "min": 1.5, "max": 2.0, "unit": "oz"}
+{"text": "22-22 %", "min": 22.0, "max": 22.0, "unit": "%"}
+{"text": "0.5-1.5 g", "min": 0.5, "max": 1.5, "unit": "g"}
+{"text": "1,000-2,000 mg", "min": 1000.0, "max": 2000.0, "unit": "mg"}
+{"text": "10 mg/ml", "min": 10.0, "max": 10.0, "unit": "mg/ml"}
+{"text": "25 mg / 5 ml", "min": 25.0, "max": 25.0, "unit": "mg / 5 ml"}
+{"text": "25 mg/5 ml", "min": 25.0, "max": 25.0, "unit": "mg/5 ml"}
+{"text": "5mg per serving", "min": 5.0, "max": 5.0, "unit": "mg per serving"}
+{"text": "5 mg per 2 servings", "min": 5.0, "max": 5.0, "unit": "mg per 2 servings"}
+{"text": "2 g/100 g", "min": 2.0, "max": 2.0, "unit": "g/100 g"}
+{"text": "0.5 mg/2.5 ml", "min": 0.5, "max": 0.5, "unit": "mg/2.5 ml"}
+{"text": "5-10 mg/5 ml", "min": 5.0, "max": 10.0, "unit": "mg/5 ml"}
+{"text": "5 mg/5 ml - 10 mg/5 ml", "min": 5.0, "max": 10.0, "unit": "mg/5 ml"}
+{"text": "2 pack", "min": 2.0, "max": 2.0, "unit": "pack"}
+{"text": "3.5 g net", "min": 3.5, "max": 3.5, "unit": "g net"}
+{"text": "2 pre-rolls", "min": 2.0, "max": 2.0, "unit": "pre-rolls"}
+{"text": "5-10 pre-rolls", "min": 5.0, "max": 10.0, "unit": "pre-rolls"}
+{"text": "10 xl", "min": 10.0, "max": 10.0, "unit": "xl"}
+{"text": "1 each", "min": 1.0, "max": 1.0, "unit": "each"}
+{"text": "2 photo", "min": 2.0, "max": 2.0, "unit": "photo"}
+{"text": "", "refused": "empty"}
+{"text": "   ", "refused": "empty"}
+{"text": "\t\n", "refused": "empty"}
+{"text": "g", "refused": "no_number"}
+{"text": "THC 22%", "refused": "no_number"}
+{"text": "eighth", "refused": "no_number"}
+{"text": "up to 22 %", "refused": "no_number"}
+{"text": "about 3.5 g", "refused": "no_number"}
+{"text": ". g", "refused": "no_number"}
+{"text": "-", "refused": "no_number"}
+{"text": "- g", "refused": "no_number"}
+{"text": "+5 g", "refused": "no_number"}
+{"text": "(3.5 g)", "refused": "no_number"}
+{"text": "$5 g", "refused": "no_number"}
+{"text": "x 10 mg", "refused": "no_number"}
+{"text": "\u0663 g", "refused": "no_number"}
+{"text": "3.5", "refused": "no_unit"}
+{"text": "18-22", "refused": "no_unit"}
+{"text": "18% - 22", "refused": "no_unit"}
+{"text": "1/8", "refused": "no_unit"}
+{"text": "½", "refused": "no_unit"}
+{"text": "1,000", "refused": "no_unit"}
+{"text": "3,5 g", "refused": "ambiguous_separator"}
+{"text": "1,00 mg", "refused": "ambiguous_separator"}
+{"text": "0,500 g", "refused": "ambiguous_separator"}
+{"text": "1000,000 mg", "refused": "ambiguous_separator"}
+{"text": "1,0000 mg", "refused": "ambiguous_separator"}
+{"text": "1,000,00 mg", "refused": "ambiguous_separator"}
+{"text": "01,000 mg", "refused": "ambiguous_separator"}
+{"text": "1, 000 mg", "refused": "ambiguous_separator"}
+{"text": "3.5,2 g", "refused": "ambiguous_separator"}
+{"text": "1,000,5 mg", "refused": "ambiguous_separator"}
+{"text": "18-2,5 %", "refused": "ambiguous_separator"}
+{"text": "1/8,5 oz", "refused": "ambiguous_separator"}
+{"text": "1.2.3 g", "refused": "bad_number"}
+{"text": "1/0 oz", "refused": "bad_number"}
+{"text": "0/8 oz", "refused": "bad_number"}
+{"text": "5. g", "refused": "bad_number"}
+{"text": "5.g", "refused": "bad_number"}
+{"text": "1.5/8 oz", "refused": "bad_number"}
+{"text": "1/8/2 oz", "refused": "bad_number"}
+{"text": "1 3/2 oz", "refused": "bad_number"}
+{"text": "1 2/2 oz", "refused": "bad_number"}
+{"text": "1 0/2 oz", "refused": "bad_number"}
+{"text": "1 1/0 oz", "refused": "bad_number"}
+{"text": "½5 oz", "refused": "bad_number"}
+{"text": "1/8.5 oz", "refused": "bad_number"}
+{"text": "18-1.2.3 %", "refused": "bad_number"}
+{"text": "1½½ oz", "refused": "bad_number"}
+{"text": "-1 g", "refused": "negative"}
+{"text": "- 1 g", "refused": "negative"}
+{"text": "\u22121 g", "refused": "negative"}
+{"text": "-.5 g", "refused": "negative"}
+{"text": "-½ oz", "refused": "negative"}
+{"text": "22-18 %", "refused": "backwards_range"}
+{"text": "1 - 1/2 oz", "refused": "backwards_range"}
+{"text": "2 to 1 g", "refused": "backwards_range"}
+{"text": "1.5-1 g", "refused": "backwards_range"}
+{"text": "500 mg - 1 g", "refused": "mixed_units"}
+{"text": "18 mg-22 %", "refused": "mixed_units"}
+{"text": "1 g - 2 gr", "refused": "mixed_units"}
+{"text": "1 pack - 2 packs", "refused": "mixed_units"}
+{"text": "10 x 10 mg", "refused": "multiple"}
+{"text": "2 × 0.5 g", "refused": "multiple"}
+{"text": "10 mg x 10", "refused": "multiple"}
+{"text": "10x10mg", "refused": "multiple"}
+{"text": "10mg×10", "refused": "multiple"}
+{"text": "2 X 5 g", "refused": "multiple"}
+{"text": "2 * 5 g", "refused": "multiple"}
+{"text": "2 x .5 g", "refused": "multiple"}
+{"text": "2 x ½ g", "refused": "multiple"}
+{"text": "2 x 5-10 mg", "refused": "multiple"}
+{"text": "10 mg x10", "refused": "multiple"}
+{"text": "<1 %", "refused": "qualified"}
+{"text": "~3.5 g", "refused": "qualified"}
+{"text": "≥ 20 %", "refused": "qualified"}
+{"text": ">20 %", "refused": "qualified"}
+{"text": "≤ 1 %", "refused": "qualified"}
+{"text": "≈ 3.5 g", "refused": "qualified"}
+{"text": "± 2 %", "refused": "qualified"}
+{"text": "< LOQ", "refused": "qualified"}
+{"text": "3.5 g (1/8 oz)", "refused": "unreadable_unit"}
+{"text": "5 mg 2", "refused": "unreadable_unit"}
+{"text": "20 %+", "refused": "unreadable_unit"}
+{"text": "1e3 mg", "refused": "unreadable_unit"}
+{"text": "3.5 g (approx)", "refused": "unreadable_unit"}
+{"text": "3.5 g, 1/8 oz", "refused": "unreadable_unit"}
+{"text": "5 /serving", "refused": "unreadable_unit"}
+{"text": "5/serving", "refused": "unreadable_unit"}
+{"text": "1 / 8 oz", "refused": "unreadable_unit"}
+{"text": "2 -pack", "refused": "unreadable_unit"}
+{"text": "2 pack-", "refused": "unreadable_unit"}
+{"text": "2 pre--rolls", "refused": "unreadable_unit"}
+{"text": "2 pre - rolls", "refused": "unreadable_unit"}
+{"text": "1 - 2 - 3 g", "refused": "unreadable_unit"}
+{"text": "5 max2", "refused": "unreadable_unit"}
+{"text": "5 mg * g", "refused": "unreadable_unit"}
+{"text": "3.5 g!", "refused": "unreadable_unit"}
+{"text": "5 mg super 2 ml", "refused": "unreadable_unit"}
+{"text": "5 mg/ml 2", "refused": "unreadable_unit"}
+{"text": "3.5 g #2", "refused": "unreadable_unit"}
+{"text": "2 .5 g", "refused": "unreadable_unit"}
+{"text": "18 % (lab) - 22 %", "refused": "unreadable_unit"}
+{"text": "5 mg/5.5 ml5", "refused": "unreadable_unit"}
+{"text": "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 g", "refused": "too_large"}
+{"text": "100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 kg", "refused": "too_large"}
