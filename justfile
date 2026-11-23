@@ -214,6 +214,11 @@ audit export config="config.example.toml" *flags:
 anchors *args:
     cargo run --release -q -p similarity-server -- anchors {{ args }}
 
+# Count what a column of amounts written as text holds, one text to a line: `just amounts survey weights.txt`
+# (`--ndjson` for events, `--examples 5` to also see refused texts, `-` for standard input)
+amounts *args:
+    cargo run --release -q -p similarity-server -- amounts {{ args }}
+
 # Run the server with no Qdrant at all; nothing is persisted
 serve-in-memory config="config.example.toml":
     cargo run --release -p similarity-server -- serve --config {{ config }} --in-memory

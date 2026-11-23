@@ -59,6 +59,11 @@ Before pulling anything at scale, find out and tell me:
 - For each of the four unit columns, **every distinct value that occurs, exactly as stored, with a count** (`g`,
   `G`, `grams`, `mg`, `oz`, `%`, `mg/g`, an empty string, and so on). The service converts the units it knows and
   treats any other as comparable only with itself, so I need the real vocabulary to know what it must convert.
+- Whether any source of these amounts holds one as a single text (`"3.5g"`, `"1/8 oz"`, `"18-22%"`) and not as a
+  number and a unit: an older column, an import file, a retailer's menu. If one does, tell me which, how many
+  values it has, and the twenty most frequent values with their counts. If the `record-similarity` binary is at
+  hand, `record-similarity amounts survey COLUMN.txt` (one value to a line) counts the units and the malformed
+  values for you, and its output without `--examples` holds no value of the column.
 - For the quantity columns: how often each is null, how often it is zero (and whether zero means "none" or "not
   measured", if you can tell), how often only one of a `min` and `max` pair is set, and whether THC or CBD is ever
   recorded per package rather than per item. Say whether there is a pack-size or item-count column as well.

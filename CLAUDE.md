@@ -203,8 +203,12 @@ changing a design. Infer conventions from the existing code first.
   company's vocabulary (D36). `NotAnAmount::code` and `AmountProblem` are an interface: add, never rename, and a
   new reason needs a wire value and a line in `data/amounts.cases.jsonl` (tests hold both). That file is
   synthetic and is the specification: a new form or refusal is a line there first, and both the parser and the
-  service are held to every line. The plan for what is not built (a survey of a column, units per something) is
-  `docs/plans/33-quantity-text-and-rates.md`.
+  service are held to every line. `amounts survey` (`offline/amounts.rs`) counts what a column of texts holds
+  by calling the same `parse`: never give it a reading of its own, keep every number of its report and its
+  events a field of `Survey`, and never let it write a text of the column unless `--examples` asks (the default
+  is 0 on purpose: the values are the data's owner's). Its `amount_*` event names and fields, and the dimension
+  names (`mass`, `volume`, `fraction`, `other`), are an interface like the calibration ones. The plan for what
+  is not built (units per something) is `docs/plans/33-quantity-text-and-rates.md`.
 - **An unknown unit is never an error.** It is its own dimension, comparable only with itself. Extend the `UNITS`
   table in `quantity.rs` when a new unit turns up; do not make the server refuse it.
 - **Calibration events are flat, and their names are an interface** (D17). `calibrate --ndjson` writes one `pair`
@@ -387,6 +391,8 @@ changing a design. Infer conventions from the existing code first.
   `just anchors restore --config config.toml anchors.ndjson` (`--dry-run` writes nothing)
 - Measure: `just throughput`, `just load`, `just calibrate`, `just calibrate-drift`, `just calibrate-match`, `just calibrate-sweep`, `just calibrate-diff`, `just verdict-gate old.ndjson pairs.full.jsonl`
 - Read a shadowed server's stdout: `just shadow-report shadow.ndjson --ids to-label.jsonl`
+- Count what a column of amounts written as text holds: `just amounts survey column.txt` (`--ndjson` for events,
+  `--examples N` to also see refused texts, `-` for standard input)
 - Put a model into service: `just promote --config candidate.toml --calibration holdout.ndjson`; then
   `record-similarity model list`, `model register <dir>`, `model retire <digest> --reason "..."`
 - See what was run: `just runs` (`calibrate` and the trainer each leave a directory under `runs/`; `--no-run`

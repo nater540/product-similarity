@@ -7,8 +7,9 @@ memory of the planning can carry it out. Reviewed the same day against the owner
 under [the decisions](#decisions-for-the-owner-with-the-default-to-use-meanwhile). Delete this file, or fold what
 is still true into `docs/decisions.md`, when the work is done.
 
-**Where it stands (2026-11-22):** steps 1 to 4 are built and are D48: `amount.rs`, its conformance file and
-properties, `Quantities.Parse`, and `just client parse`. Step 5 (the survey) is next. Nothing of 34 is built.
+**Where it stands (2026-11-22):** steps 1 to 5 are built and are D48: `amount.rs`, its conformance file and
+properties, `Quantities.Parse`, `just client parse`, and `amounts survey`. That is all of 33. Next is the
+survey's run at work, and then step 6. Nothing of 34 is built.
 
 Read `CLAUDE.md` first, then this file. D16 (quantities are compared, not embedded), D25 (mutation testing), D44
 (the judging digest), and D47 (the `Quantities` service) in `docs/decisions.md` are the decisions it rests on.
@@ -403,8 +404,9 @@ Each step ends with `just ci`. Commit a feature at a time.
 - `CLAUDE.md`: `amount.rs` in the layout; under "easy to get wrong": never guess an amount, the codes are an
   interface, the named and count-noun tables are the owner's vocabulary, and a unit row is a judging change
   that moves the digest.
-- `docs/data-request-prompt.md`: ask for the survey's output in place of a hand count of unit strings, and for
-  the trade's named amounts and count nouns.
+- `docs/data-request-prompt.md`: ask whether any source holds an amount as one text, and for the survey's
+  output where one does (done with step 5). The catalog itself holds a number and a unit in two columns, so its
+  hand count of unit strings stays. Still to ask for: the trade's named amounts and count nouns.
 - `.cargo/mutants.toml`, the Bruno collection, `tools/demo.py` (one step: a menu's `"1/8 oz"` parsed and
   compared with a catalog's `3.5 g`).
 

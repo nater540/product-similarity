@@ -95,6 +95,9 @@ enum Command {
   /// Work on a file of labeled pairs.
   #[command(subcommand)]
   Pairs(PairsCommand),
+  /// Work on amounts written as text.
+  #[command(subcommand)]
+  Amounts(AmountsCommand),
   /// Measure latency and throughput by driving the API with synthetic records.
   Load(LoadArgs),
 }
@@ -152,6 +155,44 @@ struct CarveArgs {
   /// Decides, with each brand's name, which brands move. The same salt always moves the same brands.
   #[arg(long, default_value = "validation")]
   salt: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum AmountsCommand {
+  /// Count what a column of amounts written as text holds: how many are amounts, in which units, and what the
+  /// rest are refused for. Reads them as `Quantities.Parse` does; no model, no store, no server.
+  Survey(AmountsSurveyArgs),
+}
+
+#[derive(Debug, Args)]
+struct AmountsSurveyArgs {
+  /// The column: one text to a line, each the whole of one amount, as it is stored (no quoting, no header). `-`
+  /// reads standard input.
+  column: PathBuf,
+  /// Write the survey as NDJSON events on stdout, for tools, in place of the text.
+  #[arg(long)]
+  ndjson: bool,
+  /// Also write up to this many of the refused texts for each reason, the most frequent first. They are values
+  /// of the column, and none is written unless this is given.
+  #[arg(long, default_value_t = 0)]
+  examples: usize,
+}
+
+impl AmountsSurveyArgs {
+  fn run(self) -> anyhow::Result<()> {
+    let column = if self.column.as_os_str() == "-" {
+      std::io::read_to_string(std::io::stdin().lock()).context("cannot read standard input")?
+    } else {
+      std::fs::read_to_string(&self.column).with_context(|| format!("cannot read {}", self.column.display()))?
+    };
+    let survey = offline::amounts::survey(&column, self.examples);
+    if self.ndjson {
+      offline::amounts::emit(&survey);
+    } else {
+      write!(std::io::stdout().lock(), "{}", offline::amounts::render(&survey))?;
+    }
+    Ok(())
+  }
 }
 
 #[derive(Debug, Subcommand)]
@@ -1997,6 +2038,7 @@ fn main() -> ExitCode {
     Command::Runs(RunsCommand::Compare(args)) => args.run(),
     Command::Runs(RunsCommand::Report(args)) => args.run(),
     Command::Pairs(PairsCommand::Carve(args)) => args.run(),
+    Command::Amounts(AmountsCommand::Survey(args)) => args.run(),
     Command::Load(args) => args.run(),
   }
   .map_err(|error| format!("{error:#}"));

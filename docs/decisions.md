@@ -2551,8 +2551,18 @@ many were amounts. Never a text (D40), and no metric (D39).
 **Numbers nothing measured.** A thousand texts to a call bounds the size of an answer and nothing else: reading
 nine texts took 0.04 ms.
 
-**Not done.** A command that surveys a column of texts and counts the units and the refusals, which is how the
-real data's vocabulary would be learned where the data is (the plan's next step). A weight named by a word
+**A survey answers D16's first open question where the data is.** `record-similarity amounts survey` reads a
+column of texts, one to a line, through the same `parse`, and prints how many are amounts, a count for each unit
+in the spelling it is matched in, and a count for each refusal. Two spellings of one unit are counted apart,
+because the spelling is the finding, and a unit that is not converted is marked: that list is where a
+misspelling (`gr`) or a unit the table should learn (`mg/g`) is seen. It writes none of the column's values
+unless `--examples N` asks for the most frequent refused texts; they are no part of a product's text, and they
+are still the company's. `--ndjson` writes the survey as flat events (`amount_survey`, `amount_unit`,
+`amount_problem`, `amount_example`), whose names are an interface (D17). A source with the number and the unit
+in two columns surveys its unit column by putting `1 ` in front of each value. The run that matters is the one
+at work, and it comes before the unit table is extended (the plan's second half waits for it).
+
+**Not done.** A weight named by a word
 (`eighth`, `quarter`, `zip`): what each equals is the owner's company's to say (D36), no table for them exists,
 and such a text is `no_number`. Units per something: `25 mg/5 ml` is read and kept, and until the plan's second
 half is built it is a unit the table does not know, comparable only with its own spelling. A reading of anything

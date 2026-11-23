@@ -20,7 +20,9 @@
 //! - [`report`]: the reports a person reads at a terminal.
 //! - [`events`]: the same calibration as a stream of result events, for tools, and reading one back.
 //! - [`diff`]: comparing two calibrations, or one calibration under two configurations.
+//! - [`amounts`]: a survey of a column of amounts written as text. No model either.
 
+pub mod amounts;
 pub mod calibrate;
 pub mod diff;
 pub mod drift;

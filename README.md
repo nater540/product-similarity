@@ -250,6 +250,7 @@ The binary is `record-similarity` (`target/release/record-similarity` after `jus
 | `record-similarity import [--config config.toml] EXPORT.jsonl [--check]` | Loads a whole catalog into the store. See [Importing a catalog](#importing-a-catalog). |
 | `record-similarity audit [--config config.toml] EXPORT.jsonl [--exported-at SECONDS] [--ndjson] [--fail-on-differences]` | Checks the store against an export of the catalog, and changes nothing. See [Auditing the store against the catalog](#auditing-the-store-against-the-catalog). |
 | `record-similarity anchors export --out FILE`, `anchors check FILE`, `anchors restore FILE [--dry-run]` | Keeps a copy of every record's anchor, and puts anchors back after a collection was lost. See [Backing up the anchors](#backing-up-the-anchors). |
+| `record-similarity amounts survey COLUMN.txt [--ndjson] [--examples N]` | Counts what a column of amounts written as text holds: how many are amounts, in which units, and what the rest are refused for. No model, no store. See [Surveying a column](#surveying-a-column). |
 | `record-similarity compare [--config config.toml] BEFORE.json AFTER.json` | Scores one before/after pair offline. |
 | `record-similarity calibrate [--config config.toml] PAIRS.jsonl [--full] [--split S] [--model DIR] [--ndjson]` | Scores labeled pairs and suggests a threshold. See [Choosing thresholds](#choosing-thresholds). |
 | `record-similarity calibrate-diff OLD.ndjson (NEW.ndjson \| --config-b CONFIG) [--fail-on WHAT]` | Compares two calibrations, or one under a second configuration. See [Comparing two calibrations](#comparing-two-calibrations). |
@@ -856,6 +857,73 @@ applies to what is read as much as to what is sent.
 Not read, on purpose: a weight named by a word (`eighth`, `quarter`, `zip`), which is `no_number`; a decimal
 comma; anything in a language other than English. A unit that is one thing per another (`mg/5 ml`, `mg/g`) is
 read and kept, and is for now a unit the server does not convert, comparable only with its own exact spelling.
+
+#### Surveying a column
+
+Which unit strings and which malformed values a real column holds is a question to answer before trusting any
+parser with it, and it has to be answered where the data is. `amounts survey` reads a file of texts, one to a
+line, exactly as `Parse` would, and prints counts. It needs no model, no store, and no server, and nobody has to
+read the column:
+
+```text
+$ just amounts survey weights.txt
+texts    18
+amounts  11
+refused  7
+
+amounts  measures       unit
+      3  mass           g
+      2  mass           mg
+      1  fraction       %
+      1  not converted  gr
+      1  mass           grams
+      1  not converted  mg/ml
+      1  mass           oz
+      1  not converted  pack
+
+Amounts in a unit that is not converted: 3. Such a unit is comparable only with its own spelling:
+look among those units for misspellings of one that is, and for units the table should learn.
+
+  texts  refused as
+      3  ambiguous_separator
+      1  empty
+      1  multiple
+      1  no_number
+      1  qualified
+```
+
+That is a synthetic file of eighteen lines. A unit is listed in the spelling it is matched in (lower case, single
+spaces), and two spellings of one unit are listed apart, because the spelling is the finding: `gr` above is a
+misspelling that would have become a baseline comparable with nothing. A blank line is a value and is counted,
+as `empty`.
+
+By default the survey writes counts, unit spellings, and codes, and none of the column's values. `--examples N`
+adds up to N of the refused texts under each reason, the most frequent first with how often each occurred:
+
+```text
+$ just amounts survey weights.txt --examples 2
+...
+  texts  refused as
+      3  ambiguous_separator
+               2  3,5 g
+               1  1,00 g
+```
+
+Those are values of a quantity column, not a product's name or description, and they are still the data's
+owner's: leave the flag off for anything that will be pasted elsewhere. `--ndjson` writes the same survey as
+events on stdout for a tool (`amount_survey`, then an `amount_unit` for each unit, an `amount_problem` for each
+reason, and an `amount_example` for each text kept), whose names and fields are an interface like the calibration
+ones. `-` in place of the file reads standard input.
+
+A source that holds the number and the unit in two columns has no text to survey, and its unit column can be
+surveyed all the same by putting a number in front of each value:
+
+```sh
+sed 's/^/1 /' units.txt | just amounts survey -
+```
+
+Every unit string then comes out counted, with what it measures or `not converted`, and a value that is not a
+unit at all comes out as a refusal.
 
 ### Mapping your records
 

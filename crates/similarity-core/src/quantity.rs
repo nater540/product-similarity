@@ -291,12 +291,19 @@ const UNITS: &[(&[&str], Dimension, f64)] = &[
   (&["%", "percent", "pct"], Dimension::Fraction, 1.0),
 ];
 
+/// A unit in the spelling it is matched in: trimmed, inner whitespace collapsed, and in lower case. Two units
+/// that are the same here are one unit everywhere, and it is what [`Dimension::Other`] holds.
+#[must_use]
+pub fn normalized(raw: &str) -> String {
+  raw.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
 /// The dimension of a unit and the factor that converts a value in it to the dimension's base unit.
 ///
 /// Units are matched after trimming, collapsing inner whitespace, and lowercasing, so `G`, ` g `, and `g` are one
 /// unit and `fl  oz` is `fl oz`.
 pub fn unit(raw: &str) -> (Dimension, f64) {
-  let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+  let normalized = normalized(raw);
   UNITS
     .iter()
     .find(|(spellings, ..)| spellings.contains(&normalized.as_str()))
@@ -612,6 +619,9 @@ mod tests {
 
   #[test]
   fn units_are_matched_without_regard_to_case_or_spacing() {
+    assert_eq!(normalized("  Fl \t Oz "), "fl oz");
+    assert_eq!(normalized("G"), "g");
+    assert_eq!(normalized("  "), "");
     assert_eq!(unit(" G "), (Dimension::Mass, 1000.0));
     assert_eq!(unit("Fl  Oz"), unit("fl oz"));
     assert_eq!(unit("fl oz").0, Dimension::Volume);
