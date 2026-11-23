@@ -140,8 +140,8 @@ impl MatchingConfig {
 pub struct ServerConfig {
   /// The address the gRPC server listens on.
   pub listen: SocketAddr,
-  /// The most records of an `Import` stream that are embedded as one batch. A batch is one job on the one
-  /// embedding thread, and every other request waits while it runs: larger batches load a catalog faster and
+  /// The most records of an `Import` stream that are embedded as one batch. A batch is one job on an
+  /// embedding thread (the only one, unless `model.sessions` says more), and requests behind it wait while it runs: larger batches load a catalog faster and
   /// make somebody's save wait longer.
   pub import_batch_records: usize,
   /// How often the server asks its store whether it still answers. The readiness it reports is that old at

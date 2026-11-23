@@ -992,8 +992,8 @@ impl Cli {
     // Saved before anything else is done with it. Until this returns, the last pass exists only in memory, and
     // the scoring below is minutes of forward passes on a large dataset.
     checkpoint::save_model(trained, &self.out, Some((lineage, steps)))?;
-    // Loaded back through the path the server uses, including its warm-up forward pass, so that a directory this
-    // command reports as saved is one the server is known to start with.
+    // Loaded back in Burn, as every load of a model directory begins, including the warm-up forward pass, so that a
+    // directory this command reports as saved is one that loads. The server needs it exported as well (D34).
     let embedder_options = EmbedderOptions {
       max_tokens: self.max_tokens,
       ..EmbedderOptions::default()

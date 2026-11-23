@@ -1,7 +1,7 @@
 # Decisions
 
 The choices that shaped this project, with the evidence behind them. Code comments refer to these by number.
-Numbers quoted here were measured on an Apple-silicon laptop CPU with a release build; rerun `just throughput` and
+Numbers quoted here were measured on an M4 Pro Mac mini with a release build; rerun `just throughput` and
 `just calibrate` to reproduce them.
 
 ## D1. Burn 0.22 on the `flex` CPU backend, Metal behind a feature
@@ -224,7 +224,9 @@ there the drift check was already making the same comparison.
 ## D9. One embedding thread, batching by backlog
 
 Inference is synchronous CPU work and must not run on a tokio worker. `EmbedWorker` owns one OS thread that owns
-the model. One thread and not a pool, because the backend already spreads a forward pass across cores.
+the model. One thread and not a pool, because the backend already spreads a forward pass across cores. (Since D46
+there can be several, one for each of `model.sessions`, sharing one backlog; one is still the default. The timings
+below are Burn's, from before ONNX Runtime ran the model: D34 and D45 have today's.)
 
 While a pass runs, requests queue; when it finishes, the worker takes everything waiting and runs it as one batch.
 A lone request waits for nothing, and batches grow by themselves under load, with no timer to tune. The queue is
@@ -363,7 +365,7 @@ the best pass is chosen) plus the optimizer state and a small state file. What c
 Without dropout a resumed run ends on bit-identical weights (verified on the real model). With dropout it differs
 only in the random masks after the resume: the backend's random stream is seeded, not saved.
 
-**Cost.** One step on 32 pairs of 256-token texts takes about 9 s and 9 GB on a laptop CPU and about 1.3 s on its
+**Cost.** One step on 32 pairs of 256-token texts takes about 9 s and 9 GB on the Mac mini's CPU and about 1.3 s on its
 GPU through Metal. Metal and CPU runs from the same seed without dropout agree to three decimal places in the
 resulting similarities. The CUDA feature compiles and has not been run.
 
@@ -535,7 +537,7 @@ renderers that each computed their own ranges would drift apart, as the trainer'
 **Intervals resample brands, not pairs.** The two error rates and the operating points carry a 95% interval from
 1,000 seeded bootstrap resamples. What is resampled is the brand, with all of its pairs: edits by one brand are
 written by the same people about the same product line and are not independent, so resampling pairs would give an
-interval that is too narrow, and narrower the more one brand dominates. That needs every labeled pair to name an
+interval that is too narrow, and narrower the more one brand dominates. That needs every labeled pair to name a
 brand and at least two brands; otherwise no interval is printed, which is honest for a file that cannot support
 one. A rate with no errors has a zero-width interval. That is a limit of the method on small data and the README
 says so; it is not evidence of a zero rate.
@@ -684,11 +686,12 @@ store, since the usual problems (a misnamed field, a quantity sent as text) are 
 
 Everything is embedded before anything is written, and nothing is written if the model fails. The records of a
 batch are embedded in one call, on the calling thread: a command that is the model's only user has no use for the
-server's queue (D9). On a laptop CPU 2,000 four-field records imported in 19 seconds when Burn ran the model,
+server's queue (D9). On the Mac mini 2,000 four-field records imported in 19 seconds when Burn ran the model,
 and import in 5 now that ONNX Runtime does (D34).
 
-Not built: a streaming `Import` RPC. The command covers the need as long as it can run next to Qdrant, and an RPC
-that writes without judging is a larger thing to expose than a command an operator runs.
+Not built then: a streaming `Import` RPC. The command covers the need as long as it can run next to Qdrant, and an
+RPC that writes without judging is a larger thing to expose than a command an operator runs. It was built later,
+under the same rule (it only creates): D33.
 
 ## D21. A long field is tokenized a part at a time, until the token limit is full
 
@@ -764,8 +767,8 @@ with the model cached under the hash of `fetch.rs`.
 flipping: a similarity by more than a tolerance, a kind of change, a factor, a reason. The tolerance is 0.001.
 The parity tests hold an embedding to a cosine of 0.99999 with PyTorch's, so the same model on another machine
 should agree to about five decimals, and 0.001 is well clear of that and well short of a real change. That
-reasoning has not yet met a Linux runner: the snapshot was made on macOS, and the repository has no remote for CI
-to run on. The first CI run is where the figure is confirmed or raised.
+reasoning had not met a Linux runner when this was written: the snapshot was made on macOS, and the repository had
+no remote for CI to run on. It has one now, and the snapshot test passes on CI's Linux runner at that figure.
 
 **A case on a border is refused.** `just snapshot` will not write while any case sits within the tolerance of the
 threshold, floor, or limit it is judged against (`diff::borderline`). Such a case would flip on the noise between
@@ -829,7 +832,7 @@ another run and must be accepted.
 After that, a note that cannot be written is a warning: the training matters more than the note about it.
 
 **The id is the time, the kind, and a name**, `20261111T201826Z-train-mdbr-leaf-mt-ft`, so that a directory
-menu item is in order and needs no index. The name comes from a path the caller chose, so a property holds that an
+listing is in order and needs no index. The name comes from a path the caller chose, so a property holds that an
 id is always a single safe path component.
 
 **What it does not do.** It records and lists. Comparing runs, drawing them, and deciding on them are features
@@ -890,7 +893,8 @@ A test suite says what the code does on the inputs someone thought of. It does n
 comparisons could be changed without any test noticing. For most code that is a curiosity. Here a comparison is
 a verdict: `<` against `<=` at a threshold decides whether a record is rejected.
 
-`just mutants` runs cargo-mutants over eight files: `score.rs`, `quantity.rs`, `schema.rs`, `vector.rs`, and
+`just mutants` ran cargo-mutants over eight files at first (`.cargo/mutants.toml` lists what it covers now, which
+is more, and `offline/stats.rs` has since become a directory): `score.rs`, `quantity.rs`, `schema.rs`, `vector.rs`, and
 `record.rs` in `similarity-core`, and `engine.rs`, `offline/stats.rs`, and `offline/calibrate.rs` in
 `similarity-server`. Each crate's mutants are tested by that crate's own library tests, which is stricter than
 letting the engine's scenarios vouch for the core's arithmetic, and much faster.
@@ -964,9 +968,9 @@ another misses would make the survivors differ from run to run, and a gate that 
 recipe fixes the seed and turns off the regression files, which would otherwise be written into a copy that is
 thrown away.
 
-**Why it is not in `just ci`.** Twenty-five minutes of twelve cores. It is run by hand after a change to what
-it covers, as the thorough property pass is. The repository has no remote, so there is no scheduled job to give
-it to.
+**Why it is not in `just ci`.** Twenty-five minutes of twelve cores when this was written, and forty at the last
+run. It is run by hand after a change to what it covers, as the thorough property pass is. The repository had no
+remote then; it has one now, and a scheduled job for this is not set up.
 
 **Excluding a mutant is for one case only:** the change cannot alter behavior. One is excluded, with its reason:
 `>` against `>=` at a block length that no block can have, since `Schema::new` now refuses the weighting that
@@ -1519,7 +1523,8 @@ the speed, and the first figure should not be quoted for a Linux deployment. The
 are the record of why Burn stopped serving; the README no longer carries tables a reader cannot reproduce.
 
 **Not done:** x86-64, which is unmeasured and is probably what production runs on; several embedding threads
-(ONNX Runtime may make one thread per core a better design than one thread across cores); an exporter in Rust,
+(ONNX Runtime may make one thread per core a better design than one thread across cores; measured and built
+since, as D46); an exporter in Rust,
 which would take Python out of the image build and out of the fine-tuning loop; pinned versions for what the
 export script installs.
 
@@ -1760,7 +1765,7 @@ in-process run at 256 callers the model embedded 7,859 texts for 7,565 answers i
 nothing moved (the README's table was run again: 2,448 edits a second at 64 callers against 2,435 before).
 
 **What it does not do: anything about the store.** All of this decides who gets the model. Against Qdrant in
-Docker on the same laptop the store is the limit, about 1,500 edits a second whatever the number of callers,
+Docker on the same machine the store is the limit, about 1,500 edits a second whatever the number of callers,
 with a median of 64 ms at 128 callers and no deadline at all. At a 50 ms deadline 209 of 10,000 edits were
 answered in time at 128 callers and 80 at 256 (before: 41 and 68). The requests were embedded promptly and
 then waited on the store, where nothing limits how many do or says who goes first. Their writes were finished
@@ -1815,7 +1820,8 @@ way gets its error, the write lands, the line is logged, the retry is answered "
 server asked to stop waits for the write.
 
 **Not done:** a limit on writes in flight (above); an open-loop load test (D26 says why the closed one is not
-one); a count of abandoned and refused requests where an operator can see it, which is a metric (proposal 26);
+one); a count of abandoned and refused requests where an operator can see it, which is a metric (proposal 26; built
+since, D39);
 deadlines on the store's own calls beyond `qdrant.timeout_ms`.
 
 ## D39. A few metrics about the process, as OpenTelemetry, and nothing about a record in them
@@ -1956,7 +1962,7 @@ from then on, and the traces of the ones it missed were lost. In the tests a req
 served over a real connection and a collector that keeps what it is sent holds six spans in the caller's
 trace, each wait inside the call that made it, and none for the health check that came first.
 
-**What the first version showed, on the development laptop** (the README has the table):
+**What the first version showed, on the development machine** (the README has the table):
 
 - Alone, a request is the forward pass: 1.45 of 1.48 ms for an edit. Tokenizing is 1 to 3% of a pass.
 - With company it is the wait for the model: 10 of 25 ms for an edit at 64 callers, 117 of 154 for a create.
@@ -2055,8 +2061,8 @@ still keeps its brand under `tenant`, one that does not say which record it is).
 audit exists to report, so none of them ends a scan. An unreadable point names a record only if it sits where
 that record is kept: anything can be written into a payload, and taking a stray point for the record it names
 would report a readable record as unreadable. Vectors are left out because two composites are most of a
-record's size and no part of the comparison. Feature 25 (a backup of the anchors) will need them and will have
-to add them to the scan.
+record's size and no part of the comparison. Feature 25 (a backup of the anchors) needed them and added them: a scan reads an
+anchor when it is asked to (`Read::Anchor`, D43), and never a current composite.
 
 **A scan is not a snapshot, and the contract says what it promises anyway.** Qdrant's scroll reads each page
 when it is asked for, in the order of the point ids. So: a record nobody writes during the scan is listed
@@ -2117,7 +2123,7 @@ count in either comes from one `Summary`. Lines carry ids and brands (the owner 
 on 2026-11-11) and never a record's text or a fingerprint of it. The names and codes are an interface from
 here on. An audit is not recorded as a run (D23): its arguments can hold the Qdrant API key.
 
-**Measured,** on a laptop CPU with Qdrant in Docker on the same machine: a collection of 100,000 synthetic
+**Measured,** on the Mac mini with Qdrant in Docker on the same machine: a collection of 100,000 synthetic
 records, four text fields and two quantities each, audited against its export in 1.8 seconds (three runs: 2.7,
 1.8, 1.8), with the store listed at 1,000 points a page. The process peaked at 490 MB against 300 MB for the
 same audit with a one-line export, so holding the export costs about 2 KB a record. Where that goes was not
@@ -2222,7 +2228,7 @@ answer so that nothing waits on them:
    a loss, as it is meant to be, that is the point of it. Run against a collection that was never lost, it
    would undo a delete-and-create that somebody may have meant.
 
-**Measured,** on a laptop CPU with Qdrant in Docker on the same machine, on a collection of 100,000 synthetic
+**Measured,** on the Mac mini with Qdrant in Docker on the same machine, on a collection of 100,000 synthetic
 records with anchors of 1,024 components: the export took 2.5 seconds at 1,000 records a page (4.0 at 200, 2.6
 at 5,000) and wrote 600 MB, about 6 KB a record; `anchors check` read that file in half a second; and a restore
 that found every anchor already in place, which is one read of each record, took 20 seconds.
@@ -2277,7 +2283,7 @@ the digest is what tells whoever sent the signal that every replica took it.
 ## D45. ONNX Runtime's threads spin, and how many there are is a setting of the machine
 
 Asked how to make the server faster, the first candidate was quantizing the model to 8-bit integers. It was
-measured first, on a copy of the model and in Python's ONNX Runtime 1.32 on the README's laptop (an M4 Pro, 8
+measured first, on a copy of the model and in Python's ONNX Runtime 1.32 on the README's machine (an M4 Pro Mac mini, 8
 fast cores and 4 slow ones), and it is not worth having there: one short field went from 0.82 to 0.56 ms, while
 a description (2.09 to 2.02 ms) and a batch of 32 texts (27.1 to 25.4 ms), which are most of the work, hardly
 moved. Per-channel quantization kept every vector within a cosine of 0.9974 of the original and per-tensor
@@ -2294,7 +2300,7 @@ for spinning, and ran exactly as it does with spinning turned off. The `ort` cra
 spinning is on by default; whatever the reason, this build did not behave so, and the call that turns it on is
 what made the difference measured below.
 
-**Spinning is on, always.** Measured with `just throughput` and `just load`, same laptop, release build,
+**Spinning is on, always.** Measured with `just throughput` and `just load`, same machine, release build,
 default model, the number of threads left to ONNX Runtime:
 
 | | Before | Spinning |
@@ -2344,7 +2350,7 @@ other. Sessions side by side keep more cores working. It was measured first, the
 the server.
 
 **What the model alone does.** A probe ran k sessions of t threads each, every one embedding the same batch over
-and over, on the README's laptop (M4 Pro, 8 fast cores and 4 slow ones), release build, default model. Texts a
+and over, on the README's machine (M4 Pro, 8 fast cores and 4 slow ones), release build, default model. Texts a
 second, all sessions together:
 
 | Records a pass | 1 session, ONNX Runtime's count | 2 × 4 threads | 4 × 2 | 8 × 1 |
@@ -2370,7 +2376,7 @@ refuses nobody. With one session the rule is what it was.
 ONNX Runtime, every session would take every core. Neither setting changes a vector, so neither is in the
 fingerprint, the layout id, or the judging digest (D44). The worker is alive (D37) while any session's thread is.
 
-**Measured through the server.** `just load`, same laptop with a browser and a terminal open (which is why the
+**Measured through the server.** `just load`, same machine with a browser and a terminal open (which is why the
 one-session figures are below the README's: everything here was run side by side under the same conditions, and
 the ratios are the result, not the numbers), 1,000 records a level, two runs of each alternating:
 

@@ -183,7 +183,7 @@ record-similarity load [--config config.toml]
 `queue_depth` and `batch_size`, builds an `Engine` over a `MemoryStore` (or a `QdrantStore` when
 `--qdrant-collection` is given), binds `127.0.0.1:0`, and serves with `similarity_server::serve` on the same
 runtime. Client and server then share the machine, as they do when a person runs `just serve` and a client on one
-laptop; the client's share is a few microseconds per request beside milliseconds of model time. With `--server`
+machine; the client's share is a few microseconds per request beside milliseconds of model time. With `--server`
 it reports only what a client can see, and the worker fields are left out of the events, not written as zero
 (D15). Qdrant is never used without a collection named on the command line, so a load test cannot write into the
 configured production collection by default.
@@ -358,7 +358,7 @@ Not tested: the absolute numbers. Wall time is too noisy to assert (see decision
 
 ## Which command yields which figure
 
-All on the README's machine (Apple-silicon laptop CPU, release build, default model), every figure read from the
+All on the README's machine (an M4 Pro Mac mini, release build, default model), every figure read from the
 `load_phase` lines with `jq`. Nothing is quoted that one of these did not print.
 
 | Figure | Command |
@@ -438,6 +438,6 @@ change.
 ## Size
 
 **Medium**, a few days. The worker counters and the log field are a day between them; the load module (catalog,
-closed loop, statistics, events) and its tests are two; measuring on the laptop and against Qdrant, and writing
+closed loop, statistics, events) and its tests are two; measuring on the development machine and against Qdrant, and writing
 the README and D22 to match, is most of another. It would be small without the in-process target, but without it
 batch sizes, the one thing a client cannot see, could not be reported.

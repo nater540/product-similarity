@@ -100,7 +100,7 @@ changing a design. Infer conventions from the existing code first.
   holds; it may only give the anchor the first value of a field it has never had (D8). Fields present on one side
   only stay out of the score, except a `Restored` field, which is scored against the anchor. Do not "simplify"
   that away: it is what stops a field being swapped by blanking it and filling it in again.
-- **The words are the user's company's** (D36). A record's brand is its `brand_id` (never `tenant`, never
+- **The words are the owner's company's** (D36). A record's brand is its `brand_id` (never `tenant`, never
   `owner`): the key of the brand that owns it, in the API, the store, the files, and the events. `brand` alone is
   the scored text field that holds the brand's name. What `Match` is given is a *menu item* (`menu_item`,
   `menu_items` in group files), never a "listing": where the owner works, a listing is a dispensary. A product
@@ -207,7 +207,7 @@ changing a design. Infer conventions from the existing code first.
   function behind a wire (D33) and takes the same rule: do not add a mode that replaces, and do not let one bad
   record end a stream. A record that is already stored must not be embedded; the early look for it is outside
   the lock and is only a saving, and whether a record is created is still decided under the lock.
-- **A stream shares the one embedding thread, a small batch at a time** (D33). `server.import_batch_records`
+- **A stream shares the model with every other request, a small batch at a time** (D33). `server.import_batch_records`
   trades a stream's speed against how long every other request waits; the README's table was measured with
   `just load`. Do not make the stream wait for a batch to fill, and do not buffer more than one batch on either
   side of the loop in `import_stream.rs`: back-pressure on the sender is the transport's job.
@@ -216,7 +216,7 @@ changing a design. Infer conventions from the existing code first.
   its indexes). Do not give it a repair mode or a write path: a record the store lacks is created by `import`,
   and replacing a baseline is a forced write that is the caller's to decide. Keep `Scan` a trait of its own and
   not a method of `VectorStore`: the engine never scans. A scan lists every point whatever its layout, names
-  what it cannot read instead of failing, and reads no vector; a store's `scan` must pass the `scanning` half of
+  what it cannot read instead of failing, and reads no vector but an anchor it is asked for (D43); a store's `scan` must pass the `scanning` half of
   the contract test. A record is `not_stored` only once the whole store has been listed: never conclude anything
   from part of a scan. What a valid line of an export is lives in `import::prepared`, for `import --check` and
   the audit alike, and the line compared is the first one an import would have taken. Text is compared by
@@ -261,7 +261,7 @@ changing a design. Infer conventions from the existing code first.
   comparing models with `calibrate`, check the logged `dimension=` to confirm each ran at the width you meant.
 - **Every command and number in `README.md` was run and measured.** Keep it that way: re-run an example before
   editing it, and never quote a figure that was not produced by `just throughput`, `just load`, or `just calibrate`.
-- **Rust first, by the owner's choice** (D13, revised 2026-11-12): serving, training, and evaluation are Rust,
+- **Rust first, by the owner's choice** (D13, revised 2026-11-12 in D34): serving, training, and evaluation are Rust,
   and nothing at run time may need Python. Python is allowed where it is the best tool for a job, and not as a
   default: say why in the change. `tools/golden.py` and `tools/train_golden.py` write PyTorch fixtures for the
   parity tests; `tools/export_onnx.py` converts a model directory for the ONNX engine; `tools/demo.py` is a
@@ -274,7 +274,8 @@ changing a design. Infer conventions from the existing code first.
   let the exported file be used unchecked: the loader compares it with the directory's weights in Burn at every
   load and refuses a graph that differs, because the file goes stale silently when the weights change. Never put
   the engine into the fingerprint or the layout id: the vectors are the same, and that is what the check is for.
-  `ort` stays a feature of `similarity-core` that the server always enables and the trainer never does, pinned
+  `onnx` stays a feature of `similarity-core` (the `ort` crate is behind it) that the server always enables and the
+  trainer never does, with `ort` pinned
   exactly. Its threads spin, always, and `model.threads` (left out by default) says how many there are (D45):
   neither changes a vector, so neither goes into the fingerprint, the layout id, or the judging digest. The tests
   stay on Burn, the reference: the tiny encoders, and the real-model tests, which load with

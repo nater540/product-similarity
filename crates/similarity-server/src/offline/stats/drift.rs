@@ -272,7 +272,7 @@ fn rate(histories: &[&Replayed], is_error: impl Fn(&Replayed) -> bool, seed: u64
     cluster.0 = cluster.0.saturating_add(usize::from(is_error(replayed)));
     cluster.1 = cluster.1.saturating_add(1);
   }
-  // Histories of one brand are not independent, so the brands are what is resampled (D17). Without an brand on
+  // Histories of one brand are not independent, so the brands are what is resampled (D17). Without a brand on
   // every history, or with only one brand, there is nothing to resample.
   let interval: Option<Interval> = (every_one_owned && clusters.len() > 1)
     .then(|| bootstrap(&clusters.into_values().collect::<Vec<_>>(), seed))
@@ -916,7 +916,7 @@ mod tests {
       "{interval:?}"
     );
 
-    // One history without an brand, and there is nothing sound to resample.
+    // One history without a brand, and there is nothing sound to resample.
     assert_eq!(
       blocked(&blocked_run([Some("b1"), Some("b2"), None]), 0)
         .by_policy

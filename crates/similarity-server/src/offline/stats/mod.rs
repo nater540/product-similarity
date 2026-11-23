@@ -359,7 +359,7 @@ pub struct Rate {
   pub of: usize,
   /// `errors / of`, or `None` when there were no chances.
   pub rate: Option<f64>,
-  /// How much that rate moves when the brands are resampled. `None` when the pairs do not all name an brand, or
+  /// How much that rate moves when the brands are resampled. `None` when the pairs do not all name a brand, or
   /// name only one.
   pub interval: Option<Interval>,
 }
@@ -833,7 +833,7 @@ mod tests {
       .collect();
     assert_eq!(brands, ["b1", "b2"]);
 
-    // Every pair has a category and an brand here, so those attributes' slices cover the whole.
+    // Every pair has a category and a brand here, so those attributes' slices cover the whole.
     for by in ["category", "brand_id", "label_source"] {
       let total: usize = slices
         .iter()
@@ -953,7 +953,7 @@ mod tests {
     ]);
     assert_eq!(error_rates(&partly, 0).brands, None);
 
-    // An unlabeled pair without an brand is not in the way: it is not resampled.
+    // An unlabeled pair without a brand is not in the way: it is not resampled.
     let unsure = scored_as(Label::Edit, 0.5, true, |pair| {
       pair.label = None;
       pair.label_text = "unsure".to_owned();

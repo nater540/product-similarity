@@ -148,7 +148,7 @@ quantity  weight_per_item     x1.00  Unchanged (g to g)
 Every field and every quantity `Unchanged`, overall 1.000, revision 1. **Anything else means the import and the
 application build the record differently**, and has to be understood before the rest is loaded: a field that
 shows `Modified`, a quantity that shows `Added`, `Removed`, or `Incomparable`, or an error saying the record
-`belongs to brand_id ...`. The `drift` line is the one that may be below 1.000, for a product loaded with an
+`belongs to brand ...`. The `drift` line is the one that may be below 1.000, for a product loaded with an
 `anchor`: it is how far the product has already moved from its first version.
 
 ## Load the catalog
@@ -188,9 +188,10 @@ is not an export line at all (a misspelled top-level key) stops the client befor
 client can make the same call (`Import(stream ImportRequest) returns (stream ImportResponse)`, in
 `similarity.proto`).
 
-- **A stream shares the server's one model with everyone else.** While it runs, a save by anyone else waits behind
-  it. On a 12-core development machine a stream created about 400 products a second, and an ordinary edit took a
-  median of 18 ms beside it where it takes 2 ms alone. Those are that machine's numbers; time the first thousand
+- **A stream shares the server's model with everyone else.** While it runs, a save by anyone else waits behind
+  it (with one model session, which is the default). On a 12-core development machine, on an earlier and slower
+  build, a stream created about 400 products a second, and an ordinary edit took a median of 18 ms beside it where
+  it took 2 ms alone. Those are that machine's numbers; time the first thousand
   here and tell me what you see. If the service is already taking edits, load outside editing hours, or ask me
   about lowering `server.import_batch_records`.
 - A product that fails does not stop the stream. One that is already stored is left alone and counted.

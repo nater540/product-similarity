@@ -867,7 +867,7 @@ Not features, but found while preparing this list:
   been replaced by a measured figure for the bulk import (2,000 four-field records in 19 seconds). Throughput
   through the gRPC queue is still unmeasured, and feature 12 would measure it.
 - **The store is a queue too, and nothing manages it** (measured 2026-11-12, building feature 22). Qdrant in
-  Docker on the development laptop takes about 1,500 edits a second, and the model 2,450, so against it the
+  Docker on the development machine takes about 1,500 edits a second, and the model 2,450, so against it the
   store is what a server runs out of. Everything feature 22 does decides who gets the model. Past the store's
   capacity, requests are embedded promptly and then wait on their writes until their callers give up: at a
   50 ms deadline, 209 of 10,000 edits were answered in time at 128 callers. The writes are finished and logged,

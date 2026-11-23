@@ -51,7 +51,7 @@ Read `CLAUDE.md` first (conventions, invariants, commands), then this file. `REA
 
 The owner's decisions and facts. Treat them as settled:
 
-- **First use is brand products, not retailers' menu items.** The brand is the brand that owns the product.
+- **First use is brand products, not retailers' menu items.** The `brand_id` is the brand that owns the product.
 - **`brand` on the record is a numeric foreign key.** The caller sends the brand's *name* as the `brand` text
   field. The field is kept in the schema, although it is constant per brand, because a later use may match menu
   items to brand products.

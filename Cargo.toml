@@ -25,8 +25,8 @@ similarity-store = { path = "crates/similarity-store" }
 similarity-runs = { path = "crates/similarity-runs" }
 
 # Burn 0.22 has no default execution backend: `flex` is the pure-Rust CPU backend (it replaces the deprecated
-# `ndarray`) and is what production and every test runs on. `similarity-server` adds `metal` behind a cargo feature
-# for local development on Apple silicon. `default-features = false` drops the optimizer stack, so the server is an
+# `ndarray`) and is what training and every test runs on (ONNX Runtime computes the forward pass when serving, D34).
+# `similarity-train` adds `metal` behind a cargo feature. `default-features = false` drops the optimizer stack, so the server is an
 # inference-only build; `similarity-train` alone turns `autodiff` and `optim` back on (D13).
 burn = { version = "0.22.1", default-features = false, features = ["std", "flex", "simd", "rayon"] }
 # Safetensors import with PyTorch-layout adaptation. `memmap` keeps the load from copying the checkpoint twice.

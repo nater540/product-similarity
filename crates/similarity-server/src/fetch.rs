@@ -1,7 +1,7 @@
 //! Downloading a model directory from the Hugging Face Hub.
 //!
 //! The server itself only ever takes a path: it has no network code on its model-loading path and starts the same
-//! way in an air-gapped cluster as on a laptop. This module is the one place a URL appears, and it runs only when a
+//! way in an air-gapped cluster as on a desk. This module is the one place a URL appears, and it runs only when a
 //! human or an image build asks for it (`record-similarity model fetch`).
 //!
 //! Downloads are pinned to an immutable revision (a commit hash, never `main`), and for the default model every

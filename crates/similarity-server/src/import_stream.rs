@@ -7,8 +7,8 @@
 //! **A stream is batched by its own backlog, in small batches.** The first record waiting is taken with however
 //! many more are already there, up to the engine's `import_batch` (`server.import_batch_records`, 8 by default).
 //! A caller that sends one record at a time gets each answered as it arrives; one that sends as fast as it can
-//! gets full batches. The batches are small on purpose: the server has one embedding thread (D9), and a batch is
-//! one job on it, during which somebody's save has to wait. Eight records of four fields are about one forward
+//! gets full batches. The batches are small on purpose: the server has one embedding thread unless `model.sessions` says more (D9,
+//! D46), and a batch is one job on one of them, during which somebody's save has to wait. Eight records of four fields are about one forward
 //! pass, and that is the trade the setting makes: larger batches load a catalog faster and make every other
 //! request wait longer.
 //!

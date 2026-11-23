@@ -67,20 +67,25 @@ reason's code, what it is about if it is about one field, and the number against
 - [Development](#development)
 - [Troubleshooting](#troubleshooting)
 - [Limitations](#limitations)
+- [Acknowledgments](#acknowledgments)
 
 ## Status
 
 Working end to end and tested at every layer, including a full-stack test against a real Qdrant with the real model.
-Four things stand between this and enforcing on production traffic:
+Three things stand between this and enforcing on production traffic:
 
 1. **Thresholds are calibrated on synthetic data.** `data/calibration.sample.jsonl` holds 46 pairs written for this
    repository. Collect labeled edits from production (`docs/data-request-prompt.md` describes exactly what to
-   collect), run `calibrate` on them, and set the thresholds from that. Start in `DRY_RUN`.
+   collect), run `calibrate` on them, and set the thresholds from that. Start in `DRY_RUN`. The drift threshold
+   (`anchor_threshold = 0.85`) is a starting point and was not measured on anything
+   ([The drift threshold](#the-drift-threshold)).
 2. **The choice of model is a prior, not a measured win.** On the synthetic pairs the default model and
    `all-MiniLM-L6-v2` are close. Real pairs should decide ([Using a different model](#using-a-different-model)).
 3. **No quantity limit has been measured.** Quantities are compared and reported in every response, and reject
    nothing until a limit is configured. Where a limit belongs has to be read from the same labeled edits.
-4. **Per-record locking is per process.** See [Limitations](#limitations).
+
+Replicas share a store safely, since every write is conditional on what was read (D35), once all of them run a
+version that writes that way. That and what the service does not do are under [Limitations](#limitations).
 
 ## Dependencies
 
@@ -104,7 +109,7 @@ Optional, by task:
 | `grpcurl` | Calling the server from a shell. | `brew install grpcurl` |
 | `jq` | Reading NDJSON logs and results at a terminal. | `brew install jq` |
 
-Disk and hardware: the model is about 100 MB, and Rust build artifacts for this workspace run to several gigabytes.
+Disk and hardware: the model is about 100 MB to download and 176 MB on disk once exported, and Rust build artifacts for this workspace run to several gigabytes.
 No GPU is needed to serve. Fine-tuning on long texts is much faster with one
 ([Fine-tuning the model](#fine-tuning-the-model)). The first release build takes a few minutes; Burn is a large
 dependency, and the build downloads ONNX Runtime's library once.
@@ -191,7 +196,7 @@ starts. The steps, in order:
 9. A retailer's menu item with no id, matched to the catalog.
 10. The nearest neighbors of a stored product.
 
-Two of them, from a run against the server above on the laptop that [Performance](#performance) describes:
+Two of them, from a run against the server above on the machine that [Performance](#performance) describes:
 
 ```text
 2. Loading a catalog
@@ -250,6 +255,9 @@ The binary is `record-similarity` (`target/release/record-similarity` after `jus
 | `record-similarity calibrate-diff OLD.ndjson (NEW.ndjson \| --config-b CONFIG) [--fail-on WHAT]` | Compares two calibrations, or one under a second configuration. See [Comparing two calibrations](#comparing-two-calibrations). |
 | `record-similarity calibrate-drift [--config config.toml] HISTORIES.jsonl [--ndjson]` | Replays whole edit histories and reports how far products drift. See [The drift threshold](#the-drift-threshold). |
 | `record-similarity calibrate-sweep SELECT.ndjson --grid GRID.toml [--config config.toml] [--evaluate OTHER.ndjson]` | Judges one recorded calibration under a grid of weights, floors, and limits. See [Trying many configurations at once](#trying-many-configurations-at-once). |
+| `record-similarity calibrate-match [--config config.toml] GROUPS.jsonl [--catalog EXPORT.jsonl] [--split S] [--depth N] [--ndjson]` | Scores menu items against the products they describe, and shows what a match threshold would do. See [A match threshold](#a-match-threshold). |
+| `record-similarity shadow-report EVENTS.ndjson [--shadow NAME] [--ids FILE] [--ndjson]` | Reads a shadowed server's stdout and reports where the candidate policy disagrees. See [A candidate policy in the shadow](#a-candidate-policy-in-the-shadow). |
+| `record-similarity model promote [--config candidate.toml] --calibration HOLDOUT.ndjson [--baseline OTHER.ndjson] [--fail-on WHAT] [--override REASON]`, `model list`, `model register DIR`, `model retire DIGEST --reason TEXT` | Puts a model into service through the gate, and keeps the record of which model was. See [Promote it](#5-promote-it). |
 | `record-similarity runs list [--runs DIR] [--kind KIND] [--limit N]` | Lists what was recorded: every calibration and every training run. See [Recorded runs](#recorded-runs). |
 | `record-similarity runs compare A B`, `runs report A [B ...] [--out report.html]` | Compares two recorded runs as text, or writes an HTML page for up to six. See [Recorded runs](#recorded-runs). |
 | `record-similarity pairs carve PAIRS.jsonl --fraction F [--from S] [--into S] [--salt TEXT]` | Gives a share of one split's brands a split of their own. See [Choose a model, then measure it once](#3-choose-a-model-then-measure-it-once). |
@@ -262,14 +270,15 @@ Environment variables:
 | `QDRANT_API_KEY` | The API key for a secured Qdrant or Qdrant Cloud. Never read from the config file. |
 | `RUST_LOG` | Log filter, `info` by default. `RUST_LOG=warn` quiets the per-request lines; `RUST_LOG=debug` adds detail. |
 | `RECORD_SIMILARITY_RUNS` | Where runs are recorded, `runs` by default. The same as `--runs` on `calibrate`, `runs list`, and the trainer. |
+| `RECORD_SIMILARITY_REGISTRY` | Where the record of promoted models is kept, `models/registry.ndjson` by default. The same as `--registry` on the `model` commands. |
 
 **Logs are NDJSON.** Both binaries log one JSON object per line on stderr and nothing else: there is no text
 format to switch to. Each line has `timestamp`, `level`, `message`, and `target`, with the event's own fields
 beside them:
 
 ```json
-{"timestamp":"2026-11-11T05:52:42.870451Z","level":"INFO","message":"serving gRPC","address":"127.0.0.1:50051","target":"record_similarity"}
-{"timestamp":"2026-11-11T05:52:43.254934Z","level":"INFO","message":"evaluate","id":"sku-1","verdict":"Created","stored":true,"revision":1,"measure_changed":false,"target":"similarity_server::grpc"}
+{"timestamp":"2026-11-22T23:44:38.304509Z","level":"INFO","message":"serving gRPC","address":"127.0.0.1:50051","judging_digest":"7f0f0943d564b1b1","target":"record_similarity"}
+{"timestamp":"2026-11-22T23:44:38.985807Z","level":"INFO","message":"evaluate","id":"sku-1","verdict":"Created","stored":true,"revision":1,"measure_changed":false,"elapsed_ms":8.87,"target":"similarity_server::grpc"}
 ```
 
 A command that fails ends with a `failed` line at level `ERROR` carrying the reason in `error`, and a crash is
@@ -307,6 +316,9 @@ The API is defined, with full documentation of every field, in
 | `Delete` | Forgets a record. |
 | `Describe` | Reports the model fingerprint, schema, and thresholds in force, and one digest of them all ([Replicas that judge alike](#replicas-that-judge-alike)). |
 
+A second service in the same package, `Quantities`, converts and compares amounts with no record at all:
+[Quantities on their own](#quantities-on-their-own).
+
 A record is an optional `id`, an optional `brand_id`, a map of field name to text, and a map of quantity name to
 quantity. The names must be ones the server's schema defines; `Describe` lists both kinds.
 
@@ -316,9 +328,6 @@ range of which only one end is known. `unit` is free text: mass (`mcg`, `mg`, `g
 `1000 mg` are the same quantity. Any other unit is accepted and is comparable only with itself. Values must be
 finite, not negative, and `min` not above `max`. A quantity is never sent as text in `fields`, and a quantity the
 record does not have is left out. [Mapping your records](#mapping-your-records) shows where each column goes.
-A second service in the same package, `Quantities`, converts and compares amounts with no record at all:
-[Quantities on their own](#quantities-on-their-own).
-
 
 **Brands.** Once a record is stored under a brand, every later `Evaluate` or `Delete` for its id must name the
 same brand. A request naming another brand, or none, gets `FAILED_PRECONDITION`. A record stored without a
@@ -338,6 +347,9 @@ just client similar <id> [--limit N]
 just client import <export.jsonl>
 just client match <menu-item.json> [--brand-id T] [--limit N] [--threshold S]
 just client delete <id> [--brand-id T]
+just client quantities <before.json> <after.json> [--original <first.json>]
+just client convert <value> <unit> [--to <unit>]
+just client units
 just client --server http://other-host:50051 describe
 ```
 
@@ -347,9 +359,6 @@ just client --server http://other-host:50051 describe
 
 ```json
 {
-just client quantities <before.json> <after.json> [--original <first.json>]
-just client convert <value> <unit> [--to <unit>]
-just client units
   "name": "Sour Diesel Vape Cartridge 1g",
   "category": "Vape Pens > Cartridges",
   "weight_per_item": {"value": 1, "unit": "g"},
@@ -505,8 +514,8 @@ where it is in the checkout.
 
 The top of the collection is one request for each call: `Describe`, an `Import` stream that creates two records
 and has a third refused, `Evaluate` (which creates a record), `FindSimilar` by id, `Match` with a threshold, and
-`Delete`. `Examples` holds the variations: five more kinds of `Evaluate` (an accepted update, a dry run, a rejected
-update, a forced update, and one that returns its vector), `FindSimilar` by text, and `Match` with and without a
+`Delete`. `Examples` holds the variations: six kinds of `Evaluate` (the creation again, an accepted update, a dry run, a
+rejected update, a forced update, and one that returns its vector), `FindSimilar` by text, and `Match` with and without a
 brand. Each request has a note saying what to expect.
 
 The notes describe one order on an empty server (`just serve-in-memory config.toml`), which is not the order
@@ -672,7 +681,7 @@ Nothing is written when an error is returned.
 **Deadlines and cancelled requests.** Set a deadline on every call. What becomes of a request whose caller has
 stopped waiting, because its deadline ran out or it hung up, depends on how far it had got:
 
-- **Waiting for the model:** it is passed over. The one embedding thread does not compute answers nobody is
+- **Waiting for the model:** it is passed over. An embedding thread does not compute answers nobody is
   waiting for, which matters most when the server is overloaded
   ([Past what a server can do](#past-what-a-server-can-do)).
 - **Reading, or being judged:** it is dropped, and leaves nothing behind.
@@ -693,7 +702,7 @@ answer: the server saying, before the deadline, that it will not make it.
 
 **Bootstrapping an existing catalog.** Export every record as one JSON object per line and load the file with
 `record-similarity import` ([Importing a catalog](#importing-a-catalog)). Every record that is not stored yet
-becomes a baseline. On a laptop CPU, 2,000 four-field records were imported in 5 seconds, so 50,000 take about two
+becomes a baseline. On an M4 Pro Mac mini, 2,000 four-field records were imported in 5 seconds, so 50,000 take about two
 minutes (measured before threads spun, D45, which made the model faster). A caller that cannot run a command next to
 Qdrant sends the same records over one [`Import` stream](#creating-records-over-a-stream), at about 480 records a
 second on that CPU, sharing the model with whoever else is calling. [`docs/import-prompt.md`](docs/import-prompt.md)
@@ -717,15 +726,6 @@ with what the service holds ([Auditing the store against the catalog](#auditing-
 **Rolling it out.** Run it in `DRY_RUN` on real traffic first and log the responses. That costs nothing, shows what
 would have been rejected, and produces exactly the data the next two sections need.
 
-### Mapping your records
-
-The service has two kinds of field: text, which is embedded, and quantities, which are compared as numbers. For a
-brand's product record, with the example configuration:
-
-| On the record | In the request | Notes |
-|---|---|---|
-| Brand foreign key | `brand_id`, as a string | The brand that owns the product. A product moving to another brand is then refused by the brand check. |
-| Brand name, looked up from the key | `fields["brand"]` | The same for every product of a brand, so it rarely moves a score. |
 ### Quantities on their own
 
 The package has a second service, `Quantities`, for a caller that has amounts and no record: another system that
@@ -778,6 +778,15 @@ An amount that is not a usable measurement (negative, not finite, a range that r
 health service, `recordsimilarity.v1.Quantities` ([Health and shutdown](#health-and-shutdown)). It needs neither
 the store nor the model, so it answers while the API is not ready.
 
+### Mapping your records
+
+The service has two kinds of field: text, which is embedded, and quantities, which are compared as numbers. For a
+brand's product record, with the example configuration:
+
+| On the record | In the request | Notes |
+|---|---|---|
+| Brand foreign key | `brand_id`, as a string | The brand that owns the product. A product moving to another brand is then refused by the brand check. |
+| Brand name, looked up from the key | `fields["brand"]` | The same for every product of a brand, so it rarely moves a score. |
 | Root and sub category, through the join | `fields["category"]`, for example `Edibles > Gummies` | See the two rules below. |
 | `name`, `description` | `fields["name"]`, `fields["description"]` | Sent as stored. Do not trim or clean them; the service normalizes whitespace itself. |
 | `weight_per_item_value` and `_unit` | `quantities["weight_per_item"]` | A single value: `min` and `max` both set to it. |
@@ -846,10 +855,11 @@ the call is `Import(stream ImportRequest) returns (stream ImportResponse)`.)
 - **Answers come in batches.** The server takes whatever has arrived, up to `server.import_batch_records` (8),
   imports it, and answers each record. A caller that sends one record and waits gets one answer; a caller that
   sends everything gets them eight at a time. There is no latency of a single record to speak of.
-- **A stream shares the one model with everyone else, and slows them down.** While a stream runs, any other
-  request waits for the stream's batch in front of it. Measured with one caller of `Evaluate` beside a stream
+- **A stream shares the model with everyone else, and slows them down.** With one session, the default, any
+  other request waits for the stream's batch in front of it while a stream runs; with several (`model.sessions`),
+  a stream holds one of them at a time. Measured with one caller of `Evaluate` beside a stream
   that never ran dry (`just load ... --server`, separate runs for each setting), on a build from before threads
-  spun (D45), when the model was slower:
+  spun (D45) and before a server could have more than one session (D46), when the model was slower:
 
   | `server.import_batch_records` | Stream, records per second | An edit's median, no stream | An edit's median, beside a stream | A create's median, beside a stream |
   |---|---|---|---|---|
@@ -1130,7 +1140,7 @@ left out: 0 pair(s) of another split, 1 labeled pair(s) below the confidence ask
 
 - **The intervals** are the middle 95% of each rate when the **brands** are resampled, 1,000 times, with all
   their pairs. Pairs from one brand are not independent of each other, so resampling pairs would make the
-  intervals too narrow, and narrower the more one brand contributed. They need every labeled pair to name an
+  intervals too narrow, and narrower the more one brand contributed. They need every labeled pair to name a
   brand and at least two brands, which is why the strict format has none. Zero errors give a zero-width
   interval, which says nothing about the pairs that were not sampled: with 45 pairs, treat it as no evidence.
 - **The `unsure` pairs** are the ones to look at by hand. Here all three same-brand variant changes score above
@@ -1160,7 +1170,7 @@ The events are flat: a pair is one `pair` line and then one line per field, quan
 its `pair_id`. One recycle from the sample, with the envelope fields removed:
 
 ```json
-{"message":"pair","pair_id":"p030","label":"recycle","split":"calibrate","brand_id":"brand-1","variant_change":"flavor","label_source":"moderator_revert","label_confidence":"high","category":"Edibles","note":"gummies become a different candy, same category and brand","similarity":0.808716,"accepted":false,"wrong":false,"measure_changed":false}
+{"message":"pair","pair_id":"p030","label":"recycle","split":"calibrate","brand_id":"brand-1","variant_change":"flavor","label_source":"moderator_revert","label_confidence":"high","category":"Edibles","note":"gummies become a different candy, same category and brand","similarity":0.808716,"accepted":false,"wrong":false,"measure_changed":false,"anchored":false}
 {"message":"pair_field","pair_id":"p030","field":"name","change":"modified","similarity":0.65489,"weight":4.0,"below_floor":true}
 {"message":"pair_quantity","pair_id":"p030","quantity":"thc_per_item","change":"modified","factor":2.0,"zero_crossing":false,"incomparable":false,"previous_unit":"mg","unit":"mg","beyond_limit":false}
 {"message":"pair_reason","pair_id":"p030","code":"field_below_floor","field":"name","value":0.65489,"limit":0.8}
@@ -1180,7 +1190,7 @@ its `pair_id`. One recycle from the sample, with the envelope fields removed:
 | `slice` | attribute and value | `by`, `value`, `edits`, `recycles`, `false_rejects`, `false_accepts`, `edits_low`, `edits_high`, `recycles_low`, `recycles_high` |
 | `operating_point` | target | `false_accept_target`, `threshold`, `false_accept_rate`, `false_reject_rate`, `false_reject_low`, `false_reject_high` |
 | `ignored_key` | key and reason | `key`, `reason`, `count` |
-| `summary` | run, last | `pairs`, `edits`, `recycles`, `unlabeled`, both error counts and rates with `_low` and `_high`, `brands`, `skipped_split`, `skipped_confidence` |
+| `summary` | run, last | `pairs`, `edits`, `recycles`, `unlabeled`, both error counts and rates with `_low` and `_high`, `auc`, `brands`, `skipped_split`, `skipped_confidence` |
 
 A value that does not apply is left out, never `null`. The reason codes are `below_threshold`,
 `field_below_floor`, `anchor_drift`, `quantity_beyond_factor`, `quantity_incomparable`, and `measure_changed`,
@@ -1330,7 +1340,8 @@ from it.)
   value, how often those agree, and how often only one side has one. Whether a size that differs should stop a
   match is a decision about the catalog, and this is the evidence for it.
 - `--depth` is the `limit` a caller would ask for (20). `--ndjson` writes the calibration as `match_calibration`,
-  `match_menu_item`, `match_field`, `match_quantity`, and `match_summary` lines, joined on `menu_item_id`, with no
+  `match_menu_item`, `match_field`, `match_quantity`, `match_quantity_summary`, `match_operating_point`, and
+  `match_summary` lines, joined on `menu_item_id`, with no
   menu item's text. With `matching.threshold` set, the report and the events also say what that threshold does:
   menu items whose own product is below it, menu items whose best other reaches it, and menu items matched to the
   wrong product.
@@ -1531,7 +1542,7 @@ to help rather than hurt, and it obliges you to re-index and re-calibrate.
 
 Training is Rust end to end. The `record-similarity-train` binary (crate `similarity-train`) trains the same Burn
 encoder the server runs, through the same tokenizer and the same weight files, and writes a model directory the
-server loads like any other. It is a separate binary so that the server stays an inference-only build (D13).
+server loads like any other once it has been exported (`just export-onnx`, step 4). It is a separate binary so that the server stays an inference-only build (D13).
 
 **What has and has not been tested:**
 
@@ -1571,7 +1582,7 @@ just finetune --base models/mdbr-leaf-mt --out models/mdbr-leaf-mt-ft \
   --pairs pairs.full.jsonl --catalog-groups catalog-groups.jsonl
 ```
 
-`just finetune` is `cargo run --release -p similarity-train --`. To train on a GPU, build that backend in and
+`just finetune` is `cargo run --release -q -p similarity-train --`. To train on a GPU, build that backend in and
 select it:
 
 ```sh
@@ -1623,9 +1634,9 @@ What it does:
 - The optimizer is AdamW with a linear warm-up and decay, and the encoder's own dropout (10%) is active. Dropout
   exists only inside the training pass; the server's forward pass has none to forget to turn off.
 
-When training ends it saves the model, loads it back the way the server does, and reports where edits and
-recycles sit before and after. This run trained on 47 pair and 15 catalog examples (synthetic) in 4 seconds on a
-laptop CPU; these are two of the lines it wrote to stdout, shortened:
+When training ends it saves the model, loads it back from disk, and reports where edits and
+recycles sit before and after. This run trained on 47 pair and 15 catalog examples (synthetic) in 4 seconds on an
+M4 Pro Mac mini; these are two of the lines it wrote to stdout, shortened:
 
 ```json
 {"message":"separation","split":"held_out","stage":"before","compared_with":"base model","width":256,"edits":5,"edits_mean":0.9629,"recycles":8,"recycles_mean":0.6444,"gap_of_means":0.3185}
@@ -1701,7 +1712,7 @@ is two running averages for every weight. Some things worth knowing:
   configuration files from there.
 
 **How long it takes.** Each step encodes `2 x batch-size` texts and its cost follows their length. Measured on an
-Apple-silicon laptop with the default batch size of 32:
+M4 Pro Mac mini with the default batch size of 32:
 
 | Texts | CPU | Metal |
 |---|---|---|
@@ -1982,7 +1993,7 @@ Each line is the run's id, its kind, how it stands, how long it took, the model 
 fingerprint it scored with), and its first input.
 
 - **`events.ndjson` is the run's output, kept.** For training it has the `training` lines the loss curve is made
-  of, whatever `RUST_LOG` was: quietening stderr does not thin the record. For a calibration it has the events
+  of, whatever `RUST_LOG` was: quieting stderr does not thin the record. For a calibration it has the events
   `--ndjson` writes, with or without `--ndjson`, so any two calibrations can be compared later:
   `just calibrate-diff runs/<one>/events.ndjson runs/<other>/events.ndjson`.
 - **A run that was killed says so.** A manifest is written as `running` and rewritten when the run ends. A
@@ -2104,8 +2115,8 @@ commented starting point.
 | `model.batch_size` | `32` | The most texts in one forward pass. |
 | `model.queue_depth` | `256` | Requests that may wait for the encoder before new ones get `RESOURCE_EXHAUSTED`. A request whose caller has gone no longer counts. |
 | `model.threads` | none (ONNX Runtime chooses) | How many threads one forward pass is spread across. Leaving it out was as fast as any number tried on the machine the [Performance](#performance) figures come from; set it where ONNX Runtime counts more cores than the server may use, and measure with `just load`. With `model.sessions`, the threads of each session. Changes no vector, no fingerprint, and no verdict. |
-| `model.sessions` | `1` | How many forward passes run at once, each in a session of the model of its own; more than one needs `model.threads`. On the laptop, several served up to 1.6 times the edits and over twice the creates under load, answered a request alone a third slower or more, and served an `Import` stream more slowly (D46). Measure with `just load`. Changes no vector, no fingerprint, and no verdict. |
-| `model.expected_fingerprint` | none | The fingerprint of the model the thresholds were measured with, as on the `model` line of `calibrate`. With it, `serve` and `import` refuse to run with any other model, and `compare` and the `calibrate` commands warn. Without it nothing is checked, and `serve` and `import` say so once. |
+| `model.sessions` | `1` | How many forward passes run at once, each in a session of the model of its own; more than one needs `model.threads`. On the Mac mini the [Performance](#performance) figures come from, several served up to 1.6 times the edits and over twice the creates under load, answered a request alone a third slower or more, and served an `Import` stream more slowly (D46). Measure with `just load`. Changes no vector, no fingerprint, and no verdict. |
+| `model.expected_fingerprint` | none | The fingerprint of the model the thresholds were measured with, as on the `model` line of `calibrate`. With it, `serve`, `import`, `audit`, and `anchors export` and `restore` refuse to run with any other model, and `compare`, `load`, and the `calibrate` commands warn. Without it nothing is checked, and `serve` and `import` say so once. |
 | `qdrant.url` | `http://localhost:6334` | Qdrant's gRPC endpoint (6334, not the REST port 6333). |
 | `qdrant.collection` | `records` | The collection. Created if missing. |
 | `qdrant.timeout_ms` | `5000` | Deadline for one Qdrant request. |
@@ -2305,7 +2316,7 @@ What it does, and what it will not do:
   zero into a non-zero exit status, which is what a nightly job wants. A store that cannot be listed to its end
   ends the audit with an error and no report, because every record on a page that was not read would have been
   called missing.
-- **The export is held in memory while the store is listed.** On a laptop CPU, with Qdrant in Docker on the same
+- **The export is held in memory while the store is listed.** On an M4 Pro Mac mini, with Qdrant in Docker on the same
   machine, a collection of 100,000 synthetic records (four text fields and two quantities each) was audited
   against its export in 1.8 seconds. The process peaked at 490 MB, against 300 MB for the same audit with an
   export of one line (most of that is the model), so the export costs about 2 KB a record for as long as the
@@ -2413,7 +2424,7 @@ What it does, and what it will not do:
   the [audit](#auditing-the-store-against-the-catalog) says which. An import brings the baselines up to today
   and has no anchors, which is what this file is for.
 
-On a laptop CPU, with Qdrant in Docker on the same machine, the anchors of 100,000 synthetic records were
+On an M4 Pro Mac mini, with Qdrant in Docker on the same machine, the anchors of 100,000 synthetic records were
 exported in 2.5 seconds and the file was checked in half a second. A restore that found every anchor already in
 place, which is one read of each record, took 20 seconds.
 
@@ -2543,7 +2554,8 @@ several, and `--ndjson` writes the report as `shadow_report*` lines.
   what lets disagreements be counted by brand. The requests above named none, so their lines have no `brand_id`.
 - **It costs one more comparison of vectors already in memory**: no model and no store. Its lines are written
   the way log lines are, so stdout has to be read by something, as stderr already has to be. Against
-  this server with `just load ... --server`, one caller, 300 records: edits took a median of 5.63 ms with no
+  this server with `just load ... --server`, one caller, 300 records, when Burn still ran the model (before D34)
+  and an edit took five times what it does now: edits took a median of 5.63 ms with no
   shadow, 5.63 ms with this one, and 5.69 ms with `events = "all"`; resaves, which never reach the model,
   0.10 ms, 0.11 ms, and 0.11 ms. One run each, so differences of that size are noise. (`load` without
   `--server` starts a server of its own, which has no shadow.)
@@ -2691,7 +2703,7 @@ is `delete` with `lock` and two `store` spans; `FindSimilar` and `Match` are `fi
 `convert_quantity`, which carries whether there was a conversion; neither waits for anything.
 
 - **What a span says about a record** is its id, the mode asked for, the verdict, whether it was stored, and
-  its revision; for a `Match`, the decision. Never a record's text, its brand, or a score.
+  its revision; for a `Match`, the decision; for a `Delete`, whether a record was deleted. Never a record's text, its brand, or a score.
 - **The write is in the trace**, though it runs on a task of its own and finishes whether or not the caller
   waits ([Errors](#errors)).
 - **Health checks are not traced.** Something asks every few seconds, and a trace of each would bury the rest.
@@ -2751,7 +2763,8 @@ record_similarity_writes_unanswered_total 0
   where adding one is a name, a field, and a method).
 
 **A collector that cannot be reached costs the server nothing but the telemetry.** With the collector stopped,
-a load run went as fast as with it (972 edits a second with four callers, 971 without it), each failed send
+a load run went as fast as with it (972 edits a second with four callers, 971 without it, on a build from before
+threads spun, D45), each failed send
 was one `WARN` (`Export.Failed.Exhausted`) and one `ERROR` (`PeriodicReader.ExportError` or
 `BatchSpanProcessor.ExportError`) from the SDK, and the server took 0.92 seconds to stop where it otherwise
 takes 0.02. When the collector was started again the metrics arrived whole, since they are totals (364
@@ -2760,8 +2773,9 @@ The traces of the requests it missed were lost. Plain `http://` only: like the s
 connection is made without TLS.
 
 **What it costs.** Mean milliseconds for an `Evaluate` alone and answers a second with 64 callers, from
-`just load --server --concurrency 1,64 --records 2000` against a server on a store in memory, two servers and
-two runs of each (one server for the last row), same machine, with a collector to send to:
+`just load ... --server` with `--concurrency 1,64 --records 2000` against a server on a store in memory, two
+servers and two runs of each (one server for the last row), same machine, with a collector to send to, on a
+build from before threads spun (D45):
 
 | Telemetry | Edit alone | Resave alone | Edits/s at 64 | Resaves/s at 64 |
 |---|---|---|---|---|
@@ -2797,14 +2811,15 @@ Datadog Agent has not been tried.
 
 ### Capacity
 
-One thread runs the model, and the backend spreads each forward pass across the machine's cores, so a server scales
-with cores rather than with replicas' thread counts. Under load, requests waiting for the encoder are merged into
+By default one thread runs the model, and ONNX Runtime spreads each forward pass across the machine's cores, so a
+server scales with cores. `model.sessions` runs several passes at once, which serves more under load and answers a
+request alone more slowly (D46). Under load, requests waiting for the encoder are merged into
 one batch automatically. When more than `model.queue_depth` requests are waiting, new ones are refused immediately
 with `RESOURCE_EXHAUSTED` rather than queued past their deadline. Add replicas for more throughput. They share
 nothing but the store, and need nothing else: every write is conditional on the record still being the one that
 was judged, so two replicas handed two edits of one record at the same instant cannot both accept against the
 same baseline. One is written, and the other is judged again against it (D35). Against a local Qdrant that costs
-a write one more small read: about 0.2 ms on an edit of 3 ms.
+a write one more small read: about 0.2 ms on an edit of 3 ms, measured before threads spun (D45).
 
 ### Security
 
@@ -2817,7 +2832,7 @@ or a score.
 
 ## Performance
 
-Measured with `just throughput` on an Apple-silicon laptop CPU (12 cores), release build, default model. ONNX
+Measured with `just throughput` on an M4 Pro Mac mini (12 cores), release build, default model. ONNX
 Runtime is what every command runs the model with. Burn, which defines the model and is what each load is
 checked against, is beside it because the difference is why ([The ONNX engine](#the-onnx-engine)):
 
@@ -2835,7 +2850,7 @@ memory-mapped from disk. Run `just throughput` on your own hardware before sizin
 
 ### Under concurrent callers
 
-That table is the model alone. What a caller sees also depends on the queue in front of the one embedding thread
+That table is the model alone. What a caller sees also depends on the queue in front of the embedding thread (one, by default)
 and on how many requests share a forward pass. `just load` measures it: it starts a server in its own process on
 a store in memory, drives it through gRPC with synthetic records, and reports each phase at each number of
 concurrent callers.
@@ -2935,14 +2950,14 @@ machine:
 
 **A record's lock is now its own** (D41): made when the first request for the record arrives and forgotten
 when the last has left, so a request waits for the requests for its own record that came before it, and for
-nothing else. From the traces of two `just load --server` runs of 1,000 records at 64 callers on each build,
+nothing else. From the traces of two `just load ... --server` runs of 1,000 records at 64 callers on each build,
 the `lock` span of a create went from a mean of 19 and 21 ms to 0.002 ms, and of an edit from 3.1 and 3.6 ms
 to 0.002 ms; a fifth of the requests had waited, and now none did.
 
 What that bought is not a faster server. The model is the limit, and a request that no longer waits for a
 lock waits for the model instead. It bought an even one: the requests that drew a stranger's lock took twice
-as long as the rest, and now nobody does. Latency in milliseconds over `just load --server --concurrency 64
---records 2000`, six runs of each build, taken in turn on the same machine:
+as long as the rest, and now nobody does. Latency in milliseconds over `just load ... --server` with `--concurrency 64
+--records 2000`, six runs of each build, taken in turn on the same machine, both from before threads spun (D45):
 
 | Phase | Locks | Per second | Mean | Median | 90th | 99th | Slowest |
 |---|---|---|---|---|---|---|---|
@@ -3018,7 +3033,7 @@ expired was not stored. This is still a closed loop.
 
 **All of that is about a server that is short of the model.** When the store is what it is short of, none of
 it helps, because the queue is then in the store, where this server has no say over who goes first. Qdrant in
-Docker on the same laptop is such a store. With no deadline it takes about 1,500 edits a second however many
+Docker on the same machine is such a store. With no deadline it takes about 1,500 edits a second however many
 callers there are (1,497 with 16 callers at a median of 10 ms, 1,444 with 64 at 36 ms, 1,613 with 128 at
 64 ms), against the 2,450 the model could do on that build, from before threads spun (D45). At a 50 ms
 deadline, of 10,000 edits, one run each:
@@ -3078,13 +3093,13 @@ on 2026-11-12 (`docs/decisions.md`, D34, has both sets of measurements).
   every core would spend the share.
 - **One session, or several.** `model.sessions` runs that many forward passes at once, each in a session of
   `model.threads` threads. Under load they keep more cores working (1.6 times the edits a second at 64 callers
-  with eight sessions of one thread, on the laptop); a request alone is slower, the slowest requests under load
+  with eight sessions of one thread, on the Mac mini); a request alone is slower, the slowest requests under load
   are slower, and a stream, which uses one session at a time, is slower. One is the default (D46).
 - **In a container.** `just image` builds the server on Debian 13, because the prebuilt library is compiled
   against the C++ standard library of GCC 13 and does not link on Debian 12. It fetches the model, exports it in
   a build stage that has `uv` and PyTorch (the CPU builds), and copies only the model directory out of that
   stage: the image is 328 MB with no Python in it.
-- **On Linux it is slower than on macOS.** `load` inside that image (Linux on arm64, 12 cores, the same laptop,
+- **On Linux it is slower than on macOS.** `load` inside that image (Linux on arm64, 12 cores, the same Mac mini,
   300 records per level), on a build from before threads spun (D45), which has not been measured in the image:
 
   | Callers | Phase | Requests per second | Median |
@@ -3095,7 +3110,7 @@ on 2026-11-12 (`docs/decisions.md`, D34, has both sets of measurements).
   | 16 | edit | 803 | 19.4 ms |
   | 1 | stream | 169 | |
 
-  That was under half of what the same laptop did natively on macOS on the same build, whose ONNX Runtime
+  That was under half of what the same machine did natively on macOS on the same build, whose ONNX Runtime
   build has more behind it on that hardware. **Not measured: x86-64**, which is likely what you serve on and may
   differ again. Run `load` there before sizing anything.
 
@@ -3106,12 +3121,12 @@ just                 # list every recipe
 just test            # fast tests: no model, no network, no Qdrant
 just clippy          # zero warnings, pedantic lints included
 just fmt             # format
-just ci              # fmt-check, clippy, test, cargo-deny: what CI runs
+just ci              # fmt-check, clippy, test, cargo-deny. CI runs these, the real-model tests, and the Qdrant contract
 just test-qdrant     # the storage contract against a live Qdrant
 just test-parity     # Burn against PyTorch on the real model: the embeddings, then the training steps
 just test-onnx       # ONNX Runtime against PyTorch and against Burn on the real model (needs `just export-onnx`)
 just test-snapshot   # the curated hard cases against the pinned verdicts, and the README's quoted reports
-just test-real       # both of those, then the full stack through gRPC against Qdrant
+just test-real       # test-parity and test-snapshot, then the full stack through gRPC against Qdrant
 just snapshot        # rewrite the pinned verdicts after an intended change, printing what moved
 just throughput      # forward-pass latency on this machine
 just load            # latency and throughput through gRPC, at several numbers of concurrent callers
@@ -3137,11 +3152,11 @@ belongs in the commit message. The cases pin behavior, not correctness (several 
 threshold may be read from them: they were picked, not sampled.
 
 **Property tests.** `just test` includes tests that state a rule and let the machine look for an input that
-breaks it (the `properties` modules of `similarity-core` and `similarity-server`, on
+breaks it (the `properties` modules of `similarity-core`, `similarity-server`, and `similarity-runs`, on
 [proptest](https://proptest-rs.github.io/proptest/)). The largest drives the engine with random sequences of
 requests, in every write mode, and after each one checks that a rejected revision wrote nothing, that the anchor
 lost nothing it held, that the revision counter moved by exactly one write, and that no request touched a record
-it did not name. Each property runs 64 cases by default so that the suite stays fast;
+it did not name. Each property runs 64 cases by default (proptest's own 256 in `similarity-runs`) so that the suite stays fast;
 `PROPTEST_CASES=5000 just test` is the thorough run. A failure is shrunk to a small input and saved under the
 crate's `proptest-regressions/`, which is checked in, so the case is replayed first from then on.
 
@@ -3162,7 +3177,7 @@ just mutants-train -j 3    # the trainer's checkpoint rules, a set of its own; f
 The last full run tested 811 mutants in 40 minutes at three jobs: 663 were caught, 148 did not compile, none
 survived, and none had to be stopped by the tool's time limit. The trainer's set is 58 more, 39 caught and 19
 that did not compile.
-It is not part of `just ci`. Run it after changing the scoring, the quantity comparison, the engine's write
+It is not part of `just ci`. Run it after changing the scoring, the quantity comparison, the schema, the engine's write
 path, the calibration statistics, the match ranking, the promotion gate, the audit's comparison, or the file a
 backup of anchors is kept in.
 
@@ -3186,7 +3201,8 @@ crates/
   similarity-proto/     the .proto file and generated gRPC code
   similarity-core/      the encoder (Burn), tokenization, composite vectors, quantities, scoring, policy. No network, no async.
   similarity-store/     the VectorStore trait, the Scan trait (listing a store), an in-memory implementation, and the Qdrant one
-  similarity-server/    config, embedding worker thread, engine, gRPC service, import, audit, anchor backup, calibration, telemetry, and the `record-similarity` binary
+  similarity-runs/      the local record of runs: what was trained and calibrated here
+  similarity-server/    config, embedding worker threads, engine, gRPC service, import, audit, anchor backup, calibration, telemetry, and the `record-similarity` binary
   similarity-train/     fine-tuning: data, losses, the training loop, and the `record-similarity-train` binary
 data/
   calibration.sample.jsonl        synthetic labeled pairs, in the strict format
@@ -3201,7 +3217,9 @@ docs/
   data-request-prompt.md     a brief for collecting labeled production data
   import-prompt.md           a brief for loading the real catalog into a running service
   feature-suggestions.md     features that could be added, built and not, the last twelve about production
-  plan-features.md           a plan for the first five of them
+  plan-features.md           what was built from the first five of them, and what the review of the rest found
+  plan-quantity-fields.md    the plan quantities were built from (carried out)
+  plans/                     one plan for each of the other fifteen suggestions, built or not
 models/                 fetched and fine-tuned model directories (ignored by git)
 bruno/                  a Bruno collection: one request for each call, in an order that runs on an empty server
 tools/                  Python, where Python is the right tool, and never at run time
@@ -3282,7 +3300,7 @@ what that field says.
   ordinary one (D21). The whole text still decides whether a field counts as changed.
 - **No transport security or authentication** in the server itself.
 
-## Acknowledgements
+## Acknowledgments
 
 - [Burn](https://github.com/tracel-ai/burn) for the tensor and module framework.
 - [`MongoDB/mdbr-leaf-mt`](https://huggingface.co/MongoDB/mdbr-leaf-mt) (Apache-2.0), the default embedding model.

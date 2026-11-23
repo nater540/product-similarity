@@ -154,7 +154,7 @@ runs/                                  default root; --runs or RECORD_SIMILARITY
   "ended_at": 1762871353,
   "elapsed_s": 372.4,
   "build": {"tool": "record-similarity-train", "version": "0.1.0", "commit": "545ef20c1a2b", "dirty": false},
-  "host": {"name": "laptop", "os": "macos", "arch": "aarch64", "cpus": 12, "cpu": "Apple M3 Pro"},
+  "host": {"name": "mac-mini", "os": "macos", "arch": "aarch64", "cpus": 12, "cpu": "Apple M4 Pro"},
   "pid": 41237,
   "cwd": "/Users/someone/record-similarity",
   "argv": ["record-similarity-train", "--base", "models/mdbr-leaf-mt", "--out", "models/mdbr-leaf-mt-ft", "..."],
