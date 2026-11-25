@@ -3049,7 +3049,9 @@ checked against, is beside it because the difference is why ([The ONNX engine](#
 Model load is about 0.4 s: 0.2 s for Burn to read the weights, and the rest for ONNX Runtime to read its file and
 for the two to be checked against each other. A stored composite at the example settings is 1024 floats, so
 50,000 records are about 400 MB in Qdrant across the two vectors each record keeps, of which half is
-memory-mapped from disk. Run `just throughput` on your own hardware before sizing anything.
+memory-mapped from disk. Run `just throughput` on your own hardware before sizing anything: these are figures
+of this chip under macOS, where ONNX Runtime has instructions to use that a Linux server does not
+([The ONNX engine](#the-onnx-engine)).
 
 ### Under concurrent callers
 
@@ -3341,6 +3343,24 @@ So [ONNX Runtime](https://onnxruntime.ai) runs the forward pass, in every comman
 setting for it. Burn was the engine at first and for a day was the default beside this one; it stopped serving
 on 2026-11-12 (`docs/decisions.md`, D34, has both sets of measurements).
 
+It is not that C++ is faster than Rust. The gap was taken apart afterwards (D49, which has the figures; they
+are from probes that are not in this repository):
+
+- **Burn multiplies matrices with a crate that packs a layer's weights again at every call**, where ONNX
+  Runtime packs them once when the model is loaded, and whose kernels are plainer than the ones ONNX Runtime
+  carries for each processor. Candle, the other Rust framework tried, uses the same crate and is as slow.
+- **Burn 0.22 computes the model's activation function (GELU) one number at a time, on one thread.** That is
+  about half of a batch's time. The pre-release of the next Burn vectorizes it; this workspace is on 0.22.
+- **Burn uses threads less well.** It leaves a short field on one thread however many there are, and its
+  threads sleep between the steps of a pass where ONNX Runtime's spin.
+- **On this Mac, under macOS, ONNX Runtime also uses the M4's matrix instructions (SME2).** A Linux server does
+  not have them, on this machine or any other, so part of the first table's gap is the Mac's and not the
+  engine's.
+
+On Linux, and on the x86-64 desktop the engines were also run on, ONNX Runtime was still the fastest of the
+four tried. Tract, a third Rust engine, which reads the same exported file, came closest, and cannot yet take
+this model with texts of any length in one plan.
+
 - **Burn is still the definition of the model.** It reads the weights, it is what the fingerprint is made
   from, it trains, and the tests run on it. ONNX Runtime is a faster way to compute what it defines.
 - **The exported file is checked, every time a model is loaded.** `onnx/model.onnx` is a second copy of the
@@ -3400,9 +3420,13 @@ on 2026-11-12 (`docs/decisions.md`, D34, has both sets of measurements).
   | 16 | edit | 803 | 19.4 ms |
   | 1 | stream | 169 | |
 
-  That was under half of what the same machine did natively on macOS on the same build, whose ONNX Runtime
-  build has more behind it on that hardware. **Not measured: x86-64**, which is likely what you serve on and may
-  differ again. Run `load` there before sizing anything.
+  That was under half of what the same machine did natively on macOS on the same build. The difference is the
+  M4's matrix instructions (SME2), which ONNX Runtime uses under macOS and which a Linux guest on the same
+  machine is not shown: they make a description or a batch faster, and a short field no faster (D49). So a
+  figure in this README that was measured under macOS is not a Linux server's. **Not measured through the
+  server: x86-64**, which is likely what you serve on. The forward pass alone has been measured on one x86-64
+  desktop, where ONNX Runtime was the fastest engine tried and its own thread count was a good one (D49). Run
+  `load` there before sizing anything.
 
 ## Development
 
@@ -3509,7 +3533,7 @@ data/
   amounts.cases.jsonl             what each amount written as text is read as or refused for, synthetic
   examples/                  sample records for the client
 docs/
-  decisions.md               why things are the way they are (D1 to D48)
+  decisions.md               why things are the way they are (D1 to D49)
   data-request-prompt.md     a brief for collecting labeled production data
   import-prompt.md           a brief for loading the real catalog into a running service
   feature-suggestions.md     features that could be added, built and not, the last twelve about production

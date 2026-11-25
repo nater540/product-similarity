@@ -1471,7 +1471,10 @@ its memory, and one stack for training and serving, not its arithmetic.
 **What was tried, in the order of the owner's preference.** Pure Rust first. Candle was no faster than Burn.
 Tract was two to three times faster on one core, but could not analyse the exported graph with variable input
 sizes and needed a plan per size. Thread count was not the cause: Burn takes the same four milliseconds for a
-short field on one core as on twelve. Then ONNX Runtime through the `ort` crate, which the owner had taken for a
+short field on one core as on twelve. (That sentence is true of the setting and wrong as a conclusion: Burn
+never puts a short field on a second thread, and how the engines use threads is the largest part of the gap.
+What the gap is made of, and all four engines on Linux and on x86-64, were measured later: D49.) Then ONNX
+Runtime through the `ort` crate, which the owner had taken for a
 Rust port and accepted for its speed once told it is a binding to C++, on condition that the gRPC service stays
 a Rust binary. It does.
 
@@ -1584,11 +1587,14 @@ gRPC: one edit in 1.6 ms against 5.6 ms, and a ceiling of about 2,400 edits a se
 queue, the batching, and the single embedding thread unchanged. An `Import` stream runs at 404 records a second
 against 80. **In a Linux container on the same machine the gain is 1.7 to 2.4 times, not 4 to 5:** one edit in
 3.5 ms against 6.1 ms, 822 edits a second at 16 callers against 346. Burn is about as fast there as on macOS;
-ONNX Runtime's macOS build is the one that does better on that hardware. The engine is worth having at twice
+ONNX Runtime's macOS build is the one that does better on that hardware. (It is the M4's SME2 matrix
+instructions, which ONNX Runtime uses under macOS and a Linux guest does not see: D49.) The engine is worth having at twice
 the speed, and the first figure should not be quoted for a Linux deployment. The Burn figures in this paragraph
 are the record of why Burn stopped serving; the README no longer carries tables a reader cannot reproduce.
 
-**Not done:** x86-64, which is unmeasured and is probably what production runs on; several embedding threads
+**Not done:** x86-64, which is unmeasured and is probably what production runs on (the forward pass has been
+measured there since, and ONNX Runtime is the fastest of four engines on it: D49; the server has not); several
+embedding threads
 (ONNX Runtime may make one thread per core a better design than one thread across cores; measured and built
 since, as D46); an exporter in Rust,
 which would take Python out of the image build and out of the fine-tuning loop; pinned versions for what the
@@ -2689,3 +2695,158 @@ Units per something: `25 mg/5 ml` is read and kept, and until the plan's second
 half is built it is a unit the table does not know, comparable only with its own spelling. A reading of anything
 refused above. A step in `tools/demo.py`. The Bruno requests for the service (`bruno/Quantities`, ten of them)
 were sent to a server by a Python client and not through Bruno's own.
+
+## D49. Why the Rust engines are slower was measured, on Linux and x86-64 too, and ONNX Runtime stays
+
+D34 recorded that Burn and candle were several times slower than ONNX Runtime and left it there. On 2026-11-24
+the owner asked why: it seemed odd that C++ should beat Rust by that much, the service "obviously isn't going to
+run on apple hardware", and the larger worry was what calling C++ from Rust could do in production against
+running Rust alone. So the gap was taken apart, measured again where the service will run, and looked up in the
+projects' own issue trackers. It is not the language. Nothing in the server changed because of what was found
+here; what changed because of the worry is in D34 (whose library it is, and three hours under load).
+
+**How it was measured.** Probes outside the repository, release builds, the default model, medians over repeated
+passes, at three shapes: one short field (8 tokens), one description (56 tokens), and eight descriptions in one
+batch. Burn 0.22.1 on `flex`, candle 0.11.1, tract 0.23.10 (the latest then and on 2026-11-12, when D34 tried
+it), and ONNX Runtime 1.31 through `ort`, in the build the server linked at the time. The Burn rows go through
+`Embedder`; the candle rows are the encoder alone on made-up token ids, without the workaround of candle's
+issue 4103 below, so its short-field figures are pessimistic. The probes, the profiles, and the bundle that was
+run on x86-64 are not in the repository.
+
+**On the Mac mini under macOS**, milliseconds:
+
+| | One short field | One description | Eight descriptions |
+|---|---|---|---|
+| Burn, 1 thread | 4.2 | 19.1 | 128.6 |
+| Burn, its own thread count | 4.3 | 12.7 | 58.2 |
+| candle, 1 thread | 5.5 | 19.4 | 128.5 |
+| candle, 12 threads | 4.8 | 13.6 | 43.4 |
+| candle on Apple's Accelerate, 1 thread | 1.7 | 5.9 | 40.2 |
+| ONNX Runtime without SME2, 1 thread | 1.9 | 12.4 | 97.6 |
+| ONNX Runtime without SME2, its own thread count | 0.69 | 3.0 | 20.3 |
+| ONNX Runtime as it ships, 1 thread | 1.2 | 3.3 | 20.8 |
+| ONNX Runtime as it ships, its own thread count | 0.69 | 1.8 | 9.2 |
+
+**Four causes, three of which hold on any hardware.**
+
+1. *Burn and candle share one matrix kernel.* `flex` and candle both multiply matrices with the `gemm` crate,
+   which on ARM has a NEON kernel and nothing else. That is why the two tie on one thread. NEON against NEON on
+   one thread, the multiplies of a description take 14.0 ms in Burn and 10.4 ms in ONNX Runtime. `gemm` also
+   packs a layer's weights again at every call: one feed-forward multiply of a short field takes it 85 µs with
+   the weights in cache and 237 µs when they come cold from memory, as they do in a real pass. ONNX Runtime
+   packs constant weights once, when the session is built (its default; the probe did not turn it off to see).
+2. *GELU is a scalar `libm::erff` on one thread*, in both. It is 4.0 ms of Burn's 19 ms for a description, where
+   ONNX Runtime's version, fused with the bias before it and vectorized, takes 0.54 ms. In a batch of eight at
+   Burn's own thread count it is 52% of the time. It is also why candle on Accelerate, whose multiplies are
+   Apple's, still trails: about three quarters of what is left of its time is `erf`.
+3. *Threads.* Without SME2, ONNX Runtime's threads make a description 4.1 times faster and Burn's 1.5 times.
+   `flex` does not thread a multiply below a size (`PARALLEL_THRESHOLD`, 192 cubed), so a short field stays on
+   one thread however many there are; ONNX Runtime gets 2.75 times there. Between operations rayon's workers go
+   to sleep and ONNX Runtime's spin (D45).
+4. *SME2, on this Mac under macOS only.* ONNX Runtime's profile shows Arm's KleidiAI kernels
+   (`kai_kernel_matmul_clamp_f32_..._sme2_mopa`), which use the M4's matrix instructions and take a
+   description's multiplies from 10.4 ms to 1.2 ms on one thread. At its own thread count that is worth nothing
+   for a short field, 1.7 times for a description, and 2.2 times for eight. The session entry
+   `mlas.disable_kleidiai=1` turns them off, which is how the rows "without SME2" were made. A Linux guest on
+   the same machine reports no `sme` flag and does not have them, and x86-64 has no such thing.
+
+What Burn does not lose on is everything else: allocation and copying barely appear in its profile, and its
+layer normalization was faster than ONNX Runtime's (0.15 ms against 0.96 ms for a description on one thread).
+No setting closes the gap. `gemm`'s `experimental-apple-amx` feature changed nothing on the M4.
+
+**Linux on the same machine** (arm64 in a container, NEON only), milliseconds:
+
+| | One short field | One description | Eight descriptions |
+|---|---|---|---|
+| Burn, 1 thread | 4.1 | 18.0 | 130 |
+| candle, 1 thread | 5.7 | 19.5 | 129 |
+| tract, 1 thread | 1.8 | 11.7 | 94 |
+| ONNX Runtime, 1 thread | 1.9 | 12.8 | 100 |
+| Burn, 12 threads | 4.2 | 13.6 | 66 |
+| tract, the best thread count tried | 1.5 | 5.9 | 32 |
+| ONNX Runtime, 8 threads | 0.78 | 3.2 | 18.6 |
+| ONNX Runtime, its own thread count (12) | 1.5 | 10.3 | 55 |
+
+ONNX Runtime on one thread is here what it is on macOS without SME2 (1.9, 12.8, and 100 ms against 1.9, 12.4,
+and 97.6), which is the confirmation that SME2 is what D34 saw as "the macOS build doing better". Burn and candle
+are the same on both systems. Tract is level with ONNX Runtime on one thread and about half as fast with
+threads. ONNX Runtime's own thread count was wrong in this guest: it counted the Mac's four slow cores, and 12
+threads were two to three times slower than 8. That is the case `model.threads` exists for (D45).
+
+**x86-64**, on the owner's desktop on 2026-11-25: an AMD Ryzen 9 5900X (Zen 3, 12 cores and 24 threads, AVX2
+and no AVX-512), in Docker Desktop's Linux virtual machine on Windows. Milliseconds:
+
+| One thread | One short field | One description | Eight descriptions |
+|---|---|---|---|
+| ONNX Runtime | 2.8 | 11.0 | 79 |
+| tract | 3.2 | 13.6 | 94 |
+| Burn | 5.6 | 18.9 | 138 |
+| candle | 6.7 | 21.7 | 141 |
+
+| Each at the best thread count tried | One short field | One description | Eight descriptions |
+|---|---|---|---|
+| ONNX Runtime, its own count | 1.2 | 4.4 | 21 |
+| tract, 4 threads | 3.2 | 8.7 | 45 |
+| Burn, 1 thread and then 4 | 5.6 | 15.3 | 92 |
+| candle, 2 threads, 4, and then 8 | 5.7 | 16.4 | 69 |
+
+So ONNX Runtime is the fastest of the four there too: 1.7 to 2 times Burn on one thread and 3.5 to 4.6 times
+with each at its best. Tract is 13 to 34% behind it on one thread, not level as on ARM, and 2 to 2.7 times
+behind with threads. The three Rust engines were at their best around 4 threads and got worse with more: Burn
+left to itself takes all 24, and a description then costs 48 ms against 19 ms on one. ONNX Runtime's own count
+was the best or close to it at every shape, the opposite of the Linux guest on the Mac, which is the argument
+for measuring `model.threads` on the machine and trusting neither. Three limits: the virtual machine showed 24
+cores, so 12 threads, the number of real ones, was never tried; the rows at 8 and 24 threads were noisy; and it
+is one processor without AVX-512, for which ONNX Runtime and tract have kernels and `gemm` has one to opt into.
+The server was not run there: these are forward passes, not `load`.
+
+**Tract.** It is the fastest of the Rust engines everywhere, it reads the same exported file, and its speed on
+macOS in D34 was Apple-only kernels too (eight descriptions on one thread take it 19 ms on macOS and 94 ms on
+Linux). What stopped it in D34 still does: with the batch and the length both variable, 0.23.10 refuses the
+graph at `/stages.0/Flatten` ("Can not compute a shape with square of symbols"). With only the batch variable
+and the length fixed it plans, and that plan costs nothing on Linux arm64 (91 ms against 94 ms) and 8% on the
+AMD machine (102 ms against 94 ms): one plan for each token length. Whether plans can share weights, and whether
+another export avoids the `Flatten`, was not looked at.
+
+**The projects say the same of themselves.** Read on 2026-11-25:
+
+- *Burn.* The scalar GELU is issue 6247, fixed by pull request 6341 (merged 2026-11-02), which is in
+  0.23.0-pre.2 and not in 0.22.1. Measured on the M4, GELU goes from 2 to 10 ns an element, depending on the
+  values, to a flat 2.6 ns; it is still on one thread, and ONNX Runtime's takes 1.0 ns on one. Issue 6334
+  tracks the scalar operations that remain and issue 5613 lists copies that could be avoided. Nothing is filed
+  about packing weights once, threading small multiplies, or SME.
+- *candle.* Issue 2877, open since April 2025, has it 8.5 times slower than PyTorch on a CPU for a MiniLM of
+  six layers, and a maintainer's reading is that it is how candle uses rayon. Issue 4103 shows `Linear` copying
+  its whole weight at every call, with a workaround at load. Hugging Face's own embedding server builds its CPU
+  image with ONNX Runtime and with candle on Intel's MKL, not on candle's own kernels.
+- *`gemm`.* How it scales with threads has been an open issue (10) since 2023, a way to pack constant weights
+  once has been asked for (38) and not answered, and its last commits are a release in November 2025 and one
+  in January 2025; a pull request to candle calls it unmaintained.
+
+Nothing was filed or posted anywhere on this project's behalf.
+
+**What it corrects.** D34 says that thread count was not the cause, because Burn takes the same time for a short
+field on one core as on twelve. That is true of the setting and wrong as a conclusion: Burn never puts a short
+field on a second thread, and how threads are used is the largest single part of the gap. D34 also says that
+ONNX Runtime's macOS build does better on that hardware; what does better is SME2, and with it off the engine is
+still 3 to 6 times faster than Burn at each one's own thread count. Both paragraphs now point here. Every
+figure in the README that was measured under macOS includes SME2 for a description or a batch, and none for a
+short field. The README says so where it compares Linux with macOS.
+
+**ONNX Runtime stays.** On the one x86-64 machine measured the gap to Burn is 1.7 to 2 times on one thread and
+3.5 to 4.6 times with threads. It is made of a matrix kernel, a thread pool, and work done once at load, and
+none of the three is being closed upstream at a rate that makes waiting a plan. Rust alone would also not be safe Rust alone: `gemm`, `flex`'s
+multiply, and tract's kernels are `unsafe` code and hand-written assembly, with far less use behind them than
+ONNX Runtime has. What the border to C++ puts at risk here is small where it is crossed (one call site in
+`onnx.rs` that hands over two arrays of integers and copies one of floats back, with nothing called back and
+errors returned as values) and was reduced where it could be: the library is Microsoft's own and checked, and
+it held for three hours under load (D34). What is left is a fault inside the library, which ends the process;
+a request then fails and nothing is written that should not be (D7, D35, D38). The owner asked for those two
+measures on 2026-11-25. Bringing a Rust engine back to serve would reverse the decision of 2026-11-12 (D34),
+and is theirs to make.
+
+**Not done.** Burn measured again when 0.23 is released, which is the one thing here with a date on it: it
+should help most on batches, and it touches neither the kernel, nor the threading, nor the packing. A machine
+with AVX-512. Twelve threads on the AMD machine. `load` on x86-64, which is the figure that sizes a server. The
+variable-length problem in tract. ONNX Runtime with its weight packing turned off, to confirm the first cause's
+second half. An issue for Burn about the three causes nobody has filed.

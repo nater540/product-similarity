@@ -6,7 +6,7 @@ and trained in [Burn](https://burn.dev), run by ONNX Runtime), compared with the
 rejected against calibrated thresholds. A record's quantities (weight, volume, potency) are compared as numbers
 beside that, never embedded. Vectors live in Qdrant, which also provides neighbor search.
 
-Read `README.md` for behavior and `docs/decisions.md` (D1 to D48) for why each piece is the way it is before
+Read `README.md` for behavior and `docs/decisions.md` (D1 to D49) for why each piece is the way it is before
 changing a design. Infer conventions from the existing code first.
 
 ## Code style: non-negotiable
@@ -325,7 +325,12 @@ changing a design. Infer conventions from the existing code first.
   period in five and still beat three, which were not (D45, 2026-11-25), so do not propose fewer threads because
   a container is throttled without measuring both. The README's "Three hours in a container" is one run, on
   arm64 in a virtual machine, with scripts that are not in the repository: it shows that nothing grew or slowed,
-  and its speeds are not to be quoted for any other machine. The tests
+  and its speeds are not to be quoted for any other machine. Why the Rust engines are slower is known and
+  measured (D49: the `gemm` crate that Burn and candle share, a scalar GELU, how threads are used, and SME2 on
+  the Mac under macOS). Do not reopen the choice of engine from a number measured under macOS: part of ONNX
+  Runtime's speed there is SME2, which a Linux guest and x86-64 do not have, and the session entry
+  `mlas.disable_kleidiai=1` gives the figure without it. A Rust engine serving again is the owner's decision
+  and nobody else's; the one thing with a date on it is measuring Burn again once 0.23 is released. The tests
   stay on Burn, the reference: the tiny encoders, and the real-model tests, which load with
   `Embedder::load`. After changing the encoder, the pooling, or the export, run `just test-onnx` (it needs
   `just export-onnx` first), which is what holds the two engines to each other.
