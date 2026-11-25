@@ -1,7 +1,7 @@
 meta {
   name: Evaluate [Return Vector]
   type: grpc
-  seq: 2
+  seq: 6
 }
 
 grpc {
@@ -28,5 +28,190 @@ body:grpc {
 }
 
 docs {
-  No `id`: the record is embedded and nothing is compared or stored. `return_vector` returns the vector.
+  `recordsimilarity.v1.RecordSimilarity/Evaluate` for a record with no `id`: the record is embedded, and nothing is
+  compared or stored. With `return_vector` the answer carries the vector.
+  
+  ## This request
+  
+  A record with a name and nothing else: no `id`, no `brand_id`, no `mode`. It needs nothing to be stored and changes
+  nothing.
+  
+  ```json
+  {
+    "verdict": "VERDICT_EMBEDDED",
+    "threshold": 0.9,
+    "vector": [0.0, 0.0, 0.0, "... 1024 numbers in all"]
+  }
+  ```
+  
+  `vector` is the record's composite vector, 1024 numbers with the example config: a block of 256 for each of the four
+  fields, in the order `Describe` lists them (`brand`, `category`, `description`, `name`). Only `name` has a value
+  here, so the first 768 numbers are 0 and the last 256 are the name's vector. The whole vector has length 1.
+  
+  There is no `similarity`, no `fields`, and no `quantities`, `stored` is false, and `revision` is 0. `threshold` is
+  reported even though nothing was held to it. Without `return_vector` the answer is the same with no `vector`.
+  
+  ## Request (`EvaluateRequest`)
+  
+  | Field | Type | Required | Values |
+  |---|---|---|---|
+  | `record` | `Record` | yes | The record to embed and, when it has an `id`, to judge against what is stored for that id. |
+  | `mode` | `WriteMode` | no | What the call may do to what is stored. One of the values below. Left out: `WRITE_MODE_ENFORCE`. |
+  | `threshold` | float | no | -1 to 1. Holds this one request to another overall threshold than the server's (`threshold` in `Describe`, 0.9 with the example config). It replaces only that: a field's floor, the drift threshold, and any quantity limit stay as configured. |
+  | `return_vector` | bool | no | `true` returns the record's composite vector in `vector`. Left out: `false`. |
+  
+  ### `mode` (`WriteMode`)
+  
+  The mode changes what is written, and never the verdict.
+  
+  | Value | Number | A new id | An accepted revision | A rejected revision |
+  |---|---|---|---|---|
+  | `WRITE_MODE_UNSPECIFIED` | 0 | as `WRITE_MODE_ENFORCE` | as `WRITE_MODE_ENFORCE` | as `WRITE_MODE_ENFORCE` |
+  | `WRITE_MODE_ENFORCE` | 1 | stored | stored, unless it changes nothing | not stored |
+  | `WRITE_MODE_DRY_RUN` | 2 | not stored | not stored | not stored |
+  | `WRITE_MODE_FORCE` | 3 | stored | stored | stored |
+  
+  `WRITE_MODE_FORCE` is for a reviewer who has decided that a change is legitimate. It also makes this version the
+  anchor that drift is measured from. A number that is none of these is refused and never treated as the default,
+  which writes.
+  
+  ### `record` (`Record`)
+  
+  | Field | Type | Required | Values |
+  |---|---|---|---|
+  | `id` | string | no | The caller's identifier for the record: any string that is not blank, opaque to the server. Left out, the record is embedded and nothing is compared or stored (`VERDICT_EMBEDDED`). |
+  | `brand_id` | string | no | The key of the brand that owns the record. It is an identifier, compared exactly and never embedded: the brand's name, as text, is the `brand` field. Not blank. Once a record is stored under a brand, every later `Evaluate` or `Delete` for its id has to name that brand: one that names another, or none, is refused. A record stored without a brand takes the brand of the first revision that names one. A consistency check, not access control. |
+  | `fields` | map of string to string | yes | Field name to text. The names are the ones `Describe` lists: with the example config `name` (required), `category`, `brand`, and `description`. A field that is left out and one that is blank are the same thing: no value. Runs of whitespace count as one space. Text beyond the model's limit (256 tokens with the example config) is not read. |
+  | `quantities` | map of string to `Quantity` | no | Quantity name to amount. The names are the ones `Describe` lists: with the example config `weight_per_item`, `volume_per_item`, `thc_per_item`, and `cbd_per_item`. A quantity the record does not have is left out. An amount is never sent as text in `fields`. |
+  
+  ### A quantity (`Quantity`)
+  
+  A measured amount with its unit: a weight, a volume, a potency. A single value is a range whose two ends are equal,
+  and a caller that has only one end of a range sends it as both.
+  
+  | Field | Type | Values |
+  |---|---|---|
+  | `min` | double | The low end. A finite number, 0 or more. |
+  | `max` | double | The high end. A finite number, not below `min`. |
+  | `unit` | string | The unit both ends are in. Not blank. Matched without regard to case or the space around it: `G` and `g` are one unit. |
+  
+  These units are converted before amounts are compared, so `1 g` and `1000 mg` are the same quantity:
+  
+  | Measures | Compared in | Spellings |
+  |---|---|---|
+  | a mass | `mg` | `mcg` `µg` `μg` `microgram` `micrograms`, `mg` `milligram` `milligrams`, `g` `gram` `grams`, `kg` `kilogram` `kilograms`, `oz` `ounce` `ounces`, `lb` `lbs` `pound` `pounds` |
+  | a volume | `ml` | `ml` `milliliter` `milliliters` `millilitre` `millilitres`, `cl` `centiliter` `centiliters`, `l` `liter` `liters` `litre` `litres`, `fl oz` `floz` `fl. oz` `fl. oz.` `fluid ounce` `fluid ounces` |
+  | a share of the whole | `%` | `%` `percent` `pct` |
+  
+  Any other unit (`pack`, `each`, a misspelling) is accepted and never an error. It is comparable with itself and with
+  nothing else. `Quantities` > `ListUnits` gives the table the server runs with, each unit with its factor.
+  
+  ## Response (`EvaluateResponse`)
+  
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `verdict` | `Verdict` | One of the values below. |
+  | `similarity` | float, may be absent | Overall similarity to the stored record, -1 to 1: the weighted mean of the similarities in `fields`, over the fields that have one. Absent when there was no stored record. |
+  | `threshold` | float | The overall threshold that applied: the request's, or else the server's. |
+  | `fields` | list of `FieldScore` | One entry for every field either version has a value for, in the order `Describe` lists them. Empty when there was no stored record. |
+  | `anchor_similarity` | float, may be absent | Overall similarity to the record's anchor: the first value each field had since the record was created or last force-written. It shows slow drift across many revisions that were each acceptable. Absent when there was no stored record. |
+  | `stored` | bool | Whether this call changed what is stored. |
+  | `reasons` | list of string | One sentence for each reason a `VERDICT_REJECTED` was rejected. Empty otherwise. For people: the wording may change. |
+  | `reason_details` | list of `ReasonDetail` | The same reasons as data, one for each sentence and in the same order. Branch on these, never on the sentences. |
+  | `vector` | list of float | The record's composite vector, only with `return_vector`: one block of `dimension` numbers for each field, in the order `Describe` lists them (4 blocks of 256, so 1024 numbers, with the example config). The block of a field with no value is zeros. |
+  | `revision` | uint64 (a string in JSON) | How many times the record has been written, this call included if `stored`. 0 if it has never been stored. |
+  | `quantities` | list of `QuantityScore` | One entry for every quantity either version has a value for, in order of name. Empty when there was no stored record. Reported whether or not a limit is configured. |
+  | `measure_changed` | bool | The record changed which measures it is described by: a quantity became incomparable with its old value, or one quantity was removed as a different one appeared (a weight for a volume). Filling in one that was only missing does not set it. It rejects only if `reject_on_measure_change` in `Describe` is set, which the example config leaves off. |
+  
+  | `Verdict` | Number | Meaning | Stored? |
+  |---|---|---|---|
+  | `VERDICT_UNSPECIFIED` | 0 | Not sent by this server. | |
+  | `VERDICT_EMBEDDED` | 1 | The record had no `id`: it was embedded, and nothing was compared. | never |
+  | `VERDICT_CREATED` | 2 | Nothing was stored under this `id`: this record is the baseline now. | yes, unless `WRITE_MODE_DRY_RUN` |
+  | `VERDICT_ACCEPTED` | 3 | The record is similar enough to the stored one to be the same record. | yes if it changes anything, and always with `WRITE_MODE_FORCE`; never with `WRITE_MODE_DRY_RUN` |
+  | `VERDICT_REJECTED` | 4 | The record differs too much from the stored one; `reasons` and `reason_details` say why. | no: the stored record is untouched. Only `WRITE_MODE_FORCE` stores it. |
+  
+  ### `fields[]` (`FieldScore`)
+  
+  How one field of the record compares with the stored one.
+  
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `field` | string | The field's name. |
+  | `change` | `FieldChange` | One of the values below. |
+  | `similarity` | float, may be absent | Cosine similarity between the stored value and the record's, -1 to 1; for `FIELD_CHANGE_RESTORED`, between the field's first value and the record's. Absent for `FIELD_CHANGE_ADDED` and `FIELD_CHANGE_REMOVED`. |
+  | `weight` | float | The field's weight in the overall score. |
+  | `below_floor` | bool | The similarity is below the field's own floor (`reject_below` in `Describe`), which rejects the record whatever the overall score. |
+  
+  | `FieldChange` | Number | Meaning | Scored? |
+  |---|---|---|---|
+  | `FIELD_CHANGE_UNSPECIFIED` | 0 | Not sent by this server. | |
+  | `FIELD_CHANGE_UNCHANGED` | 1 | The same text, ignoring whitespace. | Yes, as 1. |
+  | `FIELD_CHANGE_MODIFIED` | 2 | Both versions have a value and the text differs. | Yes, against the stored value. |
+  | `FIELD_CHANGE_ADDED` | 3 | Only the record has a value, and the stored record has never had one. | No: new information is taken on trust. |
+  | `FIELD_CHANGE_REMOVED` | 4 | Only the stored version has a value. | No. |
+  | `FIELD_CHANGE_RESTORED` | 5 | The stored version has no value, but the record once did and has one again. | Yes, against the first value the field had, so that a field cannot be swapped by blanking it and filling it in again. |
+  
+  ### `quantities[]` (`QuantityScore`)
+  
+  How one quantity of the record compares with the stored one. Quantities are compared as numbers after unit
+  conversion, and never move a similarity.
+  
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `field` | string | The quantity's name. |
+  | `change` | `QuantityChange` | One of the values below. |
+  | `factor` | double, may be absent | How many times larger or smaller the amount became; for a range, whichever end moved more. Always at least 1, so "eight times bigger" and "an eighth" are both 8, and exactly 1 when nothing changed. Absent for `QUANTITY_CHANGE_ADDED` and `QUANTITY_CHANGE_REMOVED`, and when `incomparable` or `zero_crossing` is set. |
+  | `zero_crossing` | bool | The amount moved between zero and a value above zero, so no factor describes the change. |
+  | `incomparable` | bool | The two values are in units that cannot be converted into one another. |
+  | `previous_unit` | string, may be absent | The unit of the value the record was compared with. Absent for `QUANTITY_CHANGE_ADDED`. |
+  | `unit` | string, may be absent | The record's unit. Absent for `QUANTITY_CHANGE_REMOVED`. |
+  | `beyond_limit` | bool | The quantity exceeds a limit the server's schema sets for it (`reject_above_factor` or `reject_incomparable` in `Describe`), which rejects the record. Never set when no limit is configured, and the example config sets none. |
+  
+  | `QuantityChange` | Number | Meaning |
+  |---|---|---|
+  | `QUANTITY_CHANGE_UNSPECIFIED` | 0 | Not sent by this server. |
+  | `QUANTITY_CHANGE_UNCHANGED` | 1 | The same amount after unit conversion: `1 g` and `1000 mg`. |
+  | `QUANTITY_CHANGE_MODIFIED` | 2 | Both versions have a value, in comparable units, and the amounts differ. |
+  | `QUANTITY_CHANGE_ADDED` | 3 | Only the record has a value, and the stored record has never had one. |
+  | `QUANTITY_CHANGE_REMOVED` | 4 | Only the stored version has a value. |
+  | `QUANTITY_CHANGE_RESTORED` | 5 | The stored version has none, but the record once did and has one again. Compared with the first value it had. |
+  | `QUANTITY_CHANGE_INCOMPARABLE` | 6 | Both versions have a value, in units that cannot be converted into one another (`%` and `mg`). Not a bigger or smaller amount: another kind of measurement. |
+  
+  ### `reason_details[]` (`ReasonDetail`)
+  
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `code` | `ReasonCode` | Which check failed. One of the values below. |
+  | `subject` | string, may be absent | The field or quantity the reason is about: the `field` of an entry of `fields` or `quantities` in the same answer. Absent for a reason about the whole record. |
+  | `value` | double, may be absent | What was measured: a similarity, or a factor. |
+  | `limit` | double, may be absent | The configured limit `value` was held to. |
+  
+  | `ReasonCode` | Number | Rejected because | `subject` | `value` | `limit` |
+  |---|---|---|---|---|---|
+  | `REASON_CODE_UNSPECIFIED` | 0 | Not sent by this server. | | | |
+  | `REASON_CODE_BELOW_THRESHOLD` | 1 | The overall similarity is below the threshold that applied. | absent | `similarity` | the threshold |
+  | `REASON_CODE_FIELD_BELOW_FLOOR` | 2 | One field's similarity is below that field's own floor. | the field | that field's similarity | its floor |
+  | `REASON_CODE_ANCHOR_DRIFT` | 3 | The overall similarity to the anchor is below the drift threshold (`anchor_threshold` in `Describe`). | absent | `anchor_similarity` | the drift threshold |
+  | `REASON_CODE_QUANTITY_BEYOND_FACTOR` | 4 | One quantity changed by more than its factor limit, or moved between zero and a value above zero. | the quantity | the factor; absent for a move from or to zero | the factor limit |
+  | `REASON_CODE_QUANTITY_INCOMPARABLE` | 5 | One quantity is now in a unit that cannot be converted from the one it had, and its schema entry rejects that. | the quantity | absent | absent |
+  | `REASON_CODE_MEASURE_CHANGED` | 6 | `measure_changed`, and the server's policy rejects that. | absent | absent | absent |
+  
+  With the example config only the first three can occur: it sets no quantity limit and leaves
+  `reject_on_measure_change` off. A newer server may send a code a client does not know; show the sentence at the same
+  position of `reasons` for it.
+  
+  ## Errors
+  
+  | Status | When |
+  |---|---|
+  | `INVALID_ARGUMENT` | No `record`. A field or quantity name the schema does not define, or an amount sent as text in `fields`. The required field `name` missing or blank. An `id` or `brand_id` that is present and blank. A quantity that is not a usable measurement: negative, not finite, `min` above `max`, a blank unit, or too large to convert. A `threshold` outside -1 to 1. A `mode` that is not one of the four. Sending it again unchanged fails again. |
+  | `FAILED_PRECONDITION` | The stored record belongs to a brand the request does not name (it names another, or none), or was written under another model or schema layout. |
+  | `RESOURCE_EXHAUSTED` | The embedding queue is full. Retry with backoff. |
+  | `DEADLINE_EXCEEDED` | The request carried a deadline, and the server could tell it would not be met. Nothing was embedded or written. |
+  | `ABORTED` | Another writer changed the record each of the four times this request had judged it and gone to write. Nothing was written; send the request again as it is. |
+  | `UNAVAILABLE` | The vector store cannot be reached. Retry with backoff. |
+  
+  Nothing is written when an error is returned. A request whose caller stopped waiting may or may not have been
+  written; sending the same request again is safe either way.
 }

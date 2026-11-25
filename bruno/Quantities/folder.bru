@@ -6,3 +6,52 @@ meta {
 auth {
   mode: inherit
 }
+
+docs {
+  The second service, `recordsimilarity.v1.Quantities`: the unit conversion and the comparison that `RecordSimilarity`
+  applies to a record's quantities, for a caller that has amounts and no record, and the reading of an amount that a
+  caller holds as text.
+  
+  Nothing here reads or writes a record, runs the model, or looks at the server's schema or limits. Every call is
+  answered from its request alone, the same request always gets the same answer, and the server answers these while it
+  is not ready for anything else. The ten requests can be sent in any order, on a server in any state.
+  
+  | Request | Call | What it shows |
+  |---|---|---|
+  | `Compare` | `Compare` | A change of amount, and the same amount in another unit. |
+  | `Compare [Restored]` | `Compare` | A quantity that comes back, compared with its first value. |
+  | `Compare [Incomparable]` | `Compare` | Units that do not compare, and a unit the server does not convert. |
+  | `Convert` | `Convert` | A quantity written in another unit. |
+  | `Convert [Base Unit]` | `Convert` | A quantity written in the unit its dimension is compared in. |
+  | `Convert [Does Not Convert]` | `Convert` | Two units that measure different things. |
+  | `ListUnits` | `ListUnits` | Every unit the server converts. |
+  | `Parse` | `Parse` | Amounts in every form that is read. |
+  | `Parse [Weight Words]` | `Parse` | The weights the trade names by a word. |
+  | `Parse [Refused]` | `Parse` | One text for each kind of refusal. |
+  
+  What a call computes is exactly what `Evaluate` reports for the same amounts, except that `beyond_limit` is never
+  set, since a limit belongs to a schema. A unit the server does not convert is never an error: it is comparable with
+  itself and with nothing else.
+  
+  ### A quantity (`Quantity`)
+  
+  A measured amount with its unit: a weight, a volume, a potency. A single value is a range whose two ends are equal,
+  and a caller that has only one end of a range sends it as both.
+  
+  | Field | Type | Values |
+  |---|---|---|
+  | `min` | double | The low end. A finite number, 0 or more. |
+  | `max` | double | The high end. A finite number, not below `min`. |
+  | `unit` | string | The unit both ends are in. Not blank. Matched without regard to case or the space around it: `G` and `g` are one unit. |
+  
+  These units are converted before amounts are compared, so `1 g` and `1000 mg` are the same quantity:
+  
+  | Measures | Compared in | Spellings |
+  |---|---|---|
+  | a mass | `mg` | `mcg` `µg` `μg` `microgram` `micrograms`, `mg` `milligram` `milligrams`, `g` `gram` `grams`, `kg` `kilogram` `kilograms`, `oz` `ounce` `ounces`, `lb` `lbs` `pound` `pounds` |
+  | a volume | `ml` | `ml` `milliliter` `milliliters` `millilitre` `millilitres`, `cl` `centiliter` `centiliters`, `l` `liter` `liters` `litre` `litres`, `fl oz` `floz` `fl. oz` `fl. oz.` `fluid ounce` `fluid ounces` |
+  | a share of the whole | `%` | `%` `percent` `pct` |
+  
+  Any other unit (`pack`, `each`, a misspelling) is accepted and never an error. It is comparable with itself and with
+  nothing else. `Quantities` > `ListUnits` gives the table the server runs with, each unit with its factor.
+}

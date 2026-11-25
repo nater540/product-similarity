@@ -21,8 +21,54 @@ body:grpc {
 }
 
 docs {
-  Every unit the server converts: its spellings, what it measures, the unit it is compared in, and how many of that
-  one of it is. Eleven units: six of mass, four of volume, and percent.
+  `recordsimilarity.v1.Quantities/ListUnits` lists every unit the server converts: the table `Evaluate`, `Match`,
+  `Compare`, `Convert`, and `Parse` all go by. It reads no record, runs no model, and looks at no schema or limit: the
+  answer comes from the request alone, on a server in any state, and the same request always gets the same answer.
   
-  A unit that is not listed is still accepted everywhere. It is comparable with itself and with nothing else.
+  ## This request
+  
+  The body is empty. The build this was written against answers eleven units, six of mass, four of volume, and
+  percent:
+  
+  | `spellings` | `dimension` | `base_unit` | `factor` |
+  |---|---|---|---|
+  | `mcg`, `µg`, `μg`, `microgram`, `micrograms` | `DIMENSION_MASS` | `mg` | 0.001 |
+  | `mg`, `milligram`, `milligrams` | `DIMENSION_MASS` | `mg` | 1 |
+  | `g`, `gram`, `grams` | `DIMENSION_MASS` | `mg` | 1000 |
+  | `kg`, `kilogram`, `kilograms` | `DIMENSION_MASS` | `mg` | 1000000 |
+  | `oz`, `ounce`, `ounces` | `DIMENSION_MASS` | `mg` | 28349.523125 |
+  | `lb`, `lbs`, `pound`, `pounds` | `DIMENSION_MASS` | `mg` | 453592.37 |
+  | `ml`, `milliliter`, `milliliters`, `millilitre`, `millilitres` | `DIMENSION_VOLUME` | `ml` | 1 |
+  | `cl`, `centiliter`, `centiliters` | `DIMENSION_VOLUME` | `ml` | 10 |
+  | `l`, `liter`, `liters`, `litre`, `litres` | `DIMENSION_VOLUME` | `ml` | 1000 |
+  | `fl oz`, `floz`, `fl. oz`, `fl. oz.`, `fluid ounce`, `fluid ounces` | `DIMENSION_VOLUME` | `ml` | 29.5735295625 |
+  | `%`, `percent`, `pct` | `DIMENSION_FRACTION` | `%` | 1 |
+  
+  `µg` is listed twice because it is written with two different characters, the micro sign and the Greek letter mu.
+  
+  A unit that is not listed is still accepted everywhere a quantity is. It is comparable with itself and with nothing
+  else, and it is never an error.
+  
+  ## Request (`ListUnitsRequest`)
+  
+  No fields. Send `{}`.
+  
+  ## Response (`ListUnitsResponse`)
+  
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `units` | list of `UnitDescription` | Every unit the server converts. |
+  
+  ### `units[]` (`UnitDescription`)
+  
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `spellings` | list of string | Every spelling the unit is recognized under, in lower case with single spaces. A unit in a request is matched after the same is done to it, so `G` and `g` are one unit, with or without space around them. |
+  | `dimension` | `Dimension` | What the unit measures: `DIMENSION_MASS` (1), `DIMENSION_VOLUME` (2), or `DIMENSION_FRACTION` (3). Never `DIMENSION_OTHER`. |
+  | `base_unit` | string | The unit its dimension is compared in: `mg`, `ml`, or `%`. |
+  | `factor` | double | How many of `base_unit` one of this unit is: 1000 for `g`. |
+  
+  ## Errors
+  
+  None of its own.
 }

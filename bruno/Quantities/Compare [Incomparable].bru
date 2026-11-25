@@ -46,10 +46,110 @@ body:grpc {
 }
 
 docs {
-  Units that measure different things are an answer, not an error.
+  `recordsimilarity.v1.Quantities/Compare` compares the quantities of two versions, name by name, with the unit
+  conversion and the comparison that `Evaluate` applies to a record's quantities. For a caller that has amounts and no
+  record. It reads no record, runs no model, and looks at no schema or limit: the answer comes from the request alone,
+  on a server in any state, and the same request always gets the same answer.
   
-  `thc_per_item` goes from 100 mg to 18-22 %: `QUANTITY_CHANGE_INCOMPARABLE`, `incomparable: true`, and no factor.
+  ## This request
   
-  `pack` is not a unit the server converts, so it is comparable only with itself, in any case and spacing: `2 pack`
-  to `2 Pack` is `QUANTITY_CHANGE_UNCHANGED`.
+  Units that do not convert into one another, which is an answer and not an error:
+  
+  - `thc_per_item` goes from 100 mg to 18-22 %, an amount to a share: `QUANTITY_CHANGE_INCOMPARABLE`, with
+    `incomparable` set and no `factor`.
+  - `count` goes from `2 pack` to `2 Pack`. `pack` is not a unit the server converts, so it is comparable only with
+    itself, in any case and spacing: `QUANTITY_CHANGE_UNCHANGED`. The name `count` is not in the server's schema, and
+    does not have to be.
+  
+  ```json
+  {
+    "quantities": [
+      { "field": "count", "change": "QUANTITY_CHANGE_UNCHANGED", "factor": 1.0, "previous_unit": "pack", "unit": "Pack" },
+      { "field": "thc_per_item", "change": "QUANTITY_CHANGE_INCOMPARABLE", "incomparable": true, "previous_unit": "mg", "unit": "%" }
+    ]
+  }
+  ```
+  
+  ## Request (`CompareQuantitiesRequest`)
+  
+  Three maps of quantity name to `Quantity`. A name is any string: it does not have to be a quantity the server's
+  schema defines. All three may be empty.
+  
+  | Field | Type | Required | Values |
+  |---|---|---|---|
+  | `before` | map of string to `Quantity` | no | The earlier version's quantities: what `Record.quantities` holds for the stored version. |
+  | `after` | map of string to `Quantity` | no | The later version's quantities: what `Record.quantities` holds for the new one. |
+  | `original` | map of string to `Quantity` | no | The first value each quantity ever had: what `Evaluate` keeps as a record's anchor. It matters only for a name that `before` lacks and `after` has. Leave it empty to compare two versions and nothing else. |
+  
+  What a name is answered, by where it appears:
+  
+  | In `before` | In `after` | In `original` | `change` |
+  |---|---|---|---|
+  | yes | yes | either | `QUANTITY_CHANGE_UNCHANGED`, `QUANTITY_CHANGE_MODIFIED`, or `QUANTITY_CHANGE_INCOMPARABLE` |
+  | yes | no | either | `QUANTITY_CHANGE_REMOVED` |
+  | no | yes | no | `QUANTITY_CHANGE_ADDED` |
+  | no | yes | yes | `QUANTITY_CHANGE_RESTORED`, compared with the value in `original` |
+  | no | no | either | not in the answer |
+  
+  ### A quantity (`Quantity`)
+  
+  A measured amount with its unit: a weight, a volume, a potency. A single value is a range whose two ends are equal,
+  and a caller that has only one end of a range sends it as both.
+  
+  | Field | Type | Values |
+  |---|---|---|
+  | `min` | double | The low end. A finite number, 0 or more. |
+  | `max` | double | The high end. A finite number, not below `min`. |
+  | `unit` | string | The unit both ends are in. Not blank. Matched without regard to case or the space around it: `G` and `g` are one unit. |
+  
+  These units are converted before amounts are compared, so `1 g` and `1000 mg` are the same quantity:
+  
+  | Measures | Compared in | Spellings |
+  |---|---|---|
+  | a mass | `mg` | `mcg` `µg` `μg` `microgram` `micrograms`, `mg` `milligram` `milligrams`, `g` `gram` `grams`, `kg` `kilogram` `kilograms`, `oz` `ounce` `ounces`, `lb` `lbs` `pound` `pounds` |
+  | a volume | `ml` | `ml` `milliliter` `milliliters` `millilitre` `millilitres`, `cl` `centiliter` `centiliters`, `l` `liter` `liters` `litre` `litres`, `fl oz` `floz` `fl. oz` `fl. oz.` `fluid ounce` `fluid ounces` |
+  | a share of the whole | `%` | `%` `percent` `pct` |
+  
+  Any other unit (`pack`, `each`, a misspelling) is accepted and never an error. It is comparable with itself and with
+  nothing else. `Quantities` > `ListUnits` gives the table the server runs with, each unit with its factor.
+  
+  ## Response (`CompareQuantitiesResponse`)
+  
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `quantities` | list of `QuantityScore` | One for each name in `before` or `after`, in order of name. Empty (`{}`) if both are empty. |
+  
+  ### `quantities[]` (`QuantityScore`)
+  
+  How one quantity of `after` compares with the one in `before`. This is exactly what `Evaluate` reports for the same
+  amounts.
+  
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `field` | string | The quantity's name. |
+  | `change` | `QuantityChange` | One of the values below. |
+  | `factor` | double, may be absent | How many times larger or smaller the amount became; for a range, whichever end moved more. Always at least 1, so "eight times bigger" and "an eighth" are both 8, and exactly 1 when nothing changed. Absent for `QUANTITY_CHANGE_ADDED` and `QUANTITY_CHANGE_REMOVED`, and when `incomparable` or `zero_crossing` is set. |
+  | `zero_crossing` | bool | The amount moved between zero and a value above zero, so no factor describes the change. |
+  | `incomparable` | bool | The two values are in units that cannot be converted into one another. |
+  | `previous_unit` | string, may be absent | The unit of the value in `before`, or in `original` for `QUANTITY_CHANGE_RESTORED`. Absent for `QUANTITY_CHANGE_ADDED`. |
+  | `unit` | string, may be absent | The unit of the value in `after`. Absent for `QUANTITY_CHANGE_REMOVED`. |
+  | `beyond_limit` | bool | Never set by this call: a limit belongs to a schema. |
+  
+  | `QuantityChange` | Number | Meaning |
+  |---|---|---|
+  | `QUANTITY_CHANGE_UNSPECIFIED` | 0 | Not sent by this server. |
+  | `QUANTITY_CHANGE_UNCHANGED` | 1 | The same amount after unit conversion: `1 g` and `1000 mg`. |
+  | `QUANTITY_CHANGE_MODIFIED` | 2 | Both versions have a value, in comparable units, and the amounts differ. |
+  | `QUANTITY_CHANGE_ADDED` | 3 | Only `after` has a value, and `original` has none. |
+  | `QUANTITY_CHANGE_REMOVED` | 4 | Only `before` has a value. |
+  | `QUANTITY_CHANGE_RESTORED` | 5 | `before` has none, `original` has one, and `after` has one again. Compared with the value in `original`. |
+  | `QUANTITY_CHANGE_INCOMPARABLE` | 6 | Both versions have a value, in units that cannot be converted into one another (`%` and `mg`). Not a bigger or smaller amount: another kind of measurement. |
+  
+  ## Errors
+  
+  | Status | When |
+  |---|---|
+  | `INVALID_ARGUMENT` | An amount in any of the three maps that is not a usable measurement: not finite, negative, `min` above `max`, a blank unit, or too large to convert. The message names the side and the quantity. |
+  
+  Units that do not compare are an answer (`QUANTITY_CHANGE_INCOMPARABLE`), not an error.
 }

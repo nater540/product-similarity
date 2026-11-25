@@ -6,3 +6,17 @@ meta {
 auth {
   mode: inherit
 }
+
+docs {
+  Variations on the calls at the top of the collection: what else a call can be asked, and what else it can answer.
+  Each request's **Docs** tab repeats the full reference of its call, so none of them has to be read beside another.
+  
+  | Folder | Requests |
+  |---|---|
+  | `Evaluate` | Six: a creation, an accepted update, a dry run, a rejected update, a forced update, and a record with no `id` that returns its vector. |
+  | `Find` | `FindSimilar` around text that is not stored. |
+  | `Match` | `Match` with and without a brand. |
+  
+  They assume that `Import` and `Evaluate` at the top of the collection have been sent: the first creates the records
+  that are searched and matched, the second the record that is revised.
+}

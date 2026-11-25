@@ -1,3 +1,104 @@
 vars:pre-request {
   server: grpc://127.0.0.1:50051
 }
+
+docs {
+  # record-similarity
+  
+  A request for every call of the server's two gRPC services. The top of the collection has one request for each call
+  of `RecordSimilarity`, `Examples` has the variations, and `Quantities` has the second service.
+  
+  Every request's **Docs** tab is a full reference for its call: each parameter with the values it takes, each field
+  of the answer with the values it can have, the errors, and what this particular body is answered.
+  
+  ## Before sending
+  
+  1. Start a server. `just serve-in-memory config.toml` needs no Qdrant and keeps nothing when it stops, which suits
+     this collection: `Ctrl-C` and start again for an empty server. `just serve` runs against Qdrant.
+  2. In Bruno, pick the `local` environment. Its `server` variable is `grpc://127.0.0.1:50051`, where the example
+     config listens. Change it there to reach another server.
+  
+  The requests read the API from the repository's `.proto`
+  (`crates/similarity-proto/proto/recordsimilarity/v1/similarity.proto`), which the collection names by a relative
+  path. They stay in step with it, and this folder has to stay where it is in the checkout.
+  
+  ## The two services
+  
+  | Service | Calls | What it is for |
+  |---|---|---|
+  | `recordsimilarity.v1.RecordSimilarity` | `Describe`, `Import`, `Evaluate`, `FindSimilar`, `Match`, `Delete` | Records: embedded, judged against their stored version, stored, searched, and matched to menu items. |
+  | `recordsimilarity.v1.Quantities` | `Compare`, `Convert`, `ListUnits`, `Parse` | Amounts on their own: no record, no model, no store. Every call is answered from its request alone. |
+  
+  ## An order that runs on an empty server
+  
+  The notes on what each request is answered assume this order. It is not the order Bruno lists them in.
+  
+  | Step | Request | What it is answered |
+  |---|---|---|
+  | 1 | `Describe` | The schema and the thresholds. |
+  | 2 | `Import` | `bruno-import-1` and `bruno-import-2` are created. `bruno-import-3` fails by itself. |
+  | 3 | `Evaluate` | `VERDICT_CREATED`: `bruno-1` is stored, at revision 1. |
+  | 4 | `Evaluate [Create Record]` | The same body again: `VERDICT_ACCEPTED` at 1, nothing written. |
+  | 5 | `Evaluate [Accepted Update]` | `VERDICT_ACCEPTED`, stored, revision 2. |
+  | 6 | `Evaluate [Dry-Run]` | `VERDICT_REJECTED`, and nothing written whatever the verdict. |
+  | 7 | `Evaluate [Rejected Update]` | `VERDICT_REJECTED` with three reasons. The stored record is untouched. |
+  | 8 | `Evaluate [Forced Update]` | `VERDICT_REJECTED` and stored all the same, revision 3. `bruno-1` is a vape cartridge from here on. |
+  | 9 | `Evaluate [Return Vector]` | `VERDICT_EMBEDDED` and a vector. Nothing stored. |
+  | 10 | `FindSimilar` | The neighbors of `bruno-import-1` within `brand-1`. |
+  | 11 | `FindSimilar [Search]` | `bruno-import-1`, found by text that is not stored. |
+  | 12 | `Match [Without Brand]` | Three candidates, `MATCH_DECISION_NOT_JUDGED`. |
+  | 13 | `Match [With Brand]` | `MATCH_DECISION_MATCHED` at a threshold of 0.9. |
+  | 14 | `Match` | The same body as step 13. |
+  | 15 | `Delete` | `deleted: true`. Last, because it removes the record the examples use. |
+  
+  The ten requests in `Quantities` need no record and can be sent at any time, in any order.
+  
+  ## Reading the notes
+  
+  - **Names are the `.proto`'s**, as they are written there: `brand_id`, `menu_item`, `return_vector`.
+  - **Enum values go by name** (`"WRITE_MODE_DRY_RUN"`). The notes give each value's number as well.
+  - **A 64-bit integer is a string in JSON**: `"revision": "1"`.
+  - **The answers shown leave out fields at their default value** (a `false`, a 0, an empty list, the first value of
+    an enum), as protobuf's JSON does. A missing `stored` is `stored: false`. A client may print those fields too.
+  - **"May be absent"** marks a field that is `optional` in the `.proto`: absent means there is no value, which is not
+    the same as 0.
+  - **A similarity is a cosine similarity**, from -1 to 1, and not a percentage. With the default model two unrelated
+    products still score around 0.5.
+  - **The scores shown** are what the default model (`mdbr-leaf-mt`, fingerprint `f46e48ee0ea2dd02-d256-t256`)
+    answered under `config.example.toml`. Another model, other weights, or other thresholds give other numbers.
+  
+  ## What the example config defines
+  
+  `Describe` reports this for any server. With `config.example.toml`:
+  
+  | Text field | Weight | Notes |
+  |---|---|---|
+  | `name` | 4 | Required. Its own floor, `reject_below`, is 0.8. |
+  | `category` | 3 | |
+  | `brand` | 1 | The brand's name, as text. Not the same thing as `brand_id`, the key of the brand that owns the record. |
+  | `description` | 2 | |
+  
+  | Quantity | Limits |
+  |---|---|
+  | `weight_per_item`, `volume_per_item`, `thc_per_item`, `cbd_per_item` | None: compared and reported, and rejecting nothing. |
+  
+  | Threshold | Value |
+  |---|---|
+  | overall (`threshold`) | 0.9 |
+  | drift (`anchor_threshold`) | 0.85 |
+  | match (`match_threshold`) | none: `Match` ranks and decides nothing unless the request gives a `threshold` |
+  
+  ## Status codes
+  
+  | Status | Meaning | What to do |
+  |---|---|---|
+  | `INVALID_ARGUMENT` | The request does not fit the schema or a parameter is out of range. | Fix the request. Sending it again will not help. |
+  | `NOT_FOUND` | `FindSimilar` by an `id` that is not stored. | |
+  | `FAILED_PRECONDITION` | The stored record belongs to a brand the request does not name, or was written under another model or schema layout. | Send the record's brand. |
+  | `RESOURCE_EXHAUSTED` | The embedding queue is full. | Retry with backoff. |
+  | `DEADLINE_EXCEEDED` | The request carried a deadline, and the server could tell it would not be met. | Retry with backoff. |
+  | `ABORTED` | Another writer kept changing the record while this request was judged. Nothing was written. | Send the request again as it is. |
+  | `UNAVAILABLE` | The vector store cannot be reached. | Retry with backoff. |
+  
+  Nothing is written when an error is returned. Of these, the `Quantities` calls answer only `INVALID_ARGUMENT`.
+}

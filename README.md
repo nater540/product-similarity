@@ -526,7 +526,12 @@ The top of the collection is one request for each call: `Describe`, an `Import` 
 and has a third refused, `Evaluate` (which creates a record), `FindSimilar` by id, `Match` with a threshold, and
 `Delete`. `Examples` holds the variations: six kinds of `Evaluate` (the creation again, an accepted update, a dry run, a
 rejected update, a forced update, and one that returns its vector), `FindSimilar` by text, and `Match` with and without a
-brand. Each request has a note saying what to expect.
+brand.
+
+Each request's **Docs** tab is the reference for its call: every parameter with the values it takes, every field
+of the answer and every value of its enums with their numbers, the errors, and what that body is answered. The
+reference is repeated in full in each request of a call, so none has to be read beside another. The collection
+and each folder have notes of their own: the order below, what the example config defines, and the status codes.
 
 `Quantities` is a folder for the second service, ten requests that need no record and can be sent in any order,
 against a server in any state: `Compare` three ways (a change of amount, a quantity that comes back, and units
@@ -535,12 +540,17 @@ that do not compare), `Convert` three ways (to a unit, to the base unit, and bet
 kind of refusal).
 
 The notes describe one order on an empty server (`just serve-in-memory config.toml`), which is not the order
-Bruno lists them in: `Describe`, `Import`, `Evaluate`, then the examples Accepted Update, Dry-Run, Rejected
-Update, Forced Update, and Return Vector, then `FindSimilar`, FindSimilar [Search], Match [Without Brand], Match
-[With Brand], `Match`, and `Delete` last. Every body was sent through Bruno's own gRPC client (4.3.0) against a
-local server in that order, and they answered as the notes say. `Delete` removes a record the examples use.
-The ten `Quantities` bodies were sent to a local server as well, and answered as their notes say, but by a
-Python gRPC client reading them out of the `.bru` files, and not through Bruno itself.
+Bruno lists them in: `Describe`, `Import`, `Evaluate`, then the examples Create Record, Accepted Update, Dry-Run,
+Rejected Update, Forced Update, and Return Vector (the order of their folder), then `FindSimilar`, FindSimilar
+[Search], Match [Without Brand], Match [With Brand], `Match`, and `Delete` last. Every body was sent through
+Bruno's own gRPC client (4.3.0) against a local server in that order. `Delete` removes a record the examples use.
+The ten `Quantities` bodies were sent to a local server as well, but by a Python gRPC client reading them out of
+the `.bru` files, and not through Bruno itself.
+
+The answers the notes show were recorded on 2026-11-25 the second way: a Python gRPC client sent every body, as
+it stands in its `.bru` file, to an empty in-memory server with `config.example.toml` and the default model, in
+the order above, and each answer written in a note was compared with what came back. The scores in them belong
+to that model and that config. The notes themselves have not been read in Bruno's Docs tab.
 
 Bodies use the names in the `.proto` as they are written there (`brand_id`, `menu_item`, `return_vector`), and
 enum values by name (`"WRITE_MODE_DRY_RUN"`).

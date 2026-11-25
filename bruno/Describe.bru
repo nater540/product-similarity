@@ -1,0 +1,98 @@
+meta {
+  name: Describe
+  type: grpc
+  seq: 2
+}
+
+grpc {
+  url: {{server}}
+  method: /recordsimilarity.v1.RecordSimilarity/Describe
+  body: grpc
+  protoPath: ../crates/similarity-proto/proto/recordsimilarity/v1/similarity.proto
+  auth: none
+  methodType: unary
+}
+
+body:grpc {
+  name: message 1
+  content: '''
+    {}
+  '''
+}
+
+docs {
+  `recordsimilarity.v1.RecordSimilarity/Describe` reports what the server is running with: the model, the schema, and
+  the thresholds. Read-only. Send it first: the field and quantity names it lists are the only keys a record may have,
+  and the thresholds are what every verdict is held to.
+  
+  ## This request
+  
+  The body is empty. With `config.example.toml` and the default model the answer is:
+  
+  ```json
+  {
+    "model_fingerprint": "f46e48ee0ea2dd02-d256-t256",
+    "dimension": 256,
+    "composite_dimension": 1024,
+    "fields": [
+      { "name": "brand", "weight": 1.0 },
+      { "name": "category", "weight": 3.0 },
+      { "name": "description", "weight": 2.0 },
+      { "name": "name", "weight": 4.0, "required": true, "reject_below": 0.8 }
+    ],
+    "threshold": 0.9,
+    "anchor_threshold": 0.85,
+    "quantities": [
+      { "name": "cbd_per_item" },
+      { "name": "thc_per_item" },
+      { "name": "volume_per_item" },
+      { "name": "weight_per_item" }
+    ],
+    "match_overfetch": 5,
+    "judging_digest": "c76281ea4196ec86"
+  }
+  ```
+  
+  `reject_on_measure_change` and `match_threshold` are missing because the example config sets neither.
+  
+  ## Request (`DescribeRequest`)
+  
+  No fields. Send `{}`.
+  
+  ## Response (`DescribeResponse`)
+  
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `model_fingerprint` | string | Identifies the model, the tokenizer, the vector width, and the truncation limit. Vectors are comparable only under the same fingerprint. |
+  | `dimension` | uint32 | The width of one field's vector. |
+  | `composite_dimension` | uint32 | The width of a record's composite vector: `dimension` times the number of fields. |
+  | `fields` | list of `FieldDescription` | The text fields of the schema: the keys a record's `fields` may have. |
+  | `threshold` | float | The overall similarity threshold: a revision that scores below it is rejected. An `Evaluate` request may override it for itself. |
+  | `anchor_threshold` | float, may be absent | The drift threshold: a revision whose similarity to the record's anchor is below it is rejected. Absent if drift is reported and not enforced. |
+  | `quantities` | list of `QuantityDescription` | The quantities of the schema: the keys a record's `quantities` may have. They are part of no vector. |
+  | `reject_on_measure_change` | bool | Whether a record whose measures changed (`measure_changed` in an `Evaluate` answer) is rejected. |
+  | `match_threshold` | float, may be absent | The similarity `Match` holds its best candidate to. Absent if none is configured, and `Match` then ranks without deciding. |
+  | `match_overfetch` | uint32 | How many records `Match` fetches for each candidate it returns, before scoring them exactly. |
+  | `judging_digest` | string | Sixteen hexadecimal digits: a digest of everything a verdict depends on (the model, every field and quantity with its settings, the thresholds, how a match is decided, and the unit table of the build). Two servers that report the same digest judge by the same rules with the same model. |
+  
+  ### `fields[]` (`FieldDescription`)
+  
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `name` | string | The key to send in a record's `fields`. |
+  | `weight` | float | The field's weight in the overall similarity. Weights are relative. |
+  | `required` | bool | A record without a value for this field is refused. |
+  | `reject_below` | float, may be absent | The field's own floor: a revision whose similarity for this field is below it is rejected whatever the overall score. Absent if the field has none. |
+  
+  ### `quantities[]` (`QuantityDescription`)
+  
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `name` | string | The key to send in a record's `quantities`. |
+  | `reject_above_factor` | double, may be absent | A revision that changes this quantity by more than this factor, or moves it between zero and a value above zero, is rejected. Absent if the factor is only reported. |
+  | `reject_incomparable` | bool | A revision that puts this quantity in a unit that cannot be compared with the one it had is rejected. |
+  
+  ## Errors
+  
+  None of its own. It reads no record and does not run the model.
+}

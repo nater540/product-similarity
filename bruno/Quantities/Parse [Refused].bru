@@ -36,20 +36,112 @@ body:grpc {
 }
 
 docs {
-  A text that is not an amount is an answer with the reason, not an error, and nothing is guessed. In order:
+  `recordsimilarity.v1.Quantities/Parse` reads amounts written as text into quantities, one answer for each text, in
+  order. For a caller whose source holds an amount as a string: a record takes a number and a unit and never a text,
+  so such a caller asks here first and puts what it gets into the record. The whole text is the amount, or it is not
+  an amount: nothing is looked for inside prose, and nothing is guessed. It reads no record, runs no model, and looks
+  at no schema or limit: the answer comes from the request alone, on a server in any state, and the same request
+  always gets the same answer.
   
-  - an empty text: `AMOUNT_PROBLEM_EMPTY`
-  - `Blueberry Gummies 100mg`: `AMOUNT_PROBLEM_NO_NUMBER`. Nothing is looked for inside prose.
-  - `3.5`: `AMOUNT_PROBLEM_NO_UNIT`
-  - `3,5 g`: `AMOUNT_PROBLEM_AMBIGUOUS_SEPARATOR`
-  - `1.2.3 g`: `AMOUNT_PROBLEM_BAD_NUMBER`
-  - `-1 g`: `AMOUNT_PROBLEM_NEGATIVE`
-  - `22-18 %`: `AMOUNT_PROBLEM_BACKWARDS_RANGE`
-  - `500 mg - 1 g`: `AMOUNT_PROBLEM_MIXED_UNITS`
-  - `10 x 10 mg`: `AMOUNT_PROBLEM_MULTIPLE`
-  - `<1 %`: `AMOUNT_PROBLEM_QUALIFIED`
-  - `3.5 g (1/8 oz)`: `AMOUNT_PROBLEM_UNREADABLE_UNIT`
-  - `half`: `AMOUNT_PROBLEM_AMBIGUOUS_NAME`
+  ## This request
   
-  More than 1000 texts in one call is `INVALID_ARGUMENT`.
+  Twelve texts that are not amounts, one for each kind of refusal but `AMOUNT_PROBLEM_TOO_LARGE`. Each is an answer
+  with its reason and nothing else (no `quantity`, no `normalized`), and the call succeeds:
+  
+  | Text | `problem` |
+  |---|---|
+  | an empty text | `AMOUNT_PROBLEM_EMPTY` |
+  | `Blueberry Gummies 100mg` | `AMOUNT_PROBLEM_NO_NUMBER` |
+  | `3.5` | `AMOUNT_PROBLEM_NO_UNIT` |
+  | `3,5 g` | `AMOUNT_PROBLEM_AMBIGUOUS_SEPARATOR` |
+  | `1.2.3 g` | `AMOUNT_PROBLEM_BAD_NUMBER` |
+  | `-1 g` | `AMOUNT_PROBLEM_NEGATIVE` |
+  | `22-18 %` | `AMOUNT_PROBLEM_BACKWARDS_RANGE` |
+  | `500 mg - 1 g` | `AMOUNT_PROBLEM_MIXED_UNITS` |
+  | `10 x 10 mg` | `AMOUNT_PROBLEM_MULTIPLE` |
+  | `<1 %` | `AMOUNT_PROBLEM_QUALIFIED` |
+  | `3.5 g (1/8 oz)` | `AMOUNT_PROBLEM_UNREADABLE_UNIT` |
+  | `half` | `AMOUNT_PROBLEM_AMBIGUOUS_NAME` |
+  
+  The second is a product's name: what a name says stays in the name, and nothing is looked for inside it.
+  
+  ## Request (`ParseAmountsRequest`)
+  
+  | Field | Type | Required | Values |
+  |---|---|---|---|
+  | `texts` | list of string | no | The texts to read, each the whole of one amount. At most 1000 in one call; an empty list gets an empty answer. The space around a text, and runs of it inside, are not part of it. |
+  
+  What a text may be, and still be read:
+  
+  | Form | Examples | Read as |
+  |---|---|---|
+  | a number and a unit | `3.5 g`, `3.5g`, `.5 g`, `22%`, `12 fl oz` | that number, in that unit |
+  | thousands grouped by commas | `1,000 mg`, `1,000.5 mg` | 1000, 1000.5 |
+  | a fraction | `1/8 oz`, `3/2 oz`, `⅛ oz`, `½ oz` | 0.125, 1.5, 0.125, 0.5 |
+  | a mixed number | `1 1/2 oz`, `1-1/2 oz`, `1½ oz` | 1.5 |
+  | a range | `18-22%`, `18 to 22 %`, `18% - 22%`, `1/8 - 1/4 oz` | `min` and `max`, in the unit the last end says |
+  | a unit the server does not convert | `2 pack`, `25 mg/5 ml`, `5mg per serving` | the number, with that unit as written: `DIMENSION_OTHER` |
+  | a weight named by a word | `gram`, `half gram`, `eighth`, `quarter`, `half ounce`, `ounce`, `zip` | the weight it is sold as, in grams (below) |
+  
+  The words, with every spelling that is read. A word is read only when it is the whole text, in any case:
+  
+  | Words | Read as |
+  |---|---|
+  | `gram`, `a gram` | 1 g |
+  | `half gram`, `half a gram`, `a half gram`, `half g` | 0.5 g |
+  | `eighth`, `an eighth`, `eighth oz`, `eighth ounce` | 3.5 g |
+  | `quarter`, `a quarter`, `quarter oz`, `quarter ounce` | 7 g |
+  | `half ounce`, `half oz`, `half an ounce`, `a half ounce` | 14 g |
+  | `ounce`, `an ounce`, `zip`, `a zip` | 28 g |
+  
+  A number and a unit stay exact: `1/8 oz` is 0.125 oz, which is 3.54 g, where `eighth` is 3.5 g.
+  
+  ## Response (`ParseAmountsResponse`)
+  
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `amounts` | list of `ParsedAmount` | One for each text of the request, in the request's order. |
+  
+  ### `amounts[]` (`ParsedAmount`)
+  
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `quantity` | `Quantity`, may be absent | The amount, when the text is one: usable as a record's quantity as it is. A single value has `min` equal to `max`. The unit is as the text wrote it, with single spaces. Absent when the text is not an amount. |
+  | `problem` | `AmountProblem` | Why the text is not an amount. One of the values below. `AMOUNT_PROBLEM_UNSPECIFIED`, which JSON leaves out, when `quantity` is present. |
+  | `dimension` | `Dimension` | What the amount's unit measures. `DIMENSION_OTHER` says the unit is one the server does not convert, which is worth a look before it becomes a record's baseline. `DIMENSION_UNSPECIFIED` when `quantity` is absent. |
+  | `normalized` | `Quantity`, may be absent | The same amount in the one unit its dimension is compared in: `mg` for a mass, `ml` for a volume, `%` for a share. It is what `Convert` answers for `quantity` with no `to_unit`. For a unit the server does not convert, the amount is unchanged and the unit is in lower case with single spaces. Absent when `quantity` is. Either may be sent as a record's quantity: they compare as unchanged. |
+  
+  | `AmountProblem` | Number | The text | Examples |
+  |---|---|---|---|
+  | `AMOUNT_PROBLEM_UNSPECIFIED` | 0 | is an amount. | `3.5 g` |
+  | `AMOUNT_PROBLEM_EMPTY` | 1 | is nothing but whitespace. | an empty text |
+  | `AMOUNT_PROBLEM_NO_NUMBER` | 2 | does not start with a number. A word in front makes it prose. | `g`, `THC 22%`, `up to 22 %`, `Blueberry Gummies 100mg` |
+  | `AMOUNT_PROBLEM_NO_UNIT` | 3 | is a number and nothing after it. In a range, the last end has to say the unit. | `3.5`, `18-22`, `1/8` |
+  | `AMOUNT_PROBLEM_AMBIGUOUS_SEPARATOR` | 4 | has a comma that is not grouping thousands, so it could be read two ways. | `3,5 g`, `1,00 mg`, `0,500 g` |
+  | `AMOUNT_PROBLEM_BAD_NUMBER` | 5 | starts as a number and is not one. | `1.2.3 g`, `1/0 oz`, `1 3/2 oz` |
+  | `AMOUNT_PROBLEM_NEGATIVE` | 6 | is below zero. | `-1 g` |
+  | `AMOUNT_PROBLEM_BACKWARDS_RANGE` | 7 | is a range that runs backwards. | `22-18 %` |
+  | `AMOUNT_PROBLEM_MIXED_UNITS` | 8 | is a range whose two ends say different units. | `500 mg - 1 g` |
+  | `AMOUNT_PROBLEM_MULTIPLE` | 9 | is one amount times another. A hundred milligrams a package or ten an item: only the caller knows which its quantity means. | `10 x 10 mg`, `2 × 0.5 g` |
+  | `AMOUNT_PROBLEM_QUALIFIED` | 10 | starts with `<`, `>`, `≤`, `≥`, `~`, `≈`, or `±`. "Less than one" is not a number and a unit. | `<1 %`, `~3.5 g` |
+  | `AMOUNT_PROBLEM_UNREADABLE_UNIT` | 11 | has something after the number that is not made of what a unit is made of: letters, spaces, `%`, `.`, `/`, a hyphen between two letters, and a number only as the amount of what it is per. | `3.5 g (1/8 oz)`, `20 %+`, `5 mg 2`, `1e3 mg` |
+  | `AMOUNT_PROBLEM_TOO_LARGE` | 12 | is a number and a unit, and too large to compare. | a 1 followed by 400 zeros, in `g` |
+  | `AMOUNT_PROBLEM_AMBIGUOUS_NAME` | 13 | is a word that names more than one weight. `half ounce` and `half gram` are read. | `half`, `a half` |
+  
+  | `Dimension` | Number | Meaning |
+  |---|---|---|
+  | `DIMENSION_UNSPECIFIED` | 0 | No unit to speak of: in a `Parse` answer, the text was not an amount. |
+  | `DIMENSION_MASS` | 1 | A mass. Compared in `mg`. |
+  | `DIMENSION_VOLUME` | 2 | A volume. Compared in `ml`. |
+  | `DIMENSION_FRACTION` | 3 | A share of the whole. Compared in `%`. |
+  | `DIMENSION_OTHER` | 4 | A unit this server does not convert: `pack`, `each`, a misspelling. It is its own dimension, the same as itself and different from every other unit. |
+  
+  ## Errors
+  
+  | Status | When |
+  |---|---|
+  | `INVALID_ARGUMENT` | More than 1000 texts in one call. Send them in several. |
+  
+  A text that is not an amount is an answer with its reason, never an error: a caller checking a column wants every
+  answer and a count of each reason.
 }

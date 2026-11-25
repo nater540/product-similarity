@@ -32,6 +32,180 @@ body:grpc {
 }
 
 docs {
-  `brand_id` here narrows the candidates to one brand's records. `threshold` holds the best candidate to a score
-  for this request, so the decision is `MATCHED` or `NO_MATCH`. 0.9 is an example, not a measured value.
+  `recordsimilarity.v1.RecordSimilarity/Match` finds the stored records a menu item describes, best first, and says
+  whether the best is the same product. A menu item is an entry on a retailer's menu: it names no stored record
+  itself. Read-only: nothing is stored or changed.
+  
+  ## This request
+  
+  The same body as `Match` at the top of the collection: the request's `brand_id` narrows the candidates to the
+  records of `brand-1`, for a caller that knows which brand the menu item is of, and `threshold` holds the best of
+  them to 0.9 for this request. 0.9 is an example, not a measured value. Send `Import` first, so that there is
+  something to match.
+  
+  `brand_id` goes on the request and never inside `menu_item`: the brand's name as text, `Sunny Orchard`, is the
+  `brand` field, and is scored like any other text.
+  
+  The first of three candidates, and the decision:
+  
+  ```json
+  {
+    "candidates": [
+      {
+        "id": "bruno-import-1",
+        "brand_id": "brand-1",
+        "similarity": 0.96024024,
+        "search_similarity": 0.85886496,
+        "fields": [
+          { "field": "brand", "change": "FIELD_CHANGE_UNCHANGED", "similarity": 1.0, "weight": 1.0 },
+          { "field": "category", "change": "FIELD_CHANGE_MODIFIED", "similarity": 0.9251419, "weight": 3.0 },
+          { "field": "description", "change": "FIELD_CHANGE_REMOVED", "weight": 2.0 },
+          { "field": "name", "change": "FIELD_CHANGE_MODIFIED", "similarity": 0.9766241, "weight": 4.0 }
+        ],
+        "quantities": [
+          { "field": "thc_per_item", "change": "QUANTITY_CHANGE_REMOVED", "previous_unit": "mg" },
+          { "field": "weight_per_item", "change": "QUANTITY_CHANGE_REMOVED", "previous_unit": "g" }
+        ]
+      }
+    ],
+    "decision": "MATCH_DECISION_MATCHED",
+    "threshold": 0.9
+  }
+  ```
+  
+  The gummies score 0.960 over the three fields both sides have, which is at or above 0.9: `MATCH_DECISION_MATCHED`.
+  The stored description counts for nothing (`FIELD_CHANGE_REMOVED`: only the stored record has one), and the stored
+  quantities are reported as `QUANTITY_CHANGE_REMOVED` because the menu item sends none. The other two candidates are
+  the two cartridges, `bruno-1` and `bruno-import-2`, at 0.556 each. With a `threshold` above 0.960 the same
+  candidates come back with `MATCH_DECISION_NO_MATCH`. The scores are those of the default model (`mdbr-leaf-mt`)
+  under `config.example.toml`; another model or other weights give other numbers.
+  
+  ## Request (`MatchRequest`)
+  
+  | Field | Type | Required | Values |
+  |---|---|---|---|
+  | `menu_item` | `Record` | yes | The menu item, under the field and quantity names of the server's schema. See below. |
+  | `limit` | uint32 | no | How many candidates to return, 1 to 100. Left out or 0: 5. |
+  | `brand_id` | string | no | Only consider records of this brand, when the caller knows which brand the menu item is of. Compared exactly. Not blank. Left out: every brand's records are candidates. |
+  | `threshold` | float | no | -1 to 1. Holds the best candidate to this, in place of the server's match threshold (`match_threshold` in `Describe`). The example config ships none, because it has to be measured, so without this field nothing is decided. |
+  
+  ### `menu_item` (`Record`)
+  
+  Map the menu item's own fields onto the schema's names, and leave out one with no counterpart.
+  
+  | Field | Type | Required | Values |
+  |---|---|---|---|
+  | `id` | string | must be absent | A menu item's id belongs to the system it came from. Present: `INVALID_ARGUMENT`. |
+  | `brand_id` | string | must be absent | Present: `INVALID_ARGUMENT`. To match within one brand, use the request's own `brand_id`. |
+  | `fields` | map of string to string | yes | Field name to text. The names are the ones `Describe` lists: with the example config `name` (required), `category`, `brand`, and `description`. A field that is left out and one that is blank are the same thing: no value. Runs of whitespace count as one space. Text beyond the model's limit (256 tokens with the example config) is not read. |
+  | `quantities` | map of string to `Quantity` | no | Quantity name to amount. The names are the ones `Describe` lists: with the example config `weight_per_item`, `volume_per_item`, `thc_per_item`, and `cbd_per_item`. A quantity the menu item does not have is left out. They are compared with each candidate's and reported, and never move a similarity or the decision. |
+  
+  ### A quantity (`Quantity`)
+  
+  A measured amount with its unit: a weight, a volume, a potency. A single value is a range whose two ends are equal,
+  and a caller that has only one end of a range sends it as both.
+  
+  | Field | Type | Values |
+  |---|---|---|
+  | `min` | double | The low end. A finite number, 0 or more. |
+  | `max` | double | The high end. A finite number, not below `min`. |
+  | `unit` | string | The unit both ends are in. Not blank. Matched without regard to case or the space around it: `G` and `g` are one unit. |
+  
+  These units are converted before amounts are compared, so `1 g` and `1000 mg` are the same quantity:
+  
+  | Measures | Compared in | Spellings |
+  |---|---|---|
+  | a mass | `mg` | `mcg` `µg` `μg` `microgram` `micrograms`, `mg` `milligram` `milligrams`, `g` `gram` `grams`, `kg` `kilogram` `kilograms`, `oz` `ounce` `ounces`, `lb` `lbs` `pound` `pounds` |
+  | a volume | `ml` | `ml` `milliliter` `milliliters` `millilitre` `millilitres`, `cl` `centiliter` `centiliters`, `l` `liter` `liters` `litre` `litres`, `fl oz` `floz` `fl. oz` `fl. oz.` `fluid ounce` `fluid ounces` |
+  | a share of the whole | `%` | `%` `percent` `pct` |
+  
+  Any other unit (`pack`, `each`, a misspelling) is accepted and never an error. It is comparable with itself and with
+  nothing else. `Quantities` > `ListUnits` gives the table the server runs with, each unit with its factor.
+  
+  ## Response (`MatchResponse`)
+  
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `candidates` | list of `MatchCandidate` | The stored records the menu item may describe, best first, at most `limit`. Equal similarities are ordered by id. |
+  | `decision` | `MatchDecision` | What was decided about the first candidate. One of the values below. |
+  | `threshold` | float, may be absent | The threshold the first candidate was held to: the request's, or else the server's. Absent if there was neither. |
+  
+  | `MatchDecision` | Number | Meaning |
+  |---|---|---|
+  | `MATCH_DECISION_UNSPECIFIED` | 0 | Not sent by this server. |
+  | `MATCH_DECISION_NOT_JUDGED` | 1 | No match threshold is configured and the request gave none: the candidates are ranked, and nothing is claimed about the best. |
+  | `MATCH_DECISION_MATCHED` | 2 | The first candidate's `similarity` is at or above the threshold. |
+  | `MATCH_DECISION_NO_MATCH` | 3 | The first candidate's `similarity` is below the threshold, or there are no candidates. |
+  
+  ### `candidates[]` (`MatchCandidate`)
+  
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `id` | string | The stored record's id. |
+  | `brand_id` | string, may be absent | The brand it is stored under. |
+  | `similarity` | float | The weighted mean of the per-field similarities over the fields both the stored record and the menu item have. This is what the decision is made on. 0 if they share no field. |
+  | `search_similarity` | float | The score the search found this candidate by: what `FindSimilar` would report for it. The search under-scores a stored record that has more fields filled in than the menu item, which is why each candidate is scored again. |
+  | `fields` | list of `FieldScore` | Read with the stored record as the baseline and the menu item as the record. |
+  | `quantities` | list of `QuantityScore` | The same reading for quantities. |
+  
+  The server fetches more records than it returns (`limit` times `match_overfetch` from `Describe`, at most 1000),
+  scores each exactly, and returns the best `limit`.
+  
+  ### `fields[]` (`FieldScore`)
+  
+  How one field of the menu item compares with the stored record's. `FIELD_CHANGE_ADDED` is a field only the menu item
+  has and `FIELD_CHANGE_REMOVED` one only the stored record has; neither is scored. `FIELD_CHANGE_RESTORED` never
+  occurs, and `below_floor` is never set: a floor is a rule for revisions.
+  
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `field` | string | The field's name. |
+  | `change` | `FieldChange` | One of the values below. |
+  | `similarity` | float, may be absent | Cosine similarity between the stored value and the record's, -1 to 1; for `FIELD_CHANGE_RESTORED`, between the field's first value and the record's. Absent for `FIELD_CHANGE_ADDED` and `FIELD_CHANGE_REMOVED`. |
+  | `weight` | float | The field's weight in the overall score. |
+  | `below_floor` | bool | The similarity is below the field's own floor (`reject_below` in `Describe`), which rejects the record whatever the overall score. |
+  
+  | `FieldChange` | Number | Meaning | Scored? |
+  |---|---|---|---|
+  | `FIELD_CHANGE_UNSPECIFIED` | 0 | Not sent by this server. | |
+  | `FIELD_CHANGE_UNCHANGED` | 1 | The same text, ignoring whitespace. | Yes, as 1. |
+  | `FIELD_CHANGE_MODIFIED` | 2 | Both versions have a value and the text differs. | Yes, against the stored value. |
+  | `FIELD_CHANGE_ADDED` | 3 | Only the record has a value, and the stored record has never had one. | No: new information is taken on trust. |
+  | `FIELD_CHANGE_REMOVED` | 4 | Only the stored version has a value. | No. |
+  | `FIELD_CHANGE_RESTORED` | 5 | The stored version has no value, but the record once did and has one again. | Yes, against the first value the field had, so that a field cannot be swapped by blanking it and filling it in again. |
+  
+  ### `quantities[]` (`QuantityScore`)
+  
+  How one quantity of the menu item compares with the stored record's. Quantities are compared as numbers after unit
+  conversion, and never move a similarity.
+  
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `field` | string | The quantity's name. |
+  | `change` | `QuantityChange` | One of the values below. |
+  | `factor` | double, may be absent | How many times larger or smaller the amount became; for a range, whichever end moved more. Always at least 1, so "eight times bigger" and "an eighth" are both 8, and exactly 1 when nothing changed. Absent for `QUANTITY_CHANGE_ADDED` and `QUANTITY_CHANGE_REMOVED`, and when `incomparable` or `zero_crossing` is set. |
+  | `zero_crossing` | bool | The amount moved between zero and a value above zero, so no factor describes the change. |
+  | `incomparable` | bool | The two values are in units that cannot be converted into one another. |
+  | `previous_unit` | string, may be absent | The unit of the value the record was compared with. Absent for `QUANTITY_CHANGE_ADDED`. |
+  | `unit` | string, may be absent | The record's unit. Absent for `QUANTITY_CHANGE_REMOVED`. |
+  | `beyond_limit` | bool | Never set by this call. |
+  
+  | `QuantityChange` | Number | Meaning |
+  |---|---|---|
+  | `QUANTITY_CHANGE_UNSPECIFIED` | 0 | Not sent by this server. |
+  | `QUANTITY_CHANGE_UNCHANGED` | 1 | The same amount after unit conversion: `1 g` and `1000 mg`. |
+  | `QUANTITY_CHANGE_MODIFIED` | 2 | Both versions have a value, in comparable units, and the amounts differ. |
+  | `QUANTITY_CHANGE_ADDED` | 3 | Only the record has a value, and the stored record has never had one. |
+  | `QUANTITY_CHANGE_REMOVED` | 4 | Only the stored version has a value. |
+  | `QUANTITY_CHANGE_RESTORED` | 5 | The stored version has none, but the record once did and has one again. Compared with the first value it had. |
+  | `QUANTITY_CHANGE_INCOMPARABLE` | 6 | Both versions have a value, in units that cannot be converted into one another (`%` and `mg`). Not a bigger or smaller amount: another kind of measurement. |
+  
+  ## Errors
+  
+  | Status | When |
+  |---|---|
+  | `INVALID_ARGUMENT` | No `menu_item`. A menu item that carries an `id` or a `brand_id`, or does not fit the schema (see `Evaluate`). A `limit` above 100. A `threshold` outside -1 to 1. A blank `brand_id`. |
+  | `RESOURCE_EXHAUSTED` | The embedding queue is full. Retry with backoff. |
+  | `DEADLINE_EXCEEDED` | The request carried a deadline, and the server could tell it would not be met. |
+  | `UNAVAILABLE` | The vector store cannot be reached. Retry with backoff. |
 }

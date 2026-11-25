@@ -96,10 +96,122 @@ body:grpc {
 }
 
 docs {
-  Creates records that are not stored yet: send each message, then end the stream. One answer comes back for
-  each record, in order. A record that is already stored is answered `IMPORT_OUTCOME_EXISTS` and left exactly as
-  it is, so the stream can be sent twice. `anchor` is the record as it was first created, if you have it.
+  `recordsimilarity.v1.RecordSimilarity/Import` creates records that are not stored yet, as many as the caller sends,
+  over one call. It is a stream both ways: the caller sends one message for each record and gets one answer for each,
+  in the order they were sent. It is how a catalog is loaded.
   
-  The third record has a field the schema does not define and is answered `IMPORT_OUTCOME_FAILED` by itself; the
-  stream goes on. The requests after this one search and match against what it creates.
+  It only creates. A record whose `id` is already stored is left exactly as it is and answered
+  `IMPORT_OUTCOME_EXISTS`: nothing is compared, nothing is replaced, and no anchor moves. Changing a stored record is
+  an `Evaluate`, which judges the change. So a stream can be sent twice, or cut off and sent again from the start.
+  
+  ## This request
+  
+  Three messages. In Bruno, send each message and then end the stream.
+  
+  1. `bruno-import-1`: a pouch of gummies of the brand `brand-1`, with all four fields and two quantities.
+  2. `bruno-import-2`: a vape cartridge, with an `anchor`: the record as it was first created, when its name did not
+     say `Live Resin` yet. Drift is measured from that version.
+  3. `bruno-import-3`: a record with a field `strain`, which the schema does not define.
+  
+  On an empty server:
+  
+  ```json
+  { "id": "bruno-import-1", "outcome": "IMPORT_OUTCOME_CREATED" }
+  { "index": "1", "id": "bruno-import-2", "outcome": "IMPORT_OUTCOME_CREATED" }
+  {
+    "index": "2",
+    "id": "bruno-import-3",
+    "outcome": "IMPORT_OUTCOME_FAILED",
+    "status_code": 3,
+    "message": "invalid record: unknown field `strain`; the schema has: brand, category, description, name"
+  }
+  ```
+  
+  The third record fails by itself and the stream goes on. The first answer's `index` is 0, which JSON leaves out.
+  Sent a second time, the first two are answered `IMPORT_OUTCOME_EXISTS` and the third fails as before.
+  
+  `FindSimilar`, `Match`, and their examples search among what this creates.
+  
+  ## Request: a stream of `ImportRequest`
+  
+  | Field | Type | Required | Values |
+  |---|---|---|---|
+  | `record` | `Record` | yes | The record as it is now. Its `id` is required here. |
+  | `anchor` | `Original` | no | The record as it was first created, if that is still known: `fields` and `quantities`, with no `id` and no `brand_id`. Drift is then measured from this version and not from the record as it is now, and a field or quantity the record has since lost is remembered. Left out, the record as it is now is its own point of reference, as for any new record. |
+  
+  ### `record` (`Record`)
+  
+  | Field | Type | Required | Values |
+  |---|---|---|---|
+  | `id` | string | yes | The caller's identifier for the record: any string that is not blank. A record without one cannot be stored and is answered `IMPORT_OUTCOME_FAILED`. |
+  | `brand_id` | string | no | The key of the brand that owns the record. It is an identifier, compared exactly and never embedded: the brand's name, as text, is the `brand` field. Not blank. Stored with the record, as for `Evaluate`. If the id is already stored under another brand, or under a brand and this names none, the record is answered `IMPORT_OUTCOME_FAILED` with status 9. |
+  | `fields` | map of string to string | yes | Field name to text. The names are the ones `Describe` lists: with the example config `name` (required), `category`, `brand`, and `description`. A field that is left out and one that is blank are the same thing: no value. Runs of whitespace count as one space. Text beyond the model's limit (256 tokens with the example config) is not read. |
+  | `quantities` | map of string to `Quantity` | no | Quantity name to amount. The names are the ones `Describe` lists: with the example config `weight_per_item`, `volume_per_item`, `thc_per_item`, and `cbd_per_item`. A quantity the record does not have is left out. An amount is never sent as text in `fields`. |
+  
+  ### `anchor` (`Original`)
+  
+  | Field | Type | Required | Values |
+  |---|---|---|---|
+  | `fields` | map of string to string | yes | As `record.fields`. The anchor has to fit the schema as a record does, so with the example config it needs a `name`. |
+  | `quantities` | map of string to `Quantity` | no | As `record.quantities`. |
+  
+  A fault in the anchor is reported with `the original version:` in front of the message.
+  
+  ### A quantity (`Quantity`)
+  
+  A measured amount with its unit: a weight, a volume, a potency. A single value is a range whose two ends are equal,
+  and a caller that has only one end of a range sends it as both.
+  
+  | Field | Type | Values |
+  |---|---|---|
+  | `min` | double | The low end. A finite number, 0 or more. |
+  | `max` | double | The high end. A finite number, not below `min`. |
+  | `unit` | string | The unit both ends are in. Not blank. Matched without regard to case or the space around it: `G` and `g` are one unit. |
+  
+  These units are converted before amounts are compared, so `1 g` and `1000 mg` are the same quantity:
+  
+  | Measures | Compared in | Spellings |
+  |---|---|---|
+  | a mass | `mg` | `mcg` `µg` `μg` `microgram` `micrograms`, `mg` `milligram` `milligrams`, `g` `gram` `grams`, `kg` `kilogram` `kilograms`, `oz` `ounce` `ounces`, `lb` `lbs` `pound` `pounds` |
+  | a volume | `ml` | `ml` `milliliter` `milliliters` `millilitre` `millilitres`, `cl` `centiliter` `centiliters`, `l` `liter` `liters` `litre` `litres`, `fl oz` `floz` `fl. oz` `fl. oz.` `fluid ounce` `fluid ounces` |
+  | a share of the whole | `%` | `%` `percent` `pct` |
+  
+  Any other unit (`pack`, `each`, a misspelling) is accepted and never an error. It is comparable with itself and with
+  nothing else. `Quantities` > `ListUnits` gives the table the server runs with, each unit with its factor.
+  
+  ## Response: a stream of `ImportResponse`
+  
+  One for each record, in the order they were sent.
+  
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `index` | uint64 (a string in JSON) | Which record of the stream this answers, counting from 0. |
+  | `id` | string, may be absent | The record's `id` as it was sent. Absent if the record had none. |
+  | `outcome` | `ImportOutcome` | One of the values below. |
+  | `status_code` | uint32 | For `IMPORT_OUTCOME_FAILED`, the gRPC status code the same record would have got from `Evaluate`. 0 otherwise. |
+  | `message` | string | For `IMPORT_OUTCOME_FAILED`, what was wrong, as a sentence. Empty otherwise. |
+  
+  | `ImportOutcome` | Number | Meaning |
+  |---|---|---|
+  | `IMPORT_OUTCOME_UNSPECIFIED` | 0 | Not sent by this server. |
+  | `IMPORT_OUTCOME_CREATED` | 1 | Nothing was stored under the id. The record is now, at revision 1. |
+  | `IMPORT_OUTCOME_EXISTS` | 2 | A record is already stored under the id. It was left exactly as it was, and the record sent was not embedded. |
+  | `IMPORT_OUTCOME_FAILED` | 3 | The record was not stored. `status_code` and `message` say why. |
+  
+  | `status_code` | Status | When |
+  |---|---|---|
+  | 3 | `INVALID_ARGUMENT` | The record, or its anchor, does not fit the schema, or it has no `id`. |
+  | 8 | `RESOURCE_EXHAUSTED` | The model was busy, and the server waited ten seconds for room. |
+  | 9 | `FAILED_PRECONDITION` | The id is stored under a brand the record does not name. |
+  | 10 | `ABORTED` | Another writer kept changing the record. |
+  | 14 | `UNAVAILABLE` | The vector store cannot be reached. |
+  
+  ## Errors
+  
+  Everything about a record is in its answer, and one record failing does not end the stream. An error on the call
+  itself is the transport's.
+  
+  The stream shares the server's model with every other request, a few records at a time
+  (`server.import_batch_records`, 8 in the example config). While the model is busy the stream is slowed down, not
+  refused.
 }

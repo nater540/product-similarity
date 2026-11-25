@@ -6,3 +6,19 @@ meta {
 auth {
   mode: inherit
 }
+
+docs {
+  Six kinds of `Evaluate`, in the order to send them after `Evaluate` at the top of the collection has created
+  `bruno-1`. They all work on that one record, so each answer depends on the ones before it.
+  
+  | Step | Request | `mode` | Answer |
+  |---|---|---|---|
+  | 1 | `Evaluate [Create Record]` | `WRITE_MODE_ENFORCE` | `VERDICT_CREATED` if `bruno-1` is not stored. After `Evaluate`: `VERDICT_ACCEPTED` at 1, nothing written. |
+  | 2 | `Evaluate [Accepted Update]` | `WRITE_MODE_ENFORCE` | `VERDICT_ACCEPTED`, stored, revision 2. |
+  | 3 | `Evaluate [Dry-Run]` | `WRITE_MODE_DRY_RUN` | `VERDICT_REJECTED`, not stored. |
+  | 4 | `Evaluate [Rejected Update]` | `WRITE_MODE_ENFORCE` | `VERDICT_REJECTED`, not stored, revision still 2. |
+  | 5 | `Evaluate [Forced Update]` | `WRITE_MODE_FORCE` | `VERDICT_REJECTED`, stored, revision 3. |
+  | 6 | `Evaluate [Return Vector]` | left out | `VERDICT_EMBEDDED`, with the vector. No `id`, so it depends on nothing. |
+  
+  To start over, send `Delete` and then `Evaluate`.
+}

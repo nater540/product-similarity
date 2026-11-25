@@ -28,5 +28,79 @@ body:grpc {
 }
 
 docs {
-  Writes one quantity in another unit. 3.5 g is 0.12345886682353145 oz, and both dimensions are `DIMENSION_MASS`.
+  `recordsimilarity.v1.Quantities/Convert` writes one quantity in another unit, or in the unit its dimension is
+  compared in. It is the conversion `Evaluate` makes before it compares two amounts. It reads no record, runs no
+  model, and looks at no schema or limit: the answer comes from the request alone, on a server in any state, and the
+  same request always gets the same answer.
+  
+  ## This request
+  
+  3.5 g, written in `oz`:
+  
+  ```json
+  {
+    "dimension": "DIMENSION_MASS",
+    "to_dimension": "DIMENSION_MASS",
+    "converted": { "min": 0.12345886682353145, "max": 0.12345886682353145, "unit": "oz" }
+  }
+  ```
+  
+  Both units measure a mass, so the amount converts. A range converts end by end.
+  
+  ## Request (`ConvertQuantityRequest`)
+  
+  | Field | Type | Required | Values |
+  |---|---|---|---|
+  | `quantity` | `Quantity` | yes | The amount to convert. |
+  | `to_unit` | string | no | The unit to write it in: any spelling of a unit the server converts, or any other unit. Not blank when present. Left out: the unit the quantity's dimension is compared in (`mg`, `ml`, or `%`), and for a unit the server does not convert, that unit itself in lower case with single spaces. |
+  
+  ### A quantity (`Quantity`)
+  
+  A measured amount with its unit: a weight, a volume, a potency. A single value is a range whose two ends are equal,
+  and a caller that has only one end of a range sends it as both.
+  
+  | Field | Type | Values |
+  |---|---|---|
+  | `min` | double | The low end. A finite number, 0 or more. |
+  | `max` | double | The high end. A finite number, not below `min`. |
+  | `unit` | string | The unit both ends are in. Not blank. Matched without regard to case or the space around it: `G` and `g` are one unit. |
+  
+  These units are converted before amounts are compared, so `1 g` and `1000 mg` are the same quantity:
+  
+  | Measures | Compared in | Spellings |
+  |---|---|---|
+  | a mass | `mg` | `mcg` `µg` `μg` `microgram` `micrograms`, `mg` `milligram` `milligrams`, `g` `gram` `grams`, `kg` `kilogram` `kilograms`, `oz` `ounce` `ounces`, `lb` `lbs` `pound` `pounds` |
+  | a volume | `ml` | `ml` `milliliter` `milliliters` `millilitre` `millilitres`, `cl` `centiliter` `centiliters`, `l` `liter` `liters` `litre` `litres`, `fl oz` `floz` `fl. oz` `fl. oz.` `fluid ounce` `fluid ounces` |
+  | a share of the whole | `%` | `%` `percent` `pct` |
+  
+  Any other unit (`pack`, `each`, a misspelling) is accepted and never an error. It is comparable with itself and with
+  nothing else. `Quantities` > `ListUnits` gives the table the server runs with, each unit with its factor.
+  
+  ## Response (`ConvertQuantityResponse`)
+  
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `dimension` | `Dimension` | What the quantity's own unit measures. |
+  | `to_dimension` | `Dimension` | What `to_unit` measures. The same as `dimension` when `to_unit` was left out. |
+  | `converted` | `Quantity`, may be absent | The same amount in the unit asked for, with the unit written as the request wrote it, apart from the space around it. Absent when the two units measure different things. |
+  
+  | `Dimension` | Number | Meaning |
+  |---|---|---|
+  | `DIMENSION_UNSPECIFIED` | 0 | No unit to speak of: in a `Parse` answer, the text was not an amount. |
+  | `DIMENSION_MASS` | 1 | A mass. Compared in `mg`. |
+  | `DIMENSION_VOLUME` | 2 | A volume. Compared in `ml`. |
+  | `DIMENSION_FRACTION` | 3 | A share of the whole. Compared in `%`. |
+  | `DIMENSION_OTHER` | 4 | A unit this server does not convert: `pack`, `each`, a misspelling. It is its own dimension, the same as itself and different from every other unit. |
+  
+  Two units convert when they measure the same thing. For `DIMENSION_OTHER` that means they are the same unit: `pack`
+  converts to `PACK` and not to `each`, though both answers say `DIMENSION_OTHER` twice. `converted` being present is
+  what tells them apart. Another spelling of the quantity's own unit (`g` to `grams`) changes no number.
+  
+  ## Errors
+  
+  | Status | When |
+  |---|---|
+  | `INVALID_ARGUMENT` | No `quantity`. An amount that is not a usable measurement: not finite, negative, `min` above `max`, a blank unit, or too large to convert. A `to_unit` that is present and blank. An amount that does not fit in a number once written in the unit asked for. |
+  
+  Units that do not convert are an answer, not an error.
 }

@@ -29,5 +29,96 @@ body:grpc {
 }
 
 docs {
-  The stored records most similar to text that is not stored.
+  `recordsimilarity.v1.RecordSimilarity/FindSimilar` around a record that is not stored: the text is embedded for the
+  search and nothing is kept. Read-only.
+  
+  ## This request
+  
+  Searches for `blueberry gummy 100 mg`, a name and nothing else, among every brand's records (no `brand_id`). `limit`
+  asks for at most 3, and `min_similarity` drops anything below 0.5. Send `Import` first, so that there is something
+  to find.
+  
+  ```json
+  {
+    "neighbors": [
+      { "id": "bruno-import-1", "brand_id": "brand-1", "similarity": 0.61616576 }
+    ]
+  }
+  ```
+  
+  Only the gummies clear 0.5. The score looks low for a name this close because the query has one field and the stored
+  record four: a field that only one side has lowers a search score. `Match` scores over the shared fields only: in
+  `Match [Without Brand]` a name alone scores 0.940 against this same record. The scores are those of the default
+  model (`mdbr-leaf-mt`) under `config.example.toml`; another model or other weights give other numbers.
+  
+  ## Request (`FindSimilarRequest`)
+  
+  Exactly one of `id` and `record` says what to search around.
+  
+  | Field | Type | Required | Values |
+  |---|---|---|---|
+  | `id` | string | one of the two | Search around a stored record. Not blank. `NOT_FOUND` if nothing is stored under it. The record itself is not among the results. |
+  | `record` | `Record` | one of the two | Search around a record that is embedded and not stored. See below. |
+  | `limit` | uint32 | no | How many neighbors to return, 1 to 100. Left out or 0: 10. |
+  | `brand_id` | string | no | Only return records of this brand. Compared exactly. Not blank. Left out: every brand's records. A brand that has no records gives an empty answer, not an error. |
+  | `min_similarity` | float | no | -1 to 1. Only return records at least this similar. Left out: no floor. |
+  
+  ### `record` (`Record`)
+  
+  | Field | Type | Required | Values |
+  |---|---|---|---|
+  | `id` | string | no | Not blank. If the record carries one, the stored record of that id is left out of the results. Nothing is stored under it by this call. |
+  | `brand_id` | string | no | Plays no part in a search. To search within one brand, use the request's own `brand_id`. |
+  | `fields` | map of string to string | yes | Field name to text. The names are the ones `Describe` lists: with the example config `name` (required), `category`, `brand`, and `description`. A field that is left out and one that is blank are the same thing: no value. Runs of whitespace count as one space. Text beyond the model's limit (256 tokens with the example config) is not read. |
+  | `quantities` | map of string to `Quantity` | no | Quantity name to amount. The names are the ones `Describe` lists: with the example config `weight_per_item`, `volume_per_item`, `thc_per_item`, and `cbd_per_item`. A quantity the record does not have is left out. They have to fit the schema, and play no part in a search: it compares vectors. |
+  
+  ### A quantity (`Quantity`)
+  
+  A measured amount with its unit: a weight, a volume, a potency. A single value is a range whose two ends are equal,
+  and a caller that has only one end of a range sends it as both.
+  
+  | Field | Type | Values |
+  |---|---|---|
+  | `min` | double | The low end. A finite number, 0 or more. |
+  | `max` | double | The high end. A finite number, not below `min`. |
+  | `unit` | string | The unit both ends are in. Not blank. Matched without regard to case or the space around it: `G` and `g` are one unit. |
+  
+  These units are converted before amounts are compared, so `1 g` and `1000 mg` are the same quantity:
+  
+  | Measures | Compared in | Spellings |
+  |---|---|---|
+  | a mass | `mg` | `mcg` `µg` `μg` `microgram` `micrograms`, `mg` `milligram` `milligrams`, `g` `gram` `grams`, `kg` `kilogram` `kilograms`, `oz` `ounce` `ounces`, `lb` `lbs` `pound` `pounds` |
+  | a volume | `ml` | `ml` `milliliter` `milliliters` `millilitre` `millilitres`, `cl` `centiliter` `centiliters`, `l` `liter` `liters` `litre` `litres`, `fl oz` `floz` `fl. oz` `fl. oz.` `fluid ounce` `fluid ounces` |
+  | a share of the whole | `%` | `%` `percent` `pct` |
+  
+  Any other unit (`pack`, `each`, a misspelling) is accepted and never an error. It is comparable with itself and with
+  nothing else. `Quantities` > `ListUnits` gives the table the server runs with, each unit with its factor.
+  
+  ## Response (`FindSimilarResponse`)
+  
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `neighbors` | list of `Neighbor` | The stored records found, most similar first. Empty (`{}`) if none qualifies. |
+  
+  ### `neighbors[]` (`Neighbor`)
+  
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `id` | string | The stored record's id. |
+  | `brand_id` | string, may be absent | The brand it is stored under. Absent for a record stored without one. |
+  | `similarity` | float | Cosine similarity of the two composite vectors, -1 to 1. |
+  
+  For two records with values for the same fields, `similarity` is exactly the weighted score `Evaluate` uses, so a
+  search is on the same scale as a verdict. A field that only one of the two has a value for lowers the score here,
+  where `Evaluate` leaves such a field out. `Match` is the call that scores over shared fields only.
+  
+  ## Errors
+  
+  | Status | When |
+  |---|---|
+  | `INVALID_ARGUMENT` | Neither `id` nor `record`. A blank `id` or `brand_id`. A `limit` above 100. A `min_similarity` outside -1 to 1. A `record` that does not fit the schema (see `Evaluate`). |
+  | `NOT_FOUND` | Nothing is stored under `id`. |
+  | `RESOURCE_EXHAUSTED` | A search by `record`: the embedding queue is full. Retry with backoff. |
+  | `DEADLINE_EXCEEDED` | A search by `record`: the request carried a deadline, and the server could tell it would not be met. |
+  | `UNAVAILABLE` | The vector store cannot be reached. Retry with backoff. |
 }

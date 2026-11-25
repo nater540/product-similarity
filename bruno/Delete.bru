@@ -1,0 +1,65 @@
+meta {
+  name: Delete
+  type: grpc
+  seq: 7
+}
+
+grpc {
+  url: {{server}}
+  method: /recordsimilarity.v1.RecordSimilarity/Delete
+  body: grpc
+  protoPath: ../crates/similarity-proto/proto/recordsimilarity/v1/similarity.proto
+  auth: none
+  methodType: unary
+}
+
+body:grpc {
+  name: message 1
+  content: '''
+    {
+      "id": "bruno-1",
+      "brand_id": "brand-1"
+    }
+  '''
+}
+
+docs {
+  `recordsimilarity.v1.RecordSimilarity/Delete` forgets a record: its vectors, its quantities, its anchor, and its
+  revision count. The next `Evaluate` for the id starts a new baseline at revision 1.
+  
+  ## This request
+  
+  Deletes `bruno-1`, naming its brand, `brand-1`. Send it last: the `Evaluate` examples revise this record.
+  
+  ```json
+  { "deleted": true }
+  ```
+  
+  Sent a second time, or for an id that was never stored, the answer is `{}`: `deleted` is false, and that is not an
+  error. The records `Import` created (`bruno-import-1`, `bruno-import-2`) stay; change `id` to delete them too.
+  
+  ## Request (`DeleteRequest`)
+  
+  | Field | Type | Required | Values |
+  |---|---|---|---|
+  | `id` | string | yes | The id of the record to forget. Not blank. |
+  | `brand_id` | string | if the record has one | The brand the record is stored under, compared exactly. Required if the record is stored under a brand: a request that names another brand, or none, is refused and deletes nothing. Not blank. For a record stored without a brand it may be left out. |
+  
+  ## Response (`DeleteResponse`)
+  
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `deleted` | bool | Whether there was a record to delete. |
+  
+  ## Errors
+  
+  | Status | When |
+  |---|---|
+  | `INVALID_ARGUMENT` | A missing or blank `id`, or a blank `brand_id`. |
+  | `FAILED_PRECONDITION` | The record is stored under a brand the request does not name: `record ... belongs to brand ..., not ...`, or `... and the request names no brand`. |
+  | `ABORTED` | Another writer changed the record each of the four times this request had read it and gone to delete. Nothing was deleted; send the request again as it is. |
+  | `UNAVAILABLE` | The vector store cannot be reached. Retry with backoff. |
+  
+  A delete that is cancelled while it is on its way to the store is finished all the same. Sending it again is then
+  answered `deleted: false`.
+}
