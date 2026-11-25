@@ -320,7 +320,12 @@ changing a design. Infer conventions from the existing code first.
   if it could not). A new version is a new `VERSION` and new digests in `onnxruntime.rs`, measured with
   `just throughput` before and after. No test in `cargo test` may need the library. Its threads spin, always, and
   `model.threads` (left out by default) says how many there are (D45):
-  neither changes a vector, so neither goes into the fingerprint, the layout id, or the judging digest. The tests
+  neither changes a vector, so neither goes into the fingerprint, the layout id, or the judging digest. In a
+  container with a CPU limit, `model.threads` starts at the limit: four threads on four CPUs were throttled one
+  period in five and still beat three, which were not (D45, 2026-11-25), so do not propose fewer threads because
+  a container is throttled without measuring both. The README's "Three hours in a container" is one run, on
+  arm64 in a virtual machine, with scripts that are not in the repository: it shows that nothing grew or slowed,
+  and its speeds are not to be quoted for any other machine. The tests
   stay on Burn, the reference: the tiny encoders, and the real-model tests, which load with
   `Embedder::load`. After changing the encoder, the pooling, or the export, run `just test-onnx` (it needs
   `just export-onnx` first), which is what holds the two engines to each other.

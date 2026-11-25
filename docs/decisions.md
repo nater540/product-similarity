@@ -1553,6 +1553,25 @@ so no figure in the README moved. The binary went from 33 MB to 17 MB, and the l
 `runtime fetch` reads a zip archive, which brought in the `zip` crate. The crate is still pinned to an exact
 version.
 
+**Three hours under load, to see what the border does over time.** Where the library comes from is one risk of
+calling C++ from Rust. The other is what only time shows: memory that C++ allocates and Rust never sees freed, a
+thread or a file left behind for each call, a crash that takes the process with it. None of that is visible in a
+run of seconds, so on 2026-11-25 the image with Microsoft's library was run under the load test for three hours:
+a container limited to 4 CPUs and 2 GiB with `model.threads = 4` and one session, Qdrant 1.20.0 beside it, and
+`load --concurrency 1,4,16 --records 300` against it over and over with a new seed each time, in the Linux
+virtual machine on the M4 Pro Mac mini. In 722 runs it answered 1,949,400 `Evaluate` calls and took 216,600
+records over `Import` streams, and none failed, was refused, or expired. The server's resident memory was 181.8
+to 182.6 MiB from half an hour in to the end (265 MiB at most, in its first seconds, when it loads the model and
+both engines hold it for the check above), its threads and open files were 14 and 14 in every sample, and the median and the
+99th percentile of every phase were within 3% of the first hour's in the third. The README has the tables
+(Three hours in a container). So the border did not leak and did not fall over in three hours of ordinary work.
+That is what was asked of it, and it is not more than that: it was arm64 and not x86-64, the store never held
+more than 300 records because the load test deletes its own, no caller had a deadline and nothing was asked
+past what the server could do, Qdrant never went away, and three hours are not weeks. About one run in eight had
+a slow moment (a request of up to 548 ms where the usual 99th percentile is 126 ms or less) that was not traced
+and is not explained; it was as frequent without the CPU throttling D45 describes. The scripts are not in the
+repository.
+
 **What each platform needed.** On macOS ONNX Runtime hands graphs to CoreML by default, which was slower and
 failed on a batch, so the session is told to prefer the CPU. The linked library also needed the compiler's
 runtime library named at link time on macOS (`.cargo/config.toml`, which is gone with it) and the C++ standard
@@ -2398,6 +2417,20 @@ where ONNX Runtime's own count is wrong, most likely a container that is given a
 sees all of its cores. It is checked to be positive, written on the line that says the model was loaded, and
 `just throughput <dir> onnx <threads>` measures a number before it is configured.
 
+**In a container with a CPU limit, the limit is the number to start from, and being throttled is not a reason
+to go below it.** Measured on 2026-11-25 in the three-hour run D34 describes: the image as a container limited
+to 4 CPUs, `threads = 4`, against Qdrant, in the Linux virtual machine on the Mac mini. Four spinning threads
+and the rest of the server want more than four CPUs at moments, and the kernel throttled the container in
+23,407 of its 100 ms periods, about one in five, for 128 seconds in all by its count, while the server used 2.9
+cores on average. The obvious answer is one thread fewer, and it was tried: `threads = 3` in the same setup for
+five minutes was not throttled once and used about 2.3 cores. It was slower where a pass is large (99, 133, and
+132 creates a second at 1, 4, and 16 callers against 107, 153, and 160; an `Import` stream at 100 records a
+second against 116) and the same where a pass is one short text or a few (222, 470, and 491 edits a second
+against 224, 470, and 464). So the throttling cost less than the thread it would take to avoid it, and the rare
+slow requests of that run came as often without it. Five minutes against three hours is a thin comparison, on
+arm64, with one session; it is enough to say that "throttled" on a dashboard is not by itself a finding, and
+not enough to choose between three and four for a deployment that only ever edits. Measure on the machine.
+
 **What was measured before this is labeled so.** In the README, where a request's time goes, a server
 against Qdrant, the Linux container, the `import` command, and a stream beside edits are from builds before
 spinning, and say so; the per-record locks are a comparison of two builds and say which. They still show what
@@ -2406,8 +2439,9 @@ costs its neighbors). The figures that size a server were measured again: the fo
 to 64 callers, and the deadline runs at 128 and 256.
 
 **Not done:** several embedding threads, each with a session of fewer threads (D34 lists it), which is the next
-thing to measure now that a pass no longer waits on its own threads (since measured and built: D46); the Linux container and x86-64 with
-spinning; and quantization on x86-64.
+thing to measure now that a pass no longer waits on its own threads (since measured and built: D46); the Linux
+container with spinning on every core (it has been measured since only limited to 4 CPUs and against Qdrant,
+above) and x86-64 with spinning; and quantization on x86-64.
 
 ## D46. Several sessions of the model can serve at once, and one is the default
 

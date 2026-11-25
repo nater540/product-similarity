@@ -2307,7 +2307,7 @@ commented starting point.
 | `model.output_dim` | none (native width) | Keep only the first N components of each field vector. Only for models trained for it. The example config sets 256 for the default model. |
 | `model.batch_size` | `32` | The most texts in one forward pass. |
 | `model.queue_depth` | `256` | Requests that may wait for the encoder before new ones get `RESOURCE_EXHAUSTED`. A request whose caller has gone no longer counts. |
-| `model.threads` | none (ONNX Runtime chooses) | How many threads one forward pass is spread across. Leaving it out was as fast as any number tried on the machine the [Performance](#performance) figures come from; set it where ONNX Runtime counts more cores than the server may use, and measure with `just load`. With `model.sessions`, the threads of each session. Changes no vector, no fingerprint, and no verdict. |
+| `model.threads` | none (ONNX Runtime chooses) | How many threads one forward pass is spread across. Leaving it out was as fast as any number tried on the machine the [Performance](#performance) figures come from; set it where ONNX Runtime counts more cores than the server may use, starting from the container's CPU limit ([Three hours in a container](#three-hours-in-a-container)), and measure with `just load`. With `model.sessions`, the threads of each session. Changes no vector, no fingerprint, and no verdict. |
 | `model.sessions` | `1` | How many forward passes run at once, each in a session of the model of its own; more than one needs `model.threads`. On the Mac mini the [Performance](#performance) figures come from, several served up to 1.6 times the edits and over twice the creates under load, answered a request alone a third slower or more, and served an `Import` stream more slowly (D46). Measure with `just load`. Changes no vector, no fingerprint, and no verdict. |
 | `model.expected_fingerprint` | none | The fingerprint of the model the thresholds were measured with, as on the `model` line of `calibrate`. With it, `serve`, `import`, `audit`, and `anchors export` and `restore` refuse to run with any other model, and `compare`, `load`, and the `calibrate` commands warn. Without it nothing is checked, and `serve` and `import` say so once. |
 | `qdrant.url` | `http://localhost:6334` | Qdrant's gRPC endpoint (6334, not the REST port 6333). |
@@ -3020,6 +3020,10 @@ was judged, so two replicas handed two edits of one record at the same instant c
 same baseline. One is written, and the other is judged again against it (D35). Against a local Qdrant that costs
 a write one more small read: about 0.2 ms on an edit of 3 ms, measured before threads spun (D45).
 
+For memory, a server in the container image held 182 MiB for three hours under load, and 265 MiB at most, in
+the seconds it took to load the model ([Three hours in a container](#three-hours-in-a-container)). That is one
+session of the default model, and it did not grow.
+
 ### Security
 
 The server speaks plaintext gRPC and has no authentication. Run it on a private network or behind a mesh or proxy
@@ -3253,6 +3257,81 @@ the first line of the handler to the log line. An `Import` stream writes one `im
 many records it created, found stored, and failed, how many batches it made, and how often it waited for the
 model. What the server is doing as a whole, and what each request waited for, is under [Telemetry](#telemetry).
 
+### Three hours in a container
+
+Every run above lasts seconds. A server also has to stay as it started: its memory, its threads, its speed. The
+forward pass is C++ called from Rust ([The ONNX engine](#the-onnx-engine)), and a leak or a crash at that border
+is the kind of fault that only time shows. So the image `just image` builds was run under the load test for
+three hours, once, on 2026-11-25:
+
+- **The server** was a container limited to 4 CPUs and 2 GiB (`docker run --cpus 4 --memory 2g`), on
+  `config.example.toml` with `model.threads = 4`, the image's model directory, and the addresses changed. One
+  session, the default.
+- **The store** was Qdrant 1.20.0 in a container beside it, with no limit.
+- **The load** was a third container that ran the line below over and over, with a new seed each time and so a
+  new synthetic catalog: 722 runs in three hours.
+- **The machine** was the Linux virtual machine Docker runs in on the M4 Pro Mac mini: Linux on arm64.
+
+```sh
+record-similarity load --config config.toml --server http://soak-server:50051 --concurrency 1,4,16 --records 300 --seed 1
+```
+
+Every 30 seconds the server's memory, threads, and open files were read from `/proc`, and the container's
+memory and CPU from its cgroup (`memory.current`, `cpu.stat`). The scripts that did this are not in the
+repository.
+
+| | Over the three hours |
+|---|---|
+| Requests | 1,949,400 `Evaluate` calls and 216,600 records over 722 `Import` streams. None failed, none was refused, none expired |
+| The server's memory (resident) | 181.8 to 182.6 MiB from half an hour in to the end; 265 MiB at most, in its first seconds, while it loaded the model |
+| The container's memory, which counts files the kernel has cached | 183 to 201 MiB after the first ten minutes, lower at the end than at the start |
+| Threads, open files | 14 and 14 in every sample |
+| CPU | 2.9 of the 4 cores, averaged over the run |
+| The server's log, at `warn` | Nothing after startup |
+| The store afterwards | Empty: every record created was deleted again |
+
+Speed in each of the three hours, as the median of that hour's runs (240 or 241 of them):
+
+| Callers | Phase | A second, by hour | Median, by hour | 99th percentile, by hour |
+|---|---|---|---|---|
+| 1 | create | 107, 107, 107 | 9.2, 9.2, 9.2 ms | 14.5, 14.4, 14.3 ms |
+| 1 | edit | 221, 226, 226 | 4.4, 4.3, 4.4 ms | 9.3, 9.2, 9.3 ms |
+| 4 | create | 153, 153, 153 | 25.9, 25.9, 25.9 ms | 36.6, 36.3, 36.1 ms |
+| 4 | edit | 465, 472, 471 | 8.4, 8.2, 8.2 ms | 14.4, 14.2, 14.2 ms |
+| 16 | create | 160, 160, 160 | 98.9, 98.7, 98.8 ms | 126.0, 124.6, 125.9 ms |
+| 16 | edit | 462, 463, 466 | 33.7, 33.3, 33.1 ms | 48.5, 47.4, 47.0 ms |
+| 16 | resave | 15,930, 16,212, 16,035 | 0.9, 0.9, 0.9 ms | 2.1, 2.0, 2.0 ms |
+| 1 | stream | 115, 116, 116 | | |
+
+- **Nothing grew.** The server's memory moved by less than 1 MiB in the last two and a half hours, and its
+  threads and open files not at all. The most the container held was in its first seconds: 291 MiB of its 2 GiB
+  in a sample here, and 390 MiB in the shorter run below, which was sampled every 10 seconds.
+- **Nothing slowed.** The third hour is the first, to within 3% in every row.
+- **The CPU limit throttled the container, and that cost little.** Four spinning threads and the rest of the
+  server want more than 4 CPUs at moments, and the kernel held the container back in about one of every five of
+  its 100 ms periods (23,407 of them, 128 seconds in all by its count). The same setup with `model.threads = 3`,
+  for five minutes and 19 runs of the load test, was never throttled and used about 2.3 cores. It created
+  records more slowly (99, 133, and 132 a second at 1, 4, and 16 callers against 107, 153, and 160; a stream 100
+  against 116) and edited them as fast (222, 470, and 491 a second against 224, 470, and 464). So throttling is
+  no reason to set fewer threads than the limit: the fourth thread is worth 8 to 22% more creates, and nothing
+  for an edit.
+- **About one run of the load test in eight had a slow moment that is not explained.** In 94 of the 722 runs
+  some phase's 99th percentile was over twice its usual figure, and the slowest request of the three hours took
+  548 ms. It happened as often with three threads and no throttling (4 runs of 19), so the CPU limit is not the
+  cause. Nothing was traced (`[telemetry]` was off), so whether it is Qdrant, the virtual machine, or the server
+  is not known. The medians and the usual 99th percentile, above, did not move.
+
+What it does not say:
+
+- **Nothing about x86-64, and little about speed.** This was arm64 in a virtual machine. The figures are for
+  comparing one hour with another, and are not the table under [The ONNX engine](#the-onnx-engine), which had
+  twelve cores and a store in memory.
+- **Nothing about a large catalog.** The load test deletes its records after each level, so Qdrant never held
+  more than 300.
+- **Nothing about a server that is asked for too much.** No caller had a deadline, no request was refused, and
+  Qdrant never went away. [Past what a server can do](#past-what-a-server-can-do) is where that is measured.
+- **Three hours are not weeks**, and one session is not several (`model.sessions`).
+
 ### The ONNX engine
 
 The forward pass is nearly all of what a request costs, and Burn's CPU backend is not the fastest way to run it:
@@ -3297,7 +3376,9 @@ on 2026-11-12 (`docs/decisions.md`, D34, has both sets of measurements).
   about a third more for the same requests in one measurement, and none while the server is idle. There is no setting to
   turn it off. `model.threads` sets how many threads a pass uses; leave it out unless ONNX Runtime counts more
   cores than the server may use, as in a container given a share of a larger machine, where spinning threads on
-  every core would spend the share.
+  every core would spend the share. The share itself is a fair number to start from: with 4 threads on a limit
+  of 4 CPUs the kernel throttled the container in one period of five, and 3 threads, never throttled, edited
+  about as fast and created more slowly ([Three hours in a container](#three-hours-in-a-container)).
 - **One session, or several.** `model.sessions` runs that many forward passes at once, each in a session of
   `model.threads` threads. Under load they keep more cores working (1.6 times the edits a second at 64 callers
   with eight sessions of one thread, on the Mac mini); a request alone is slower, the slowest requests under load
@@ -3307,7 +3388,9 @@ on 2026-11-12 (`docs/decisions.md`, D34, has both sets of measurements).
   copies only the model directory out of that stage: the image is 332 MB with no Python in it. The library is at
   `/opt/onnxruntime`, and `ORT_DYLIB_PATH` is set to it.
 - **On Linux it is slower than on macOS.** `load` inside that image (Linux on arm64, 12 cores, the same Mac mini,
-  300 records per level), on a build from before threads spun (D45), which has not been measured in the image:
+  300 records per level), on a build from before threads spun (D45). With spinning, the image has been measured
+  only as a container of 4 CPUs against Qdrant ([Three hours in a container](#three-hours-in-a-container)),
+  which is not this table's setup:
 
   | Callers | Phase | Requests per second | Median |
   |---|---|---|---|
