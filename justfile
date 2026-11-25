@@ -6,6 +6,11 @@ set positional-arguments := false
 # Where the ignored Qdrant tests look for a server.
 qdrant_url := env_var_or_default("QDRANT_URL", "http://localhost:6334")
 
+# Where ONNX Runtime's library is: every recipe that runs the model opens the one `just fetch-onnxruntime` put
+# here, unless the variable already names another. The binary run by hand needs the variable, or the library
+# beside it.
+export ORT_DYLIB_PATH := env_var_or_default("ORT_DYLIB_PATH", justfile_directory() / "onnxruntime" / if os() == "macos" { "libonnxruntime.dylib" } else { "libonnxruntime.so" })
+
 default:
     @just --list --unsorted
 
@@ -15,7 +20,7 @@ default:
 build:
     cargo build --workspace
 
-# Release build of the server binary (ONNX Runtime is linked in: its prebuilt library is downloaded on the first build)
+# Release build of the server binary (ONNX Runtime is not in it: `just fetch-onnxruntime` gets the library it opens)
 release:
     cargo build --release -p similarity-server
 
@@ -46,7 +51,7 @@ test-parity:
     cargo test -p similarity-core --test real_parity -- --ignored
     cargo test -p similarity-train --test real_parity -- --ignored
 
-# The ONNX Runtime engine against PyTorch and against Burn, on the real model (needs `just export-onnx`)
+# The ONNX Runtime engine against PyTorch and against Burn, on the real model (needs `just export-onnx`, `just fetch-onnxruntime`)
 test-onnx:
     cargo test -p similarity-core --features onnx --test real_onnx -- --ignored
 
@@ -116,6 +121,10 @@ ci: fmt-check clippy test deny
 # Download the default model into ./models, verifying checksums
 fetch-model:
     cargo run --release -p similarity-server -- model fetch
+
+# Download Microsoft's build of ONNX Runtime, which runs the model, into ./onnxruntime, verifying checksums
+fetch-onnxruntime:
+    cargo run --release -p similarity-server -- runtime fetch
 
 # Regenerate both PyTorch parity fixtures (needs `uv`; downloads PyTorch on first run)
 golden:

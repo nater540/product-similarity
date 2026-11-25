@@ -94,7 +94,7 @@ To build and run:
 | Tool | Why | macOS | Debian / Ubuntu |
 |---|---|---|---|
 | Rust 1.96 | The toolchain. `rust-toolchain.toml` pins it, so `rustup` installs the right one on first build. | [rustup.rs](https://rustup.rs) | [rustup.rs](https://rustup.rs) |
-| A C and C++ toolchain | Some dependencies compile C, and ONNX Runtime, which runs the model, is C++. Its prebuilt library, downloaded at build time, needs the C++ standard library of GCC 13 or later: the server links on Debian 13 and not on Debian 12. | Xcode command line tools | `apt-get install build-essential` |
+| A C toolchain | Some dependencies compile C. ONNX Runtime, which runs the model, is C++, and none of it is compiled or linked here: `just fetch-onnxruntime` downloads Microsoft's build of its library, which the server opens when it starts. On Linux that library needs glibc 2.28 or later and the C++ standard library (`libstdc++6`) installed. | Xcode command line tools | `apt-get install build-essential` |
 | `protoc` | Compiles the gRPC definitions at build time. | `brew install protobuf` | `apt-get install protobuf-compiler` |
 | [`uv`](https://docs.astral.sh/uv/) | Writes the file ONNX Runtime runs the model from, once for each model directory (`just export-onnx`). PyTorch does the export, and `uv` installs it on first use: a download of several hundred megabytes or more. Nothing at run time needs Python. | `brew install uv` | [The installer](https://docs.astral.sh/uv/getting-started/installation/) |
 | Docker with Compose | Runs Qdrant locally. Not needed with `--in-memory`. | Docker Desktop or OrbStack | Docker Engine |
@@ -121,28 +121,34 @@ git clone <this repository> && cd record-similarity
 
 just fetch-model          # 1. download the model into ./models and verify its checksums
 just export-onnx          # 2. write the model's ONNX file beside its weights (needs uv)
-just qdrant-up            # 3. start Qdrant in Docker (dashboard: http://localhost:6333/dashboard)
-cp config.example.toml config.toml     # 4. your own copy of the configuration
-just serve config.toml    # 5. build and run the server on 127.0.0.1:50051
+just fetch-onnxruntime    # 3. download ONNX Runtime's library into ./onnxruntime and verify its checksums
+just qdrant-up            # 4. start Qdrant in Docker (dashboard: http://localhost:6333/dashboard)
+cp config.example.toml config.toml     # 5. your own copy of the configuration
+just serve config.toml    # 6. build and run the server on 127.0.0.1:50051
 ```
 
 What each step does:
 
 1. **Model.** `record-similarity model fetch` downloads `MongoDB/mdbr-leaf-mt` at a pinned revision from the
    Hugging Face Hub, checks the SHA-256 of every file against values compiled into the binary, and then loads the
-   model once to prove it runs. Re-running it only downloads what is missing. Of the binary's commands this is the
-   only one that touches the network; the server itself only ever reads a directory. See
+   model once to prove it runs. Re-running it only downloads what is missing. This and step 3 are the only
+   commands of the binary that touch the network; the server itself only ever reads a directory. See
    [`models/README.md`](models/README.md).
 2. **Export.** `tools/export_onnx.py` has PyTorch write the model as `models/mdbr-leaf-mt/onnx/model.onnx` and
    checks the file against PyTorch before keeping it. ONNX Runtime runs the model from that file, and no command
    embeds anything without it. This is the one step that uses Python, and it is done once for a model directory,
    and again after fine-tuning. See [The ONNX engine](#the-onnx-engine).
-3. **Qdrant.** `docker compose up -d qdrant` starts Qdrant 1.20 with its data in `./qdrant_storage`. The server
+3. **ONNX Runtime.** `record-similarity runtime fetch` downloads Microsoft's own build of ONNX Runtime 1.31.1
+   for this platform from nuget.org, checks the SHA-256 of the package and of the library taken out of it against
+   values compiled into the binary, and opens the library once to prove it loads. It is not part of the server
+   binary: it is a file the server opens, and the `just` recipes point the server at this one. See
+   [The ONNX engine](#the-onnx-engine).
+4. **Qdrant.** `docker compose up -d qdrant` starts Qdrant 1.20 with its data in `./qdrant_storage`. The server
    creates its collection on first start.
-4. **Configuration.** The example is commented line by line. For a first run nothing needs changing.
-5. **Server.** The first build downloads ONNX Runtime's library and links it in. On start-up the server loads
-   the model, checks the exported file against the weights ([The ONNX engine](#the-onnx-engine)), runs one
-   warm-up embedding, connects to Qdrant, verifies or creates the collection, and logs `serving gRPC`.
+5. **Configuration.** The example is commented line by line. For a first run nothing needs changing.
+6. **Server.** On start-up the server opens ONNX Runtime's library, loads the model, checks the exported file
+   against the weights ([The ONNX engine](#the-onnx-engine)), runs one warm-up embedding, connects to Qdrant,
+   verifies or creates the collection, and logs `serving gRPC`.
 
 Check that it works, from another terminal:
 
@@ -3271,11 +3277,19 @@ on 2026-11-12 (`docs/decisions.md`, D34, has both sets of measurements).
 - **A model directory needs the export before any command will embed with it.** `just export-onnx <dir>`: after
   `model fetch`, after fine-tuning, and for a checkpoint that is to be calibrated. It is the one step that needs
   Python. The trainer is unchanged and still runs in Burn.
-- **It is C++, not Rust.** The `ort` crate is a binding to Microsoft's runtime. The build downloads a prebuilt
-  static library for the target (from the crate author's distribution, pinned by the crate's exact version) and
-  links it in: the binary is 33 MB and needs nothing installed beside it. The prebuilt library is the choice for
-  now; linking one you built or obtained yourselves instead is a change of the crate's features, not of code
-  (D34).
+- **It is C++, not Rust, and it is not in the binary.** The `ort` crate is a binding to Microsoft's runtime,
+  which is a shared library the server opens when it loads a model. `just fetch-onnxruntime`
+  (`record-similarity runtime fetch`) downloads Microsoft's own build of version 1.31.1, out of the
+  `Microsoft.ML.OnnxRuntime` package on nuget.org, and keeps it only if the package and the library have the
+  SHA-256 compiled into the binary. The binary is 17 MB; the library beside it is 45 MB on macOS, 29 MB on Linux
+  x86-64, and 25 MB on Linux arm64. Nothing of ONNX Runtime is downloaded or linked by the build (D34).
+- **The server opens the library `ORT_DYLIB_PATH` names.** The variable holds the whole path of
+  `libonnxruntime.so` (`libonnxruntime.dylib` on macOS). Without it the server looks for a file of that name
+  beside its own binary, and then where the system's loader looks. The `just` recipes set the variable to the
+  library in `./onnxruntime`, and the container image sets it; a binary run by hand needs one or the other. A
+  server that cannot open the library does not start, and says where it looked. The `model loaded` line names
+  the library that was opened (`runtime_library`) and what it says it was built from (`runtime`). A build of
+  ONNX Runtime of your own, 1.22 or later, is used the same way.
 - **It runs on the CPU.** On macOS ONNX Runtime would otherwise pick CoreML, which is slower for a model this
   size. There is no GPU setting for serving; `--device` on the trainer is unaffected.
 - **Its threads spin.** A pass is many small steps, and ONNX Runtime's threads wait busily between them instead
@@ -3288,10 +3302,10 @@ on 2026-11-12 (`docs/decisions.md`, D34, has both sets of measurements).
   `model.threads` threads. Under load they keep more cores working (1.6 times the edits a second at 64 callers
   with eight sessions of one thread, on the Mac mini); a request alone is slower, the slowest requests under load
   are slower, and a stream, which uses one session at a time, is slower. One is the default (D46).
-- **In a container.** `just image` builds the server on Debian 13, because the prebuilt library is compiled
-  against the C++ standard library of GCC 13 and does not link on Debian 12. It fetches the model, exports it in
-  a build stage that has `uv` and PyTorch (the CPU builds), and copies only the model directory out of that
-  stage: the image is 328 MB with no Python in it.
+- **In a container.** `just image` builds the server on Debian 13. It fetches the model and ONNX Runtime's
+  library, verifying both, exports the model in a build stage that has `uv` and PyTorch (the CPU builds), and
+  copies only the model directory out of that stage: the image is 332 MB with no Python in it. The library is at
+  `/opt/onnxruntime`, and `ORT_DYLIB_PATH` is set to it.
 - **On Linux it is slower than on macOS.** `load` inside that image (Linux on arm64, 12 cores, the same Mac mini,
   300 records per level), on a build from before threads spun (D45), which has not been measured in the image:
 
@@ -3317,7 +3331,7 @@ just fmt             # format
 just ci              # fmt-check, clippy, test, cargo-deny. CI runs these, the real-model tests, and the Qdrant contract
 just test-qdrant     # the storage contract against a live Qdrant
 just test-parity     # Burn against PyTorch on the real model: the embeddings, then the training steps
-just test-onnx       # ONNX Runtime against PyTorch and against Burn on the real model (needs `just export-onnx`)
+just test-onnx       # ONNX Runtime against PyTorch and against Burn on the real model (needs `just export-onnx` and `just fetch-onnxruntime`)
 just test-snapshot   # the curated hard cases against the pinned verdicts, and the README's quoted reports
 just test-real       # test-parity and test-snapshot, then the full stack through gRPC against Qdrant
 just snapshot        # rewrite the pinned verdicts after an intended change, printing what moved
@@ -3439,7 +3453,7 @@ what that field says.
 |---|---|
 | Build fails with `Could not find protoc` | Install `protoc` ([Dependencies](#dependencies)). |
 | `cannot read config file config.toml` | `serve` looks for `config.toml` in the current directory. Create it (`cp config.example.toml config.toml`) or pass `--config`. |
-| `cannot load the model from ...` | The model directory is missing, incomplete, or not exported. `just fetch-model`, then `just export-onnx`. The cause is printed underneath. |
+| `cannot load the model from ...` | The model directory is missing, incomplete, or not exported, or ONNX Runtime's library was not found. `just fetch-model`, then `just export-onnx`, then `just fetch-onnxruntime`. The cause is printed underneath. |
 | `unsupported model at ...` | The directory is not a BERT-architecture sentence-transformers model, or uses a pooling mode other than mean or CLS. The message names what is unsupported. |
 | `weight load failed for ...` | The checkpoint does not match its `config.json`. Re-download; do not edit model files by hand. |
 | `cannot use Qdrant collection ... vector store unavailable` | Qdrant is not running, or `qdrant.url` points at the REST port. The gRPC port is 6334. `just qdrant-up`. |
@@ -3447,7 +3461,7 @@ what that field says.
 | `FAILED_PRECONDITION: record ... was stored under layout ...` | Same cause, for a single record in a collection of the right width. Re-index. |
 | ``the ONNX engine needs `onnx/model.onnx`, which is not there`` | The model directory was never exported. `just export-onnx <dir>`. |
 | ``` `onnx/model.onnx` does not compute what the directory's weights compute ``` | The file was exported from other weights, usually before a fine-tune. `just export-onnx <dir>` again. |
-| The build fails at the link step on Linux with `undefined reference to` `std::__cxx11::basic_string<...>::_M_replace_cold` or `__cxa_call_terminate` | The prebuilt ONNX Runtime library needs the C++ standard library of GCC 13 or later. Build on Debian 13 or newer. |
+| ``ONNX Runtime: cannot start: cannot load the runtime library `...` `` | ONNX Runtime's library is not where the server looked: the path in the message. `just fetch-onnxruntime` downloads it, and the `just` recipes point at it. For a binary run by hand, set `ORT_DYLIB_PATH` to the library's whole path, or put the library beside the binary. On Linux the library also needs `libstdc++6` installed. |
 | `` `model.engine` is no longer a setting `` or `` `model.device` is no longer a setting `` | The config is from when Burn could serve and chose an engine or a device. ONNX Runtime runs the model now, on the CPU. Remove the line. |
 | `--device metal needs a binary built with --features metal` (fine-tuning) | Build with `just release-train metal` and run `./target/release/record-similarity-train`; `just finetune` always runs the CPU build. |
 | `... already exists and is not empty` (fine-tuning) | `--out` names a directory that holds something. Choose a new one; a model directory is never overwritten. |

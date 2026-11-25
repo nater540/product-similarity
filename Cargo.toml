@@ -46,10 +46,12 @@ tonic-reflection = "0.14"
 prost = "0.14"
 tokio = { version = "1.54", features = ["rt-multi-thread", "net", "sync", "time", "signal", "macros"] }
 # ONNX Runtime, behind `similarity-core`'s `onnx` feature, which the server always enables and the trainer never
-# does. This is a binding to Microsoft's C++ runtime, not a Rust implementation: `download-binaries` fetches a
-# prebuilt static library at build time and links it in (docs/decisions.md, D34). Pinned exactly, because 2.0 is still a release candidate. rustls for that
-# download, like everything else here; `api-22` is the first level with the setting that keeps it on the CPU.
-ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-rustls", "api-22"] }
+# does. This is a binding to Microsoft's C++ runtime, not a Rust implementation. `load-dynamic`: nothing of the
+# runtime is linked into the binary or downloaded by the build; the library is opened when a model is loaded, and
+# it is Microsoft's own build, which `record-similarity runtime fetch` downloads and checks (docs/decisions.md,
+# D34). Pinned exactly, because 2.0 is still a release candidate. `api-22` is the first level with the setting
+# that keeps it on the CPU, and so the oldest runtime the binding accepts is 1.22.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-22"] }
 # The response half of a streaming call is a `Stream`. Already in the tree through `tonic`.
 tokio-stream = { version = "0.1", default-features = false }
 # The metrics endpoint is one HTTP/1.1 route (docs/decisions.md, D39). Already in the tree through `tonic`, which
@@ -93,8 +95,12 @@ uuid = { version = "1", features = ["v5"] }
 # A backup of anchors keeps each vector as its bytes, in base64: the numbers that were stored, exactly, in a
 # line of text. The version is the one tonic already brings in.
 base64 = "0.22"
-# `model fetch` only: a blocking, dependency-light HTTPS client, so no second async HTTP stack in the binary.
+# `model fetch` and `runtime fetch` only: a blocking, dependency-light HTTPS client, so no second async HTTP stack
+# in the binary.
 ureq = "3"
+# `runtime fetch` only: ONNX Runtime's library comes inside a NuGet package, which is a zip archive. Reading one
+# compression method is all of it that is used.
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 tempfile = "3"
 # Property-based tests only (dev-dependency): generated inputs for the invariants a verdict rests on. Without the

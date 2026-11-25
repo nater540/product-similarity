@@ -1,5 +1,6 @@
 /target
 /models
+/onnxruntime
 /qdrant_storage
 /.git
 /.github

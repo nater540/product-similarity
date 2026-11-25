@@ -147,7 +147,7 @@ fn pinned_checksum(request: &FetchRequest, name: &str) -> Option<&'static str> {
     .map(|(_, digest)| *digest)
 }
 
-fn hex(digest: &[u8]) -> String {
+pub(crate) fn hex(digest: &[u8]) -> String {
   use std::fmt::Write as _;
   digest.iter().fold(String::new(), |mut hex, byte| {
     // Writing to a `String` cannot fail.
@@ -156,7 +156,7 @@ fn hex(digest: &[u8]) -> String {
   })
 }
 
-fn sha256_of_file(path: &Path) -> anyhow::Result<String> {
+pub(crate) fn sha256_of_file(path: &Path) -> anyhow::Result<String> {
   let mut file = std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
   let mut hasher = Sha256::new();
   std::io::copy(&mut file, &mut hasher).with_context(|| format!("cannot read {}", path.display()))?;
@@ -164,7 +164,7 @@ fn sha256_of_file(path: &Path) -> anyhow::Result<String> {
 }
 
 /// Streams `url` into `destination` through a temporary file, returning the SHA-256 of what was written.
-fn download(url: &str, destination: &Path) -> anyhow::Result<String> {
+pub(crate) fn download(url: &str, destination: &Path) -> anyhow::Result<String> {
   if let Some(parent) = destination.parent() {
     std::fs::create_dir_all(parent).with_context(|| format!("cannot create {}", parent.display()))?;
   }

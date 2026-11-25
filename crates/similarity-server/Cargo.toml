@@ -46,6 +46,7 @@ thiserror.workspace = true
 toml.workspace = true
 tracing.workspace = true
 ureq.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 # The tiny in-memory encoder, so that the offline tools are tested end to end without a model directory.

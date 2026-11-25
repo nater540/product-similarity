@@ -4,6 +4,7 @@
 //!
 //! - `serve` runs the gRPC server.
 //! - `model fetch` downloads and verifies a model directory.
+//! - `runtime fetch` downloads and verifies ONNX Runtime's library, which runs the model.
 //! - `compare` and `calibrate` score records offline, for choosing thresholds.
 //! - `runs list` shows what was recorded: every `calibrate`, and every training run, leaves a directory behind.
 //!
@@ -34,6 +35,7 @@ use similarity_server::import::{self, Failure, Summary};
 use similarity_server::load;
 use similarity_server::offline::events::{self, Run};
 use similarity_server::offline::{self, Confidence, Offline, RecordFields, Selection, diff};
+use similarity_server::onnxruntime;
 use similarity_server::registry::{self, Registry};
 use similarity_server::runs;
 use similarity_server::shadow::{self, PolicyShadow};
@@ -64,6 +66,9 @@ enum Command {
   /// Manage model files.
   #[command(subcommand)]
   Model(ModelCommand),
+  /// Manage ONNX Runtime's library, which computes the model and is a file beside this binary, not part of it.
+  #[command(subcommand)]
+  Runtime(RuntimeCommand),
   /// Score one before/after pair of records, field by field.
   Compare(CompareArgs),
   /// Score a file of labeled pairs and report the threshold that separates edits from recycled records.
@@ -327,6 +332,19 @@ struct RetireArgs {
   reason: String,
   #[command(flatten)]
   registry: RegistryArgs,
+}
+
+#[derive(Debug, Subcommand)]
+enum RuntimeCommand {
+  /// Download Microsoft's build of ONNX Runtime for this platform, verify it, and check that it loads.
+  Fetch(RuntimeFetchArgs),
+}
+
+#[derive(Debug, Args)]
+struct RuntimeFetchArgs {
+  /// Where to put the library.
+  #[arg(long, default_value = onnxruntime::DEFAULT_DIR)]
+  dir: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -630,8 +648,8 @@ fn load_embedder(config: &Config, tie: Tie) -> anyhow::Result<Embedder> {
   )
   .with_context(|| {
     format!(
-      "cannot load the model from {}; `record-similarity model fetch` downloads it, and `just export-onnx` writes \
-       the `onnx/model.onnx` it is run from",
+      "cannot load the model from {}; `record-similarity model fetch` downloads it, `just export-onnx` writes the \
+       `onnx/model.onnx` it is run from, and `record-similarity runtime fetch` downloads the library that runs it",
       config.model.dir.display()
     )
   })?;
@@ -648,6 +666,9 @@ fn load_embedder(config: &Config, tie: Tie) -> anyhow::Result<Embedder> {
     fingerprint = embedder.fingerprint(),
     dimension = embedder.dimension(),
     engine = embedder.engine().as_str(),
+    // Which library computes the forward pass: what it says it was built from, and where it was opened from.
+    runtime = similarity_core::model::onnx::runtime_info().ok(),
+    runtime_library = %similarity_core::model::onnx::library().display(),
     threads = config.model.threads,
     sessions = config.model.sessions,
     elapsed = ?started.elapsed(),
@@ -893,6 +914,43 @@ impl ServeArgs {
         serve_with(store, worker, telemetry, &config, listen).await
       }
     })
+  }
+}
+
+impl RuntimeFetchArgs {
+  fn run(self) -> anyhow::Result<()> {
+    let mut out = std::io::stdout().lock();
+    writeln!(
+      out,
+      "fetching ONNX Runtime {} (Microsoft's build, from nuget.org) into {}",
+      onnxruntime::VERSION,
+      self.dir.display()
+    )?;
+    let fetched = onnxruntime::fetch(&self.dir)?;
+    let how = if fetched.cached {
+      "already present, checksum ok"
+    } else {
+      "downloaded, checksum ok"
+    };
+    let name = fetched.library.file_name().unwrap_or_default().to_string_lossy();
+    writeln!(out, "  {name:<28} {how}")?;
+
+    // Loading is the real acceptance test, as for a model: the library is opened the way the server opens it.
+    // By its whole path, because that is what the variable has to hold: a relative one is looked for beside the
+    // executable first.
+    let library = std::path::absolute(&fetched.library)
+      .with_context(|| format!("cannot make a whole path of {}", fetched.library.display()))?;
+    let info = similarity_core::model::onnx::library_info(&library)
+      .with_context(|| format!("{} was downloaded but does not load", library.display()))?;
+    writeln!(out, "\nlibrary loads: {info}")?;
+    writeln!(
+      out,
+      "the server opens the library `{}` names, or one beside the binary:\n  export {}={}",
+      similarity_core::model::onnx::LIBRARY_VARIABLE,
+      similarity_core::model::onnx::LIBRARY_VARIABLE,
+      library.display()
+    )?;
+    Ok(())
   }
 }
 
@@ -2022,6 +2080,7 @@ fn main() -> ExitCode {
     Command::Model(ModelCommand::Register(args)) => args.run(),
     Command::Model(ModelCommand::Retire(args)) => args.run(),
     Command::Model(ModelCommand::List(args)) => args.run(),
+    Command::Runtime(RuntimeCommand::Fetch(args)) => args.run(),
     Command::Compare(args) => args.run(),
     Command::Calibrate(args) => args.run(run.as_ref()),
     Command::CalibrateDiff(args) => args.run(),
@@ -2320,5 +2379,14 @@ mod tests {
       (fetch::DEFAULT_REPO, fetch::DEFAULT_REVISION)
     );
     assert_eq!(args.dir, None, "the directory follows the repository unless given");
+  }
+
+  #[test]
+  fn runtime_fetch_defaults_to_the_directory_the_recipes_look_in() {
+    let cli = Cli::parse_from(["record-similarity", "runtime", "fetch"]);
+    let Command::Runtime(RuntimeCommand::Fetch(args)) = cli.command else {
+      panic!("expected runtime fetch")
+    };
+    assert_eq!(args.dir, PathBuf::from(onnxruntime::DEFAULT_DIR));
   }
 }

@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1
 
 # ---- build -------------------------------------------------------------------------------------------------------
-# Debian 13 for every stage. The server links a prebuilt ONNX Runtime library that is compiled against the C++
-# standard library of GCC 13, and Debian 12 has GCC 12's: the build fails at the link step there.
+# Debian 13 for every stage. It had to be while ONNX Runtime was a prebuilt static library, compiled against the
+# C++ standard library of GCC 13, that the server linked. The library is Microsoft's own build now, a file beside
+# the binary, and asks for nothing newer than glibc 2.28: an older base would do again, and has not been tried.
 ARG BUILD_IMAGE=rust:1.96-trixie
 ARG EXPORT_IMAGE=ghcr.io/astral-sh/uv:0.11.28-python3.13-trixie-slim
 ARG RUNTIME_IMAGE=debian:trixie-slim
@@ -30,6 +31,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # network to start and every replica is guaranteed to run the same weights.
 RUN record-similarity model fetch --dir /opt/models/mdbr-leaf-mt
 
+# ONNX Runtime, which computes the model, is not in the binary: it is Microsoft's build of one pinned version,
+# taken from its NuGet package, checksum-verified, and opened here once to see that it loads. As with the model, a
+# running container never downloads it.
+RUN record-similarity runtime fetch --dir /opt/onnxruntime
+
 # ---- export ------------------------------------------------------------------------------------------------------
 # The file ONNX Runtime runs the model from, written by PyTorch from the weights fetched above. The script checks
 # it against PyTorch before keeping it, and the server checks it against the weights again every time it starts.
@@ -55,7 +61,10 @@ RUN apt-get update \
   && useradd --system --uid 1001 --no-create-home similarity
 
 COPY --from=build /usr/local/bin/record-similarity /usr/local/bin/record-similarity
+COPY --from=build /opt/onnxruntime /opt/onnxruntime
 COPY --from=export /opt/models /opt/models
+# Where the server opens ONNX Runtime from. The library needs the C++ standard library, which the base image has.
+ENV ORT_DYLIB_PATH=/opt/onnxruntime/libonnxruntime.so
 COPY config.example.toml /etc/record-similarity/config.toml
 # The example config uses paths and addresses that suit a checkout; a container listens on every interface and
 # reads the baked-in model.

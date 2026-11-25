@@ -1,5 +1,0 @@
-# ONNX Runtime's prebuilt macOS library (the `onnx` feature) holds Objective-C that asks which OS version it is
-# running on, through a routine in the compiler's own runtime library. Rust does not link that library unless
-# asked. Linux is not affected, and without the feature the flag changes nothing.
-[target.'cfg(target_os = "macos")']
-rustflags = ["-C", "link-arg=-fapple-link-rtlib"]

@@ -1,9 +1,10 @@
 //! The encoder through ONNX Runtime, for a server that wants the forward pass faster than Burn's CPU backend runs it.
 //!
 //! This is the one place the workspace calls into C++. ONNX Runtime is not a Rust library: the `ort` crate binds
-//! Microsoft's runtime, which is linked into the binary. It is behind the `onnx` feature so that the default build
-//! has none of it, and it computes from a file, `onnx/model.onnx`, that `tools/export_onnx.py` writes from the
-//! model directory's weights.
+//! Microsoft's runtime, which is a shared library of its own, opened when the first model is loaded and never
+//! linked into the binary ([`library`] says where it is looked for). It is behind the `onnx` feature so that the
+//! default build has none of it, and it computes from a file, `onnx/model.onnx`, that `tools/export_onnx.py`
+//! writes from the model directory's weights.
 //!
 //! **That file is not taken on trust.** It is a second copy of the model: nothing in it says which weights it was
 //! made from, and a directory whose weights were fine-tuned after the export still has the old file. So an
@@ -11,8 +12,9 @@
 //! directory's weights in Burn and found the two to agree (see `Embedder::load_with`). The Burn encoder stays the
 //! definition of what a model computes; this is a faster way of computing it.
 
+use std::ffi::OsString;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use ort::environment::Environment;
@@ -42,13 +44,79 @@ impl fmt::Debug for OnnxEncoder {
   }
 }
 
+/// The environment variable that says where the runtime's library is: the path of `libonnxruntime` itself, not of
+/// the directory it is in. The name is the `ort` crate's own, so that what is written about it elsewhere applies.
+pub const LIBRARY_VARIABLE: &str = "ORT_DYLIB_PATH";
+
+/// The file name of the runtime's library on this platform: `libonnxruntime.so`, `libonnxruntime.dylib`.
+pub fn library_file_name() -> String {
+  format!(
+    "{}onnxruntime{}",
+    std::env::consts::DLL_PREFIX,
+    std::env::consts::DLL_SUFFIX
+  )
+}
+
+/// Where the runtime's library is looked for: where [`LIBRARY_VARIABLE`] says, and without it by its bare file
+/// name, which is tried beside the executable and then wherever the system's loader looks.
+pub fn library() -> PathBuf {
+  library_from(std::env::var_os(LIBRARY_VARIABLE))
+}
+
+fn library_from(variable: Option<OsString>) -> PathBuf {
+  match variable {
+    Some(path) if !path.is_empty() => PathBuf::from(path),
+    _ => PathBuf::from(library_file_name()),
+  }
+}
+
+/// Opens the runtime's library at `library`, which has to happen before anything else is asked of the binding.
+///
+/// Left to itself the binding opens the library at its first call and panics when it cannot. Opened here, by
+/// path, a library that is missing, is not a library, or is older than the binding accepts is an error with the
+/// path in it.
+fn open(library: &Path) -> std::result::Result<ort::environment::EnvironmentBuilder, String> {
+  ort::init_from(library).map_err(|error| {
+    format!(
+      "cannot load the runtime library `{}` ({error}). `record-similarity runtime fetch` downloads it, and \
+       `{LIBRARY_VARIABLE}` says where it is",
+      library.display()
+    )
+  })
+}
+
+/// What the runtime's library at `library` says it is: the release it was built from, and how. It is opened to
+/// be asked, the way the first model load opens it.
+///
+/// A process opens ONNX Runtime once. After a library has been opened this describes that one, whatever
+/// `library` is.
+///
+/// # Errors
+///
+/// Returns [`Error::Inference`] if the library cannot be opened: it is not there, is not ONNX Runtime, or is
+/// older than the binding accepts.
+pub fn library_info(library: &Path) -> Result<String> {
+  open(library).map_err(|error| failed("cannot start", error))?;
+  Ok(ort::info().to_owned())
+}
+
+/// What the runtime's library in use says it is. If none has been opened yet, the one [`library`] names is.
+///
+/// # Errors
+///
+/// Returns [`Error::Inference`] if the library cannot be opened.
+pub fn runtime_info() -> Result<String> {
+  environment()?;
+  Ok(ort::info().to_owned())
+}
+
 /// ONNX Runtime allows one environment in a process. It is made the first time a graph is loaded and kept.
 static ENVIRONMENT: OnceLock<std::result::Result<Environment, String>> = OnceLock::new();
 
 fn environment() -> Result<&'static Environment> {
   ENVIRONMENT
     .get_or_init(|| {
-      ort::init()
+      open(&library())?
         .with_telemetry(false)
         .build()
         .map_err(|error| error.to_string())
@@ -150,5 +218,43 @@ impl OnnxEncoder {
       )));
     }
     Ok(values.to_vec())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn the_variable_says_where_the_library_is() {
+    let found = library_from(Some(OsString::from("/opt/onnxruntime/libonnxruntime.so")));
+    assert_eq!(found, PathBuf::from("/opt/onnxruntime/libonnxruntime.so"));
+  }
+
+  #[test]
+  fn without_the_variable_the_library_is_looked_for_by_its_file_name() {
+    let name = library_file_name();
+    assert!(name.contains("onnxruntime"), "{name}");
+    assert_eq!(library_from(None), PathBuf::from(&name));
+    // A variable that is set and empty is how a shell says "unset" as often as not.
+    assert_eq!(library_from(Some(OsString::new())), PathBuf::from(&name));
+  }
+
+  #[test]
+  fn a_library_that_is_not_there_is_an_error_that_names_it_and_not_a_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join(library_file_name());
+    let error = open(&missing).err().unwrap();
+    assert!(error.contains(&missing.display().to_string()), "{error}");
+    assert!(error.contains("runtime fetch"), "{error}");
+    assert!(error.contains(LIBRARY_VARIABLE), "{error}");
+  }
+
+  #[test]
+  fn a_file_that_is_not_a_library_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(library_file_name());
+    std::fs::write(&path, b"not a shared library").unwrap();
+    assert!(open(&path).is_err());
   }
 }

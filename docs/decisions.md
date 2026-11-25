@@ -1497,9 +1497,9 @@ needs no Python.
 
 **What that costs.** A model directory is not usable by the server binary until it has been exported, which is
 Python, once for each directory: the fetched model, a fine-tuned one, and any checkpoint that is to be
-calibrated. The trainer's own validation scores are computed in Burn and need none. The server no longer builds
-without the ONNX Runtime download, and on Linux not without the C++ standard library of GCC 13; there is nothing
-to fall back to. The container image exports the model in a build stage of its own.
+calibrated. The trainer's own validation scores are computed in Burn and need none. The server does not start
+without ONNX Runtime's library beside it (below); there is nothing to fall back to. The container image exports
+the model in a build stage of its own.
 
 **One model, two engines, one fingerprint.** The graph is exported from the directory's weights and computes
 the same function in another order of operations. On the pinned model the engines differ by at most 2e-7 in a
@@ -1522,19 +1522,43 @@ the best tool, not for everything. `tools/export_onnx.py` exports the sentence-t
 not including, normalization, checks the result against PyTorch on batches of other shapes than it was traced
 with, and writes the file by rename. Nothing at run time needs Python.
 
-**Where the C++ comes from: the prebuilt download, for now.** The `ort` crate's `download-binaries` feature
-fetches a prebuilt static library at build time from the crate author's distribution. That is convenient and it
-is a third party's binary inside the server. The owner chose to keep it for now (2026-11-12). The crate is
-pinned to an exact version, and the alternative (`load-dynamic`, with a runtime library the organization builds
-or takes from Microsoft's releases) is a change of features, not of code, so the choice can be taken again
-without touching the engine.
+**Where the C++ comes from: Microsoft's own build, opened at run time.** For its first two weeks the server
+linked a prebuilt static library that the `ort` crate's `download-binaries` feature fetched at build time from
+the crate author's distribution. That was convenient and it was a third party's binary inside the server, which
+the owner kept "for now" on 2026-11-12 and replaced on 2026-11-25, before the service judges real edits: of
+everything that calling C++ from Rust puts at risk, where the binary comes from was the part that could be
+settled. The crate is built with `load-dynamic` now. The build links and downloads nothing of ONNX Runtime, and
+the server opens `libonnxruntime` when it loads a model: the file `ORT_DYLIB_PATH` names, or one of that name
+beside the binary. `record-similarity runtime fetch` gets the file: Microsoft's release build of version 1.31.1
+(the linked library was 1.31.0), out of the `Microsoft.ML.OnnxRuntime` package on nuget.org, kept only if
+the package and the library taken out of it both have the SHA-256 compiled into the binary (`onnxruntime.rs`),
+which is what `model fetch` does for the model and for the same reason. The package and not a release on GitHub:
+on that day `github.com/microsoft/onnxruntime` answered 404, and the package is where Microsoft publishes the
+native library for all three platforms in one file. The digests pin what nuget.org served that day; the macOS
+library in it carries Microsoft's Developer ID signature, which was checked by hand and is not checked by the
+command.
 
-**What each platform needed.** On macOS the prebuilt library has Objective-C that calls into the compiler's
-runtime library, which Rust does not link unless told (`.cargo/config.toml`); and ONNX Runtime hands graphs to
-CoreML by default there, which was slower and failed on a batch, so the session is told to prefer the CPU. On
-Linux neither applies, and something else does: the prebuilt library is compiled against the C++ standard
-library of GCC 13, so it does not link on Debian 12 (the first container build failed on exactly that). The
-image moved to Debian 13, which the owner accepted for production on 2026-11-12.
+**The library is opened in one place, by path.** Left to itself the binding opens the library at its first call
+and panics when it cannot. `onnx.rs` opens it first, by the path it resolved, so a library that is missing, is
+not ONNX Runtime, or is older than the binding accepts (1.22) is an error with the path in it, and the server
+does not start. There is no setting in the config for the path: a process has one ONNX Runtime, the path is a
+fact about the machine and not about judging, and the variable is the binding's own. The `model loaded` line
+says which library was opened and what it reports it was built from. What a wrong library can do is bounded by
+the check below: one that computes anything else is refused at load exactly as a wrong graph is.
+
+**What the change cost and what it did not.** A second file to ship and a variable to set; the image carries
+both. On the Mac mini `just throughput` gives the same figures with the official library as with the linked one
+(0.74 ms for a short field and 13.1 ms for eight records, against 0.74 ms and 13.0 ms measured the same hour),
+so no figure in the README moved. The binary went from 33 MB to 17 MB, and the library is 25 to 45 MB beside it.
+`runtime fetch` reads a zip archive, which brought in the `zip` crate. The crate is still pinned to an exact
+version.
+
+**What each platform needed.** On macOS ONNX Runtime hands graphs to CoreML by default, which was slower and
+failed on a batch, so the session is told to prefer the CPU. The linked library also needed the compiler's
+runtime library named at link time on macOS (`.cargo/config.toml`, which is gone with it) and the C++ standard
+library of GCC 13 on Linux, which is why the image moved from Debian 12 to Debian 13 (accepted by the owner for
+production on 2026-11-12). Microsoft's library needs neither: it asks for glibc 2.28 and a C++ standard library
+of GCC 6's age. The image stays on Debian 13, which is what was measured; an older base has not been tried.
 
 **Measured.** On macOS, `just throughput`: a four-field record in 4.2 ms against 20.2 ms. `just load`, through
 gRPC: one edit in 1.6 ms against 5.6 ms, and a ceiling of about 2,400 edits a second against 470, with the

@@ -35,6 +35,7 @@ pub mod load;
 pub mod locks;
 pub mod metrics;
 pub mod offline;
+pub mod onnxruntime;
 #[cfg(test)]
 mod properties;
 pub mod quantities;

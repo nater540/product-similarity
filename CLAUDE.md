@@ -83,7 +83,7 @@ changing a design. Infer conventions from the existing code first.
   `import_stream` (the loop behind the streaming `Import` call), `locks` (one lock for each record a request is
   at), `metrics` (the few numbers the server keeps
   about itself), `telemetry` (where its traces and metrics go: the exporters, the page, the traced store),
-  `model fetch`, `import`, `audit` (the store checked against an export: `compare.rs` for one record and the counts,
+  `model fetch`, `onnxruntime` (`runtime fetch`: which library runs the model, and its digests), `import`, `audit` (the store checked against an export: `compare.rs` for one record and the counts,
   `mod.rs` for the run, `report.rs` for the report and the events), `anchors` (a backup of every record's anchor:
   `file.rs` for the file, `mod.rs` for the export and the restore), `compare`/`calibrate`/`calibrate-drift`/`calibrate-match`/`calibrate-sweep` (the `offline` module), `load` (the load
   test), `runs` (reading recorded runs back, comparing and reporting them), `shadow` (a candidate policy judging
@@ -312,7 +312,14 @@ changing a design. Infer conventions from the existing code first.
   the engine into the fingerprint or the layout id: the vectors are the same, and that is what the check is for.
   `onnx` stays a feature of `similarity-core` (the `ort` crate is behind it) that the server always enables and the
   trainer never does, with `ort` pinned
-  exactly. Its threads spin, always, and `model.threads` (left out by default) says how many there are (D45):
+  exactly. The runtime itself is not in the binary (2026-11-25, the owner's choice): it is Microsoft's own build,
+  which `record-similarity runtime fetch` downloads from nuget.org and checks against digests in `onnxruntime.rs`,
+  and which the server opens from `ORT_DYLIB_PATH` or from beside the binary. Do not go back to `download-binaries`
+  or any other build that links a third party's library. `onnx.rs` opens the library by path before anything else
+  is asked of `ort`; never let an `ort` call run before that (the binding would open the library itself and panic
+  if it could not). A new version is a new `VERSION` and new digests in `onnxruntime.rs`, measured with
+  `just throughput` before and after. No test in `cargo test` may need the library. Its threads spin, always, and
+  `model.threads` (left out by default) says how many there are (D45):
   neither changes a vector, so neither goes into the fingerprint, the layout id, or the judging digest. The tests
   stay on Burn, the reference: the tiny encoders, and the real-model tests, which load with
   `Embedder::load`. After changing the encoder, the pooling, or the export, run `just test-onnx` (it needs
@@ -385,16 +392,17 @@ changing a design. Infer conventions from the existing code first.
 
 ## Commands
 
-- Build: `just build` (`cargo build --workspace`); release binary: `just release`. The first build of the server
-  downloads ONNX Runtime's prebuilt library; on Linux it links only against GCC 13's C++ library or later
+- Build: `just build` (`cargo build --workspace`); release binary: `just release`. Nothing of ONNX Runtime is built
+  or linked: `just fetch-onnxruntime` downloads the library, and every recipe that runs the model opens it from
+  `./onnxruntime` (the justfile exports `ORT_DYLIB_PATH`; a binary run by hand needs the variable set)
 - Test (fast): `just test`, or one crate: `just test similarity-core`
 - Lint: `just clippy`; format: `just fmt`; everything CI runs: `just ci`
-- Model: `just fetch-model`, then `just export-onnx` (needs `uv`); Qdrant: `just qdrant-up` / `just qdrant-down`
+- Model: `just fetch-model`, then `just export-onnx` (needs `uv`), then `just fetch-onnxruntime`; Qdrant: `just qdrant-up` / `just qdrant-down`
 - Slow tests: `just test-parity`, `just test-snapshot`, `just test-qdrant`, `just test-real`; `just snapshot` rewrites
   the pinned verdicts
 - The engine: `just export-onnx <model-dir>` (needs `uv`), `just test-onnx`, `just throughput <model-dir>` and
   `just throughput <model-dir> burn` for the reference beside it; `just image <tag>` exports inside the build
-  (Debian 13: the prebuilt runtime does not link on Debian 12)
+  and carries the runtime's library at `/opt/onnxruntime`
 - Mutation testing, in extreme cases only (40 minutes; needs `cargo install cargo-mutants`): `just mutants -j 3`,
   `just mutants-diff`, `just mutants-train`
 - Run: `just serve` (needs Qdrant) or `just serve-in-memory`; then `just client describe`

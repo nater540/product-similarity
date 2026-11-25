@@ -2,6 +2,8 @@
 # Model weights are fetched, not vendored (`record-similarity model fetch`); the provenance note is checked in.
 /models/*
 !/models/README.md
+# ONNX Runtime's library is fetched too (`record-similarity runtime fetch`), and is 25 to 45 MB of machine code.
+/onnxruntime/
 # Local Qdrant storage from `just qdrant-up`.
 /qdrant_storage/
 .env

@@ -9,9 +9,10 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
   # Enough debug information for a backtrace to name files and lines, and no more. With all of it, the test
-  # binaries of this workspace come to 12 GB (17 of them, up to 640 MB each, every one with Burn and ONNX Runtime
-  # linked in), which a hosted runner's disk does not have: the linker died of a bus error writing one. This way
-  # they come to 5 GB.
+  # binaries of this workspace come to 12 GB (17 of them, up to 640 MB each, every one with Burn linked in), which
+  # a hosted runner's disk does not have: the linker died of a bus error writing one. This way they come to 5 GB.
+  # (Those sizes are from when ONNX Runtime was linked in too; it is opened at run time now, and no test here
+  # opens it.)
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
@@ -46,11 +47,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    env:
-      # `RUSTFLAGS` in the environment replaces the flags in `.cargo/config.toml`, it does not add to them, and the
-      # macOS link needs the one that is there: ONNX Runtime's library calls into the compiler's runtime library.
-      # (`matrix`, not `runner`: the `runner` context does not exist yet where a job's `env` is evaluated.)
-      RUSTFLAGS: ${{ matrix.os == 'macos-latest' && '-D warnings -C link-arg=-fapple-link-rtlib' || '-D warnings' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
