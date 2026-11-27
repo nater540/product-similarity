@@ -2995,13 +2995,15 @@ build from before threads spun (D45):
 About 0.04 ms a request, and of what a busy server answers, 5% of the edits and 7% of the resaves. Keeping fewer
 traces saves what is sent and stored, and little of the server's time: the spans are made either way.
 
-**Trying it.** `just observe-up` starts an OpenTelemetry Collector, Jaeger, and Prometheus in Docker
-(`compose.yml`, profile `observability`; the two small configs are in `deploy/observability/`). The Collector
-passes the traces to Jaeger and holds the metrics for Prometheus, which scrapes it as the job
-`record-similarity-pushed` and scrapes the server's own page as `record-similarity-page`:
+**Trying it.** `just observe-up` starts an OpenTelemetry Collector, Jaeger, Prometheus, and Grafana in Docker
+(`compose.yml`, profile `observability`; the small configs and the dashboard are in `deploy/observability/`).
+The Collector passes the traces to Jaeger and holds the metrics for Prometheus, which scrapes it as the job
+`record-similarity-pushed` and scrapes the server's own page as `record-similarity-page`. Grafana reads from
+both and opens on a dashboard of the six metrics, with the latest traces under them:
 
 ```sh
-just observe-up                      # Jaeger at http://localhost:16686, Prometheus at http://localhost:9090
+just observe-up                      # Jaeger at http://localhost:16686, Prometheus at http://localhost:9090,
+                                     # Grafana at http://localhost:3000
 # in a copy of the config:
 #   [telemetry]
 #   otlp_endpoint = "http://127.0.0.1:4317"
@@ -3017,6 +3019,29 @@ On Linux the page has to listen on `0.0.0.0:9464` for the Prometheus container t
 `record-similarity`, one for each of the 182 `Evaluate` and 100 `Delete` calls, the `Import` stream, and the
 `Describe`; both Prometheus targets were up, with the same 31 series under each job and the same values. A
 Datadog Agent has not been tried.
+
+**The dashboard** ([`record-similarity.json`](deploy/observability/grafana/dashboards/record-similarity.json))
+is what the table above looks like over time: how busy the model is, how many are waiting for it, how long a
+forward pass takes (quantiles read back from the buckets, and the buckets themselves), the answers by verdict
+and by write mode, the share of edits rejected, and who was refused, abandoned, or left unanswered. Under them
+are 20 of the latest traces Jaeger holds, and a trace ID opens that trace in Jaeger.
+
+- **Prometheus has every metric twice**, once under each job, so the dashboard reads one route at a time:
+  `Metrics from`, at the top, is the server's page unless changed. A sum over both would count everything
+  twice.
+- **Nobody signs in to look.** Whoever can reach port 3000 is a viewer, and the port is bound to this machine.
+  Changing a panel, or Explore, needs a sign-in as `admin` with Grafana's default password, `admin`.
+- **Nothing is kept.** The two things Grafana reads from and the dashboard are files it reads at start; a panel
+  changed in the browser is gone with the container unless its JSON is exported into the file. A test holds the
+  file to the six names (`metrics.rs`), so a dashboard that asks for a metric no server keeps fails `cargo test`.
+- **No color on it is a limit.** A count of refusals turns orange at one, which says "some" and nothing more.
+  There are no alert rules: when a number is worth waking somebody for is a measurement nobody has made.
+- **A forward pass is not on it until there has been one**, and what happened before Prometheus first read the
+  histogram is its starting value, not an increase: the first load run against a new server, 50 records in a
+  fifth of a second, showed as answers and no passes. The counts start at zero and do not have that gap.
+
+Run here with Grafana 13.3.2, against a server that `just load` had driven past its deadlines (64 callers
+with `--deadline-ms 4`): all 17 panels had data by either route, as a visitor who had not signed in.
 
 ### Capacity
 

@@ -1973,10 +1973,18 @@ Prometheus 3.5.0 in Docker), with Prometheus scraping the page and scraping the 
 sent to: both targets up, the same 31 series by each route, and the same values. In the tests, a collector
 that keeps what it is sent (`fake-opentelemetry-collector`) receives the six from a served request.
 
+**A dashboard ships with them** (2026-11-25): `just observe-up` also starts Grafana 13.3.2, which reads from
+the same Prometheus and Jaeger and opens on one dashboard of the six, with the latest traces under them
+(`deploy/observability/grafana/`, all of it files, nothing kept). It is the first thing written against the
+names, and a test in `metrics.rs` holds it to them: every series it asks for is one of the six, and each of the
+six is on it. Prometheus has each metric under two jobs, so the dashboard reads one route at a time. A visitor
+is a viewer without signing in, because Grafana 13 says an anonymous editor is going away. No color on it is a
+limit, and there are no alert rules: when a number is worth waking somebody for has not been measured.
+
 **Not done:** a Datadog Agent, by either route; delta temporality, which some backends prefer and the
 exporter can be told to use; TLS to the collector; process metrics (memory, file descriptors), which a
 platform reports itself; TLS or authentication on the page, which like the gRPC port has neither and belongs
-behind the mesh; and anything per brand, on purpose.
+behind the mesh; alert rules; and anything per brand, on purpose.
 
 ## D40. A request is a trace, and what it waited for is in it
 

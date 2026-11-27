@@ -206,6 +206,7 @@ fn evaluation(verdict: Verdict, mode: WriteMode) -> [KeyValue; 2] {
 
 #[cfg(test)]
 mod tests {
+  use std::collections::BTreeSet;
   use std::sync::Arc;
   use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -379,5 +380,33 @@ mod tests {
     metrics.write_unanswered();
     metrics.evaluated(Verdict::Created, WriteMode::Enforce);
     metrics.watch_waiting(|| 7);
+  }
+
+  /// The dashboard that ships (`deploy/observability/grafana/`) is written against these names, which is what
+  /// makes them an interface. A name it asks for that no server keeps is a panel that stays empty and says
+  /// nothing, so every series in it is one of the six, and each of the six is on it.
+  #[test]
+  fn the_dashboard_asks_for_every_metric_and_for_no_other() {
+    let dashboard = include_str!("../../../deploy/observability/grafana/dashboards/record-similarity.json");
+    let asked: BTreeSet<&str> = dashboard
+      .split(|c: char| !(c.is_ascii_lowercase() || c == '_'))
+      .filter(|word| word.starts_with("record_similarity_"))
+      // A histogram is read back as three series named after it.
+      .map(|word| {
+        ["_bucket", "_sum", "_count"]
+          .iter()
+          .find_map(|part| word.strip_suffix(part))
+          .unwrap_or(word)
+      })
+      .collect();
+    let kept = BTreeSet::from([
+      PASS_SECONDS,
+      WAITING,
+      REFUSED,
+      ABANDONED,
+      UNANSWERED_WRITES,
+      EVALUATIONS,
+    ]);
+    assert_eq!(asked, kept);
   }
 }

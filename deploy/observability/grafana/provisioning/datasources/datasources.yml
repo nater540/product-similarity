@@ -1,0 +1,25 @@
+# What Grafana reads from, for `just observe-up`: the Prometheus and the Jaeger of the same compose profile.
+# The uids are what the dashboard's panels name, so they are fixed here and not left for Grafana to make up.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # Prometheus's `scrape_interval` (prometheus.yml). Grafana sizes `$__rate_interval` from it: a rate over
+      # less than a few scrapes has too few points to be one.
+      timeInterval: 5s
+      httpMethod: POST
+
+  - name: Jaeger
+    uid: jaeger
+    type: jaeger
+    access: proxy
+    url: http://jaeger:16686
+    editable: false

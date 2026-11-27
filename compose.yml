@@ -2,10 +2,10 @@
 #
 #   docker compose up -d qdrant                  # just the vector store, for `cargo run` and the ignored tests
 #   docker compose --profile server up --build   # the server too, built from this checkout
-#   docker compose --profile observability up -d # a Collector, Jaeger, and Prometheus, to watch a server
+#   docker compose --profile observability up -d # a Collector, Jaeger, Prometheus, and Grafana, to watch a server
 #
-# Qdrant's dashboard is at http://localhost:6333/dashboard, Jaeger (traces) is at http://localhost:16686, and
-# Prometheus (metrics) is at http://localhost:9090.
+# Qdrant's dashboard is at http://localhost:6333/dashboard, Jaeger (traces) is at http://localhost:16686,
+# Prometheus (metrics) is at http://localhost:9090, and Grafana (a dashboard of both) is at http://localhost:3000.
 
 services:
   qdrant:
@@ -56,3 +56,28 @@ services:
       - "127.0.0.1:9090:9090" # queries and the web page
     extra_hosts:
       - "host.docker.internal:host-gateway" # the machine the server runs on, also on Linux
+
+  # A dashboard of the server's metrics, with its latest traces beside them. Everything it shows is in files
+  # (`deploy/observability/grafana/`): the two things it reads from and the one dashboard, which is also the
+  # page it opens on. It keeps nothing, like the rest of the profile, and asks nothing of the internet. Nobody
+  # has to sign in to look: whoever can reach the port is a viewer, and the port is this machine's alone. To
+  # change a panel or try a query in Explore, sign in as `admin` with the password `admin`, which is Grafana's
+  # own default. (An anonymous editor would save that step, and Grafana 13 says the setting is going away.)
+  grafana:
+    image: grafana/grafana:13.3.2
+    profiles: ["observability"]
+    depends_on:
+      - prometheus
+      - jaeger
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/record-similarity.json
+    volumes:
+      - ./deploy/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:3000:3000" # the web page

@@ -1,0 +1,14 @@
+# Where Grafana finds its dashboards, for `just observe-up`: the JSON files of `deploy/observability/grafana/
+# dashboards/`, mounted at the path below. They are read at start and again when a file changes. A dashboard
+# changed in the browser is not saved back: export its JSON and put it in the file.
+
+apiVersion: 1
+
+providers:
+  - name: record-similarity
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 10
+    options:
+      path: /var/lib/grafana/dashboards

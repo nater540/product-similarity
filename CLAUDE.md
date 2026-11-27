@@ -416,8 +416,10 @@ changing a design. Infer conventions from the existing code first.
 - Mutation testing, in extreme cases only (40 minutes; needs `cargo install cargo-mutants`): `just mutants -j 3`,
   `just mutants-diff`, `just mutants-train`
 - Run: `just serve` (needs Qdrant) or `just serve-in-memory`; then `just client describe`
-- Watch its traces and metrics: `just observe-up` (an OpenTelemetry Collector on 4317, Jaeger on 16686, and
-  Prometheus on 9090, in Docker; the server needs `[telemetry]` set), `just observe-down`
+- Watch its traces and metrics: `just observe-up` (an OpenTelemetry Collector on 4317, Jaeger on 16686,
+  Prometheus on 9090, and Grafana on 3000 with a dashboard of the six metrics, in Docker; the server needs
+  `[telemetry]` set), `just observe-down`. The dashboard is `deploy/observability/grafana/dashboards/
+  record-similarity.json`, held to the metric names by a test in `metrics.rs`: a new metric gets a panel there
 - Show it to an audience: `just serve-in-memory config.toml`, then `just demo --pause` (needs `uv`)
 - Load a catalog: `just import export.jsonl config.toml` (`--check` validates only)
 - Check the store against the catalog: `just audit export.jsonl config.toml` (`--ndjson` for every finding as an
